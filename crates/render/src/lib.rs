@@ -10,9 +10,11 @@
 #![allow(missing_docs)] // TODO(MS-04): re-enable once the v0.0.1 API surface settles
 #![forbid(unsafe_code)]
 
+pub mod environment;
 pub mod frustum;
 pub mod mesh;
 pub mod offscreen;
+pub mod outline;
 mod pipeline;
 pub mod textures;
 pub mod ui;
@@ -24,9 +26,11 @@ use bytemuck::{Pod, Zeroable};
 use ob_math::{Mat4, SectionPos, WorldVec};
 use winit::window::Window;
 
+pub use environment::{DAY_LENGTH_TICKS, Environment, EnvironmentVisual};
 pub use frustum::{FRUSTUM_PLANE_COUNT, aabb_visible, section_bounds, section_visible};
 pub use mesh::{MesherStats, SNAPSHOT_SIZE, SectionSnapshot, mesh_section, mesh_section_with_stats};
 pub use offscreen::OffscreenRenderer;
+pub use outline::{BlockOutline, DEFAULT_EDGE_COLOR, DEFAULT_INFLATION, OUTLINE_VERTEX_COUNT, OutlineVertex};
 pub use textures::{TexturePack, TexturePackStyle};
 pub use ui::{GLYPH_SIZE, LINE_HEIGHT, UiFrame, UiRenderer, UiStats, UiTexture, UiVertex, glyph_advance, line_height};
 
@@ -70,6 +74,26 @@ impl Camera {
         [-sy * cp, sp, -cy * cp]
     }
 
+    /// Unit right vector, independent of pitch.
+    ///
+    /// This is the camera's `+X` axis in world space and matches the
+    /// right-handed view matrix used by [`Camera::view_projection`].
+    pub fn right(&self) -> [f32; 3] {
+        let (sy, cy) = self.yaw.sin_cos();
+        [cy, 0.0, -sy]
+    }
+
+    /// Unit up vector (`cross(right, forward)`).
+    pub fn up(&self) -> [f32; 3] {
+        let forward = self.forward();
+        let right = self.right();
+        [
+            right[1] * forward[2] - right[2] * forward[1],
+            right[2] * forward[0] - right[0] * forward[2],
+            right[0] * forward[1] - right[1] * forward[0],
+        ]
+    }
+
     /// Combined view-projection matrix for an aspect ratio.
     pub fn view_projection(&self, aspect: f32) -> Mat4 {
         let forward = ob_math::forward_from_angles(self.yaw, self.pitch);
@@ -98,6 +122,45 @@ impl Camera {
         let start = self.far * 0.55;
         let end = (self.far * 0.95).max(start + 1.0);
         (start, end)
+    }
+}
+
+/// Everything a frame needs besides the camera: the time of day, an optional
+/// immediate-mode UI frame and an optional targeted-block outline.
+///
+/// The default environment is noon, so `SceneParams::default()` and
+/// [`Environment::default()`] keep the pre-v0.0.5 daylight look. Existing
+/// renderer methods delegate here with the default environment and no outline.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SceneParams<'a> {
+    /// Time-of-day environment driving the sky and world light.
+    pub environment: Environment,
+    /// Optional HUD/menu frame drawn after the world and the outline.
+    pub ui: Option<&'a UiFrame>,
+    /// Optional targeted-block outline drawn after the world, before the UI.
+    pub outline: Option<BlockOutline>,
+}
+
+impl<'a> SceneParams<'a> {
+    /// Creates scene parameters for an environment with no UI and no outline.
+    pub fn new(environment: Environment) -> Self {
+        Self {
+            environment,
+            ui: None,
+            outline: None,
+        }
+    }
+
+    /// Attaches an immediate-mode UI frame.
+    pub fn with_ui(mut self, ui: &'a UiFrame) -> Self {
+        self.ui = Some(ui);
+        self
+    }
+
+    /// Attaches a targeted-block outline.
+    pub fn with_outline(mut self, outline: BlockOutline) -> Self {
+        self.outline = Some(outline);
+        self
     }
 }
 
@@ -209,10 +272,14 @@ pub struct Renderer {
     pub(crate) pipeline: wgpu::RenderPipeline,
     /// Full-screen sky gradient pipeline.
     pub(crate) sky_pipeline: wgpu::RenderPipeline,
+    /// Targeted-block outline line-list pipeline.
+    pub(crate) outline_pipeline: wgpu::RenderPipeline,
     /// Depth texture view.
     pub(crate) depth_view: wgpu::TextureView,
-    /// Camera uniform buffer.
+    /// Camera, fog and environment uniform buffer.
     pub(crate) uniform_buffer: wgpu::Buffer,
+    /// Small per-frame outline vertex buffer (24 line-list vertices).
+    pub(crate) outline_buffer: wgpu::Buffer,
     /// Procedural block texture array and sampler.
     ///
     /// Kept alive here even though the bind group also retains its view.
@@ -309,12 +376,14 @@ impl Renderer {
         let depth_view = pipeline::create_depth_view(&device, width, height);
 
         let uniform_buffer = pipeline::create_camera_buffer(&device);
+        let outline_buffer = pipeline::create_outline_buffer(&device);
         let textures = BlockTextureArray::new_with_style(&device, &queue, style);
         let ui = ui::UiRenderer::new(&device, &queue, &textures, format);
         let bind_group_layout = pipeline::create_bind_group_layout(&device);
         let bind_group = pipeline::create_bind_group(&device, &bind_group_layout, &uniform_buffer, &textures);
         let pipeline = pipeline::create_pipeline(&device, format, &bind_group_layout);
-        let sky_pipeline = pipeline::create_sky_pipeline(&device, format);
+        let sky_pipeline = pipeline::create_sky_pipeline(&device, format, &bind_group_layout);
+        let outline_pipeline = pipeline::create_outline_pipeline(&device, format, &bind_group_layout);
 
         Ok(Self {
             instance,
@@ -324,8 +393,10 @@ impl Renderer {
             config,
             pipeline,
             sky_pipeline,
+            outline_pipeline,
             depth_view,
             uniform_buffer,
+            outline_buffer,
             _textures: textures,
             ui,
             bind_group,
@@ -402,18 +473,36 @@ impl Renderer {
         self.meshes.clear();
     }
 
-    /// Renders one frame of the world with an optional UI overlay.
+    /// Renders one frame with a day/night environment, an optional UI overlay
+    /// and an optional targeted-block outline.
     ///
-    /// The sky gradient is drawn first into a cleared colour target (no depth),
-    /// the world pass loads that colour and clears depth on its own, and the UI
-    /// frame is drawn last with alpha blending and no depth attachment.
-    pub fn render_with_ui(&mut self, camera: &Camera, ui: Option<&ui::UiFrame>) -> Result<(), RenderError> {
+    /// The sky gradient, sun/moon and stars are drawn first into a cleared
+    /// colour target (no depth). The world pass loads that colour, clears depth
+    /// and draws the chunk meshes. The outline is drawn in the same pass
+    /// immediately after the world geometry, with `LessEqual` depth testing and
+    /// depth writes disabled, so it is hidden by nearer terrain but never
+    /// occludes anything. The UI frame is drawn last with alpha blending and no
+    /// depth attachment.
+    ///
+    /// The uploaded outline and the uniform are shared by the whole frame; the
+    /// statistics returned by [`Self::stats`] still count chunk draws only.
+    pub fn render_scene(&mut self, camera: &Camera, scene: &SceneParams<'_>) -> Result<(), RenderError> {
         let (width, height) = self.size();
         let aspect = width as f32 / height as f32;
-        let uniform = CameraUniform::new(camera, aspect);
+        let uniform = CameraUniform::new(camera, aspect, scene.environment);
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         let frustum = camera.frustum_planes(aspect);
+
+        // A non-finite outline is skipped rather than uploaded as NaNs.
+        let outline_vertices = scene
+            .outline
+            .filter(BlockOutline::is_finite)
+            .map(|outline| outline.vertices());
+        if let Some(vertices) = &outline_vertices {
+            self.queue
+                .write_buffer(&self.outline_buffer, 0, bytemuck::cast_slice(vertices));
+        }
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -440,6 +529,7 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         {
             // Sky first, with no depth attachment: one full-screen triangle.
+            // The clear colour follows the current horizon as a fallback.
             let mut sky = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("sky"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -447,7 +537,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(pipeline::SKY_CLEAR),
+                        load: wgpu::LoadOp::Clear(uniform.sky_clear()),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -457,6 +547,7 @@ impl Renderer {
                 multiview_mask: None,
             });
             sky.set_pipeline(&self.sky_pipeline);
+            sky.set_bind_group(0, &self.bind_group, &[]);
             sky.draw(0..3, 0..1);
         }
         {
@@ -503,15 +594,37 @@ impl Renderer {
                 stats.vertices += u64::from(mesh.vertex_count);
                 stats.sections += 1;
             }
+            // Outline after the world geometry: the depth buffer now contains
+            // the nearest opaque surface, so the outline is correctly hidden
+            // behind terrain. Depth writes stay off; the UI pass follows.
+            if outline_vertices.is_some() {
+                pass.set_pipeline(&self.outline_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.outline_buffer.slice(..));
+                pass.draw(0..OUTLINE_VERTEX_COUNT as u32, 0..1);
+            }
         }
         self.stats = stats;
-        if let Some(ui_frame) = ui {
+        if let Some(ui_frame) = scene.ui {
             self.ui.render(&mut encoder, &view, ui_frame);
         }
         self.queue.submit([encoder.finish()]);
         drop(view);
         self.queue.present(frame);
         Ok(())
+    }
+
+    /// Renders one frame of the world with an optional UI overlay at the default
+    /// (noon) environment and without a block outline.
+    pub fn render_with_ui(&mut self, camera: &Camera, ui: Option<&ui::UiFrame>) -> Result<(), RenderError> {
+        self.render_scene(
+            camera,
+            &SceneParams {
+                environment: Environment::default(),
+                ui,
+                outline: None,
+            },
+        )
     }
 
     /// Renders one frame of the world without a UI overlay.
@@ -573,6 +686,21 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Vertex, uv), 12);
         assert_eq!(std::mem::offset_of!(Vertex, layer), 20);
         assert_eq!(std::mem::offset_of!(Vertex, light), 24);
+    }
+
+    #[test]
+    fn scene_params_default_to_noon_and_are_composable() {
+        let scene = SceneParams::default();
+        assert_eq!(scene.environment, Environment::default());
+        assert_eq!(scene.environment.time_of_day, 0.5);
+        assert!(scene.ui.is_none());
+        assert!(scene.outline.is_none());
+
+        let outline = BlockOutline::for_block([1, 2, 3]);
+        let scene = SceneParams::new(Environment::new(0.0)).with_outline(outline);
+        assert_eq!(scene.environment, Environment::new(0.0));
+        assert_eq!(scene.outline, Some(outline));
+        assert!(scene.ui.is_none());
     }
 
     #[test]

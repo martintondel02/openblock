@@ -170,3 +170,49 @@ Snapshot capture costs ~25.9 µs per solid section, so 32 submissions/frame cost
 - Workspace tests: 166 (v0.0.3: 149), including CPU tests for every texture
   style, mip determinism and leaf alpha; GPU texture-grid previews remain an
   explicitly-run ignored test to keep CI GPU-free.
+
+## 2026-11-24 — v0.0.5 (inventory, mining, day/night, biomes)
+
+### World generation (biomes)
+
+- Five biomes were added (plains, forest, desert, snowy taiga, mountains) using
+  low-frequency temperature/humidity/highland fields and smooth weights that
+  also blend height parameters, so biome borders have no height seams.
+- Public 512×512 biome shares: seed 1 — plains 14.6%, forest 22.7%, desert
+  21.3%, snowy taiga 15.8%, mountains 25.6%; seed 42 — 9.0 / 26.5 / 9.8 / 12.6 /
+  42.2%. Every biome is present within the default world's streaming area for
+  the seeds tested.
+- Generation throughput (test profile, opt-level 1): 300 chunks in 435 ms =
+  1.45 ms/chunk, worst chunk 1.85 ms. This is well under the 2 ms/chunk budget
+  used for streaming, and chunk generation is parallelised across the rayon
+  pool in `Host::ensure_streaming`.
+- Effective tree densities (seed 42, 256×256 columns): forest 1 trunk / 50
+  columns, taiga 1 / 55, plains 1 / 145, mountains 1 / 754, desert 0; taiga also
+  places supported 2×2 snow drifts.
+
+### Rendering (day/night + outline)
+
+- The day/night environment is presentation-only and does not affect the
+  simulation/save hash. Sun path: east at sunrise, zenith at noon, west at
+  sunset; moonlight keeps block light at 0.154–0.22 of daylight, and night
+  geometry measured 148 → 65 mean luma (readable, not black).
+- Star field: deterministic hash over a rotating azimuth/altitude grid; 0 star
+  pixels at noon vs 224 isolated star pixels at midnight in the GPU test.
+- Targeted-block outline: 24-vertex line list drawn after the world pass,
+  depth-tested with no depth writes; GPU test finds 0 outline pixels without a
+  target vs 114 with one, all four projected top edges, and full occlusion
+  behind a nearer pillar.
+- Cost is negligible: one fullscreen sky triangle, a handful of ALU ops per
+  fragment, one 24-vertex line-list draw. The cached offscreen benchmark gate is
+  unchanged.
+
+### Interactive systems
+
+- Inventory uses the existing immediate-mode UI renderer (no new draw calls per
+  widget beyond the existing batches); the whole frame stays within the UI
+  batch budget.
+- Mining is a pure state machine driven by the frame clock; the per-block
+  hardness table lives in `ob_content` (stone 1.5 s, log 2.0 s, leaves 0.2 s,
+  bedrock/water unbreakable) so tools and future content can reuse it.
+- World tests: 216 total (biome determinism/surfaces/trees, environment/outline
+  CPU and GPU tests, inventory/mining/UI tests, plus the pre-existing suites).

@@ -29,6 +29,14 @@
     <content_attribute id="social-chat">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.0.5" date="2026-11-24" type="development">
+      <description>
+        <p>Inventory and hotbar management, hold-to-mine with block hardness and
+        a targeted-block outline, a day/night cycle with sun, moon and stars,
+        and five biomes with blended terrain and biome-specific surfaces and
+        trees.</p>
+      </description>
+    </release>
     <release version="0.0.4" date="2026-11-24" type="development">
       <description>
         <p>Four selectable procedural texture styles (classic, painterly, lush,

@@ -41,11 +41,11 @@ OpenBlock is designed to express content and systems Minecraft cannot:
 programmable logic blocks, first-class energy/fluid networks, scriptable mob
 AI, procedural dungeons, server-side minigames and more.
 
-![OpenBlock v0.0.4 tech preview — textured terrain with fog, sky gradient, HUD and hotbar](docs/img/v0.0.4-screenshot.png)
+![OpenBlock v0.0.5 tech preview — desert and snowy mountain at day, with HUD](docs/img/v0.0.5-screenshot.png)
 
-<p align="center"><em>v0.0.4, seed 42, classic texture style: mipmapped block textures, cut-out leaves, distance fog, sky gradient and the HUD (offscreen capture on Fedora 45, RADV).</em></p>
+<p align="center"><em>v0.0.5, seed 7, classic textures: desert dunes, a snowy mountain and forest, with the HUD (offscreen capture on Fedora 45, RADV).</em></p>
 
-> **Status: v0.0.4 tech preview.** A runnable single-player vertical slice now
+> **Status: v0.0.5 tech preview.** A runnable single-player vertical slice now
 > exists: procedural terrain, chunk streaming, walk/fly physics, block
 > break/place, hotbar selection, save/load and a headless host with a
 > determinism smoke test. It is the first slice of MS-03, not a finished game:
@@ -231,6 +231,18 @@ cargo run --release -p ob_tools --bin openblock-tools -- bench --frames 60 --see
 cargo run --release -p ob_client --bin openblock -- --seed 42 --fly --seconds 10
 ```
 
+## Day, dusk, night and inventory
+
+| Dusk | Night |
+| --- | --- |
+| ![Dusk](docs/img/v0.0.5-dusk.png) | ![Night with stars](docs/img/v0.0.5-night.png) |
+
+![Inventory screen](docs/img/v0.0.5-inventory.png)
+
+`--time-of-day F` renders screenshots at any clock time (0 midnight, 0.25
+sunrise, 0.5 noon, 0.75 sunset); in game the clock advances with the simulation
+and starts at sunrise.
+
 ## Texture styles
 
 ![Four OpenBlock texture styles: classic, painterly, lush and minimal](docs/img/v0.0.4-texture-styles.png)
@@ -253,8 +265,10 @@ Measured on the reference dev machine (Fedora 45, RADV integrated GPU,
 gate. Full log: [`docs/plan/08-measurements.md`](docs/plan/08-measurements.md).
 
 Controls: mouse look (click to capture), `WASD` move, `Space` jump, `Shift`
-sprint, `F` toggle fly, left/right click break/place, `1`–`8` or the mouse wheel
-select a block. Texture style is in the settings menu. `F3` toggles the debug overlay, `F1` toggles the HUD, `F2` saves
+sprint, `F` toggle fly, **hold left button to mine**, right click to place,
+`1`–`9` or the mouse wheel select a hotbar slot, `E` opens the inventory,
+`F3` debug, `F1` HUD, `F2` screenshot, `Esc` pause/settings. Texture style is in
+the settings menu. `F3` toggles the debug overlay, `F1` toggles the HUD, `F2` saves
 a screenshot, `Esc` opens the pause/settings menu (render distance, FOV, mouse
 sensitivity, fullscreen, HUD/debug toggles, save and quit). Settings are saved to
 `<data-dir>/config.json`; worlds live under

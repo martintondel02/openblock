@@ -138,6 +138,19 @@ pub struct BlockType {
     pub fluid: bool,
     /// Textures for top/side/bottom faces.
     pub textures: BlockTextures,
+    /// Hand-breaking hardness in seconds; `f32::INFINITY` means unbreakable.
+    ///
+    /// Creative-mode instant breaking and tool multipliers arrive with the
+    /// inventory/tool system; the client currently uses this as hold-to-mine
+    /// duration.
+    pub hardness: f32,
+}
+
+impl BlockType {
+    /// Whether the player can break this block by hand.
+    pub fn breakable(&self) -> bool {
+        self.hardness.is_finite()
+    }
 }
 
 /// A frozen registry of block types for a session.
@@ -148,7 +161,7 @@ pub struct Registry {
 }
 
 /// Raw definition tuple used while building the base registry.
-type BlockDef = (&'static str, [f32; 3], bool, bool, bool, BlockTextures);
+type BlockDef = (&'static str, [f32; 3], bool, bool, bool, BlockTextures, f32);
 
 impl Registry {
     /// Builds the first-party base block set.
@@ -162,6 +175,7 @@ impl Registry {
                 false,
                 false,
                 BlockTextures::all(tex::DEBUG),
+                0.0,
             ),
             (
                 "openblock:stone",
@@ -170,6 +184,7 @@ impl Registry {
                 true,
                 false,
                 BlockTextures::all(tex::STONE),
+                1.5,
             ),
             (
                 "openblock:dirt",
@@ -178,6 +193,7 @@ impl Registry {
                 true,
                 false,
                 BlockTextures::all(tex::DIRT),
+                0.5,
             ),
             (
                 "openblock:grass",
@@ -186,6 +202,7 @@ impl Registry {
                 true,
                 false,
                 BlockTextures::column(tex::GRASS_TOP, tex::GRASS_SIDE, tex::DIRT),
+                0.6,
             ),
             (
                 "openblock:sand",
@@ -194,6 +211,7 @@ impl Registry {
                 true,
                 false,
                 BlockTextures::all(tex::SAND),
+                0.5,
             ),
             (
                 "openblock:water",
@@ -202,6 +220,7 @@ impl Registry {
                 false,
                 true,
                 BlockTextures::all(tex::WATER),
+                f32::INFINITY,
             ),
             (
                 "openblock:log",
@@ -210,6 +229,7 @@ impl Registry {
                 true,
                 false,
                 BlockTextures::column(tex::LOG_TOP, tex::LOG_SIDE, tex::LOG_TOP),
+                2.0,
             ),
             (
                 "openblock:leaves",
@@ -218,6 +238,7 @@ impl Registry {
                 false,
                 false,
                 BlockTextures::all(tex::LEAVES),
+                0.2,
             ),
             (
                 "openblock:bedrock",
@@ -226,6 +247,7 @@ impl Registry {
                 true,
                 false,
                 BlockTextures::all(tex::BEDROCK),
+                f32::INFINITY,
             ),
             (
                 "openblock:gravel",
@@ -234,6 +256,7 @@ impl Registry {
                 true,
                 false,
                 BlockTextures::all(tex::GRAVEL),
+                0.6,
             ),
             (
                 "openblock:clay",
@@ -242,6 +265,7 @@ impl Registry {
                 true,
                 false,
                 BlockTextures::all(tex::CLAY),
+                0.6,
             ),
             (
                 "openblock:snow",
@@ -250,17 +274,19 @@ impl Registry {
                 true,
                 false,
                 BlockTextures::all(tex::SNOW),
+                0.1,
             ),
         ];
         let blocks = defs
             .into_iter()
-            .map(|(id, color, solid, opaque, fluid, textures)| BlockType {
+            .map(|(id, color, solid, opaque, fluid, textures, hardness)| BlockType {
                 id,
                 color,
                 solid,
                 opaque,
                 fluid,
                 textures,
+                hardness,
             })
             .collect();
         Self::from_blocks(blocks).expect("the built-in base block set is valid")
@@ -347,6 +373,9 @@ mod tests {
         assert!(reg.block(BlockId(3)).opaque);
         assert!(reg.block(reg.id("openblock:water").unwrap()).fluid);
         assert_eq!(reg.len(), 12);
+        assert_eq!(reg.block(reg.id("openblock:bedrock").unwrap()).hardness, f32::INFINITY);
+        assert!(!reg.block(reg.id("openblock:bedrock").unwrap()).breakable());
+        assert_eq!(reg.block(reg.id("openblock:stone").unwrap()).hardness, 1.5);
     }
 
     #[test]

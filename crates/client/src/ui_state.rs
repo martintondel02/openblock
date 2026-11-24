@@ -4,13 +4,28 @@
 //! while `ob_render::ui` draws it. Keeping the model separate makes the layout
 //! and menu logic unit-testable without a window or a device.
 
+use ob_content::{BlockType, Registry};
 use ob_core::config::{
     MAX_FOV_DEGREES, MAX_MOUSE_SENSITIVITY, MAX_RENDER_DISTANCE, MIN_FOV_DEGREES, MIN_MOUSE_SENSITIVITY,
     MIN_RENDER_DISTANCE, Settings,
 };
 
+use crate::inventory::{InventoryLayout, InventoryState, layout as inventory_layout};
+
 /// Number of hotbar slots.
-pub const HOTBAR_SLOTS: usize = 8;
+pub const HOTBAR_SLOTS: usize = 9;
+/// Default hotbar contents, in slot order.
+pub const DEFAULT_HOTBAR: [&str; HOTBAR_SLOTS] = [
+    "openblock:grass",
+    "openblock:dirt",
+    "openblock:stone",
+    "openblock:sand",
+    "openblock:log",
+    "openblock:leaves",
+    "openblock:water",
+    "openblock:bedrock",
+    "openblock:snow",
+];
 /// Hotbar slot edge length in UI pixels at 1080p.
 pub const HOTBAR_SLOT_SIZE: f32 = 44.0;
 /// Gap between hotbar slots.
@@ -27,6 +42,8 @@ pub const BLOCK_NAME_SECONDS: f32 = 2.5;
 pub enum Screen {
     /// Normal gameplay with a captured pointer.
     Playing,
+    /// Creative inventory with a released pointer.
+    Inventory,
     /// Pause menu.
     Pause,
     /// Settings screen reached from the pause menu.
@@ -149,6 +166,8 @@ pub struct DebugStats {
     pub window: [u32; 2],
     /// Vertical field of view in degrees.
     pub fov_degrees: f32,
+    /// Normalised time of day (0 midnight, 0.5 noon).
+    pub time_of_day: f32,
 }
 
 impl DebugStats {
@@ -198,8 +217,8 @@ impl DebugStats {
                 self.ticks
             ),
         ];
-        if lines.len() < 11 {
-            lines.resize(11, String::new());
+        if lines.len() < 12 {
+            lines.resize(12, String::new());
         }
         lines
     }
@@ -247,8 +266,16 @@ pub struct UiState {
     pub hovered_row: Option<usize>,
     /// Hotbar slot selected.
     pub hotbar_selected: usize,
+    /// Resource ids of the blocks in each hotbar slot.
+    pub hotbar: [&'static str; HOTBAR_SLOTS],
+    /// Inventory selection, hover and scroll.
+    pub inventory: InventoryState,
     /// Remaining seconds to show the selected block name.
     pub block_name_seconds: f32,
+    /// Recently broken block name shown briefly near the crosshair.
+    pub break_flash: Option<String>,
+    /// Remaining seconds to show [`Self::break_flash`].
+    pub break_flash_seconds: f32,
     /// Cursor position in UI pixels.
     pub cursor: (f32, f32),
     /// Drag value for a future settings slider.
@@ -265,7 +292,11 @@ impl Default for UiState {
             selected_row: 0,
             hovered_row: None,
             hotbar_selected: 0,
+            hotbar: DEFAULT_HOTBAR,
+            inventory: InventoryState::default(),
             block_name_seconds: 0.0,
+            break_flash: None,
+            break_flash_seconds: 0.0,
             cursor: (0.0, 0.0),
             dragging: false,
         }
@@ -286,6 +317,10 @@ impl UiState {
     /// Advances timers.
     pub fn tick(&mut self, dt_seconds: f32) {
         self.block_name_seconds = (self.block_name_seconds - dt_seconds).max(0.0);
+        self.break_flash_seconds = (self.break_flash_seconds - dt_seconds).max(0.0);
+        if self.break_flash_seconds <= 0.0 {
+            self.break_flash = None;
+        }
     }
 
     /// Toggles the F3 overlay and mirrors it into settings.
@@ -298,6 +333,74 @@ impl UiState {
     pub fn select_hotbar(&mut self, slot: usize) {
         self.hotbar_selected = slot % HOTBAR_SLOTS;
         self.block_name_seconds = BLOCK_NAME_SECONDS;
+    }
+
+    /// Cycles the hotbar selection by `steps` slots (normally the mouse wheel).
+    pub fn cycle_hotbar(&mut self, steps: i32) {
+        let slot = (self.hotbar_selected as i32 + steps).rem_euclid(HOTBAR_SLOTS as i32);
+        self.select_hotbar(slot as usize);
+    }
+
+    /// Block type stored in a hotbar slot, or `None` when the current registry
+    /// does not contain it (so the HUD can skip slots that do not exist).
+    pub fn hotbar_block<'a>(&self, registry: &'a Registry, index: usize) -> Option<&'a BlockType> {
+        let name = *self.hotbar.get(index)?;
+        registry.id(name).map(|id| registry.block(id))
+    }
+
+    /// Short display name of a hotbar slot's block, preserving the legacy
+    /// lowercase HUD label (the inventory uses title-cased display names).
+    pub fn hotbar_label(&self, index: usize) -> Option<&'static str> {
+        let name = *self.hotbar.get(index)?;
+        Some(name.split_once(':').map(|(_, label)| label).unwrap_or(name))
+    }
+
+    /// Opens the inventory, releasing the pointer.
+    pub fn open_inventory(&mut self) {
+        self.screen = Screen::Inventory;
+        self.inventory.open();
+    }
+
+    /// Closes the inventory and returns to gameplay.
+    pub fn close_inventory(&mut self) {
+        if self.screen == Screen::Inventory {
+            self.screen = Screen::Playing;
+        }
+    }
+
+    /// Toggles the inventory from gameplay or closes it again.
+    pub fn toggle_inventory(&mut self) {
+        match self.screen {
+            Screen::Playing => self.open_inventory(),
+            Screen::Inventory => self.close_inventory(),
+            Screen::Pause | Screen::Settings => {}
+        }
+    }
+
+    /// Shows a block name briefly near the crosshair after a completed break.
+    pub fn flash_broken_block(&mut self, name: impl Into<String>) {
+        self.break_flash = Some(name.into());
+        self.break_flash_seconds = BLOCK_NAME_SECONDS;
+    }
+
+    /// Layout of the inventory grid for the current selection/scroll.
+    pub fn inventory_layout(&self, screen: [f32; 2], item_count: usize) -> InventoryLayout {
+        inventory_layout(screen, item_count, self.inventory.scroll)
+    }
+
+    /// Updates the hovered inventory slot from [`Self::cursor`].
+    pub fn update_inventory_hover(&mut self, screen: [f32; 2], item_count: usize) {
+        self.inventory.update_hover(self.cursor, screen, item_count);
+    }
+
+    /// Moves the inventory keyboard selection by grid columns/rows.
+    pub fn move_inventory_selection(&mut self, screen: [f32; 2], item_count: usize, dx: i32, dy: i32) {
+        self.inventory.move_selection(screen, item_count, dx, dy);
+    }
+
+    /// Scrolls the inventory grid by rows.
+    pub fn scroll_inventory(&mut self, screen: [f32; 2], item_count: usize, rows: i32) {
+        self.inventory.scroll_by(screen, item_count, rows);
     }
 
     /// Opens the pause screen.
@@ -315,7 +418,7 @@ impl UiState {
     /// Menu rows for the current screen.
     pub fn menu_items(&self) -> Vec<MenuItem> {
         match self.screen {
-            Screen::Playing => Vec::new(),
+            Screen::Playing | Screen::Inventory => Vec::new(),
             Screen::Pause => vec![MenuItem::Resume, MenuItem::OpenSettings, MenuItem::SaveAndQuit],
             Screen::Settings => vec![
                 MenuItem::RenderDistanceDown,
@@ -537,6 +640,89 @@ mod tests {
     }
 
     #[test]
+    fn hotbar_has_nine_default_slots_in_creative_order() {
+        let mut state = UiState::default();
+        assert_eq!(HOTBAR_SLOTS, 9);
+        assert_eq!(state.hotbar, DEFAULT_HOTBAR);
+        assert_eq!(
+            state.hotbar,
+            [
+                "openblock:grass",
+                "openblock:dirt",
+                "openblock:stone",
+                "openblock:sand",
+                "openblock:log",
+                "openblock:leaves",
+                "openblock:water",
+                "openblock:bedrock",
+                "openblock:snow",
+            ]
+        );
+        let registry = Registry::base();
+        assert_eq!(
+            state.hotbar_block(&registry, 0).map(|block| block.id),
+            Some("openblock:grass")
+        );
+        assert_eq!(
+            state.hotbar_block(&registry, 8).map(|block| block.id),
+            Some("openblock:snow")
+        );
+        assert_eq!(state.hotbar_label(2), Some("stone"));
+        state.hotbar[1] = "openblock:not_a_block";
+        assert!(state.hotbar_block(&registry, 1).is_none());
+        assert!(state.hotbar_block(&registry, HOTBAR_SLOTS).is_none());
+    }
+
+    #[test]
+    fn hotbar_cycling_wraps_across_all_nine_slots() {
+        let mut state = UiState::default();
+        for expected in 1..HOTBAR_SLOTS {
+            state.cycle_hotbar(1);
+            assert_eq!(state.hotbar_selected, expected);
+        }
+        state.cycle_hotbar(1);
+        assert_eq!(state.hotbar_selected, 0);
+        state.cycle_hotbar(-1);
+        assert_eq!(state.hotbar_selected, HOTBAR_SLOTS - 1);
+        state.cycle_hotbar(HOTBAR_SLOTS as i32 + 2);
+        assert_eq!(state.hotbar_selected, 1);
+    }
+
+    #[test]
+    fn inventory_screen_toggles_without_opening_the_pause_menu() {
+        let mut state = UiState::default();
+        state.toggle_inventory();
+        assert_eq!(state.screen, Screen::Inventory);
+        assert!(state.menu_items().is_empty());
+        assert!(state.panel_rect([1280.0, 720.0]).is_none());
+        assert!(state.inventory_layout([1280.0, 720.0], 11).slots.len() == 11);
+        state.toggle_inventory();
+        assert_eq!(state.screen, Screen::Playing);
+
+        state.open_inventory();
+        state.close_inventory();
+        assert_eq!(state.screen, Screen::Playing);
+
+        // The pause menu remains reachable only from gameplay.
+        state.open_pause();
+        state.toggle_inventory();
+        assert_eq!(state.screen, Screen::Pause);
+    }
+
+    #[test]
+    fn break_flash_expires_with_the_ui_clock() {
+        let mut state = UiState::default();
+        state.flash_broken_block("Log");
+        assert_eq!(state.break_flash.as_deref(), Some("Log"));
+        assert!(state.break_flash_seconds > 0.0);
+        state.tick(1.0);
+        assert!(state.break_flash_seconds > 0.0);
+        state.tick(10.0);
+        assert_eq!(state.break_flash_seconds, 0.0);
+        assert_eq!(state.break_flash, None);
+    }
+
+    #[test]
     fn pause_and_settings_navigation() {
         let mut state = UiState::default();
         state.open_pause();
@@ -687,9 +873,10 @@ mod tests {
             adapter: "Test GPU".into(),
             window: [1280, 720],
             fov_degrees: 70.0,
+            time_of_day: 0.5,
         };
         let left = stats.left_lines();
-        assert_eq!(left.len(), 11);
+        assert_eq!(left.len(), 12);
         let joined = left.join("\n");
         for needle in [
             "120 FPS",

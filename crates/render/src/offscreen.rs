@@ -14,7 +14,10 @@ use ob_world::World;
 
 use crate::textures::BlockTextureArray;
 use crate::ui::{UiFrame, UiRenderer};
-use crate::{Camera, RenderError, RenderStats, Vertex, mesh, pipeline, section_visible};
+use crate::{
+    BlockOutline, Camera, Environment, OUTLINE_VERTEX_COUNT, RenderError, RenderStats, SceneParams, Vertex, mesh,
+    pipeline, section_visible,
+};
 
 /// Offscreen colour target format (sRGB, readable through `copy_texture_to_buffer`).
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -29,8 +32,12 @@ pub struct OffscreenRenderer {
     pipeline: wgpu::RenderPipeline,
     /// Full-screen sky gradient pipeline.
     sky_pipeline: wgpu::RenderPipeline,
-    /// Camera uniform buffer.
+    /// Targeted-block outline line-list pipeline.
+    outline_pipeline: wgpu::RenderPipeline,
+    /// Camera, fog and environment uniform buffer.
     uniform_buffer: wgpu::Buffer,
+    /// Small per-frame outline vertex buffer.
+    outline_buffer: wgpu::Buffer,
     /// Procedural block texture array and sampler.
     ///
     /// Kept alive here even though the bind group also retains its view.
@@ -112,19 +119,23 @@ impl OffscreenRenderer {
         let depth_view = pipeline::create_depth_view(&device, width, height);
 
         let uniform_buffer = pipeline::create_camera_buffer(&device);
+        let outline_buffer = pipeline::create_outline_buffer(&device);
         let textures = BlockTextureArray::new_with_style(&device, &queue, style);
         let ui = UiRenderer::new(&device, &queue, &textures, COLOR_FORMAT);
         let bind_group_layout = pipeline::create_bind_group_layout(&device);
         let bind_group = pipeline::create_bind_group(&device, &bind_group_layout, &uniform_buffer, &textures);
         let pipeline = pipeline::create_pipeline(&device, COLOR_FORMAT, &bind_group_layout);
-        let sky_pipeline = pipeline::create_sky_pipeline(&device, COLOR_FORMAT);
+        let sky_pipeline = pipeline::create_sky_pipeline(&device, COLOR_FORMAT, &bind_group_layout);
+        let outline_pipeline = pipeline::create_outline_pipeline(&device, COLOR_FORMAT, &bind_group_layout);
 
         Ok(Self {
             device,
             queue,
             pipeline,
             sky_pipeline,
+            outline_pipeline,
             uniform_buffer,
+            outline_buffer,
             _textures: textures,
             bind_group,
             color_texture,
@@ -222,11 +233,44 @@ impl OffscreenRenderer {
 
     /// Renders the cached meshes and an optional UI frame, then reads the frame back.
     pub fn render_cached_with_ui(&mut self, camera: &Camera, ui: Option<&UiFrame>) -> Result<RenderStats, RenderError> {
+        self.render_cached_scene(
+            camera,
+            &SceneParams {
+                environment: Environment::default(),
+                ui,
+                outline: None,
+            },
+        )
+    }
+
+    /// Renders the cached meshes for a full scene and reads the frame back.
+    ///
+    /// This is the offscreen counterpart of [`crate::Renderer::render_scene`]:
+    /// the sky pass uses the scene environment, the world loads that colour and
+    /// draws the chunk meshes, the outline (when present) is drawn next with
+    /// `LessEqual` depth testing and no depth writes, and the UI frame is drawn
+    /// last. The GPU-to-CPU readback is included in the returned timing, like
+    /// [`Self::render_cached_with_ui`].
+    pub fn render_cached_scene(
+        &mut self,
+        camera: &Camera,
+        scene: &SceneParams<'_>,
+    ) -> Result<RenderStats, RenderError> {
         let aspect = self.width as f32 / self.height as f32;
-        let uniform = pipeline::CameraUniform::new(camera, aspect);
+        let uniform = pipeline::CameraUniform::new(camera, aspect, scene.environment);
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         let frustum = camera.frustum_planes(aspect);
+
+        // A non-finite outline is skipped rather than uploaded as NaNs.
+        let outline_vertices = scene
+            .outline
+            .filter(BlockOutline::is_finite)
+            .map(|outline| outline.vertices());
+        if let Some(vertices) = &outline_vertices {
+            self.queue
+                .write_buffer(&self.outline_buffer, 0, bytemuck::cast_slice(vertices));
+        }
 
         let mut stats = RenderStats::default();
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -241,7 +285,7 @@ impl OffscreenRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(pipeline::SKY_CLEAR),
+                        load: wgpu::LoadOp::Clear(uniform.sky_clear()),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -251,6 +295,7 @@ impl OffscreenRenderer {
                 multiview_mask: None,
             });
             sky.set_pipeline(&self.sky_pipeline);
+            sky.set_bind_group(0, &self.bind_group, &[]);
             sky.draw(0..3, 0..1);
         }
         {
@@ -291,8 +336,17 @@ impl OffscreenRenderer {
                 stats.vertices += u64::from(cached.vertex_count);
                 stats.sections += 1;
             }
+            // Outline after the world geometry, before the UI pass. The depth
+            // buffer already holds the nearest opaque surface, so terrain in
+            // front of the selection hides it.
+            if outline_vertices.is_some() {
+                pass.set_pipeline(&self.outline_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.outline_buffer.slice(..));
+                pass.draw(0..OUTLINE_VERTEX_COUNT as u32, 0..1);
+            }
         }
-        if let Some(ui_frame) = ui {
+        if let Some(ui_frame) = scene.ui {
             self.ui.render(&mut encoder, &self.color_view, ui_frame);
         }
         self.queue.submit([encoder.finish()]);
@@ -322,8 +376,31 @@ impl OffscreenRenderer {
         camera: &Camera,
         ui: Option<&UiFrame>,
     ) -> Result<(), RenderError> {
+        self.render_world_scene(
+            world,
+            camera,
+            &SceneParams {
+                environment: Environment::default(),
+                ui,
+                outline: None,
+            },
+        )
+    }
+
+    /// Renders a world for a full scene: environment, optional outline and
+    /// optional UI frame.
+    ///
+    /// This rebuilds the mesh cache first, exactly like
+    /// [`OffscreenRenderer::render_world_with_ui`]; the benchmark path uses
+    /// [`Self::rebuild_mesh_cache`] plus [`Self::render_cached_scene`] instead.
+    pub fn render_world_scene(
+        &mut self,
+        world: &World,
+        camera: &Camera,
+        scene: &SceneParams<'_>,
+    ) -> Result<(), RenderError> {
         self.rebuild_mesh_cache(world);
-        let _ = self.render_cached_with_ui(camera, ui)?;
+        let _ = self.render_cached_scene(camera, scene)?;
         log::info!(
             "offscreen frame: {} visible sections drawn, {} vertices, {} draws",
             self.stats.sections,
@@ -451,7 +528,7 @@ mod tests {
     use std::collections::HashMap;
 
     use ob_content::{BlockId, Registry};
-    use ob_math::{BlockPos, ChunkPos, WorldVec};
+    use ob_math::{BlockPos, ChunkPos, Vec4, WorldVec};
     use ob_world::ChunkColumn;
 
     use super::*;
@@ -872,5 +949,578 @@ mod tests {
             "block icon produced only {} distinct colours",
             icon_colours.len()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Day/night environment and targeted-block outline GPU tests.
+    // ------------------------------------------------------------------
+
+    /// Opens an offscreen renderer, or returns `None` when the host has no GPU
+    /// or the caller disabled GPU tests.
+    fn open_renderer(width: u32, height: u32, test: &str) -> Option<OffscreenRenderer> {
+        if std::env::var_os("OPENBLOCK_NO_GPU_TESTS").is_some() {
+            eprintln!("skipping {test}: OPENBLOCK_NO_GPU_TESTS is set");
+            return None;
+        }
+        match OffscreenRenderer::new(width, height) {
+            Ok(renderer) => {
+                eprintln!("{test} GPU: {}", renderer.adapter_summary());
+                Some(renderer)
+            }
+            Err(RenderError::NoAdapter(reason)) => {
+                eprintln!("skipping {test}: no GPU adapter ({reason})");
+                None
+            }
+            Err(err) => panic!("failed to create the offscreen renderer: {err}"),
+        }
+    }
+
+    /// Builds a camera at `eye` looking at a world-space target.
+    fn look_at(eye: WorldVec, target: [f32; 3]) -> Camera {
+        let delta = [
+            f64::from(target[0]) - eye.x,
+            f64::from(target[1]) - eye.y,
+            f64::from(target[2]) - eye.z,
+        ];
+        let length = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+        let yaw = (-delta[0]).atan2(-delta[2]) as f32;
+        let pitch = (delta[1] / length).asin() as f32;
+        let mut camera = Camera::new(eye, yaw, pitch);
+        camera.far = 128.0;
+        camera
+    }
+
+    /// Projects a world-space point to framebuffer pixels, top-left origin.
+    fn project(camera: &Camera, width: u32, height: u32, point: [f32; 3]) -> Option<[f32; 2]> {
+        let clip = camera.view_projection(width as f32 / height as f32) * Vec4::new(point[0], point[1], point[2], 1.0);
+        if clip.w <= 0.0 {
+            return None;
+        }
+        let ndc = clip.truncate() / clip.w;
+        Some([
+            (ndc.x * 0.5 + 0.5) * width as f32,
+            (1.0 - (ndc.y * 0.5 + 0.5)) * height as f32,
+        ])
+    }
+
+    /// sRGB byte value of a linear RGB channel, matching the sRGB render target.
+    fn linear_to_srgb_byte(value: f32) -> f32 {
+        let srgb = if value <= 0.003_130_8 {
+            value * 12.92
+        } else {
+            1.055 * value.powf(1.0 / 2.4) - 0.055
+        };
+        (srgb.clamp(0.0, 1.0) * 255.0).round()
+    }
+
+    fn is_outline_pixel(pixel: &[u8]) -> bool {
+        pixel[0] >= 240 && pixel[1] >= 240 && pixel[2] >= 240
+    }
+
+    fn count_outline_pixels(pixels: &[u8]) -> usize {
+        pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| is_outline_pixel(&pixel[..]))
+            .count()
+    }
+
+    /// Whether a near-white outline pixel lies within `radius` of a point.
+    fn outline_near(pixels: &[u8], width: u32, height: u32, point: [f32; 2], radius: i32) -> bool {
+        let cx = point[0].round() as i32;
+        let cy = point[1].round() as i32;
+        for y in (cy - radius).max(0)..=(cy + radius).min(height as i32 - 1) {
+            for x in (cx - radius).max(0)..=(cx + radius).min(width as i32 - 1) {
+                let offset = ((y as u32 * width + x as u32) * 4) as usize;
+                if is_outline_pixel(&pixels[offset..offset + 4]) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Mean colour of the pixels selected by `mask`.
+    fn mean_colour(pixels: &[u8], mask: &[bool]) -> [f32; 3] {
+        let mut sum = [0f64; 3];
+        let mut count = 0usize;
+        for (index, selected) in mask.iter().copied().enumerate() {
+            if !selected {
+                continue;
+            }
+            let offset = index * 4;
+            for channel in 0..3 {
+                sum[channel] += f64::from(pixels[offset + channel]);
+            }
+            count += 1;
+        }
+        if count == 0 {
+            return [0.0; 3];
+        }
+        [
+            (sum[0] / count as f64) as f32,
+            (sum[1] / count as f64) as f32,
+            (sum[2] / count as f64) as f32,
+        ]
+    }
+
+    /// Counts isolated bright points: pixels at least 25 luminance steps above
+    /// the mean of a 7x7 ring around them. A smooth sky gradient has none; a
+    /// procedural star field has many.
+    fn count_star_pixels(pixels: &[u8], width: u32, height: u32) -> usize {
+        let luma = |offset: usize| {
+            0.2126 * f32::from(pixels[offset])
+                + 0.7152 * f32::from(pixels[offset + 1])
+                + 0.0722 * f32::from(pixels[offset + 2])
+        };
+        let mut count = 0usize;
+        for y in 4..height.saturating_sub(4) {
+            for x in 4..width.saturating_sub(4) {
+                let offset = ((y * width + x) * 4) as usize;
+                let centre = luma(offset);
+                if centre < 100.0 {
+                    continue;
+                }
+                let mut ring_sum = 0f32;
+                let mut ring_count = 0f32;
+                for dy in -3i32..=3 {
+                    for dx in -3i32..=3 {
+                        if dx.abs() < 3 && dy.abs() < 3 {
+                            continue;
+                        }
+                        let nx = (x as i32 + dx) as u32;
+                        let ny = (y as i32 + dy) as u32;
+                        ring_sum += luma(((ny * width + nx) * 4) as usize);
+                        ring_count += 1.0;
+                    }
+                }
+                if centre - ring_sum / ring_count > 25.0 {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    fn luma_srgb(colour: [f32; 3]) -> f32 {
+        0.2126 * colour[0] + 0.7152 * colour[1] + 0.0722 * colour[2]
+    }
+
+    #[test]
+    fn day_night_sky_stars_and_twilight_horizon() {
+        let Some(mut renderer) = open_renderer(320, 180, "day_night_sky_stars_and_twilight_horizon") else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let empty = World::new(registry, 1);
+        let camera = Camera::new(WorldVec::new(0.0, 128.0, 0.0), 0.0, 0.0);
+        let render = |renderer: &mut OffscreenRenderer, env: Environment| {
+            renderer
+                .render_world_scene(&empty, &camera, &SceneParams::new(env))
+                .expect("render sky-only environment");
+            renderer.read_rgba()
+        };
+
+        let day = render(&mut renderer, Environment::new(0.5));
+        let night = render(&mut renderer, Environment::new(0.0));
+        // The star field is a pure function of the environment: the same clock
+        // must produce bit-identical pixels on a second frame.
+        let night_again = render(&mut renderer, Environment::new(0.0));
+        assert_eq!(night, night_again, "the night sky is not deterministic");
+        let dawn = render(&mut renderer, Environment::new(0.25));
+        let dusk = render(&mut renderer, Environment::new(0.75));
+        assert_eq!(day.len(), 320 * 180 * 4);
+
+        let all = vec![true; 320 * 180];
+        let day_mean = mean_colour(&day, &all);
+        let night_mean = mean_colour(&night, &all);
+        let day_top = row_rgb(&day, 320, 20);
+        let night_top = row_rgb(&night, 320, 20);
+        eprintln!("day mean={day_mean:?} top={day_top:?}; night mean={night_mean:?} top={night_top:?}");
+        assert!(
+            luma_srgb(day_mean) > luma_srgb(night_mean) * 2.0,
+            "the night sky is not darker than the day sky: {} vs {}",
+            luma_srgb(day_mean),
+            luma_srgb(night_mean)
+        );
+        assert!(
+            colour_distance(day_mean, night_mean) > 40.0,
+            "day and night sky colours are too similar: {day_mean:?} vs {night_mean:?}"
+        );
+        assert!(
+            luma_srgb(day_top) > luma_srgb(night_top) * 3.0,
+            "the zenith is not much darker at night: {day_top:?} vs {night_top:?}"
+        );
+
+        // Dawn and dusk are warm above the horizon; noon is a cool blue.
+        let noon_horizon = row_rgb(&day, 320, 90);
+        for (name, pixels) in [("dawn", &dawn), ("dusk", &dusk)] {
+            let horizon = row_rgb(pixels, 320, 90);
+            eprintln!("{name} horizon={horizon:?}, noon horizon={noon_horizon:?}");
+            assert!(
+                horizon[0] - horizon[2] > noon_horizon[0] - noon_horizon[2] + 30.0,
+                "{name} horizon is not redder than noon: {horizon:?} vs {noon_horizon:?}"
+            );
+            assert!(
+                horizon[0] > horizon[2] + 20.0,
+                "{name} horizon is not warm: {horizon:?}"
+            );
+            assert!(
+                horizon[0] / horizon[1] > noon_horizon[0] / noon_horizon[1],
+                "{name} horizon has the wrong warmth ratio: {horizon:?} vs {noon_horizon:?}"
+            );
+        }
+
+        let day_stars = count_star_pixels(&day, 320, 180);
+        let night_stars = count_star_pixels(&night, 320, 180);
+        eprintln!("isolated star pixels: day={day_stars}, night={night_stars}");
+        assert!(
+            night_stars > 20,
+            "the night sky only has {night_stars} isolated bright star pixels"
+        );
+        assert!(
+            day_stars < 3,
+            "the noon sky has {day_stars} star-like pixels; stars must be off by day"
+        );
+    }
+
+    #[test]
+    fn world_geometry_is_darker_at_night() {
+        let Some(mut renderer) = open_renderer(320, 180, "world_geometry_is_darker_at_night") else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let world = test_world(&registry);
+        let empty = World::new(registry, 1);
+        let mut camera = Camera::new(WorldVec::new(8.0, 76.0, 8.0), 0.6, -1.0);
+        camera.far = 128.0;
+
+        let render = |renderer: &mut OffscreenRenderer, world: &World, env: Environment| {
+            renderer
+                .render_world_scene(world, &camera, &SceneParams::new(env))
+                .expect("render environment world");
+            renderer.read_rgba()
+        };
+
+        renderer
+            .render_world_scene(&empty, &camera, &SceneParams::new(Environment::default()))
+            .expect("render empty background");
+        let background = renderer.read_rgba();
+        let day = render(&mut renderer, &world, Environment::new(0.5));
+        let night = render(&mut renderer, &world, Environment::new(0.0));
+
+        // The geometry mask is taken from the daylight frame: perspective
+        // coverage does not depend on the environment, only the colours do.
+        let mut mask = vec![false; 320 * 180];
+        for (index, pixel) in day.as_chunks::<4>().0.iter().enumerate() {
+            let offset = index * 4;
+            if pixel[0].abs_diff(background[offset]) > 2
+                || pixel[1].abs_diff(background[offset + 1]) > 2
+                || pixel[2].abs_diff(background[offset + 2]) > 2
+            {
+                mask[index] = true;
+            }
+        }
+        let geometry_pixels = mask.iter().filter(|selected| **selected).count();
+        assert!(geometry_pixels > 1000, "only {geometry_pixels} geometry pixels");
+
+        let day_mean = mean_colour(&day, &mask);
+        let night_mean = mean_colour(&night, &mask);
+        eprintln!(
+            "world mean geometry: day={day_mean:?} luma={}, night={night_mean:?} luma={}",
+            luma_srgb(day_mean),
+            luma_srgb(night_mean)
+        );
+        assert!(
+            luma_srgb(night_mean) < luma_srgb(day_mean) * 0.7,
+            "night geometry is not darker: {} vs {}",
+            luma_srgb(night_mean),
+            luma_srgb(day_mean)
+        );
+        // Moonlight keeps the world readable rather than black.
+        assert!(
+            luma_srgb(night_mean) > 6.0,
+            "night geometry is almost black: {night_mean:?}"
+        );
+    }
+
+    #[test]
+    fn fog_colour_follows_the_horizon_at_every_time_of_day() {
+        let Some(mut renderer) = open_renderer(320, 180, "fog_colour_follows_the_horizon_at_every_time_of_day") else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let stone = registry.id_or_air("openblock:stone");
+        assert_ne!(stone, BlockId::AIR);
+
+        // A tall wall at 43 m, just inside a 44 m far plane but beyond the fog
+        // end (41.8 m): every wall pixel must be exactly the horizon colour.
+        let mut column = ChunkColumn::new(ChunkPos::new(0, -1));
+        for y in 40..120 {
+            for x in 0..SECTION_SIZE as i32 {
+                for z in -4..=-3 {
+                    column.set_block(BlockPos::new(x, y, z), stone);
+                }
+            }
+        }
+        column.recompute_heightmap();
+        let mut wall_world = World::new(Arc::clone(&registry), 1);
+        wall_world.insert_chunk(column);
+        let empty = World::new(registry, 1);
+
+        let mut camera = Camera::new(WorldVec::new(8.0, 76.0, 40.0), 0.0, 0.0);
+        camera.far = 44.0;
+        let (fog_start, fog_end) = camera.fog_range();
+        assert!(
+            fog_end < 43.0,
+            "the fog wall must be fully fogged: {fog_start}..{fog_end}"
+        );
+
+        for env in [Environment::new(0.5), Environment::new(0.75), Environment::new(0.0)] {
+            renderer
+                .render_world_scene(&empty, &camera, &SceneParams::new(env))
+                .expect("render empty sky");
+            let background = renderer.read_rgba();
+            let horizon = row_rgb(&background, 320, 90);
+            let expected = env.visual().horizon;
+            let expected = [
+                linear_to_srgb_byte(expected[0]),
+                linear_to_srgb_byte(expected[1]),
+                linear_to_srgb_byte(expected[2]),
+            ];
+            for channel in 0..3 {
+                assert!(
+                    (horizon[channel] - expected[channel]).abs() <= 2.0,
+                    "time {}: horizon row {horizon:?} does not match the CPU horizon {expected:?}",
+                    env.time_of_day
+                );
+            }
+
+            renderer
+                .render_world_scene(&wall_world, &camera, &SceneParams::new(env))
+                .expect("render fogged wall");
+            let wall = renderer.read_rgba();
+            let mut mask = vec![false; 320 * 180];
+            for (index, pixel) in wall.as_chunks::<4>().0.iter().enumerate() {
+                let offset = index * 4;
+                if pixel[0].abs_diff(background[offset]) > 2
+                    || pixel[1].abs_diff(background[offset + 1]) > 2
+                    || pixel[2].abs_diff(background[offset + 2]) > 2
+                {
+                    mask[index] = true;
+                }
+            }
+            let wall_pixels = mask.iter().filter(|selected| **selected).count();
+            assert!(
+                wall_pixels > 1500,
+                "time {}: only {wall_pixels} fogged wall pixels found",
+                env.time_of_day
+            );
+
+            let distance = mean_distance_to(&wall, &mask, horizon);
+            eprintln!(
+                "time {}: horizon={horizon:?}, {wall_pixels} fully fogged pixels, mean distance={distance:.3}",
+                env.time_of_day
+            );
+            assert!(
+                distance < 5.0,
+                "time {}: fogged geometry does not match the horizon ({distance:.3})",
+                env.time_of_day
+            );
+        }
+    }
+
+    /// Projects the midpoint of each of the four top edges of an outline box.
+    fn projected_top_edge_midpoints(outline: &BlockOutline, camera: &Camera, width: u32, height: u32) -> [[f32; 2]; 4] {
+        let [x0, _, z0] = outline.min;
+        let [x1, y1, z1] = outline.max;
+        let corners = [[x0, y1, z0], [x1, y1, z0], [x1, y1, z1], [x0, y1, z1]];
+        let mut points = [[0f32; 2]; 4];
+        for edge in 0..4 {
+            let a = corners[edge];
+            let b = corners[(edge + 1) % 4];
+            let midpoint = [(a[0] + b[0]) * 0.5, y1, (a[2] + b[2]) * 0.5];
+            points[edge] = project(camera, width, height, midpoint).expect("an outline edge is behind the camera");
+        }
+        points
+    }
+
+    #[test]
+    fn block_outline_is_drawn_at_the_projected_edges() {
+        let Some(mut renderer) = open_renderer(480, 270, "block_outline_is_drawn_at_the_projected_edges") else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let mut world = test_world(&registry);
+        // Raise the selected block one metre above the flat field so its top
+        // square is fully visible instead of being foreshortened against the
+        // surrounding grass.
+        let grass = registry.id_or_air("openblock:grass");
+        assert_ne!(grass, BlockId::AIR);
+        assert!(world.set_block(BlockPos::new(8, 66, 8), grass));
+
+        let camera = look_at(WorldVec::new(8.5, 70.5, 16.0), [8.5, 66.8, 8.5]);
+        let outline = BlockOutline::for_block([8, 66, 8]);
+
+        let without = {
+            renderer
+                .render_world_scene(&world, &camera, &SceneParams::new(Environment::default()))
+                .expect("render world without outline");
+            renderer.read_rgba()
+        };
+        let with = {
+            renderer
+                .render_world_scene(
+                    &world,
+                    &camera,
+                    &SceneParams::new(Environment::default()).with_outline(outline),
+                )
+                .expect("render world with outline");
+            renderer.read_rgba()
+        };
+
+        let without_outline = count_outline_pixels(&without);
+        let with_outline = count_outline_pixels(&with);
+        eprintln!("outline pixels: without={without_outline}, with={with_outline}");
+        assert!(
+            with_outline > 60,
+            "only {with_outline} outline-coloured pixels were drawn"
+        );
+        assert!(
+            with_outline > without_outline + 60,
+            "the outline did not add enough pixels: {without_outline} -> {with_outline}"
+        );
+
+        // Every top edge midpoint must have outline pixels within two pixels.
+        let midpoints = projected_top_edge_midpoints(&outline, &camera, 480, 270);
+        let mut found = 0;
+        for point in midpoints {
+            if outline_near(&with, 480, 270, point, 2) {
+                found += 1;
+            }
+        }
+        eprintln!("projected top edge midpoints: {midpoints:?}, found {found}/4");
+        assert_eq!(found, 4, "only {found}/4 projected top edges have outline pixels");
+    }
+
+    #[test]
+    fn block_outline_respects_depth_against_a_nearer_pillar() {
+        let Some(mut renderer) = open_renderer(480, 270, "block_outline_respects_depth_against_a_nearer_pillar") else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let stone = registry.id_or_air("openblock:stone");
+        let grass = registry.id_or_air("openblock:grass");
+        assert_ne!(stone, BlockId::AIR);
+        assert_ne!(grass, BlockId::AIR);
+        let mut world = test_world(&registry);
+        assert!(world.set_block(BlockPos::new(8, 66, 8), grass));
+
+        let camera = look_at(WorldVec::new(8.5, 72.0, 24.0), [8.5, 66.8, 8.5]);
+        let outline = BlockOutline::for_block([8, 66, 8]);
+        let scene = SceneParams::new(Environment::default()).with_outline(outline);
+
+        // Baseline: with no pillar the whole outline is visible.
+        renderer
+            .render_world_scene(&world, &camera, &scene)
+            .expect("render visible outline");
+        let baseline = count_outline_pixels(&renderer.read_rgba());
+        assert!(baseline > 30, "the unoccluded outline only has {baseline} pixels");
+
+        // A solid pillar between the camera and the selected block. It is much
+        // nearer, so every outline edge is behind it.
+        for y in 66..76 {
+            assert!(world.set_block(BlockPos::new(8, y, 14), stone));
+        }
+        renderer
+            .render_world_scene(&world, &camera, &scene)
+            .expect("render occluded outline");
+        let pixels = renderer.read_rgba();
+        let visible = count_outline_pixels(&pixels);
+        eprintln!("outline pixels: unoccluded={baseline}, behind a nearer pillar={visible}");
+        assert!(
+            visible < 5,
+            "the outline painted {visible} pixels over a much nearer opaque pillar"
+        );
+    }
+
+    /// Writes one RGBA8 image to disk.
+    fn write_test_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) {
+        let file = std::fs::File::create(path).expect("create screenshot png");
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("write screenshot png header");
+        writer.write_image_data(rgba).expect("write screenshot png pixels");
+    }
+
+    /// Ignored GPU verification: noon, sunset and midnight skies over the test
+    /// platform, plus the targeted-block outline.
+    ///
+    /// Run with:
+    /// `./dev-cargo test -p ob_render --lib -- --ignored write_environment_screenshots`
+    #[test]
+    #[ignore = "GPU screenshot verification; writes /tmp/ob-env-*.png and /tmp/ob-outline.png"]
+    fn write_environment_screenshots() {
+        if std::env::var_os("OPENBLOCK_NO_GPU_TESTS").is_some() {
+            eprintln!("skipping write_environment_screenshots: OPENBLOCK_NO_GPU_TESTS is set");
+            return;
+        }
+        const WIDTH: u32 = 640;
+        const HEIGHT: u32 = 360;
+        let registry = Arc::new(Registry::base());
+        let mut world = test_world(&registry);
+        let grass = registry.id_or_air("openblock:grass");
+        assert_ne!(grass, BlockId::AIR);
+        // The outlined block sits one metre proud of the field so the screenshot
+        // shows the whole wireframe.
+        assert!(world.set_block(BlockPos::new(8, 66, 8), grass));
+        let mut renderer = OffscreenRenderer::new(WIDTH, HEIGHT).expect("create screenshot renderer");
+        eprintln!("environment screenshots GPU: {}", renderer.adapter_summary());
+
+        // Looking west towards the sunset over the edge of the test platform.
+        let horizon_camera = Camera::new(WorldVec::new(8.5, 72.0, 8.5), std::f32::consts::FRAC_PI_2, -0.08);
+        // Looking up at the moon and the star field.
+        let night_sky_camera = Camera::new(WorldVec::new(8.5, 72.0, 8.5), std::f32::consts::FRAC_PI_2, 1.0);
+        let outline_camera = look_at(WorldVec::new(8.5, 70.5, 16.0), [8.5, 66.8, 8.5]);
+
+        let shots: [(&str, &Camera, Environment, Option<BlockOutline>); 5] = [
+            ("/tmp/ob-env-day.png", &horizon_camera, Environment::new(0.5), None),
+            ("/tmp/ob-env-dusk.png", &horizon_camera, Environment::new(0.75), None),
+            ("/tmp/ob-env-night.png", &horizon_camera, Environment::new(0.0), None),
+            (
+                "/tmp/ob-env-night-sky.png",
+                &night_sky_camera,
+                Environment::new(0.0),
+                None,
+            ),
+            (
+                "/tmp/ob-outline.png",
+                &outline_camera,
+                Environment::default(),
+                Some(BlockOutline::for_block([8, 66, 8])),
+            ),
+        ];
+
+        for (path, camera, environment, outline) in shots {
+            let mut scene = SceneParams::new(environment);
+            if let Some(outline) = outline {
+                scene.outline = Some(outline);
+            }
+            renderer
+                .render_world_scene(&world, camera, &scene)
+                .expect("render environment screenshot");
+            let pixels = renderer.read_rgba();
+            assert_eq!(pixels.len(), (WIDTH * HEIGHT * 4) as usize);
+            let path = std::path::Path::new(path);
+            write_test_png(path, WIDTH, HEIGHT, &pixels);
+            eprintln!(
+                "wrote {} (time {:.2}, outline {})",
+                path.display(),
+                environment.time_of_day,
+                outline.is_some()
+            );
+        }
     }
 }

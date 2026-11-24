@@ -14,10 +14,12 @@ use std::time::{Duration, Instant};
 
 use ob_content::{BlockId, Registry};
 use ob_core::config::{Settings, TextureStyle, load_settings, save_settings};
-use ob_math::{ChunkPos, SEA_LEVEL, SectionPos, WorldVec};
-use ob_render::{Camera, OffscreenRenderer, Renderer, UiFrame};
+use ob_math::{BlockPos, ChunkPos, SEA_LEVEL, SectionPos, WorldVec};
+use ob_render::{
+    BlockOutline, Camera, DAY_LENGTH_TICKS, Environment, OffscreenRenderer, Renderer, SceneParams, UiFrame,
+};
 use ob_server::{Host, HostConfig};
-use ob_sim::{BlockAction, PlayerInput};
+use ob_sim::{BlockAction, PlayerInput, REACH};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -25,14 +27,20 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
+pub mod inventory;
 pub mod mesh_scheduler;
+pub mod mining;
 pub mod ui_state;
 
+use inventory::inventory_blocks;
 use mesh_scheduler::MeshScheduler;
+use mining::MiningState;
 use ui_state::{DebugStats, MenuAction, MenuItem, Screen, UiState, facing_label};
 
 /// One fixed simulation tick (20 Hz, DEC-038).
 const TICK: Duration = Duration::from_millis(50);
+/// Cooldown between right-click block placements.
+const PLACE_COOLDOWN: Duration = Duration::from_millis(200);
 /// Maximum dirty sections handed to the mesh scheduler per frame. The rest are
 /// re-marked dirty so they are retried on the next frame.
 const MAX_MESH_SUBMISSIONS_PER_FRAME: usize = 32;
@@ -72,12 +80,16 @@ pub struct ClientOptions {
     pub force_x11: bool,
     /// Render one offscreen frame to this PNG path, then exit without a window.
     pub screenshot: Option<std::path::PathBuf>,
+    /// Render the inventory screen offscreen to this PNG path, then exit.
+    pub screenshot_inventory: Option<std::path::PathBuf>,
     /// Automatically close the window after this many seconds and log frame stats.
     pub seconds: Option<f32>,
     /// Number of dedicated section-meshing worker threads (1..=16).
     pub mesh_workers: usize,
     /// Texture style override for this run (persisted settings otherwise).
     pub texture_style: Option<TextureStyle>,
+    /// Time-of-day override in 0..=1 for screenshots (0 midnight, 0.5 noon).
+    pub time_of_day: Option<f32>,
 }
 
 impl Default for ClientOptions {
@@ -90,9 +102,11 @@ impl Default for ClientOptions {
             fly: false,
             force_x11: false,
             screenshot: None,
+            screenshot_inventory: None,
             seconds: None,
             mesh_workers: default_mesh_workers(),
             texture_style: None,
+            time_of_day: None,
         }
     }
 }
@@ -107,6 +121,9 @@ fn default_mesh_workers() -> usize {
 
 /// Runs the client until the window closes, or writes a single screenshot and exits.
 pub fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(path) = &options.screenshot_inventory {
+        return screenshot_with_mode(&options, path, ScreenshotMode::Inventory);
+    }
     if let Some(path) = &options.screenshot {
         return screenshot(&options, path);
     }
@@ -127,11 +144,28 @@ pub fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Which UI overlay an offscreen screenshot should compose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenshotMode {
+    /// Crosshair, 9-slot hotbar and selected block name.
+    Hud,
+    /// Inventory panel over the world with a block hovered.
+    Inventory,
+}
+
 /// Renders one offscreen frame of the world and writes it as a PNG (RGBA8).
 ///
 /// This requires no window or display; it is used both for screenshots and to
 /// verify the GPU pipeline on headless hosts.
 pub fn screenshot(options: &ClientOptions, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    screenshot_with_mode(options, path, ScreenshotMode::Hud)
+}
+
+fn screenshot_with_mode(
+    options: &ClientOptions,
+    path: &std::path::Path,
+    mode: ScreenshotMode,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (settings, _data_dir) = effective_settings(options);
     let registry = Arc::new(Registry::base());
     let config = HostConfig {
@@ -170,77 +204,53 @@ pub fn screenshot(options: &ClientOptions, path: &std::path::Path) -> Result<(),
         render_texture_style(settings.texture_style),
     )?;
 
-    // Compose a showcase frame: HUD (crosshair, hotbar, block name) drawn over
-    // the world. Screenshot mode is also the headless verification path for the
-    // UI renderer, since it needs no window or surface.
+    // Compose a showcase frame: HUD or inventory drawn over the world.
+    // Screenshot mode is also the headless verification path for the UI
+    // renderer, since it needs no window or surface.
     let screen = [SCREENSHOT_WIDTH as f32, SCREENSHOT_HEIGHT as f32];
-    let ui = UiState::default();
-    let hotbar = [
-        "openblock:stone",
-        "openblock:dirt",
-        "openblock:grass",
-        "openblock:sand",
-        "openblock:log",
-        "openblock:leaves",
-        "openblock:water",
-        "openblock:bedrock",
-    ];
+    let mut ui = UiState::default();
     let mut frame = UiFrame::new(screen[0], screen[1]);
     let (centre_x, centre_y) = (screen[0] / 2.0, screen[1] / 2.0);
-    let cross = [0.95, 0.97, 1.0, 0.85];
-    frame.rect(centre_x - 1.0, centre_y - 9.0, 2.0, 18.0, cross);
-    frame.rect(centre_x - 9.0, centre_y - 1.0, 18.0, 2.0, cross);
-    for (index, slot) in ui.hotbar_rects(screen).iter().enumerate() {
-        let selected = index == ui.hotbar_selected;
-        frame.rect(
-            slot.x,
-            slot.y,
-            slot.w,
-            slot.h,
-            if selected {
-                [0.24, 0.28, 0.34, 0.88]
-            } else {
-                [0.10, 0.11, 0.14, 0.66]
-            },
-        );
-        frame.outline(
-            slot.x,
-            slot.y,
-            slot.w,
-            slot.h,
-            if selected { 2.0 } else { 1.0 },
-            if selected {
-                [1.0, 0.92, 0.45, 1.0]
-            } else {
-                [0.62, 0.66, 0.72, 0.9]
-            },
-        );
-        if let Some(id) = registry.id(hotbar[index]) {
-            let block = registry.block(id);
-            frame.block_icon(
-                slot.x + 6.0,
-                slot.y + 5.0,
-                slot.w - 12.0,
-                u32::from(block.textures.top.0),
-                u32::from(block.textures.side.0),
-            );
+    match mode {
+        ScreenshotMode::Hud => {
+            let cross = [0.95, 0.97, 1.0, 0.85];
+            frame.rect(centre_x - 1.0, centre_y - 9.0, 2.0, 18.0, cross);
+            frame.rect(centre_x - 9.0, centre_y - 1.0, 18.0, 2.0, cross);
+            ui.block_name_seconds = ui_state::BLOCK_NAME_SECONDS;
+            draw_hotbar(&mut frame, &ui, &registry, screen);
+            if let Some(label) = ui
+                .hotbar_block(&registry, ui.hotbar_selected)
+                .map(|block| inventory::display_name(block.id))
+            {
+                frame.text_centered(
+                    centre_x,
+                    ui.hotbar_rects(screen)[0].y - 30.0,
+                    2.0,
+                    [1.0, 1.0, 1.0, 1.0],
+                    &label,
+                );
+            }
         }
-        frame.text(
-            slot.x + 3.0,
-            slot.y + 2.0,
-            1.0,
-            [1.0, 1.0, 1.0, 0.75],
-            &format!("{}", index + 1),
-        );
+        ScreenshotMode::Inventory => {
+            ui.open_inventory();
+            let items = inventory_blocks(&registry);
+            if let Some(index) = items.iter().position(|id| registry.block(*id).id == "openblock:log") {
+                ui.inventory.selected = index;
+                ui.inventory.hovered = Some(index);
+                ui.hotbar_selected = 4;
+            }
+            inventory::draw(&mut frame, &ui, &registry, screen);
+            // Keep the hotbar visible above the dimmed world, as in gameplay.
+            draw_hotbar(&mut frame, &ui, &registry, screen);
+        }
     }
-    frame.text_centered(
-        centre_x,
-        ui.hotbar_rects(screen)[0].y - 30.0,
-        2.0,
-        [1.0, 1.0, 1.0, 1.0],
-        "stone",
-    );
-    renderer.render_world_with_ui(host.world(), &camera, Some(&frame))?;
+    let environment = options.time_of_day.map(Environment::new).unwrap_or_default();
+    let scene = SceneParams {
+        environment,
+        ui: Some(&frame),
+        outline: None,
+    };
+    renderer.render_world_scene(host.world(), &camera, &scene)?;
     let rgba = renderer.read_rgba();
     if rgba.len() != (SCREENSHOT_WIDTH * SCREENSHOT_HEIGHT * 4) as usize {
         return Err(format!(
@@ -261,6 +271,42 @@ pub fn screenshot(options: &ClientOptions, path: &std::path::Path) -> Result<(),
         renderer.adapter_summary()
     );
     Ok(())
+}
+
+/// Draws the nine-slot hotbar, skipping slots whose blocks are missing from the
+/// active registry.
+fn draw_hotbar(frame: &mut UiFrame, ui: &UiState, registry: &Registry, screen: [f32; 2]) {
+    for (index, slot) in ui.hotbar_rects(screen).iter().enumerate() {
+        let selected = index == ui.hotbar_selected;
+        let background = if selected {
+            [0.24, 0.28, 0.34, 0.88]
+        } else {
+            [0.10, 0.11, 0.14, 0.66]
+        };
+        frame.rect(slot.x, slot.y, slot.w, slot.h, background);
+        let border = if selected {
+            [1.0, 0.92, 0.45, 1.0]
+        } else {
+            [0.62, 0.66, 0.72, 0.9]
+        };
+        frame.outline(slot.x, slot.y, slot.w, slot.h, if selected { 2.0 } else { 1.0 }, border);
+        if let Some(block) = ui.hotbar_block(registry, index) {
+            frame.block_icon(
+                slot.x + 6.0,
+                slot.y + 5.0,
+                slot.w - 12.0,
+                u32::from(block.textures.top.0),
+                u32::from(block.textures.side.0),
+            );
+        }
+        frame.text(
+            slot.x + 3.0,
+            slot.y + 2.0,
+            1.0,
+            [1.0, 1.0, 1.0, 0.75],
+            &format!("{}", index + 1),
+        );
+    }
 }
 
 struct App {
@@ -286,8 +332,9 @@ struct GameState {
     input_pitch: f32,
     fly_toggle: bool,
     captured: bool,
-    selected: usize,
-    hotbar: [&'static str; 8],
+    mouse_left: bool,
+    mining: MiningState,
+    last_place: Option<Instant>,
     accumulator: Duration,
     last_frame: Instant,
     prev_eye: WorldVec,
@@ -337,8 +384,14 @@ impl GameState {
     fn handle_escape(&mut self) {
         match self.ui.screen {
             Screen::Playing => {
+                self.cancel_mining();
                 self.ui.open_pause();
                 self.release_pointer();
+            }
+            Screen::Inventory => {
+                // Esc closes the inventory back to gameplay; it must not open
+                // the pause menu.
+                self.close_inventory();
             }
             Screen::Settings => {
                 self.ui.apply(MenuItem::Back);
@@ -349,6 +402,27 @@ impl GameState {
             }
         }
         self.persist_settings();
+    }
+
+    /// Opens the creative inventory and releases the pointer.
+    fn open_inventory(&mut self) {
+        self.cancel_mining();
+        self.ui.open_inventory();
+        let item_count = inventory_blocks(&self.registry).len();
+        self.ui.update_inventory_hover(self.window_screen(), item_count);
+        self.release_pointer();
+    }
+
+    /// Closes the inventory, returns to gameplay and recaptures the pointer.
+    fn close_inventory(&mut self) {
+        self.ui.close_inventory();
+        self.capture_pointer();
+    }
+
+    /// Stops any in-flight mining and clears the physical mouse-button latch.
+    fn cancel_mining(&mut self) {
+        self.mouse_left = false;
+        self.mining.stop();
     }
 
     fn menu_move(&mut self, delta: i32) {
@@ -478,20 +552,23 @@ impl GameState {
             adapter: self.renderer.adapter_summary().to_string(),
             window: [self.window_size.0 as u32, self.window_size.1 as u32],
             fov_degrees: self.ui.settings.fov_degrees,
+            time_of_day: Environment::from_ticks(self.host.tick_count() + DAY_LENGTH_TICKS / 4, DAY_LENGTH_TICKS)
+                .time_of_day,
         };
     }
 
     fn update_title(&mut self) {
         let player = self.host.player();
-        let block = self.hotbar[self.selected];
+        let block = self.ui.hotbar_label(self.ui.hotbar_selected).unwrap_or("unknown");
         let status = match self.ui.screen {
             Screen::Playing => {
                 if self.captured {
                     ""
                 } else {
-                    " | click to capture | F3 debug"
+                    " | click to capture | E inventory | F3 debug"
                 }
             }
+            Screen::Inventory => " | INVENTORY (E/Esc to close)",
             Screen::Pause => " | PAUSED (Esc to resume)",
             Screen::Settings => " | SETTINGS (Esc to go back)",
         };
@@ -559,7 +636,9 @@ impl GameState {
     }
 
     fn selected_block(&self) -> BlockId {
-        self.registry.id(self.hotbar[self.selected]).unwrap_or(BlockId::AIR)
+        self.registry
+            .id(self.ui.hotbar[self.ui.hotbar_selected])
+            .unwrap_or(BlockId::AIR)
     }
 
     fn stream_and_mesh(&mut self) {
@@ -724,6 +803,7 @@ impl GameState {
             // Menus pause simulation and movement input; rendering continues.
             self.accumulator = Duration::ZERO;
         }
+        self.update_mining(dt);
         self.ui.tick(dt.as_secs_f32());
         self.rolling_frame_ms.push(dt.as_secs_f32() * 1000.0);
         if self.rolling_frame_ms.len() > 120 {
@@ -740,13 +820,24 @@ impl GameState {
         if self.applied_render_distance != self.host.render_distance_chunks() {
             self.applied_render_distance = self.host.render_distance_chunks();
         }
+        // Day starts at sunrise: tick 0 is 06:00 rather than midnight.
+        let environment = Environment::from_ticks(self.host.tick_count() + DAY_LENGTH_TICKS / 4, DAY_LENGTH_TICKS);
         self.refresh_debug_stats();
         let ui_frame = self.build_ui_frame();
-        if let Err(err) = self.renderer.render_with_ui(&camera, ui_frame.as_ref()) {
+        let outline = self
+            .mining
+            .targeted_block()
+            .map(|block| BlockOutline::for_block([block.x, block.y, block.z]));
+        let scene = SceneParams {
+            environment,
+            ui: ui_frame.as_ref(),
+            outline,
+        };
+        if let Err(err) = self.renderer.render_scene(&camera, &scene) {
             log::error!("render error: {err}");
         }
         if std::mem::take(&mut self.screenshot_requested) {
-            self.save_screenshot(&camera, ui_frame.as_ref());
+            self.save_screenshot(&camera, ui_frame.as_ref(), &environment, outline);
         }
         self.frames += 1;
         if self.fps_timer.elapsed() >= Duration::from_secs(1) {
@@ -758,7 +849,13 @@ impl GameState {
     }
 
     /// Renders the current world (and HUD) from the player's camera to a PNG (F2).
-    fn save_screenshot(&mut self, camera: &Camera, ui: Option<&UiFrame>) {
+    fn save_screenshot(
+        &mut self,
+        camera: &Camera,
+        ui: Option<&UiFrame>,
+        environment: &Environment,
+        outline: Option<BlockOutline>,
+    ) {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -777,7 +874,12 @@ impl GameState {
         } else {
             None
         };
-        if let Err(err) = renderer.render_world_with_ui(self.host.world(), camera, ui_frame.as_ref().or(ui)) {
+        let scene = SceneParams {
+            environment: *environment,
+            ui: ui_frame.as_ref().or(ui),
+            outline,
+        };
+        if let Err(err) = renderer.render_world_scene(self.host.world(), camera, &scene) {
             log::warn!("screenshot render failed: {err}");
             return;
         }
@@ -788,23 +890,9 @@ impl GameState {
         }
     }
 
-    /// Texture layers (top, side) for the block shown in a hotbar slot.
-    fn hotbar_layers(&self, index: usize) -> (u32, u32) {
-        self.registry
-            .id(self.hotbar[index])
-            .map(|id| {
-                let block = self.registry.block(id);
-                (u32::from(block.textures.top.0), u32::from(block.textures.side.0))
-            })
-            .unwrap_or((0, 0))
-    }
-
     /// Short display name of the block in a hotbar slot.
-    fn hotbar_label(&self, index: usize) -> &str {
-        self.hotbar[index]
-            .split_once(':')
-            .map(|(_, name)| name)
-            .unwrap_or(self.hotbar[index])
+    fn hotbar_label(&self, index: usize) -> Option<&'static str> {
+        self.ui.hotbar_label(index)
     }
 
     /// Builds the UI frame for the current window size.
@@ -816,10 +904,12 @@ impl GameState {
     fn build_ui_frame_at(&self, screen: [f32; 2]) -> Option<UiFrame> {
         let [width, height] = screen;
         let playing = self.ui.screen == Screen::Playing;
-        let show_hud = playing && self.ui.hud_visible;
+        let inventory_open = self.ui.screen == Screen::Inventory;
+        let show_hotbar = (playing || inventory_open) && self.ui.hud_visible;
+        let show_crosshair = playing && self.ui.hud_visible;
         let show_debug = self.ui.debug_overlay;
-        let show_menu = !playing;
-        if !show_hud && !show_debug && !show_menu {
+        let show_menu = matches!(self.ui.screen, Screen::Pause | Screen::Settings);
+        if !show_hotbar && !show_crosshair && !show_debug && !show_menu && !inventory_open {
             return None;
         }
         let mut frame = UiFrame::new(width, height);
@@ -877,50 +967,51 @@ impl GameState {
             );
         }
 
-        // --- HUD: crosshair, hotbar and selected block name ---
-        if show_hud {
+        // --- Inventory: dimmed world, centred block grid and hotbar ---
+        if inventory_open {
+            inventory::draw(&mut frame, &self.ui, &self.registry, screen);
+        }
+
+        // --- HUD: crosshair, mining progress, hotbar and selected name ---
+        if show_crosshair || show_hotbar {
             let centre_x = width / 2.0;
             let centre_y = height / 2.0;
-            let cross = [0.95, 0.97, 1.0, 0.85];
-            frame.rect(centre_x - 1.0, centre_y - 9.0, 2.0, 18.0, cross);
-            frame.rect(centre_x - 9.0, centre_y - 1.0, 18.0, 2.0, cross);
+            if show_crosshair {
+                let cross = [0.95, 0.97, 1.0, 0.85];
+                frame.rect(centre_x - 1.0, centre_y - 9.0, 2.0, 18.0, cross);
+                frame.rect(centre_x - 9.0, centre_y - 1.0, 18.0, 2.0, cross);
+                if self.mining.is_mining() {
+                    mining::draw_progress(&mut frame, (centre_x, centre_y), self.mining.progress());
+                }
+                if self.ui.break_flash_seconds > 0.0
+                    && let Some(name) = &self.ui.break_flash
+                {
+                    frame.text_centered(centre_x, centre_y + 30.0, 1.5, [0.98, 0.94, 0.78, 0.95], name);
+                }
+            }
 
-            let slots = self.ui.hotbar_rects(screen);
-            for (index, slot) in slots.iter().enumerate() {
-                let selected = index == self.ui.hotbar_selected;
-                let background = if selected {
-                    [0.24, 0.28, 0.34, 0.88]
-                } else {
-                    [0.10, 0.11, 0.14, 0.66]
-                };
-                frame.rect(slot.x, slot.y, slot.w, slot.h, background);
-                let border = if selected {
-                    [1.0, 0.92, 0.45, 1.0]
-                } else {
-                    [0.62, 0.66, 0.72, 0.9]
-                };
-                frame.outline(slot.x, slot.y, slot.w, slot.h, if selected { 2.0 } else { 1.0 }, border);
-                let (top, side) = self.hotbar_layers(index);
-                frame.block_icon(slot.x + 6.0, slot.y + 5.0, slot.w - 12.0, top, side);
-                frame.text(
-                    slot.x + 3.0,
-                    slot.y + 2.0,
-                    1.0,
-                    [1.0, 1.0, 1.0, 0.75],
-                    &format!("{}", index + 1),
-                );
+            if show_hotbar {
+                draw_hotbar(&mut frame, &self.ui, &self.registry, screen);
+                if playing && self.ui.block_name_seconds > 0.0 {
+                    let name = self.hotbar_label(self.ui.hotbar_selected).unwrap_or("unknown");
+                    let y = self
+                        .ui
+                        .hotbar_rects(screen)
+                        .first()
+                        .map(|slot| slot.y - 30.0)
+                        .unwrap_or(height - 70.0);
+                    frame.text_centered(centre_x, y, 2.0, white, name);
+                }
             }
-            if self.ui.block_name_seconds > 0.0 {
-                let name = self.hotbar_label(self.ui.hotbar_selected);
-                let y = slots.first().map(|slot| slot.y - 30.0).unwrap_or(height - 70.0);
-                frame.text_centered(centre_x, y, 2.0, white, name);
+
+            if playing {
+                let mode = if self.host.player().flying {
+                    "fly (F)"
+                } else {
+                    "walk (F to fly)"
+                };
+                frame.text(12.0, height - 26.0, 1.5, [0.85, 0.89, 0.94, 0.85], mode);
             }
-            let mode = if self.host.player().flying {
-                "fly (F)"
-            } else {
-                "walk (F to fly)"
-            };
-            frame.text(12.0, height - 26.0, 1.5, [0.85, 0.89, 0.94, 0.85], mode);
         }
 
         // --- Pause and settings menus ---
@@ -932,7 +1023,7 @@ impl GameState {
                 let title = match self.ui.screen {
                     Screen::Pause => "Paused",
                     Screen::Settings => "Settings",
-                    Screen::Playing => "",
+                    Screen::Playing | Screen::Inventory => "",
                 };
                 frame.text_centered(panel.x + panel.w / 2.0, panel.y + 14.0, 2.5, white, title);
                 let rows = self.ui.menu_rects(screen);
@@ -947,7 +1038,7 @@ impl GameState {
                 let hint = match self.ui.screen {
                     Screen::Pause => "Esc resume   Enter/Click select   F3 debug   F2 screenshot",
                     Screen::Settings => "Esc back   Enter/Click adjust   changes are saved",
-                    Screen::Playing => "",
+                    Screen::Playing | Screen::Inventory => "",
                 };
                 frame.text_centered(
                     panel.x + panel.w / 2.0,
@@ -961,17 +1052,142 @@ impl GameState {
         Some(frame)
     }
 
-    fn interact(&mut self, place: bool) {
-        if !self.captured {
-            self.capture_pointer();
+    /// Advances hold-to-mine progress from the frame clock.
+    ///
+    /// Starts mining the breakable block under the crosshair while the left
+    /// mouse button is held, resets when the target changes or the button is
+    /// released, and applies exactly one break action on completion.
+    fn update_mining(&mut self, dt: Duration) {
+        if self.ui.screen != Screen::Playing || !self.captured || !self.mouse_left {
+            self.mining.stop();
             return;
         }
+        let player = self.host.player();
+        let current = self
+            .host
+            .world()
+            .raycast(player.eye(), player.forward(), REACH)
+            .map(|hit| hit.block);
+        let breakable_target = current.and_then(|pos| {
+            let block = self.registry.block(self.host.world().get_block(pos));
+            block.breakable().then_some((pos, block.hardness))
+        });
+
+        self.mining.update(dt.as_secs_f32(), current);
+        if let Some(pos) = self.mining.take_completed() {
+            self.break_block(pos);
+            // Do not immediately start on the next block in the same frame;
+            // the next frame re-raycasts the changed world.
+            return;
+        }
+        if self.mining.target().is_none()
+            && let Some((pos, hardness)) = breakable_target
+        {
+            self.mining.start(pos, hardness);
+        }
+    }
+
+    /// Sends one break action for the completed mining target.
+    fn break_block(&mut self, pos: BlockPos) {
+        let name = {
+            let block = self.registry.block(self.host.world().get_block(pos));
+            if block.id == "openblock:air" {
+                return;
+            }
+            inventory::display_name(block.id)
+        };
         let action = BlockAction {
-            break_block: !place,
-            place_block: place,
+            break_block: true,
+            place_block: false,
+            place: BlockId::AIR,
+        };
+        if self.host.apply_action(&action) {
+            self.ui.flash_broken_block(name);
+        }
+    }
+
+    /// Starts hold-to-mine for the block currently under the crosshair.
+    fn start_mining(&mut self) {
+        if !self.captured || self.ui.screen != Screen::Playing {
+            return;
+        }
+        self.mouse_left = true;
+        let player = self.host.player();
+        let Some(hit) = self.host.world().raycast(player.eye(), player.forward(), REACH) else {
+            self.mining.stop();
+            return;
+        };
+        let block = self.registry.block(self.host.world().get_block(hit.block));
+        if block.breakable() {
+            self.mining.start(hit.block, block.hardness);
+        } else {
+            self.mining.stop();
+        }
+    }
+
+    /// Immediately places the selected block, throttled to one per cooldown.
+    fn place_block(&mut self) {
+        if !self.captured || self.ui.screen != Screen::Playing {
+            return;
+        }
+        if self.last_place.is_some_and(|at| at.elapsed() < PLACE_COOLDOWN) {
+            return;
+        }
+        self.last_place = Some(Instant::now());
+        let action = BlockAction {
+            break_block: false,
+            place_block: true,
             place: self.selected_block(),
         };
         self.host.apply_action(&action);
+    }
+
+    /// Number of registry-backed inventory entries (every block except air).
+    fn inventory_item_count(&self) -> usize {
+        inventory_blocks(&self.registry).len()
+    }
+
+    /// Updates the inventory hover from the last cursor position.
+    fn update_inventory_hover(&mut self) {
+        let item_count = self.inventory_item_count();
+        self.ui.update_inventory_hover(self.window_screen(), item_count);
+    }
+
+    /// Moves the inventory grid selection with the arrow keys.
+    fn move_inventory_selection(&mut self, dx: i32, dy: i32) {
+        let item_count = self.inventory_item_count();
+        self.ui
+            .move_inventory_selection(self.window_screen(), item_count, dx, dy);
+    }
+
+    /// Scrolls the inventory grid and re-evaluates the hover under the cursor.
+    fn scroll_inventory(&mut self, rows: i32) {
+        let item_count = self.inventory_item_count();
+        let screen = self.window_screen();
+        self.ui.scroll_inventory(screen, item_count, rows);
+        self.ui.update_inventory_hover(screen, item_count);
+    }
+
+    /// Assigns the current inventory selection and returns to gameplay.
+    fn assign_inventory_selection(&mut self) -> bool {
+        if inventory::assign_selected_to_hotbar(&mut self.ui, &self.registry).is_some() {
+            self.capture_pointer();
+            self.update_title();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Handles a left click on the inventory: hovering a slot selects and
+    /// assigns it. Clicks outside the panel keep the inventory open.
+    fn inventory_click(&mut self) {
+        self.update_inventory_hover();
+        let Some(index) = self.ui.inventory.hovered else {
+            return;
+        };
+        self.ui.inventory.selected = index;
+        self.assign_inventory_selection();
     }
 }
 
@@ -1054,17 +1270,9 @@ impl ApplicationHandler for App {
             input_pitch: pitch,
             fly_toggle: self.options.fly,
             captured: false,
-            selected: 0,
-            hotbar: [
-                "openblock:stone",
-                "openblock:dirt",
-                "openblock:grass",
-                "openblock:sand",
-                "openblock:log",
-                "openblock:leaves",
-                "openblock:water",
-                "openblock:bedrock",
-            ],
+            mouse_left: false,
+            mining: MiningState::default(),
+            last_place: None,
             accumulator: Duration::ZERO,
             last_frame: Instant::now(),
             prev_eye: eye,
@@ -1134,6 +1342,11 @@ impl ApplicationHandler for App {
                         KeyCode::KeyF if pressed && state.ui.screen == Screen::Playing => {
                             state.fly_toggle = true;
                         }
+                        KeyCode::KeyE if pressed => match state.ui.screen {
+                            Screen::Playing => state.open_inventory(),
+                            Screen::Inventory => state.close_inventory(),
+                            Screen::Pause | Screen::Settings => {}
+                        },
                         KeyCode::Escape if pressed => state.handle_escape(),
                         KeyCode::F1 if pressed => {
                             state.ui.apply(MenuItem::ToggleHud);
@@ -1146,45 +1359,48 @@ impl ApplicationHandler for App {
                             state.ui.toggle_debug_overlay();
                             state.persist_settings();
                         }
-                        KeyCode::ArrowUp if pressed => state.menu_move(-1),
-                        KeyCode::ArrowDown if pressed => state.menu_move(1),
+                        KeyCode::ArrowUp if pressed => {
+                            if state.ui.screen == Screen::Inventory {
+                                state.move_inventory_selection(0, -1);
+                            } else {
+                                state.menu_move(-1);
+                            }
+                        }
+                        KeyCode::ArrowDown if pressed => {
+                            if state.ui.screen == Screen::Inventory {
+                                state.move_inventory_selection(0, 1);
+                            } else {
+                                state.menu_move(1);
+                            }
+                        }
+                        KeyCode::ArrowLeft if pressed && state.ui.screen == Screen::Inventory => {
+                            state.move_inventory_selection(-1, 0);
+                        }
+                        KeyCode::ArrowRight if pressed && state.ui.screen == Screen::Inventory => {
+                            state.move_inventory_selection(1, 0);
+                        }
                         KeyCode::Enter if pressed => {
-                            if state.activate_selected() {
+                            if state.ui.screen == Screen::Inventory {
+                                state.assign_inventory_selection();
+                            } else if state.activate_selected() {
                                 state.persist_settings();
                                 event_loop.exit();
                             }
                         }
-                        KeyCode::Digit1 if state.ui.screen == Screen::Playing => {
-                            state.selected = 0;
-                            state.ui.select_hotbar(0);
-                        }
-                        KeyCode::Digit2 if state.ui.screen == Screen::Playing => {
-                            state.selected = 1;
-                            state.ui.select_hotbar(1);
-                        }
-                        KeyCode::Digit3 if state.ui.screen == Screen::Playing => {
-                            state.selected = 2;
-                            state.ui.select_hotbar(2);
-                        }
-                        KeyCode::Digit4 if state.ui.screen == Screen::Playing => {
-                            state.selected = 3;
-                            state.ui.select_hotbar(3);
-                        }
-                        KeyCode::Digit5 if state.ui.screen == Screen::Playing => {
-                            state.selected = 4;
-                            state.ui.select_hotbar(4);
-                        }
-                        KeyCode::Digit6 if state.ui.screen == Screen::Playing => {
-                            state.selected = 5;
-                            state.ui.select_hotbar(5);
-                        }
-                        KeyCode::Digit7 if state.ui.screen == Screen::Playing => {
-                            state.selected = 6;
-                            state.ui.select_hotbar(6);
-                        }
-                        KeyCode::Digit8 if state.ui.screen == Screen::Playing => {
-                            state.selected = 7;
-                            state.ui.select_hotbar(7);
+                        KeyCode::Digit1
+                        | KeyCode::Digit2
+                        | KeyCode::Digit3
+                        | KeyCode::Digit4
+                        | KeyCode::Digit5
+                        | KeyCode::Digit6
+                        | KeyCode::Digit7
+                        | KeyCode::Digit8
+                        | KeyCode::Digit9
+                            if state.ui.screen == Screen::Playing =>
+                        {
+                            if let Some(slot) = digit_slot(code) {
+                                state.ui.select_hotbar(slot);
+                            }
                         }
                         _ => {}
                     }
@@ -1196,32 +1412,52 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput {
                 state: element, button, ..
             } => {
+                if button == MouseButton::Left && element == ElementState::Released {
+                    state.cancel_mining();
+                }
                 if element != ElementState::Pressed {
                     return;
                 }
-                if state.ui.screen != Screen::Playing {
-                    if button == MouseButton::Left {
-                        let screen = state.window_screen();
-                        if let Some(action) = state.ui.click(screen)
-                            && state.handle_menu_action(action)
-                        {
-                            state.persist_settings();
-                            event_loop.exit();
+                match state.ui.screen {
+                    Screen::Inventory => {
+                        if button == MouseButton::Left {
+                            state.inventory_click();
                         }
+                        return;
                     }
+                    Screen::Pause | Screen::Settings => {
+                        if button == MouseButton::Left {
+                            let screen = state.window_screen();
+                            if let Some(action) = state.ui.click(screen)
+                                && state.handle_menu_action(action)
+                            {
+                                state.persist_settings();
+                                event_loop.exit();
+                            }
+                        }
+                        return;
+                    }
+                    Screen::Playing => {}
+                }
+                if !state.captured {
+                    state.capture_pointer();
                     return;
                 }
                 match button {
-                    MouseButton::Left => state.interact(false),
-                    MouseButton::Right => state.interact(true),
+                    MouseButton::Left => state.start_mining(),
+                    MouseButton::Right => state.place_block(),
                     _ => {}
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 state.ui.cursor = (position.x as f32, position.y as f32);
-                if state.ui.screen != Screen::Playing {
-                    let screen = state.window_screen();
-                    state.ui.update_hover(screen);
+                match state.ui.screen {
+                    Screen::Inventory => state.update_inventory_hover(),
+                    Screen::Pause | Screen::Settings => {
+                        let screen = state.window_screen();
+                        state.ui.update_hover(screen);
+                    }
+                    Screen::Playing => {}
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1229,15 +1465,21 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
                     MouseScrollDelta::PixelDelta(pos) => (pos.y / 40.0).round() as i32,
                 };
-                if steps != 0 && state.ui.screen == Screen::Playing {
-                    let count = state.hotbar.len() as i32;
-                    state.selected = ((state.selected as i32 + steps).rem_euclid(count)) as usize;
-                    state.ui.select_hotbar(state.selected);
-                    state.update_title();
+                match state.ui.screen {
+                    Screen::Playing if steps != 0 => {
+                        state.ui.cycle_hotbar(steps);
+                        state.update_title();
+                    }
+                    Screen::Inventory if steps != 0 => {
+                        // Wheel up (positive y) reveals earlier rows.
+                        state.scroll_inventory(-steps);
+                    }
+                    _ => {}
                 }
             }
             WindowEvent::Focused(false) => {
                 state.keys = [false; 8];
+                state.cancel_mining();
             }
             WindowEvent::DroppedFile(path) => {
                 log::info!("ignoring dropped file: {}", path.display())
@@ -1280,6 +1522,22 @@ impl ApplicationHandler for App {
             return;
         }
         state.window.request_redraw();
+    }
+}
+
+/// Maps the top-row digit keys to zero-based hotbar slots.
+fn digit_slot(code: KeyCode) -> Option<usize> {
+    match code {
+        KeyCode::Digit1 => Some(0),
+        KeyCode::Digit2 => Some(1),
+        KeyCode::Digit3 => Some(2),
+        KeyCode::Digit4 => Some(3),
+        KeyCode::Digit5 => Some(4),
+        KeyCode::Digit6 => Some(5),
+        KeyCode::Digit7 => Some(6),
+        KeyCode::Digit8 => Some(7),
+        KeyCode::Digit9 => Some(8),
+        _ => None,
     }
 }
 
@@ -1342,6 +1600,15 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
             }
             "fly" => options.fly = true,
             "x11" => options.force_x11 = true,
+            "time-of-day" => {
+                let parsed: f32 = value
+                    .parse()
+                    .map_err(|_| format!("invalid --time-of-day value '{value}'"))?;
+                if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+                    return Err("--time-of-day must be between 0 and 1".into());
+                }
+                options.time_of_day = Some(parsed);
+            }
             "texture-style" => {
                 options.texture_style =
                     Some(TextureStyle::from_name(value).ok_or_else(|| format!("unknown texture style '{value}'"))?);
@@ -1370,6 +1637,12 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
                 }
                 options.screenshot = Some(value.into());
             }
+            "screenshot-inventory" => {
+                if value.is_empty() {
+                    return Err("--screenshot-inventory requires a path".into());
+                }
+                options.screenshot_inventory = Some(value.into());
+            }
             "help" | "version" => {}
             other => return Err(format!("unknown option --{other}")),
         }
@@ -1385,4 +1658,42 @@ pub fn default_spawn_hint() -> WorldVec {
 /// Stable hash of the loaded world (used by tools and the smoke test).
 pub fn world_hash(host: &Host) -> u64 {
     host.state_hash()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn digit_keys_map_to_all_nine_hotbar_slots() {
+        let codes = [
+            KeyCode::Digit1,
+            KeyCode::Digit2,
+            KeyCode::Digit3,
+            KeyCode::Digit4,
+            KeyCode::Digit5,
+            KeyCode::Digit6,
+            KeyCode::Digit7,
+            KeyCode::Digit8,
+            KeyCode::Digit9,
+        ];
+        for (expected, code) in codes.into_iter().enumerate() {
+            assert_eq!(digit_slot(code), Some(expected));
+        }
+        assert_eq!(digit_slot(KeyCode::Digit0), None);
+        assert_eq!(digit_slot(KeyCode::KeyE), None);
+    }
+
+    #[test]
+    fn screenshot_inventory_flag_is_parsed_and_documented_by_parser() {
+        let path = std::path::PathBuf::from("/tmp/inventory.png");
+        let options = options_from_args(&[("screenshot-inventory".to_string(), path.to_string_lossy().into_owned())])
+            .expect("valid flag");
+        assert_eq!(options.screenshot_inventory.as_deref(), Some(path.as_path()));
+        assert_eq!(options.screenshot, None);
+
+        let error = options_from_args(&[("screenshot-inventory".to_string(), String::new())])
+            .expect_err("empty path must fail");
+        assert!(error.contains("--screenshot-inventory"));
+    }
 }

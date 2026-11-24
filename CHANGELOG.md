@@ -6,6 +6,47 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [0.0.5] — 2026-11-24 (tech preview, gameplay slice)
+
+### Added
+- Inventory screen (`E`): every registered block in a centred grid with icons,
+  hover names and hardness hints; click or Enter assigns the block to the
+  selected hotbar slot; arrow-key selection, wheel scrolling.
+- Hotbar expanded to nine slots (`1`–`9`, mouse wheel); slots skip blocks that
+  the active registry does not define.
+- Hold-to-mine: raycast to 5 m, per-block hand-breaking hardness (stone 1.5 s,
+  log 2.0 s, leaves 0.2 s, bedrock/water unbreakable), a progress bar under the
+  crosshair, and a targeted-block wireframe outline; right-click placement now
+  has a 200 ms cooldown.
+- Day/night cycle: `Environment::from_ticks` over a 24,000-tick day (20 minutes
+  at 20 Hz) drives sky palettes (day/twilight/night), a sun and moon disc, a
+  deterministic procedural star field, moonlight and ambient tinting; fog
+  follows the horizon colour; the F3 overlay shows the in-game clock. New worlds
+  start at sunrise.
+- Targeted-block outline rendered in both the windowed and offscreen renderers
+  (`BlockOutline`, `SceneParams`, `Renderer::render_scene`,
+  `OffscreenRenderer::render_world_scene`).
+- Five biomes with smoothly blended heights: plains, forest, desert, snowy
+  taiga and mountains; biome surfaces (sand dunes, snow, stone slopes),
+  broadleaf and spruce trees, taiga snow drifts and boulders; public
+  `Generator::biome_at` / `Biome` API.
+
+### Changed
+- World generation changed for every seed (new climate fields and biome
+  blending), so new worlds look different and spawn points may move; existing
+  saves still load and only newly generated chunks use the new generator.
+- Screenshots accept `--time-of-day F` and the inventory has
+  `--screenshot-inventory PATH`.
+
+### Measured
+- Biome shares at 512x512: seed 1 plains 14.6%, forest 22.7%, desert 21.3%,
+  taiga 15.8%, mountains 25.6%; seed 42 plains 9.0%, forest 26.5%, desert 9.8%,
+  taiga 12.6%, mountains 42.2%.
+- Generation throughput: 1.45 ms/chunk in the test profile (300 chunks in
+  435 ms), worst chunk 1.85 ms.
+- Test count: 166 -> 216 (biome/worldgen, environment/outline GPU tests,
+  inventory/mining/UI tests).
+
 ## [0.0.4] — 2026-11-24 (tech preview, visual-quality slice)
 
 ### Added

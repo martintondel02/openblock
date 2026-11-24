@@ -125,6 +125,17 @@ pub enum PackError {
         /// Why the color is invalid.
         reason: String,
     },
+    /// The optional hardness value is out of range.
+    InvalidHardness {
+        /// File being loaded, when the error came from a pack.
+        path: Option<PathBuf>,
+        /// Index of the offending block.
+        index: usize,
+        /// Resource id of the offending block.
+        id: String,
+        /// Why the hardness is invalid.
+        reason: String,
+    },
     /// A texture name is not present in [`crate::textures::NAMES`].
     UnknownTexture {
         /// File being loaded, when the error came from a pack.
@@ -162,6 +173,12 @@ impl PackError {
                 reason,
             },
             Self::InvalidColor { index, id, reason, .. } => Self::InvalidColor {
+                path,
+                index,
+                id,
+                reason,
+            },
+            Self::InvalidHardness { index, id, reason, .. } => Self::InvalidHardness {
                 path,
                 index,
                 id,
@@ -255,6 +272,15 @@ impl fmt::Display for PackError {
             } => {
                 write_path(f, path.as_deref())?;
                 write!(f, "invalid color for block {id:?} at block {index}: {reason}")
+            }
+            Self::InvalidHardness {
+                path,
+                index,
+                id,
+                reason,
+            } => {
+                write_path(f, path.as_deref())?;
+                write!(f, "invalid hardness for block {id:?} at block {index}: {reason}")
             }
             Self::UnknownTexture {
                 path,
@@ -390,6 +416,8 @@ struct RawBlock {
     fluid: bool,
     color: Option<Vec<f64>>,
     textures: Option<RawTextures>,
+    /// Hand-breaking seconds; -1 means unbreakable, omitted means 1.0.
+    hardness: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -467,6 +495,7 @@ fn build_blocks(path: &Path, raw_blocks: &[RawBlock]) -> Result<Vec<BlockType>, 
 
         let color = validate_color(path, index, &raw.id, raw.color.as_deref())?;
         let textures = resolve_textures(path, index, &raw.id, raw.textures.as_ref())?;
+        let hardness = validate_hardness(path, index, &raw.id, raw.hardness)?;
         blocks.push(BlockType {
             id: intern(&raw.id),
             color,
@@ -474,9 +503,37 @@ fn build_blocks(path: &Path, raw_blocks: &[RawBlock]) -> Result<Vec<BlockType>, 
             opaque: raw.opaque,
             fluid: raw.fluid,
             textures,
+            hardness,
         });
     }
     Ok(blocks)
+}
+
+/// Validates the optional hardness field: seconds, or -1 for unbreakable.
+fn validate_hardness(path: &Path, index: usize, id: &str, hardness: Option<f64>) -> Result<f32, PackError> {
+    let Some(value) = hardness else {
+        return Ok(1.0);
+    };
+    if !value.is_finite() {
+        return Err(PackError::InvalidHardness {
+            path: Some(path.to_path_buf()),
+            index,
+            id: id.to_owned(),
+            reason: "must be a finite number or -1".to_owned(),
+        });
+    }
+    if value < 0.0 {
+        return Ok(f32::INFINITY);
+    }
+    if value > 3600.0 {
+        return Err(PackError::InvalidHardness {
+            path: Some(path.to_path_buf()),
+            index,
+            id: id.to_owned(),
+            reason: "must be at most 3600 seconds".to_owned(),
+        });
+    }
+    Ok(value as f32)
 }
 
 fn validate_id(id: &str) -> Result<(), &'static str> {
