@@ -1,0 +1,57 @@
+# Flatpak manifest for OpenBlock — draft, built from milestone MS-16 onward.
+#
+# Flathub is the recommended install for Fedora and other Linux players
+# (DEC-054). Cargo dependencies are bundled as vendored sources, which is the
+# standard Flatpak model and avoids the Fedora Rust unbundling problem.
+#
+# Before submitting:
+#   1. Generate the cargo sources file:
+#        flatpak-cargo-generator.py Cargo.lock -o cargo-sources.json
+#   2. Uncomment the cargo-sources.json source below and pin the git tag/commit.
+#   3. Run: flatpak-builder --user --install --force-clean build-dir \
+#             packaging/flatpak/io.github.martintondel02.OpenBlock.yml
+#   4. Validate with: flatpak run io.github.martintondel02.OpenBlock
+app-id: io.github.martintondel02.OpenBlock
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'   # keep in step with the Fedora cycle; bump deliberately
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: openblock
+
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11          # explicit X11/XWayland fallback
+  - --device=dri                   # Vulkan
+  - --socket=pulseaudio            # PipeWire through the PulseAudio compatibility protocol
+  - --share=network
+  # No --filesystem on purpose: saves/config/cache live in the sandbox XDG dirs,
+  # and world/pack import-export goes through portals.
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/openblock/cargo
+    CARGO_NET_OFFLINE: 'true'
+
+modules:
+  - name: openblock
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --locked --offline
+      - install -Dm755 target/release/openblock /app/bin/openblock
+      - install -Dm644 packaging/fedora/io.github.martintondel02.OpenBlock.desktop
+        /app/share/applications/io.github.martintondel02.OpenBlock.desktop
+      - install -Dm644 packaging/fedora/openblock.metainfo.xml
+        /app/share/metainfo/io.github.martintondel02.OpenBlock.metainfo.xml
+      - install -Dm644 packaging/fedora/io.github.martintondel02.OpenBlock.svg
+        /app/share/icons/hicolor/scalable/apps/io.github.martintondel02.OpenBlock.svg
+      - install -Dm644 packaging/fedora/openblock.mime.xml /app/share/mime/packages/openblock.xml
+    sources:
+      - type: git
+        url: https://github.com/martintondel02/openblock.git
+        tag: v0.0.0
+        commit: 0000000000000000000000000000000000000000   # pin at release time
+      # - type: file
+      #   path: cargo-sources.json

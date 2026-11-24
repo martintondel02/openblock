@@ -560,16 +560,20 @@ entities and block entities use versioned structs keyed by resource IDs.
 change later. Weft's format has no migrations and refuses newer formats; we
 commit to migration tooling from the first public release.
 
-### DEC-034 — Platforms and packaging: desktop first, headless servers everywhere
-**Status:** settled · **Reversal cost:** medium · **Owner:** MS-13
+### DEC-034 — Platforms and packaging: Linux/Fedora first, desktop and headless servers
+**Status:** settled · **Reversal cost:** medium · **Owner:** MS-13 · **Amended by:** DEC-054
 
-1.0 platforms: Windows 10/11 x86_64, Linux x86_64 (X11+Wayland), macOS 12+
-(Apple Silicon and Intel), plus headless servers on Linux/Windows/macOS
-x86_64 and aarch64. Android is post-1.0 on the roadmap (Vulkan; touch UI,
-safe areas and 48dp targets designed for from the start). Web/WebGPU is
-aspirational. Packaging: signed GitHub Releases with delta updates, an
-auto-updater with signed manifests and rollback, a Flatpak/AppImage/AUR path,
-and an official container image for servers.
+The **primary platform is Fedora Linux x86_64** (DEC-054): Wayland-first,
+Vulkan, PipeWire, systemd, SELinux enforcing. Windows 10/11 and macOS 12+
+(Apple Silicon and Intel) ship at 1.0 as supported secondary platforms, not as
+the lead target. Other Linux distributions run the Flatpak or AppImage on a
+best-effort basis. Headless servers ship for Linux (x86_64/aarch64, RPM and
+container), Windows and macOS. Android is post-1.0 on the roadmap (Vulkan;
+touch UI, safe areas and 48dp targets designed for from the start).
+Web/WebGPU is aspirational. Packaging: signed GitHub Releases with delta
+updates and rollback, Flathub Flatpak as the player default, a COPR RPM for
+Fedora native installs, AppImage/tarball fallbacks, and an official container
+image for servers.
 
 ### DEC-035 — Performance gates in CI, budgets are normative
 **Status:** settled · **Reversal cost:** low · **Owner:** MS-02
@@ -834,6 +838,48 @@ renaming after a public release is expensive; and clean-room provenance
 is weaker if shipped data uses the incumbent's names. Original names cost nothing
 before content freeze and are a legal launch gate afterwards.
 
+### DEC-054 — Fedora Linux is the primary platform
+**Status:** settled · **Reversal cost:** medium · **Owner:** MS-00 (development and CI), MS-16 (launch)
+
+OpenBlock is a **Linux-first game, and Fedora is the reference distribution**.
+Concretely:
+
+1. **Primary target:** Fedora Linux x86_64, versions 44 and 45 at launch, following
+   Fedora's own current-plus-previous support window (Fedora 44 is supported
+   until 2027-06; support rolls forward with each Fedora release). Fedora Server
+   is the reference dedicated-server OS.
+2. **Desktop stack:** **Wayland-first** (Fedora's default session; winit Wayland
+   backend) with X11/XWayland as a fallback, fractional scaling, IME and
+   keyboard-layout correctness. Graphics are **Vulkan** through wgpu (Mesa RADV
+   for AMD, ANV for Intel, the proprietary NVIDIA driver from RPM Fusion);
+   OpenGL is not a supported fallback on Linux.
+3. **Audio:** **PipeWire-first** (Fedora default), with PulseAudio/ALSA fallback
+   through the ALSA compatibility layer.
+4. **Packaging priority:** **Flathub Flatpak** is the player-facing default
+   (bundled crates, sandboxed, portals), then a **COPR RPM** for Fedora native
+   installs, then AppImage/tarball. An official Fedora repository package
+   requires unbundling via cargo2rpm and is tracked as OPEN-021. The dedicated
+   server ships as an **RPM plus a hardened systemd unit and a firewalld service
+   definition**, and as the container image.
+5. **The reference machine and benchmark box run Fedora Workstation 45
+   (Wayland, Vulkan)**; every performance gate is measured there (DEC-035).
+6. **CI gates on Fedora:** a Fedora 44 and 45 container job builds and tests every
+   PR; Wayland session smoke tests run in a Fedora VM on the nightly tier.
+7. **Windows and macOS remain supported at 1.0** (DEC-034) but are secondary:
+   they are not the reference for performance numbers, packaging order, or
+   release-blocking certification. Other Linux distributions are best-effort via
+   Flatpak/AppImage.
+
+*Why:* the player base is on Linux and Fedora is where the developers, players
+and servers will actually run the game. Making that explicit aligns the CI,
+packaging, driver matrix and support policy with reality instead of treating
+Linux as one column in a Windows-led matrix. Fedora also gives us a modern,
+predictable stack (Wayland, PipeWire, Mesa RADV/ANV, SELinux, systemd, Btrfs)
+that removes the "which X11/Wayland/audio combination is broken today?" class of
+support bugs.
+*Reversal cost:* medium — packaging, CI and support text change; the engine
+itself already targets Linux through wgpu/winit/CPAL.
+
 ## 7. Open decisions (must close before their milestone)
 
 | ID | Question | Owner | Deadline |
@@ -858,6 +904,7 @@ before content freeze and are a legal launch gate afterwards.
 | OPEN-018 | When the forward-compatibility promise for saves starts (at 1.0, or at the first public alpha). | MS-13 | before 0.1 |
 | OPEN-019 | 2.0 staffing and funding: who pays for the ~500–800 dev-week Tier-2 parity track and the 6–10 person team for 2–3 years? | Lead | before the MS-17 track starts |
 | OPEN-020 | Modern Delta: re-baseline parity from the pinned 1.21.11 baseline to the then-current Minecraft release before the 2.0 claim, with a separate delta manifest that cannot destabilise the pinned acceptance corpus. | MS-17 | before the 2.0 parity claim |
+| OPEN-021 | Fedora distribution route: Flathub-first plus a bundled-COPR RPM (fast, but not Fedora-packaging-compliant), or invest in unbundling via cargo2rpm for an official Fedora repository package? The second is the long-term credible path but is a recurring packaging cost per release. | MS-16 | before 1.0 launch |
 
 ## 8. Rejected alternatives (recorded so we don't relitigate)
 

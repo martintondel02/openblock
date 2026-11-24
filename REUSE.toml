@@ -5,7 +5,7 @@ version = 1
 [[annotations]]
 path = [
   "README.md", "CONTRIBUTING.md", "SECURITY.md", "CODE_OF_CONDUCT.md",
-  "MAINTAINERS.md", "docs/**", "crates/**", "xtask/**", "justfile",
+  "MAINTAINERS.md", "docs/**", "crates/**", "xtask/**", "perf/**", "justfile",
   "Cargo.toml", "rust-toolchain.toml", "rustfmt.toml", "deny.toml",
   "architecture.toml", "REUSE.toml", "perf/**",
   ".github/**", ".editorconfig", ".markdownlint.jsonc", ".gitignore",
@@ -19,6 +19,16 @@ SPDX-License-Identifier = "MIT OR Apache-2.0"
 path = ["DCO", "LICENSES/LicenseRef-DCO-1.1.txt"]
 SPDX-FileCopyrightText = "2004, 2006 The Linux Foundation and its contributors"
 SPDX-License-Identifier = "LicenseRef-DCO-1.1"
+
+[[annotations]]
+path = ["packaging/**"]
+SPDX-FileCopyrightText = "2026 OpenBlock contributors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = ["packaging/fedora/io.github.martintondel02.OpenBlock.svg"]
+SPDX-FileCopyrightText = "2026 OpenBlock contributors"
+SPDX-License-Identifier = "CC0-1.0"
 
 [[annotations]]
 path = ["LICENSE-MIT", "LICENSES/MIT.txt"]

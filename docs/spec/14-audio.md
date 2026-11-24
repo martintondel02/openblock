@@ -456,7 +456,7 @@ p95 unless stated, reference machine ([vision §9](../vision.md#9-platforms-and-
 | RISK-141 | Mixer work migrates onto the main thread, or occlusion probes become a per-frame raycast storm | callback only on the audio thread, REQ-AUDIO-010 detectors, PERF-AUDIO-008 probe budget | MS-12 |
 | RISK-142 | Content authors ship unnormalised clips, so the limiter pumps | manifest loudness required, build rejects a clip without LUFS data | MS-21 |
 | RISK-143 | Voice chat scope grows into a 1.0 feature and drags moderation, privacy and bandwidth work | feature gate, host setting, post-1.0 milestone, review at MS-14 | MS-14 |
-| RISK-144 | Platform backends (ALSA, WASAPI, CoreAudio) behave differently under device churn | null-device fallback, device matrix in §7, no game coupling | MS-13 |
+| RISK-144 | Platform backends (PipeWire, PulseAudio, ALSA, WASAPI, CoreAudio) behave differently under device churn | null-device fallback, device matrix in §7, no game coupling | MS-13 |
 
 ## 7. Testing strategy
 
@@ -468,7 +468,7 @@ p95 unless stated, reference machine ([vision §9](../vision.md#9-platforms-and-
 | Music and ambience | context matrix, hysteresis, cooldown, no repeat, bed weights, storm behaviour | fixture snapshots with a virtual clock |
 | Captions | every critical definition has a key; culled voices still caption; sectors are correct | shared contract test with [23](23-accessibility-localization.md) |
 | Determinism | audio on/off produces the same replay hash | MS-02 harness, audio feature toggled |
-| Device matrix and stress | null, ALSA/PulseAudio/PipeWire, WASAPI, CoreAudio; 44.1/48/96 kHz; hotplug; one hour at 64 voices, 10k-event storms, rapid teleports | CI runners, manual checklist, soak with leak and underrun counters |
+| Device matrix and stress | **PipeWire-first on Fedora 44/45** with PulseAudio and ALSA fallbacks, then WASAPI and CoreAudio; 44.1/48/96 kHz; hotplug; one hour at 64 voices, 10k-event storms, rapid teleports | Fedora VM/CI runners, manual checklist, soak with leak and underrun counters |
 | Privacy (voice) | no voice bytes in logs, crash reports or saves | feature test, review |
 
 ## 8. Open questions

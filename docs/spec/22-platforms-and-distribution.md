@@ -26,12 +26,12 @@ degrade to a playable previous state, not to a lost install.
 
 | ID | Requirement | Verification | Milestone |
 | --- | --- | --- | --- |
-| REQ-PLAT-001 | 1.0 client binaries MUST be Windows 10 22H2/11 x86_64, Linux x86_64 with X11 and Wayland, and macOS 12+ universal2 (Apple Silicon and Intel); any other client target is post-1.0. | Release artifact inventory | MS-16 |
+| REQ-PLAT-001 | 1.0 client binaries MUST primarily target **Fedora Linux 44/45 x86_64 (Wayland-first)**, and MUST also ship Windows 10 22H2/11 x86_64 and macOS 12+ universal2 as supported secondary platforms; any other client target is post-1.0 ([DEC-054](../decisions.md)). | Release artifact inventory | MS-16 |
 | REQ-PLAT-002 | Dedicated servers MUST build for Linux, Windows and macOS on x86_64 and aarch64 (static musl on Linux), and MUST run with no GPU, display server or audio device. | Container/no-DRI CI ([REQ-ARCH-012](01-technical-architecture.md)) | MS-13 |
-| REQ-PLAT-003 | Graphics backends MUST be DX12 (primary) and Vulkan (option) on Windows, Vulkan 1.1 (primary) on Linux, and Metal on macOS; each shipped backend MUST pass the §7 smoke test. | Per-backend CI job | MS-13 |
+| REQ-PLAT-003 | Graphics backends MUST be **Vulkan on Linux (the Fedora reference path)**, DX12 primary with Vulkan as an option on Windows, and Metal on macOS; the Linux matrix MUST cover Mesa RADV and ANV and the NVIDIA driver, and each shipped backend MUST pass the §7 smoke test. | Per-backend CI job + driver matrix | MS-13 |
 | REQ-PLAT-004 | The x86_64 baseline MUST be `x86-64-v2` (SSE4.2, POPCNT) with a runtime check that fails with an actionable message on older CPUs; `target-cpu=native` MUST NOT be shipped and aarch64 assumes mandatory NEON. | CPUID fixture + binary inspection | MS-13 |
 | REQ-PLAT-005 | Display requirements MUST be 1280×720 minimum, per-monitor DPI from 1.0 to 3.0, borderless/windowed/fullscreen modes, and HDR output disabled at 1.0. | Scale matrix + display fixture | MS-16 |
-| REQ-PLAT-006 | Audio MUST use WASAPI on Windows, PipeWire with PulseAudio/ALSA fallback on Linux and CoreAudio on macOS; a missing device MUST start muted and retry, never abort. | Device-removal test | MS-13 |
+| REQ-PLAT-006 | Audio MUST use **PipeWire-first on Linux/Fedora** with PulseAudio and ALSA fallbacks, WASAPI on Windows and CoreAudio on macOS; a missing device MUST start muted and retry, never abort. | Device-removal test | MS-13 |
 | REQ-PLAT-007 | Config, data, cache and log directories MUST follow §3.1 per OS, be overridable by `--data-dir`, and no file may be written outside them without explicit user action. | Path tests per OS | MS-13 |
 | REQ-PLAT-008 | A second client launch for one data directory MUST forward its arguments to the running instance and exit; `--multi-instance` opts out for tests ([REQ-CORE-017](02-engine-core.md)). | Two-process test | MS-13 |
 | REQ-PLAT-009 | The client MUST run without administrator/root and without requiring elevation; any first-run firewall prompt for outbound UDP MUST be documented and optional, and only a dedicated server listens for inbound UDP. | Clean-VM install test | MS-16 |
@@ -40,7 +40,7 @@ degrade to a playable previous state, not to a lost install.
 | REQ-PLAT-012 | First-run auto-detection MUST map the detected CPU, GPU, RAM and display to a preset conservatively, show what it detected, persist the result and never override a user choice silently; `--safe-mode` forces the lowest preset. | Detection fixtures + first-run test | MS-16 |
 | REQ-PLAT-013 | On Steam Deck (1280×800, `medium`, 256-block render distance) the client MUST sustain ≥ 40 FPS average and ≥ 30 FPS 1% low as a verification target, with controller-only navigation. | Deck measurement | MS-16 |
 | REQ-PLAT-014 | Cargo profiles MUST follow §3.3: client and distribution builds use `panic = "abort"`, the dedicated server profile uses `panic = "unwind"`, and neither may be changed without a decision ([DEC-042](../decisions.md)). | Profile inspection + panic test | MS-13 |
-| REQ-PLAT-015 | Linux binaries MUST be built against glibc 2.35 or older; Windows and macOS MUST use native runners, and cross-compilation MUST NOT be the only build path for a shipped target. | Runner inventory | MS-13 |
+| REQ-PLAT-015 | Linux binaries MUST be built in a **Fedora 44 build root** (the glibc baseline for the supported Fedora window) rather than on the newest distribution; Windows and macOS MUST use native runners, and cross-compilation MUST NOT be the only build path for a shipped target. | Runner inventory + `ldd --version` check | MS-13 |
 | REQ-PLAT-016 | Windows executables, DLLs, installers and the uninstaller MUST be Authenticode-signed with SHA-256 and an RFC 3161 timestamp from a key held in an HSM or managed signing service. | `signtool verify /pa` | MS-16 |
 | REQ-PLAT-017 | The macOS app MUST be Developer-ID signed with hardened runtime, notarised with `notarytool --wait`, stapled and verified with `spctl --assess`; `disable-library-validation` MUST NOT be used at 1.0. | Notarisation log + `codesign -dv` | MS-16 |
 | REQ-PLAT-018 | Linux archives and the update manifest MUST publish SHA-256 and BLAKE3 checksums plus an Ed25519 or minisign signature; Flatpak and Steam signatures are accepted in addition, never instead. | Checksum verification test | MS-16 |
@@ -50,9 +50,9 @@ degrade to a playable previous state, not to a lost install.
 | REQ-PLAT-022 | Every artifact MUST contain license texts, `THIRD-PARTY-NOTICES.md`, an SBOM and an embedded dependency list from `cargo-auditable`. | Artifact inspection | MS-16 |
 | REQ-PLAT-023 | GitHub Releases MUST be the primary channel, carrying every desktop and server artifact, checksums, SBOM, changelog and the signed update manifest. | Release checklist | MS-16 |
 | REQ-PLAT-024 | Windows packaging MUST be a per-user MSI needing no elevation plus a portable zip; uninstall MUST preserve saves and settings. | Clean-VM install/uninstall | MS-16 |
-| REQ-PLAT-025 | Linux packaging MUST provide AppImage, Flatpak (Flathub), AUR and a `.tar.zst`; Flatpak MUST use portals for filesystem access and MUST NOT self-update. | Flathub review + sandbox test | MS-16 |
+| REQ-PLAT-025 | Fedora-facing packaging MUST provide a **Flathub Flatpak (player default)**, a **COPR RPM** following the Fedora Packaging Guidelines (SPDX `License` field, `.desktop`, AppStream metainfo, no privileged helpers), and an AppImage/`.tar.zst` fallback; AUR is best effort; Flatpak MUST use portals and MUST NOT self-update. | Flathub review + RPM lint + sandbox test | MS-16 |
 | REQ-PLAT-026 | macOS packaging MUST be a universal2 `.app` in a DMG, notarised and stapled, with no kernel extensions and minimal entitlements. | Gatekeeper clean-machine test | MS-16 |
-| REQ-PLAT-027 | Server distribution MUST include Linux/Windows/macOS archives, a multi-arch container image with non-root UID, read-only root, `/data` volume, health check and 30 s SIGTERM drain. Runtime operations, backups and runbooks for that image are owned by [19](19-server-administration.md). | Image inspection + Kubernetes smoke | MS-16 |
+| REQ-PLAT-027 | Server distribution MUST include a **Fedora RPM with a hardened systemd unit and a firewalld service definition** for the primary platform, plus Linux/Windows/macOS archives and a multi-arch container image with non-root UID, read-only root, `/data` volume, health check and 30 s SIGTERM drain. Runtime operations, backups and runbooks are owned by [19](19-server-administration.md). | Image inspection + systemd/firewalld test + Kubernetes smoke | MS-16 |
 | REQ-PLAT-028 | No channel may receive content, features or binaries that the direct download lacks; the only permitted differences are store-integrated updates and store-mandated metadata. | Store manifest diff | MS-16 |
 | REQ-PLAT-029 | Steam builds MUST use Steamworks depots and Steam's updater; the self-updater MUST be disabled when `SteamAppId` is present, and Steam Deck verification MUST follow the §3.4 checklist. | Steam build + Deck review | MS-16 |
 | REQ-PLAT-030 | itch.io builds MUST be uploaded via butler and MUST match the GitHub artifacts byte-for-byte before signing differences are accounted for. | Hash comparison | MS-16 |
@@ -76,25 +76,66 @@ degrade to a playable previous state, not to a lost install.
 | REQ-PLAT-048 | Support policy MUST be: the latest and previous minor receive security fixes for 12 months after the next minor ships; the last minor of each major is the LTS line, released annually with 12 months of security and save fixes; saves migrate forward indefinitely. | Published policy + fixture saves | MS-16 |
 | REQ-PLAT-049 | Removing a platform MUST be announced 12 months ahead, keep security fixes until the final build, and archive documentation and symbols. | Policy review | MS-16 |
 | REQ-PLAT-050 | Every failure class in §6 MUST have a documented detection, rollback and operator/user message, exercised by the update, install and store tests. | Failure-matrix test | MS-16 |
+| REQ-PLAT-051 | CI MUST build and test the workspace in **Fedora 44 and Fedora 45 containers on every pull request** ([DEC-054](../decisions.md)), and a nightly job MUST run the client smoke test in a Fedora Wayland VM; a release tag MUST NOT be accepted without both. | CI job list + nightly artifact | MS-00, MS-16 |
+| REQ-PLAT-052 | The Fedora RPM MUST install the client under `/usr/bin` with `.desktop`, AppStream, icon and `.obworld` MIME files, and the server RPM MUST install the hardened systemd unit, firewalld service and sysusers/tmpfiles definitions; `rpmlint` MUST pass in CI. | `rpmlint` + install/remove test in a Fedora container | MS-16 |
+| REQ-PLAT-053 | The Wayland path MUST support fractional scaling from 1.0 to 3.0 without blurry text, IME composition, layout switching and pointer confinement; when the session is X11/XWayland the client MUST degrade explicitly (documented limitation, no silent difference in input behaviour). | Wayland/X11 input matrix in the Fedora VM | MS-13, MS-16 |
 
 ## 3. Design
 
 ### 3.1 Platform matrix and per-platform rules
 
-| Platform | Artifacts | Graphics | Minimum | Notes |
-| --- | --- | --- | --- | --- |
-| Windows 10 22H2 / 11, x86_64 | MSI (per-user), portable zip | DX12 primary, Vulkan option | x86-64-v2, 8 GiB | Authenticode, SmartScreen reputation |
-| Linux x86_64, X11 + Wayland | AppImage, Flatpak, AUR, `.tar.zst` | Vulkan 1.1 | glibc 2.35, 8 GiB | no root; portals inside Flatpak |
-| macOS 12+, universal2 | `.app` in DMG | Metal | Apple Silicon or Intel, 8 GiB | Developer ID, notarised, stapled |
-| Server Linux x86_64 / aarch64 | `.tar.zst`, container | none | 2 GiB RAM | static musl, no display or audio |
-| Server Windows x86_64 / aarch64, macOS x86_64 / aarch64 | zip / `.tar.gz` | none | 2 GiB RAM | console binary, not a service |
-| Android arm64 | AAB | Vulkan 1.1 | API 26, 4 GiB | post-1.0, touch UI; iOS feasibility only |
-| WebGPU | — | WebGPU | — | aspirational ([OPEN-008](../decisions.md)) |
+| Priority | Platform | Artifacts | Graphics / audio | Minimum | Notes |
+| --- | --- | --- | --- | --- | --- |
+| **1 — primary** | **Fedora Linux 44/45, x86_64** (Workstation, KDE, Silverblue; Fedora Server for hosting) | Flathub Flatpak (default), COPR RPM, AppImage, `.tar.zst`, server RPM, container | **Vulkan** (Mesa RADV/ANV or NVIDIA from RPM Fusion), **PipeWire**, Wayland-first | x86-64-v2, 8 GiB, Wayland or X11 session | Reference platform for performance, CI, packaging and support ([DEC-054](../decisions.md)) |
+| 2 — supported secondary | Windows 10 22H2 / 11, x86_64 | MSI (per-user), portable zip | DX12 primary, Vulkan option; WASAPI | x86-64-v2, 8 GiB | Authenticode, SmartScreen reputation |
+| 2 — supported secondary | macOS 12+, universal2 | `.app` in DMG | Metal; CoreAudio | Apple Silicon or Intel, 8 GiB | Developer ID, notarised, stapled |
+| 3 — best effort | Other Linux x86_64 distros | Flatpak, AppImage, `.tar.zst` | Vulkan; PipeWire/PulseAudio/ALSA | Vulkan-capable driver, 8 GiB | No distro-specific packaging promise at 1.0 |
+| 3 — best effort | Linux aarch64 | `.tar.zst`, container | Vulkan; PipeWire | 8 GiB | Build published, support best effort |
+| Server — primary | **Fedora Server 44/45, x86_64** | RPM + hardened systemd unit + firewalld service, container | none | 2 GiB RAM | Headless, no display or audio |
+| Server — secondary | Linux aarch64, Windows, macOS | archives, container | none | 2 GiB RAM | Console binary, not a service |
+| Post-1.0 | Android arm64 | AAB | Vulkan 1.1 | API 26, 4 GiB | MS-19, touch UI |
+| Post-1.0 | Steam Deck (SteamOS/Flatpak) | Flatpak/AppImage on SteamOS | Vulkan; PipeWire | 16 GiB | Verification target (REQ-PLAT-013) |
+| Aspirational | WebGPU | — | WebGPU | — | [OPEN-008](../decisions.md) |
 
-Windows 10 22H2 is the floor because older builds lack the DX12/WARP combinations wgpu 30 expects;
-Linux targets glibc 2.35 so the binary runs on 22.04 and later, while musl servers have no glibc
-dependency; macOS 12 is the Metal floor. CPU features are checked at startup, so an older CPU gets
-"OpenBlock requires SSE4.2 and POPCNT" rather than SIGILL.
+Fedora 44 (released 2026-04-28, supported until 2027-06) and Fedora 45
+(released 2026-11-03) are the launch window; support rolls forward with Fedora's
+current-plus-previous window, and the CI matrix moves in the same release that a
+Fedora version reaches end of life. Windows 10 22H2 is the Windows floor because
+older builds lack the DX12/WARP combinations wgpu 30 expects; the Linux baseline
+is the glibc shipped with Fedora 44 (build in a `fedora:44` container, never on
+the newest distro); macOS 12 is the Metal floor. CPU features are checked at
+startup, so an older CPU gets "OpenBlock requires SSE4.2 and POPCNT" rather than
+SIGILL.
+
+#### 3.1.1 Fedora reference platform
+
+Fedora is not just the first row: it defines the reference environment.
+
+- **Session:** Wayland-first. The client must be correct under GNOME and KDE
+  Wayland (fractional scaling, IME, keyboard layout switching, pointer
+  confinement for drag operations) with an X11/XWayland fallback. There must be
+  no X11-only code path in the default configuration.
+- **Graphics:** Vulkan through wgpu. The validation matrix is Mesa RADV (AMD),
+  Mesa ANV (Intel) and the NVIDIA proprietary driver (RPM Fusion); a machine
+  with no Vulkan-capable driver gets an actionable error, not a black window.
+  OpenGL/GLES is not a supported fallback on Linux.
+- **Audio:** PipeWire (the Fedora default), through the ALSA compatibility
+  layer; PulseAudio and bare ALSA remain supported fallbacks.
+- **System services:** systemd for the dedicated server (journald logging,
+  `Restart=on-failure`, sandboxing), firewalld service definition for the QUIC
+  UDP port, no custom SELinux policy required (the client is an unconfined user
+  application; the server runs under systemd sandboxing rather than a bespoke
+  domain).
+- **Filesystem:** XDG Base Directory paths on Btrfs including subvolumes and
+  snapshots; saves are ordinary files, so snapshot/rollback works, and
+  reflink-based backups are available (ch17).
+- **Desktop integration:** `.desktop` entry, AppStream metainfo, themed icons,
+  `.obworld` MIME association, and a portal-based file chooser inside the
+  Flatpak.
+- **Gaming stack:** the Flatpak/AppImage build works without Steam; Steam
+  installs use the Steam Linux Runtime container and Proton is never required
+  for the native build. Steam Input is supported through standard gamepad APIs.
+
 
 | Area | Windows | Linux | macOS |
 | --- | --- | --- | --- |
@@ -117,12 +158,14 @@ elevates, the macOS app writes nothing next to the bundle, and the AppImage moun
 | --- | --- | --- | --- | --- | --- | --- |
 | Minimum (`potato`/`low`) | 4 cores/8 threads, Ryzen 3 3100 or i3-10100 class | GTX 1060 6 GB / RX 580 8 GB | 8 GiB | 720p, 128–192 blocks | `low` | 60 FPS at 128–192 blocks |
 | Recommended | 6 cores/12 threads, Ryzen 5 5600 or i5-12400 | RTX 2060 / RX 6600, 8 GB | 16 GiB | 1080p 120–144 Hz, 384 blocks | `medium` | 120 FPS at 384 blocks |
-| Reference (all gates) | 8 cores/16 threads, 5800X3D or i7-12700 | RTX 3060 12 GB / RX 6600 XT | 32 GiB | 1080p 144 Hz, 512 blocks | `high` | ≥ 120 FPS avg, p99 ≤ 12 ms ([25 §5](25-performance-budgets.md#5-performance-budgets)) |
+| Reference (all gates) — **Fedora Workstation 45, Wayland, Vulkan** | 8 cores/16 threads, 5800X3D or i7-12700 | RTX 3060 12 GB / RX 6600 XT | 32 GiB | 1080p 144 Hz, 512 blocks | `high` | ≥ 120 FPS avg, p99 ≤ 11.1 ms ([25 §5](25-performance-budgets.md#5-performance-budgets)) |
 | Steam Deck (verification, not a gate tier) | 4 cores/8 threads Zen 2, 8 RDNA2 CUs | integrated | 16 GiB | 1280×800, 256 blocks | `medium` | ≥ 40 FPS avg, 1% low ≥ 30 |
 
 The client tiers are those of [25 §3.1](25-performance-budgets.md#31-hardware-tiers); the bench box
 and reference server are CI/server roles there, and Steam Deck is a verification target, not a
-gate tier. Anything else is a `Report` row. The 144 FPS mode is verified on the reference machine
+gate tier. The reference client and bench box run **Fedora Workstation 45 (Wayland, Vulkan)**
+([DEC-054](../decisions.md)); Windows and macOS are supported but are not the source of the gate
+numbers. Anything else is a `Report` row. The 144 FPS mode is verified on the reference machine
 at 512 blocks and remains subject to [OPEN-003](../decisions.md); 120 FPS is the release floor. A
 client needs 1 GiB free for the install and cache; a server needs 2 GiB plus the world size.
 
@@ -134,6 +177,11 @@ choice ([REQ-RENDER-029](03-rendering.md)), shows "Detected: <GPU>, <CPU>, <RAM>
 `--safe-mode` bypasses it, disabling packs, shaders and native plugins at the lowest preset.
 
 ### 3.3 Build system, signing and reproducibility
+
+The Linux release build root is **`fedora:44`** (the oldest supported Fedora at launch),
+not the newest distribution, so the shipped binary runs on Fedora 44 and later without
+newer-glibc symbols; the CI matrix builds in both `fedora:44` and `fedora:45` and runs the
+gated smoke tests on each ([REQ-PLAT-015](#2-requirements), [REQ-PLAT-051](#2-requirements)).
 
 | Profile | Used by | opt | LTO | codegen units | panic | debug | strip |
 | --- | --- | ---: | --- | ---: | --- | --- | --- |
@@ -182,12 +230,14 @@ not bit-identical. Every artifact embeds `cargo-auditable` metadata and ships a 
 | GitHub Releases (primary) | MSI, zip, AppImage, tar.zst, DMG, server archives, container digest | self-updater | we own signing, CDN and manifest |
 | Steam | depot builds via SteamPipe | Steam | onboarding, Deck verification, no self-updater |
 | itch.io | zip/DMG via butler | self-updater or manual | demo/beta channel, no DRM |
-| Flathub | Flatpak | OSTree | sandbox and portals, AppStream metadata, review |
+| **Flathub (Fedora player default)** | Flatpak | OSTree | sandbox and portals, AppStream metadata, review |
+| **COPR (Fedora native)** | RPM (client and server) | dnf | Fedora Packaging Guidelines; bundled Rust crates disclosed; not Fedora-repository-compliant until OPEN-021 closes |
 | AUR | `PKGBUILD` source and `-bin` | pacman | community-maintained, no bundled libraries |
 | Container | multi-arch image | registry tag | non-root, read-only root, `/data`, health check |
 
-GitHub Releases is the primary channel and updater source because it keeps signing, CDN and rollback
-in our hands and survives a store delisting — a real risk for a voxel game
+GitHub Releases is the direct-download channel and updater source because it keeps signing, CDN and
+rollback in our hands and survives a store delisting; for Fedora players the recommended install is
+the Flathub Flatpak, with the COPR RPM for native installs — a real risk for a voxel game
 ([research 07 §4](../research/07-legal-licensing-and-ip.md)). Steam is the reach channel with its own
 updater, disabled self-updater when `SteamAppId` is set. itch.io carries demo and beta builds through
 butler. Flathub follows once portals for saves and packs are tested; a Flatpak cannot self-update and
@@ -196,18 +246,33 @@ image is the server's preferred deployment: multi-stage musl, a minimal base cho
 audit, UID 10001, `/data` volume, read-only root, `cap_drop: ALL`, `no-new-privileges`, an exec
 health check and a SIGTERM drain within 30 s.
 
-**Windows MSI** installs per user into `%LOCALAPPDATA%\Programs\OpenBlock`, registers an uninstall
-entry, optionally associates `.obworld` and upgrades in place; uninstall removes program files only,
-keeping saves, packs and settings unless the user checks "delete my data", and the MSI passes WiX ICE
-validation in CI. **macOS** ships a DMG with the relocatable app; it writes only to Application
-Support and installs no privileged helper. **Linux** offers AppImage (portable), Flatpak (sandboxed,
-portals), AUR (Arch) and `tar.zst` (manual).
+**Fedora (primary).** The player-facing default is the **Flathub Flatpak**: it bundles
+the Rust crates and assets, runs sandboxed with portals for saves and pack import,
+and avoids the Fedora Rust unbundling problem. Native installs use a **COPR RPM**
+that follows the Fedora Packaging Guidelines (SPDX license expression, `.desktop`,
+AppStream metainfo, icons, MIME type, no privileged helper, no bundled system
+libraries); because the game bundles Rust crates, the COPR package is explicitly
+labelled as not yet Fedora-repository-compliant, and unbundling via cargo2rpm is
+tracked as [OPEN-021](../decisions.md). The dedicated server ships as a separate
+RPM containing the binary, a hardened systemd unit (`DynamicUser`-style isolation
+with a `StateDirectory`, `ProtectSystem=strict`, `NoNewPrivileges`, `PrivateTmp`,
+`MemoryMax`), a firewalld service definition for the QUIC UDP port, and sysusers
+and tmpfiles entries; installation and removal are tested inside a Fedora
+container in CI. AppImage and `.tar.zst` remain available for portability and
+for non-Fedora distributions. **Windows MSI** installs per user into
+`%LOCALAPPDATA%\Programs\OpenBlock`, registers an uninstall entry, optionally
+associates `.obworld` and upgrades in place; uninstall removes program files only,
+keeping saves, packs and settings unless the user checks "delete my data", and the
+MSI passes WiX ICE validation in CI. **macOS** ships a DMG with the relocatable
+app; it writes only to Application Support and installs no privileged helper.
 
 **Storefront policy.** Builds are identical across channels; the only permitted differences are
 store-integrated updates and store metadata. No channel-exclusive content, no always-online
 single-player, no DRM beyond the storefront client, no telemetry by default. Listings avoid Minecraft
 names, marks, fonts and screenshots, and carry the disclaimer, age rating, privacy link and licence.
 A store rejection is a distribution event: the direct download stays live while it is resolved.
+Fedora-specific storefront work (Flathub review, COPR rebuilds per Fedora release, RPM lint) is
+MS-16 work and is scheduled before Windows/macOS storefront polish ([DEC-054](../decisions.md)).
 
 **Steam Deck verification.** Native Linux (no Proton), 1280×800 with legible text at 100% UI scale,
 default controller configuration with on-screen glyphs, suspend/resume that re-establishes audio and
@@ -313,8 +378,11 @@ consistent with §3.7.
 Deck), hot-plug reconfigures prompts without dropping input, the layout is remappable, and no action
 depends on a platform-specific button. **macOS** follows the standard menu bar: About, Settings
 (Cmd+,), Services, Quit (Cmd+Q), Window and Help menus; the green button enters fullscreen and there
-is no custom title bar in windowed mode. **Linux** ships a `.desktop` file, AppStream metadata,
-themed icons and a MIME association for `.obworld`. **Windows** is per-user, long-path and DPI aware,
+is no custom title bar in windowed mode. **Fedora Linux** is Wayland-first: fractional scaling, IME composition, layout switching
+and pointer confinement must work under GNOME and KDE Wayland, with X11/XWayland as an
+explicit fallback; the client ships a `.desktop` file, AppStream metadata, themed icons
+and a MIME association for `.obworld`. Gamepads are read through the standard evdev/hidraw
+APIs, work with Steam Input, and need no udev rule beyond the desktop's default. **Windows** is per-user, long-path and DPI aware,
 with no global hotkeys. Text fields support IME and clipboard, and focus loss pauses single-player
 while a hosted server keeps running.
 
@@ -457,15 +525,21 @@ version with `--health-check`, waits for the marker, and commits or rolls back; 
 
 - **Per-platform smoke tests.** Every CI target launches the client with `--smoke-test` (create a
   device, present 60 frames to an offscreen or virtual surface, exit 0), starts the server for 200
-  ticks and runs `openblock-tools --version`; failures block the release.
+  ticks and runs `openblock-tools --version`; failures block the release. **Fedora is a required
+  matrix entry**: `fedora:44` and `fedora:45` container jobs build and test every PR, and a nightly
+  Wayland-VM job runs the client smoke test under a real compositor (GNOME and KDE sessions).
 - **VM and emulation limits.** Linux CI uses lavapipe for validation coverage, never for performance
   claims; Windows and macOS runners are real machines but not GPU-diverse, so a nightly real-GPU job
-  covers AMD, Intel and Apple silicon. ARM performance is measured on ARM hardware, never emulated.
+  covers AMD (RADV), Intel (ANV) and NVIDIA on Fedora, plus Apple silicon. The Fedora VM jobs cover
+  Wayland/PipeWire/systemd integration, not performance. ARM performance is measured on ARM hardware, never emulated.
 - **Install and update tests.** MSI install/upgrade/uninstall and save preservation in Windows
   Sandbox; a fresh macOS user for Gatekeeper; Docker as non-root with a read-only root; Flatpak in
   its sandbox. Updates cover N−2 → N and N−1 → N full and delta, an interrupted download, bad
   signature, wrong size, corrupted patch, two failed health checks, downgrade and channel switch.
-- **Store validation.** WiX ICE, `flatpak-builder --run` and Flathub lint, AppImage extraction,
+- **Store validation.** Fedora-first: `rpmlint` plus install/upgrade/remove of the client and server
+  RPMs in `fedora:44`/`fedora:45` containers; `flatpak-builder --run` and Flathub lint (including
+  portals and no network outside declared permissions); systemd unit verification with
+  `systemd-analyze verify` and a firewalld open-close test; then WiX ICE, AppImage extraction,
   Steam depot install and Deck review, AUR build in a clean chroot.
 - **Crash, privacy and accessibility.** A forced panic writes a redacted report; a network capture
   proves no upload without consent; the collector schema diff fails CI on unreviewed fields; every
@@ -483,6 +557,7 @@ version with `--health-check`, waits for the marker, and commits or rolls back; 
 | 4 | Register item needed: how long macOS Intel is supported, and whether Windows aarch64 becomes a client target. | Keep universal2 while macOS 12 is supported; no Windows ARM client before a native runner and measured tier. | MS-16 |
 | 5 | Register item needed: does an opt-in telemetry programme exist, or is diagnostics-only permanent, and is crash upload self-hosted? | Self-host any collector; keep telemetry off unless a concrete coverage question needs it; publish the schema either way. | MS-16 |
 | 6 | Register item needed: Android minimum API and store scope (Play only, or F-Droid too)? | API 26, Play first, F-Droid if the build is fully free of Play services. | MS-19 |
+| 7 | Register item needed: Fedora distribution route — Flathub plus a bundled-COPR RPM, or unbundling via cargo2rpm for an official Fedora repository package? | Flathub/COPR at 1.0, evaluate cargo2rpm unbundling after 1.0; keep both buildable so the choice is reversible. | MS-16 |
 
 ## 9. References
 

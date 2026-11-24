@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=OpenBlock
+GenericName=Voxel Sandbox Game
+Comment=Mine, build, explore and survive in an open voxel world
+Exec=openblock %f
+Icon=io.github.martintondel02.OpenBlock
+Terminal=false
+Categories=Game;ActionGame;AdventureGame;
+Keywords=voxel;sandbox;block;building;survival;multiplayer;
+MimeType=application/x-openblock-world;
+StartupNotify=true
+StartupWMClass=openblock

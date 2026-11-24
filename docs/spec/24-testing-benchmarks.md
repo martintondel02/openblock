@@ -66,7 +66,7 @@ loudly; anything else is a demo.
 | REQ-TEST-026 | Mutation testing is sampled nightly on inventory, lighting, protocol and save modules; surviving mutants are triaged. | Mutation report | MS-10 |
 | REQ-TEST-027 | A failing nightly or soak job attaches a replay, profiler capture or crash dump sufficient to reproduce it locally. | Artifact presence check | MS-02 |
 | REQ-TEST-028 | The release checklist of §3.17 is executed on the release branch; an unchecked item blocks the tag. | Release checklist | MS-16 |
-| REQ-TEST-029 | CI matrix: three desktop OSes for PRs, x86_64 and aarch64 for headless sim, and the server job proves no GPU crates are linked. | Matrix definition | MS-00 |
+| REQ-TEST-029 | CI matrix: **Fedora 44 and Fedora 45 containers are required PR entries ([DEC-054](../decisions.md))**, three desktop OSes for PRs, x86_64 and aarch64 for headless sim, and the server job proves no GPU crates are linked. | Matrix definition | MS-00 |
 | REQ-TEST-030 | sccache speeds builds but never changes results; a cold cache reproduces the same hashes and test outcomes. | Cold-cache job | MS-00 |
 | REQ-TEST-031 | Bench JSON and environment records are retained for ≥ 400 days (REQ-PERF-013); captures and replay logs 30 days; fuzz crash seeds live on as corpus. | Retention audit | MS-02 |
 | REQ-TEST-032 | A benchmark is added as scene + budget row + gate in one change; no gate without a budget and no budget without a scene. | Review checklist | MS-02 |
@@ -74,7 +74,7 @@ loudly; anything else is a demo.
 | REQ-TEST-034 | Bots reuse the game client's protocol code, are headless, scriptable, and one process can drive 500 of them on the reference VPS. | Scale job | MS-15 |
 | REQ-TEST-035 | Soak tests assert RSS slope ≈ 0, bounded file descriptors, tick-rate drift and save growth within budget. | Soak report | MS-15 |
 | REQ-TEST-036 | Tests never depend on execution order or shared global state; each owns its temp directory and port. | nextest parallel run | MS-00 |
-| REQ-TEST-037 | Windows and macOS run the full unit and integration tiers nightly; release branches merge only with all three green. | Nightly matrix | MS-00 |
+| REQ-TEST-037 | **Fedora Wayland-VM jobs run the full client smoke and input matrix nightly**, and Windows and macOS run the full unit and integration tiers nightly; release branches merge only with Fedora and all three desktop OSes green. | Nightly matrix | MS-00 |
 | REQ-TEST-038 | A panicking system or handler is exercised by a containment test and cannot fail the test process silently (DEC-042). | Fault-injection test | MS-02 |
 
 ## 3. Design

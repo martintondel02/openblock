@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata. Required by Flathub and GNOME/KDE software centres. -->
+<component type="desktop-application">
+  <id>io.github.martintondel02.OpenBlock</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>OpenBlock</name>
+  <summary>Mine, build, explore and survive in an open voxel world</summary>
+  <description>
+    <p>
+      OpenBlock is an open-source voxel sandbox game. Mine, build, explore and
+      survive alone or with friends on servers you host yourself.
+    </p>
+    <p>
+      It targets the Minecraft Java feature set as a baseline, then goes further
+      with a scriptable content platform, GPU-driven rendering and a multiplayer
+      stack designed for self-hosted servers. It contains no Minecraft code or
+      assets and is not affiliated with Mojang or Microsoft.
+    </p>
+  </description>
+  <launchable type="desktop-id">openblock.desktop</launchable>
+  <url type="homepage">https://github.com/martintondel02/openblock</url>
+  <url type="bugtracker">https://github.com/martintondel02/openblock/issues</url>
+  <developer id="io.github.martintondel02">
+    <name>OpenBlock contributors</name>
+  </developer>
+  <content_rating type="oars-1.1">
+    <content_attribute id="violence-fantasy">moderate</content_attribute>
+    <content_attribute id="social-chat">intense</content_attribute>
+  </content_rating>
+  <releases>
+    <release version="0.0.0" date="2026-11-24" type="development">
+      <description><p>Specification-stage scaffold: no playable build yet.</p></description>
+    </release>
+  </releases>
+</component>

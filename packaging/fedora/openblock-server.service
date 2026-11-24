@@ -1,0 +1,58 @@
+# Hardened systemd unit for the OpenBlock dedicated server on Fedora Server.
+# Installed by the openblock-server RPM.
+#
+# Operator notes:
+#   - Worlds, backups and content live in /var/lib/openblock-server (StateDirectory).
+#   - The config is /etc/openblock-server/server.toml and is not world-writable.
+#   - Open UDP/QUIC with: firewall-cmd --permanent --add-service=openblock-server
+#   - Logs: journalctl -u openblock-server -f   (join ticket is printed once at start)
+[Unit]
+Description=OpenBlock dedicated server
+Documentation=https://github.com/martintondel02/openblock
+Documentation=man:openblock-server(1)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/openblock-server --config /etc/openblock-server/server.toml
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=40
+
+# Dedicated unprivileged identity (created by sysusers).
+User=openblock-server
+Group=openblock-server
+StateDirectory=openblock-server
+StateDirectoryMode=0750
+ConfigurationDirectory=openblock-server
+RuntimeDirectory=openblock-server
+
+# Sandboxing: no access outside the state/config directories, no privileges.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/openblock-server
+LimitNOFILE=65536
+TasksMax=4096
+MemoryMax=8G
+# Only needed if configured to listen below 1024 (not the default).
+AmbientCapabilities=
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

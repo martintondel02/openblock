@@ -58,7 +58,7 @@ chunk columns, never a 512-block diameter.
 | REQ-RENDER-029 | Presets are data (potato, low, medium, high, performance, ultra) mapping to §3.11 settings; `performance` is the 144 FPS mode, not a quality tier above `high`; no automatic preset changes state unreported in the UI. | Settings schema test |
 | REQ-RENDER-030 | Profiling exposes per-pass timestamps, CPU scopes, per-pass markers and the §3.12 scenes with p50/p95/p99. | CI artifact check |
 | REQ-RENDER-031 | Device loss, surface loss and OOM recover without a process restart; meshes rebuild from world state. | Fault-injection test |
-| REQ-RENDER-032 | Golden-image and validation-layer gates pass on all three desktop backends; the performance envelope is gated on the reference machine, with macOS Metal a `Warn` tier until MS-13 proves it ([25 §3.1](25-performance-budgets.md#31-hardware-tiers)). | CI job |
+| REQ-RENDER-032 | Golden-image and validation-layer gates pass on all three desktop backends; **on Linux the required matrix is Vulkan through Mesa RADV (AMD), Mesa ANV (Intel) and the NVIDIA driver on Fedora ([DEC-054](../decisions.md))**, with OpenGL/GLES not supported as a fallback; the performance envelope is gated on the Fedora reference machine, with macOS Metal a `Warn` tier until MS-13 proves it ([25 §3.1](25-performance-budgets.md#31-hardware-tiers)). | CI job + Fedora driver matrix |
 
 ## 3. Design
 

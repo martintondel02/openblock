@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- firewalld service definition for the OpenBlock dedicated server.
+     Only the QUIC/UDP game port is opened; the admin console stays local. -->
+<service>
+  <short>OpenBlock Server</short>
+  <description>OpenBlock dedicated voxel game server (QUIC over UDP).</description>
+  <port protocol="udp" port="25565"/>
+</service>

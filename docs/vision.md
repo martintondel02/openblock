@@ -232,16 +232,19 @@ default (P7), so they cannot be claimed as measured at launch.
 
 | Tier | Target | Notes |
 | --- | --- | --- |
-| **Launch** | Windows 10/11 x86_64, Linux x86_64 (X11 + Wayland), macOS 12+ (Apple Silicon and Intel) | Vulkan, DX12 and Metal through wgpu |
-| **Soon after** | Linux aarch64, macOS Apple Silicon native | CI cross-builds |
+| **Primary — launch** | **Fedora Linux 44/45 x86_64** (Wayland session, Vulkan, PipeWire); Flatpak first, RPM/COPR native, AppImage/tarball fallbacks | The reference platform for performance, CI, packaging and support (DEC-054) |
+| **Supported secondary — launch** | Windows 10/11 x86_64, macOS 12+ universal2 (Apple Silicon and Intel) | Same 1.0 feature set; DX12/Metal; not the reference for performance gates |
+| **Best effort** | Other Linux distributions via Flatpak/AppImage; Linux aarch64 build | No distro-specific packaging promise at launch |
 | **Later** | Android (Vulkan), Steam Deck (verified), iOS (feasibility) | Touch UI and mobile budgets |
 | **Aspirational** | WebGPU in browser | Single-player and small servers |
-| **Dedicated server** | Linux x86_64/aarch64, Windows, macOS; **no GPU required**; container image | Headless from day one |
+| **Dedicated server — primary** | **Fedora Server 44/45 x86_64**, RPM + hardened systemd unit + firewalld service; container image | Headless, **no GPU required**, from day one |
+| **Dedicated server — secondary** | Linux aarch64, Windows, macOS | Same binary, best-effort packaging |
 
-**Reference machine** for all budgets: 8-core CPU (Ryzen 7 5800X3D / i7-12700
-class), 32 GiB RAM, RTX 3060 12 GiB / RX 6600 XT class GPU, NVMe SSD, 1080p
-display. **Minimum spec** at 1.0: 4-core CPU, 8 GiB RAM, GTX 1060 / RX 580 class
-GPU, 720p, 8-chunk render distance, ≥ 60 FPS.
+**Reference machine** for all budgets: **Fedora Workstation 45 (Wayland, Vulkan)**, 8-core
+CPU (Ryzen 7 5800X3D / i7-12700 class), 32 GiB RAM, RTX 3060 12 GiB / RX 6600 XT
+class GPU, NVMe SSD, 1080p display. **Minimum spec** at 1.0: Fedora 44+
+(Wayland or X11), 4-core CPU, 8 GiB RAM, GTX 1060 / RX 580 class GPU with a
+Vulkan-capable driver, 720p, 8-chunk render distance, ≥ 60 FPS.
 
 ## 10. How we compare
 

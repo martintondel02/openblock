@@ -8,6 +8,7 @@
   <a href="LICENSE-MIT"><img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a>
   <img alt="Status" src="https://img.shields.io/badge/status-specification%20stage-orange.svg">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.100%2B-B7410E.svg?logo=rust">
+  <img alt="Primary platform" src="https://img.shields.io/badge/platform-Fedora%2044%2F45%20%7C%20Linux-51A2DA.svg?logo=fedora">
 </p>
 
 OpenBlock is an open-source voxel sandbox: mine, build, explore and survive
@@ -26,6 +27,11 @@ promises:
 - **Server-first multiplayer** — an authoritative, headless dedicated server
   that runs on a GPU-less VPS, with self-signed identity, content-hash
   verification and progressive world streaming.
+
+**Linux is the primary platform, and Fedora is the reference distribution**
+(Fedora 44/45; Wayland + Vulkan + PipeWire; Flathub Flatpak first, COPR RPM for
+native installs, a hardened Fedora Server package for hosting). Windows and macOS
+ship as supported secondary platforms at 1.0.
 
 Minecraft Java Edition's feature set is the reference, delivered in stages: the
 **1.0 Early Access** release targets Tier-1 parity plus the platform (modding,
@@ -180,6 +186,33 @@ NVMe, 1080p) and enforced by benchmarks in CI:
 
 Budgets and their enforcement: [`spec/25-performance-budgets.md`](docs/spec/25-performance-budgets.md).
 
+## Platforms
+
+| | Target |
+| --- | --- |
+| **Primary (launch)** | **Fedora Linux 44/45 x86_64** — Wayland session, Vulkan (Mesa RADV/ANV or NVIDIA), PipeWire; **Flathub Flatpak** first, COPR RPM, AppImage/tarball fallbacks |
+| **Supported secondary (launch)** | Windows 10/11 x86_64 (DX12), macOS 12+ universal2 (Metal) |
+| **Best effort** | Other Linux distributions via Flatpak/AppImage; Linux aarch64 |
+| **Dedicated server — primary** | **Fedora Server 44/45** — RPM + hardened systemd unit + firewalld service; container image |
+| **Post-1.0** | Android, Steam Deck verification, WebGPU feasibility |
+
+The reference machine, CI gates and packaging order all follow Fedora ([DEC-054](docs/decisions.md)).
+Packaging sources (RPM spec, systemd unit, firewalld service, Flatpak manifest,
+AppStream metadata) live in [`packaging/`](packaging/README.md).
+
+### Building on Fedora (for contributors)
+
+```sh
+sudo dnf install gcc gcc-c++ pkgconf-pkg-config git   alsa-lib-devel wayland-devel libxkbcommon-devel   vulkan-loader-devel fontconfig-devel freetype-devel systemd-devel
+# Rust toolchain (the pinned stable channel is in rust-toolchain.toml)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+cargo check --workspace --all-targets
+```
+
+The workspace is a specification-stage scaffold today: it compiles and CI passes,
+but the playable client arrives at milestone `MS-03`. Fedora 44 and 45 container
+jobs are required CI entries.
+
 ## Frequently asked questions
 
 **Is this a Minecraft clone?**
@@ -202,6 +235,11 @@ Bevy is excellent, but its renderer does not solve voxel streaming, LOD,
 visibility or GPU-driven submission, and its release cadence would add migration
 cost. We use a purpose-built engine on wgpu; see
 [`research/02`](docs/research/02-engine-and-render-stack.md).
+
+**What platforms will it run on?**
+Fedora Linux first (44/45, Wayland + Vulkan), then Windows and macOS at 1.0; a
+Flatpak will be the recommended install for players, with an RPM for native Fedora
+setups and a hardened RPM + systemd + firewalld package for servers.
 
 **When can I play?**
 The first playable tech preview (`0.0.1`) is the `MS-03` milestone. Until then

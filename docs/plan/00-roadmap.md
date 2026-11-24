@@ -74,7 +74,7 @@ graph LR
 | **D — World and survival** | MS-08, MS-10, MS-13 | `0.3.0-beta` | Biomes, caves, structures, dimensions; health/hunger/crafting/furnaces | 43–53 |
 | **E — Depth and ecosystem** | MS-09, MS-11, MS-12 | `0.4.0-beta`, `0.5.0-beta` | Common mobs, basic redstone, enchanting/trading basics; WASM mods; shadows and audio | 44–53 |
 | **F — Parity, scale and polish** | MS-14, MS-15 | `0.6.0-beta`, `1.0.0-rc` | Tier-1 parity gate green; parity-corpus infrastructure; 50 co-located players; anti-cheat; accessibility | 28–33 |
-| **G — Early Access launch** | MS-16 | `1.0.0` | Signed builds, updater, docs, Early Access launch | 10 |
+| **G — Early Access launch** | MS-16 | `1.0.0` | **Fedora-first packages** (Flathub, COPR RPM, server RPM/systemd/firewalld), signed builds, updater, docs, launch | 10 |
 | | | | **Total to 1.0 (Early Access)** | **≈ 200–240 dev-weeks** + content/QA |
 | **2.0 track** | MS-17 | `2.0` | Full Tier-2 parity: the remaining blocks, items, mobs, structures, redstone, bosses and commands | **≈ 500–800 dev-weeks** + art/audio |
 
@@ -244,11 +244,14 @@ than feature-complete. 1.0 does **not** close Tier 2; `MS-17` does.
 
 ## 10. Phase G — 1.0 Early Access launch (`1.0.0`)
 
-**Milestone MS-16** delivers the boring-but-critical launch work: signed builds
-for all 1.0 platforms, auto-updater with delta patches and rollback, Flatpak/
-AppImage/AUR packaging, container images, website and download page, migration
-from 0.x saves, mod API 1.0 freeze and compatibility promise, launch trailer,
-trademark clearance sign-off (DEC-037), and the support/security playbook.
+**Milestone MS-16** delivers the boring-but-critical launch work, **Fedora first**:
+Flathub Flatpak as the player default, a COPR RPM (client and server) following the
+Fedora Packaging Guidelines, a hardened systemd unit and firewalld service for Fedora
+Server hosting, AppImage/tarball fallbacks, then Windows/macOS packaging; plus the
+auto-updater with delta patches and rollback, container images, website and download
+page, migration from 0.x saves, mod API 1.0 freeze and compatibility promise, launch
+trailer, trademark clearance sign-off (DEC-037), and the support/security playbook
+([DEC-054](../decisions.md)).
 
 1.0 is an **Early Access** release (DEC-051): Tier-1 parity + Tier-2
 infrastructure + the modding platform. Full Tier-2 parity is `MS-17` (2.0) and

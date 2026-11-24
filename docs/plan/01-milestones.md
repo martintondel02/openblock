@@ -87,8 +87,8 @@ stranger following only the repository docs.
 
 **Exit criteria**
 
-- [ ] A fresh clone builds and runs the window and the headless server on all
-      three desktop OSes following only `CONTRIBUTING.md`.
+- [ ] A fresh clone builds and runs the window and the headless server on **Fedora 44 and Fedora 45** (the primary platform, [DEC-054](../decisions.md)) and on Windows and macOS following only `CONTRIBUTING.md`.
+- [ ] The CI matrix contains required `fedora:44` and `fedora:45` container jobs that build and test every PR.
 - [ ] CI catches a deliberate `clippy` warning, a failing test, a forbidden
       dependency and a broken shader in a test PR.
 - [ ] `cargo xtask bench --scene empty` produces a report with frame-time
@@ -190,7 +190,8 @@ physics, real saves. This is the milestone that de-risks the project.
 **Exit criteria**
 
 - [ ] Walk/jump/fall/collide in a generated world for 10 minutes with no crash,
-      no tunnelling through blocks at normal speed, and no visible mesh seams.
+      no tunnelling through blocks at normal speed, and no visible mesh seams — on a **Fedora 45 Wayland session** (the primary platform) with the documented `dnf` build dependencies.
+- [ ] The contributor docs include a verified Fedora build recipe (`dnf install` build deps plus `rustup`), tested by a scripted fresh-container run.
 - [ ] Breaking and placing blocks updates geometry and lighting within 2 frames
       at the camera and within 100 ms at 8 chunks away.
 - [ ] 256-block view distance holds ≥ 60 FPS average on the reference machine
@@ -722,14 +723,14 @@ Tier-0/1 scope**; it does not close Tier-2 content.
 
 ### MS-16 — 1.0 Early Access launch (`1.0.0`)
 
-**Goal:** a release a stranger can install, run and trust, with the Early Access
-scope stated plainly rather than buried.
+**Goal:** a release a stranger can install, run and trust **on Fedora first**, with the
+Early Access scope stated plainly rather than buried ([DEC-054](../decisions.md)).
 
 **Deliverables**
 
-- Signed builds for Windows (MSI/portable), Linux (AppImage + Flatpak + AUR),
-  macOS (universal, notarised), and server tarballs + containers; reproducible
-  build documentation.
+- **Fedora-first packaging:** Flathub Flatpak (player default), COPR RPM (client and server) following the Fedora Packaging Guidelines, `.desktop` + AppStream metainfo + icons + `.obworld` MIME, a hardened systemd unit, a firewalld service definition, and sysusers/tmpfiles entries; `rpmlint`, `systemd-analyze verify`, `flatpak-builder` and `appstreamcli validate` pass in `fedora:44`/`fedora:45` containers.
+- AppImage and `.tar.zst` fallbacks for non-Fedora Linux; documented `dnf copr enable` + `dnf install` path verified by a scripted fresh-Fedora-Server run.
+- Signed builds for Windows (MSI/portable) and macOS (universal, notarised), and server tarballs + containers; reproducible build documentation from the `fedora:44` build root.
 - Auto-updater: signed manifest, delta patches, rollback, staged rollout
   channels (stable/beta/nightly).
 - Website: download, docs, server list (opt-in), mod/content index (curated
@@ -761,8 +762,8 @@ scope stated plainly rather than buried.
       exploitable duplication or remote-crash issue.
 - [ ] Dedicated server runs 7 days unattended on the reference VPS without leak,
       corruption or TPS degradation.
-- [ ] Storefront/platform requirements met (Steam Deck verification if shipping
-      on Steam, macOS notarisation, Windows code signing).
+- [ ] Storefront/platform requirements met: **Flathub review and `rpmlint` clean**, Fedora 44/45 install/upgrade/rollback tested, Steam Deck verification if shipping on Steam, macOS notarisation, Windows code signing.
+- [ ] A Fedora 45 Wayland clean-machine test passes at the reference quality preset, with the reference FPS numbers reproduced on the Fedora bench box.
 - [ ] Documentation is complete enough that a contributor can land their first
       PR without a maintainer's help (verified with a first-time contributor).
 

@@ -50,7 +50,7 @@ boundaries are owned by [chapter 01](01-technical-architecture.md) and are refer
 | REQ-CORE-029 | The invariant fuzzer MUST fail on non-finite positions, tunnelling, item creation or destruction, out-of-bounds entities or panics. | nightly fuzz |
 | REQ-CORE-030 | Fallible boundaries MUST return typed errors with context; panics only for proven invariant violations; library crates deny `unwrap_used` and `expect_used` outside tests. | clippy, review |
 | REQ-CORE-031 | Exit codes MUST be 0 clean, 2 configuration, 65 data, 70 internal, 143 SIGTERM. | process tests |
-| REQ-CORE-032 | The platform layer MUST be tested on Linux X11 and Wayland, Windows and macOS, including DPI, suspend, single-instance and paths. | CI matrix |
+| REQ-CORE-032 | The platform layer MUST be tested **Wayland-first on Fedora 44/45** with X11/XWayland as a fallback, plus Windows and macOS, including fractional DPI scaling, IME, suspend/resume, single-instance and paths ([DEC-054](../decisions.md)). | CI matrix + Fedora Wayland VM job |
 
 ## 3. Design
 
@@ -220,6 +220,15 @@ retries and queue depth raises a budget alarm. `Network` backpressures at the tr
 spins or sleeps on a full queue inside a tick.
 
 ### 3.5 Platform layer
+
+The primary platform is **Fedora Linux on Wayland** ([DEC-054](../decisions.md)): the platform
+layer selects the winit Wayland backend first and falls back to X11/XWayland only when no
+Wayland session is available, and it must keep fractional scaling, IME composition, keyboard
+layout switching and pointer confinement correct on both GNOME and KDE sessions. Audio is
+PipeWire-first through the ALSA compatibility layer, with PulseAudio and bare ALSA fallbacks;
+fonts come from the system through fontconfig with bundled fallbacks. All mutable state lives
+under the XDG directories in the table below, so Btrfs subvolume and snapshot setups work
+without special cases.
 
 The platform layer is the only code that calls OS windowing, input, timer, path, thread and process
 APIs directly. It exposes traits for them, and everything above compiles against those traits, which

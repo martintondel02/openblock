@@ -58,6 +58,9 @@ abuse policy in [20](20-security-and-anti-cheat.md).
 | REQ-SRV-034 | Save failure, metrics failure and disk exhaustion MUST degrade only their feature and MUST be visible in health and logs; the tick MUST keep running. | Fault injection | MS-07 |
 | REQ-SRV-035 | All operator-facing timestamps MUST be UTC, durations integer seconds, and tick counts explicit about 20 Hz versus the snapshot rate. | Review, UI strings | MS-07 |
 | REQ-SRV-036 | Every runbook action and every destructive command MUST be auditable and reversible or explicitly confirmed. | Audit and confirmation tests | MS-07 |
+| REQ-SRV-037 | The Fedora server RPM MUST install a hardened systemd unit (`ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp=true`, `NoNewPrivileges=true`, `StateDirectory=openblock-server`, `TimeoutStopSec=40`, `Restart=on-failure`), a firewalld service file for the QUIC UDP port, and a sysusers entry; `systemd-analyze verify` and `rpm -e` MUST pass in a Fedora 44/45 container. | RPM install/remove + `systemd-analyze verify` | MS-07, MS-16 |
+| REQ-SRV-038 | Fedora installations MUST run with SELinux enforcing and no custom policy module; the unit MUST fail with a logged, actionable error rather than a silent permission deny, and `openblock-server diagnose` MUST report SELinux mode and relevant denials from the journal. | SELinux enforcing test on Fedora Server | MS-07 |
+| REQ-SRV-039 | The documented primary path MUST be `dnf install` from COPR, and the documentation MUST be verified by a scripted fresh-Fedora-Server run (install, configure, join, upgrade, uninstall) in CI or the nightly Fedora VM job. | Scripted Fedora Server runbook test | MS-07, MS-16 |
 
 ## 3. Design
 
@@ -65,8 +68,9 @@ abuse policy in [20](20-security-and-anti-cheat.md).
 
 | Model | Artifact | Pros | Costs | Supported |
 | --- | --- | --- | --- | --- |
+| **Fedora RPM + systemd (primary)** | client-independent server RPM, unit, firewalld service | one `dnf install`, journald, sandboxing, automatic restart, no container runtime | Fedora only | yes, reference |
 | Bare binary | `.tar.zst` per target | no runtime, easy debugging | operator writes a supervisor | yes |
-| systemd | unit file | restart, journald, hardening directives | Linux only | yes |
+| systemd | unit file (generic distros) | restart, journald, hardening directives | Linux only | yes |
 | Container | OCI image, multi-arch | reproducible, read-only root, limits | UDP and volumes must be configured | yes |
 | Compose | `compose.yaml` + `.env` | one command on a VPS | single host | yes (reference) |
 | Orchestration | manifest-free | readiness, drain, probes | no operator in 1.0 | prepared, not shipped; proxy in MS-21 |
@@ -104,6 +108,32 @@ The systemd unit uses `Restart=on-failure`, `RestartSec=5`, `LimitNOFILE=65536`,
 `ReadWritePaths=/var/lib/openblock`, `NoNewPrivileges=true`, `SuccessExitStatus=143`, and
 `AmbientCapabilities=CAP_NET_BIND_SERVICE` only when binding below 1024. `SIGTERM` starts the drain in
 §3.8; systemd's `TimeoutStopSec=40` covers the 30 s drain plus flush.
+
+#### 3.1.1 Fedora Server (primary deployment)
+
+The reference deployment is **Fedora Server 44/45 x86_64**:
+
+1. `dnf copr enable openblock/openblock && dnf install openblock-server` (COPR; the
+   package is also published as a release RPM). This installs the binary, a
+   dedicated system user, `openblock-server.service`, a firewalld service file
+   (`openblock-server.xml`, UDP/QUIC port), and the default configuration under
+   `/etc/openblock-server/server.toml`.
+2. `systemctl enable --now openblock-server`; logs go to the journal
+   (`journalctl -u openblock-server -f`), and the world, backups and content
+   live under `/var/lib/openblock-server` (`StateDirectory`).
+3. `firewall-cmd --permanent --add-service=openblock-server && firewall-cmd --reload`
+   opens only the QUIC UDP port; the admin console binds to localhost unless the
+   operator explicitly enables it.
+4. SELinux stays enforcing: the unit uses systemd sandboxing rather than a custom
+   policy, the binary installs to `/usr/bin`, the world to `/var/lib`, and no
+   privileged helper or setuid file exists. A missing or denied mount surfaces as
+   an actionable health error, not a silent failure.
+5. Upgrades are `dnf upgrade openblock-server` with the drain-then-restart
+   semantics of §3.11; downgrades require an explicit `--allow-downgrade` if the
+   save format is newer.
+
+The container image remains the cross-distro and cloud path and is built from the
+same source commit; it is not the Fedora reference deployment.
 
 Reference sizing for the three co-located player-count tiers; the capacity evidence, including the
 separate distributed-player row, is in §3.9. Render and simulation distance are equal by default (256 blocks,

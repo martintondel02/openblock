@@ -62,12 +62,13 @@ The tiers below are the only machines a gate number may name; anything else is a
 | --- | --- | --- | --- | --- | --- | --- |
 | **Minimum** (1.0 floor) | 4 cores / 8 threads, Ryzen 3 3100 or i3-10100 class | GTX 1060 6 GB or RX 580 8 GB | 8 GiB | SATA SSD | 720p, 60 Hz | 60 FPS at a 128–192-block radius, `potato`/`low` |
 | **Recommended** | 6 cores / 12 threads, Ryzen 5 5600 or i5-12400 | RTX 2060 / RX 6600, 8 GB | 16 GiB | NVMe | 1080p, 120–144 Hz | 120 FPS at a 384-block radius, `medium` |
-| **Reference** (all gates) | 8 cores / 16 threads, Ryzen 7 5800X3D or i7-12700 | RTX 3060 12 GB or RX 6600 XT | 32 GiB | NVMe | 1080p, 144 Hz | the numbers in §5 |
-| **Bench box** (CI) | Ryzen 7 5800X3D, PBO off, governor `performance` | RTX 3060 12 GB, one pinned driver | 32 GiB DDR4-3600 | 1 TB NVMe, ≥ 20% free | 1080p 144 Hz, no compositor effects | gate measurements |
-| **Reference server** | 4 vCPU of the reference class, 3.0 GHz+ | none (headless) | 8 GiB | NVMe | — | tick, capacity, join |
+| **Reference** (all gates), **Fedora Workstation 45, Wayland, Vulkan** | 8 cores / 16 threads, Ryzen 7 5800X3D or i7-12700 | RTX 3060 12 GB or RX 6600 XT | 32 GiB | NVMe | 1080p, 144 Hz | the numbers in §5 |
+| **Bench box** (CI), **Fedora Workstation 45, Wayland, Vulkan** | Ryzen 7 5800X3D, PBO off, governor `performance` | RTX 3060 12 GB, one pinned driver | 32 GiB DDR4-3600 | 1 TB NVMe, ≥ 20% free | 1080p 144 Hz, no compositor effects | gate measurements |
+| **Reference server**, **Fedora Server 45** | 4 vCPU of the reference class, 3.0 GHz+ | none (headless) | 8 GiB | NVMe | — | tick, capacity, join |
 
-The bench box has a fixed UEFI, microcode, driver and OS build and runs nothing else; its GPU
-drives no display. The macOS gate is a Mac mini (M2 Pro) and a `Warn` tier until MS-13 proves Metal.
+The bench box has a fixed UEFI, microcode, driver and OS build (Fedora Workstation 45, Wayland,
+Vulkan) and runs nothing else; its GPU drives no display. Linux gate numbers are measured on the
+Fedora reference; Windows and macOS are Report rows unless a release gate names them ([DEC-054](../decisions.md)). The macOS gate is a Mac mini (M2 Pro) and a `Warn` tier until MS-13 proves Metal.
 
 ### 3.2 The frame envelope
 

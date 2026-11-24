@@ -15,6 +15,12 @@ releases may change APIs, save formats and the protocol between minors; see
   (`docs/adr/`).
 - Cargo workspace skeleton for the crate topology in DEC-003, CI, license and
   provenance policy.
+- **Fedora-first platform decision (DEC-054)**: Fedora 44/45 x86_64 (Wayland,
+  Vulkan, PipeWire) is the primary platform and reference distribution; Flathub
+  Flatpak, COPR RPM, a hardened Fedora Server RPM/systemd/firewalld package, and
+  required `fedora:44`/`fedora:45` CI jobs. Packaging scaffolding in `packaging/`.
+- Linux-first platform section in the README, Fedora build prerequisites, and
+  Fedora-specific requirements in spec/02, 03, 14, 19, 21, 22, 24 and 25.
 
 ### Changed
 

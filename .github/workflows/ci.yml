@@ -36,6 +36,42 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
+  fedora:
+    # Primary platform (DEC-054): Fedora 44/45 are required matrix entries.
+    name: Linux (Fedora ${{ matrix.fedora }})
+    runs-on: ubuntu-latest
+    container: fedora:${{ matrix.fedora }}
+    strategy:
+      fail-fast: false
+      matrix:
+        fedora: ["44", "45"]
+    steps:
+      - name: Install build dependencies
+        run: >
+          dnf -y install gcc gcc-c++ make git tar gzip curl which python3
+          pkgconf-pkg-config alsa-lib-devel wayland-devel libxkbcommon-devel
+          vulkan-loader-devel fontconfig-devel freetype-devel systemd-devel
+      - uses: actions/checkout@v7
+      - name: Install pinned Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build and test
+        run: cargo test --workspace --all-targets
+      - name: Architecture guard
+        run: .github/scripts/check-arch.sh
+      - name: Documentation consistency
+        run: python3 .github/scripts/check-docs.py
+      - name: Validate Fedora packaging metadata
+        run: |
+          dnf -y install desktop-file-utils appstream systemd
+          desktop-file-validate packaging/fedora/io.github.martintondel02.OpenBlock.desktop
+          appstreamcli validate --no-net packaging/fedora/openblock.metainfo.xml
+          install -Dm755 /bin/true /usr/bin/openblock-server
+          useradd -r -M -s /sbin/nologin openblock-server || true
+          systemd-analyze --man=no verify packaging/fedora/openblock-server.service
+
   arch:
     name: Architecture guard
     runs-on: ubuntu-latest

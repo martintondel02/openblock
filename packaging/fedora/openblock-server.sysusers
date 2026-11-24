@@ -1,0 +1,2 @@
+# Dedicated system user for the OpenBlock dedicated server (systemd-sysusers).
+u openblock-server - "OpenBlock dedicated server" /var/lib/openblock-server -
