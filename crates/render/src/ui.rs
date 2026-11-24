@@ -1098,8 +1098,12 @@ mod tests {
         );
     }
 
-    /// Builds a headless device, returning `None` when no adapter exists.
+    /// Builds a headless device, returning `None` when no adapter exists or when
+    /// GPU tests are disabled (containers with an unstable software Vulkan).
     fn test_gpu() -> Option<(wgpu::Device, wgpu::Queue, String)> {
+        if std::env::var_os("OPENBLOCK_NO_GPU_TESTS").is_some() {
+            return None;
+        }
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let options = |power_preference| wgpu::RequestAdapterOptions {
             power_preference,

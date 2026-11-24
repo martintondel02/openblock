@@ -51,8 +51,9 @@ jobs:
           sudo apt-get install -y -qq mesa-vulkan-drivers libvulkan1
           cargo run --release --locked -p ob_tools --bin openblock-tools -- bench --frames 30 --width 640 --height 360 --seed 42 --render-distance 6 --data-dir target/bench-data --json target/bench.json --max-frame-ms 2000
       - name: Save size guard
-        # The 169-chunk reference world is ~49 KiB compressed (v0.0.2). Fail loudly
-        # if compression or light storage regresses by an order of magnitude.
+        if: matrix.os == 'ubuntu-latest'
+        # The 169-chunk reference world is ~49 KiB compressed. Fail loudly if
+        # compression or light storage regresses by an order of magnitude.
         run: |
           save=$(find target/smoke -name world.obs | head -1)
           test -n "$save"
@@ -85,6 +86,11 @@ jobs:
             | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Build and test
+        env:
+          # Fedora container images have no GPU; some have an unstable software
+          # Vulkan that segfaults wgpu adapter enumeration. Skip GPU tests there;
+          # Ubuntu CI covers the offscreen render path with lavapipe.
+          OPENBLOCK_NO_GPU_TESTS: "1"
         run: cargo test --workspace --all-targets
       - name: Headless host smoke test
         run: cargo run --release --locked -p ob_server --bin openblock-server -- --smoke --data-dir target/smoke --seed 42

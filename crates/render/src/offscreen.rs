@@ -557,6 +557,10 @@ mod tests {
     fn offscreen_render_is_not_black() {
         // The renderer itself must not depend on worldgen or content beyond the
         // base registry, so the test builds its chunk by hand.
+        if std::env::var_os("OPENBLOCK_NO_GPU_TESTS").is_some() {
+            eprintln!("skipping offscreen GPU tests: OPENBLOCK_NO_GPU_TESTS is set");
+            return;
+        }
         let registry = Arc::new(Registry::base());
         let world = test_world(&registry);
 
@@ -658,6 +662,10 @@ mod tests {
     fn offscreen_ui_overlay_draws_over_the_world() {
         // Proves the full integration: world pass, then the alpha-blended UI
         // pass into the same colour target, then readback.
+        if std::env::var_os("OPENBLOCK_NO_GPU_TESTS").is_some() {
+            eprintln!("skipping offscreen GPU tests: OPENBLOCK_NO_GPU_TESTS is set");
+            return;
+        }
         let registry = Arc::new(Registry::base());
         let world = test_world(&registry);
         let mut renderer = match OffscreenRenderer::new(320, 180) {
