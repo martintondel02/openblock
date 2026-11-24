@@ -26,7 +26,7 @@ Two invariants frame everything. First, item state is a **typed component map**,
 | REQ-ITEM-008 | Inventories and windows have hard slot caps and bounded nesting; exceeding a cap fails the pack or the placement. | Fuzz + validation | MS-10 |
 | REQ-ITEM-009 | Inventory interaction is a host-validated transaction on the reliable ordered stream, per DEC-023. | Integration: loss/latency | MS-05 |
 | REQ-ITEM-010 | Click, shift-click, drag, gather, swap, drop and creative clone intents have the semantics of §3.4 and are shared by client prediction and host validation. | Model-based test | MS-10 |
-| REQ-ITEM-011 | An intent carries its target revision and expected touched state; a mismatch produces a resync, never a partial apply. | Property: stale intents | MS-10 |
+| REQ-ITEM-011 | An intent carries its target revision and a keyed BLAKE3-128 expected-state digest over every touched slot plus the cursor; the host recomputes and compares it at apply time, and a mismatch produces a resync, never a partial apply. CRC32C is only an accidental-corruption check. | Property: stale and forged intents | MS-10 |
 | REQ-ITEM-012 | Transactions are idempotent: replaying a sequence number returns the original acknowledgement without applying twice. | Network simulator | MS-06 |
 | REQ-ITEM-013 | The client rolls back to confirmed state on correction and replays only still-valid pending intents. | Model-based test | MS-06 |
 | REQ-ITEM-014 | Conservation holds for every transaction; a violation rolls back, audits and resyncs. | Duplication fuzz (100k) | MS-10 |
@@ -46,7 +46,7 @@ Two invariants frame everything. First, item state is a **typed component map**,
 | REQ-ITEM-028 | Presentation reads view-only item models; the host never loads models, and missing models fall back. | Inspection + content test | MS-10 |
 | REQ-ITEM-029 | Item behaviour is data plus capability-gated server hooks; clients receive no mod code and no item behaviour can run client-authoritative. | Integration: modded item | MS-09 |
 | REQ-ITEM-030 | Stacks save and load with unknown items and components preserved as opaque, restorable placeholders. | Save round-trip | MS-13 |
-| REQ-ITEM-031 | Every base item has a parity manifest row with a test or a documented divergence. | Manifest diff (MS-14) | MS-14 |
+| REQ-ITEM-031 | Every shipped base-pack item has a hand-authored parity-checklist row with a test or a documented divergence. | Hand-authored checklist diff (MS-14) | MS-14 |
 
 ## 3. Design
 
@@ -177,11 +177,11 @@ DEC-023 fixes the transport: a reliable ordered QUIC stream, click intents refer
 
 ```mermaid
 flowchart TD
-  A[Intent: seq, window, revision, expected] --> B{seq already applied?}
+  A[Intent: seq, window, revision, expected digest] --> B{seq already applied?}
   B -- yes --> C[Ack: replay, no apply]
   B -- no --> D{window open, player in range, mode allows?}
   D -- no --> E[Reject, then close or resync]
-  D -- yes --> F{revision and expected match?}
+  D -- yes --> F{revision and expected digest match?}
   F -- no --> G[Resync full window]
   F -- yes --> H[apply_intent pure function]
   H --> I{conservation holds?}
@@ -208,7 +208,7 @@ The client keeps a *confirmed* snapshot at revision `R` and a queue of pending i
 
 Shift-click order is explicit, not "whatever feels right": container → main → hotbar for moves out of the container, hotbar → main → container for moves into it; within a section, lowest index first, filling matching stacks before empty slots. Drag preserves the client's visited order and distributes `floor(total/n)` per slot with the remainder to the first `total % n` slots; right-drag places one per slot and stops when the cursor empties.
 
-Expected-state validation is by revision *and* a compact expected fingerprint: the intent carries a CRC32C over the canonical encoding of every touched slot plus the cursor. This catches the case where a revision changed for an unrelated slot, which a revision-only check would reject unnecessarily, and the case where two players mutate the same container between revision reads. A mismatch yields `Resync { window, revision, slots, cursor }` (≤ 2.5 KiB for a 63-slot chest window and ≤ 3.5 KiB for a 90-slot double chest, with ordinary stacks), which clears the pending queue. Sequence numbers are per window and per player, with a 128-entry dedupe ring; replaying an old sequence returns the original acknowledgement, so a retransmitted intent after reconnect cannot duplicate an item.
+Expected-state validation is by revision *and* a keyed expected-state digest, not a checksum. The host publishes `expected = BLAKE3-128(k, canonical encoding of every touched slot plus the cursor)` in the snapshot or acknowledgement the client predicts from, where `k` is the per-world transaction key used in BLAKE3's keyed mode; the intent echoes that 16-byte value, and the host recomputes the digest from authoritative state at apply time and compares the full 128 bits. A keyed digest is required because CRC32C is linear and client-controlled: a malicious client can adjust slot values while preserving a stale checksum, defeating the very check that protects against a lost update. An intent touching at most four slots MAY instead carry the exact expected `(slot, stack hash, count)` tuples and have the host compare slot values exactly; the digest is the compact default, not the only legal form. Either way this catches the case where a revision changed for an unrelated slot, which a revision-only check would reject unnecessarily, and the case where two players mutate the same container between revision reads. A mismatch yields `Resync { window, revision, slots, cursor }` (≤ 2.5 KiB for a 63-slot chest window and ≤ 3.5 KiB for a 90-slot double chest, with ordinary stacks), which clears the pending queue. CRC32C survives only as an accidental-corruption check over the canonical bytes: a frame that fails it is dropped before apply and retransmitted, and it never authorises a state match. Sequence numbers are per window and per player, with a 128-entry dedupe ring; replaying an old sequence returns the original acknowledgement, so a retransmitted intent after reconnect cannot duplicate an item.
 
 Host checks before applying: window open; player alive, not spectator, same dimension, within 6 m of the container block; slot exists in the window layout; mode allows container interaction; transaction rate below 40/s sustained with a 60 burst; stack and component limits; and, after applying, total item count conserved across every touched inventory plus the cursor, with the only permitted deltas being recipe, station and trade consumption/production, fuel burn, and logged creative clones. A conservation failure rolls back the transaction, emits a structured audit event with the pre-state hashes, resyncs the player and increments an anti-cheat counter ([20](20-security-and-anti-cheat.md)). Transactions are serialized per player and per inventory, so two viewers of one chest cannot interleave into a lost update.
 
@@ -360,7 +360,7 @@ pub struct LootEntry { pub weight: u32, pub quality: i32, pub item: LootItem, pu
 | Wire message | Payload | Typical size |
 | --- | --- | --- |
 | `OpenWindow` | window id, kind, container id, slot layout hash, revision | 12 B |
-| `Intent` | window, seq, revision, kind, args, expected CRC32C | 9–21 B |
+| `Intent` | window, seq, revision, kind, args, expected BLAKE3-128 digest | 21–33 B |
 | `Ack` | window, seq, revision, slot deltas, cursor | 6–40 B |
 | `Resync` | window, revision, all window slots, cursor | ≤ 3.5 KiB for 90 slots |
 | `Close` | window, reason | 2 B |
@@ -383,7 +383,7 @@ Slot deltas encode a varint slot index plus a wire stack (or a single zero byte 
 ## 6. Failure modes and edge cases
 
 - **Retransmitted intent.** The sequence is in the dedupe ring: return the stored acknowledgement, apply nothing.
-- **Stale revision or fingerprint.** Send a full resync; never apply a guessed delta.
+- **Stale revision or expected digest.** Send a full resync; never apply a guessed delta. A CRC32C failure is a corrupt frame and is dropped before this check.
 - **Two players in one chest.** Transactions serialize per inventory; the later one gets a fresh revision and either succeeds against it or resyncs.
 - **Window closed by death, distance, dimension change or block destruction.** On death the cursor joins the death drops; on any other close it returns to the inventory, then drops what does not fit. The window closes before any drop is generated.
 - **Container destroyed while open.** Close first, then drop the saved inventory once; the open window copy cannot be taken again.
@@ -402,24 +402,24 @@ Slot deltas encode a varint slot index plus a wire stack (or a single zero byte 
 | Layer | What is tested | Tooling |
 | --- | --- | --- |
 | Stack model | invariants, canonicalisation, hash stability, component bounds | property tests and golden vectors |
-| Transactions | click/shift/drag/gather/swap/drop/clone state machine | model-based `proptest` with a shadow client |
-| Network | 30% loss, 150 ms RTT, reconnect, duplicate intent | in-process simulator (MS-05/MS-06) |
+| Transactions | click/shift/drag/gather/swap/drop/clone state machine, stale revision, forged or replayed expected digest | model-based `proptest` with a shadow client and a malicious client |
+| Network | 30% loss, 150 ms RTT, reconnect, duplicate intent, corrupt frame (CRC32C) | in-process simulator (MS-05/MS-06) |
 | Duplication | 100k randomized transaction/container/hopper sequences | conservation assertion and audit log diff |
 | Recipes | matching versus a naive reference matcher; ambiguity order; tags; mirrors | differential test over the base pack plus generated recipes |
 | Loot | same seed and context produce identical items; save/load; missing table | golden fixtures and distribution checks |
 | Stations | fuel, cook time, XP, anvil cost, enchanting seed, brewing, trading restock | unit scenarios with fixed seeds |
 | Automation | hopper clock and conservation across chunks and redstone gating | differential test against a naive hopper, save/load |
 | Content | schema, caps, unknown components, view hash separation | pack validator and fuzz corpus |
-| Parity | every base item, recipe kind and station has a manifest row | generated diff (MS-14) |
+| Parity | every shipped base-pack item, recipe kind and station has a hand-authored checklist row | hand-authored checklist diff (MS-14) |
 
-The duplication fuzz is the release gate from the MS-10 exit criteria: 100k randomized container, hopper, crafting and network sequences must produce zero duplications and zero item loss, including deaths, disconnects, dimension changes and container destruction. Recipe and transaction tests compare against reference implementations rather than hand-written expectations, so a new recipe kind or intent cannot silently diverge between client and host. Every requirement names its layer; the parity manifest maps each base item ID to a test or a documented divergence.
+The duplication fuzz is the release gate from the MS-10 exit criteria: 100k randomized container, hopper, crafting and network sequences must produce zero duplications and zero item loss, including deaths, disconnects, dimension changes and container destruction. Recipe and transaction tests compare against reference implementations rather than hand-written expectations, so a new recipe kind or intent cannot silently diverge between client and host. Every requirement names its layer; the hand-authored parity checklist maps each shipped base-item behaviour to a test or a documented divergence, with a citation per row rather than a copied registry dump ([DEC-009](../decisions.md), [DEC-051](../decisions.md)).
 
 ## 8. Open questions
 
 The register settles the decisions this chapter depends on. Items that are still open are listed below; where a former placeholder now has a canonical decision, the item records the mapping rather than asking again.
 
-1. **Typed component schema — settled by DEC-041.** Item data is a typed component map with canonical sorted encoding and a BLAKE3 transaction hash; this chapter implements that decision and no further register entry is needed. Owner: MS-05/MS-10.
-2. **Transaction wire details beyond DEC-023.** DEC-023 fixes the transport and authority; the revision-plus-fingerprint check, sequence idempotency and the resync message are still chapter-level. **Register item needed: inventory transactions carry a window revision plus a touched-slot fingerprint, are idempotent by sequence, and a mismatch triggers a full window resync (owner MS-06).**
+1. **Typed component schema — settled by DEC-041.** Item data is a typed component map with canonical sorted encoding and a keyed BLAKE3-128 transaction digest; this chapter implements that decision and no further register entry is needed. Owner: MS-05/MS-10.
+2. **Transaction wire details beyond DEC-023.** DEC-023 fixes the transport and authority; the revision-plus-digest check, sequence idempotency and the resync message are still chapter-level. **Register item needed: inventory transactions carry a window revision plus a keyed BLAKE3-128 expected-state digest over the touched slots and cursor, are idempotent by sequence, and a mismatch triggers a full window resync (owner MS-06).**
 3. **Cursor persistence.** Should a cursor stack survive disconnect, or be returned to the inventory on close? This chapter persists it; confirm. Owner: MS-10.
 4. **Unknown components.** Preserve opaque bytes (recommended for forward compatibility) or reject the stack when the content hash matches but the component is unknown? Owner: MS-13/MS-09.
 5. **Automated furnace XP.** Drop stored XP as orbs when automation empties the output, or void it? Dropping rewards farms but avoids silent loss. Owner: MS-10.
@@ -429,7 +429,7 @@ The register settles the decisions this chapter depends on. Items that are still
 
 ## 9. References
 
-- Decisions: [DEC-006](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-017](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-022](../decisions.md), [DEC-023](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md), [DEC-038](../decisions.md), [DEC-040](../decisions.md), [DEC-041](../decisions.md).
+- Decisions: [DEC-006](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-017](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-022](../decisions.md), [DEC-023](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md), [DEC-038](../decisions.md), [DEC-040](../decisions.md), [DEC-041](../decisions.md), [DEC-051](../decisions.md) (parity gate).
 - Research: [feature inventory](../research/05-minecraft-feature-inventory.md) (item, recipe and station scope), [modding and content](../research/06-modding-and-content-system.md) (typed components, canonicalisation, host ABI), [networking SOTA](../research/04-networking-sota.md).
 - Chapters: [03](03-rendering.md), [09](09-entities-ai.md), [12](12-redstone-and-logic.md), [13](13-ui-and-ux.md), [15](15-content-system.md), [16](16-modding.md), [17](17-persistence.md), [18](18-networking-multiplayer.md), [20](20-security-and-anti-cheat.md), [25](25-performance-budgets.md).
 - External facts checked against the parity baseline: [Item components](https://minecraft.wiki/w/Data_component_format), [Crafting](https://minecraft.wiki/w/Crafting), [Recipe](https://minecraft.wiki/w/Recipe), [Smelting](https://minecraft.wiki/w/Smelting), [Enchanting](https://minecraft.wiki/w/Enchanting), [Anvil](https://minecraft.wiki/w/Anvil), [Brewing](https://minecraft.wiki/w/Brewing), [Trading](https://minecraft.wiki/w/Trading), [Loot table](https://minecraft.wiki/w/Loot_table), [Hopper](https://minecraft.wiki/w/Hopper).

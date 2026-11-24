@@ -12,7 +12,10 @@
 # Field values are copied from spec/25 (sections 3.3, 5.1-5.7). Where a single
 # budget row states several limits (average + 1% low, or per-player + total),
 # the `metric`/`percentile` pair names the primary gated measurement and
-# `notes` records the rest.
+# `notes` records the rest. `percentile = 0` on an `fps` metric means the run
+# mean (average FPS). Render distances are block radii: 512 blocks =
+# 32-chunk radius = 65x65 = 4,225 columns. A scene named here that is absent
+# from perf/scenes.toml fails the manifest load.
 
 schema = "openblock.budgets/1"
 
@@ -33,7 +36,7 @@ gate = "gate"
 tolerance_pct = 10.0
 owner_ms = "MS-04"
 status = "active"
-notes = "Average >= 120, 1% low >= 90, p99 frame <= 12 ms, no frame > 33 ms, 512 blocks."
+notes = "Average >= 120, 1% low >= 90 (= 1000/p99), p99 frame <= 11.1 ms, no frame > 33 ms, 512-block radius."
 
 [[budget]]
 id = "PERF-FRAME-003"
@@ -48,9 +51,9 @@ preset = "performance"
 tier = "reference"
 gate = "gate"
 tolerance_pct = 10.0
-owner_ms = "MS-04"
+owner_ms = "MS-04, MS-12"
 status = "active"
-notes = "Average >= 144, 1% low >= 120, p99 frame <= 8.5 ms, 512 blocks; performance mode gate."
+notes = "Average >= 144, 1% low >= 120 (= 1000/p99), p99 frame <= 8.3 ms, 512-block radius; performance mode gate."
 
 [[budget]]
 id = "PERF-FRAME-005"
@@ -65,7 +68,7 @@ preset = "high"
 tier = "bench_box"
 gate = "gate"
 tolerance_pct = 10.0
-owner_ms = "MS-06"
+owner_ms = "MS-04, MS-06"
 status = "active"
 notes = "<= 3 frame periods p99; <= 1 additional frame versus single-player at 80 ms RTT."
 
@@ -101,7 +104,7 @@ gate = "gate"
 tolerance_pct = 10.0
 owner_ms = "MS-05"
 status = "active"
-notes = "UI layout and text for visible screens."
+notes = "UI layout and text for the gameplay HUD; full-screen menu ceiling is 0.5 ms p99 (ch13 PERF-UI-001), not additive."
 
 # --- GPU ----------------------------------------------------------------
 
@@ -135,9 +138,9 @@ preset = "performance"
 tier = "reference"
 gate = "gate"
 tolerance_pct = 10.0
-owner_ms = "MS-12"
+owner_ms = "MS-04, MS-12"
 status = "active"
-notes = "All GPU passes <= 4.00 ms at the 144 FPS mode; pass sum <= 3.33 ms."
+notes = "All GPU passes <= 4.00 ms at the 144 FPS performance mode; pass sum <= 3.33 ms."
 
 # --- Tick and server -----------------------------------------------------
 
@@ -159,6 +162,23 @@ status = "active"
 notes = "World tick at 2,000 loaded columns."
 
 [[budget]]
+id = "PERF-TICK-003"
+area = "tick"
+metric = "cpu_time"
+direction = "lower_is_better"
+limit = 2.0
+unit = "ms"
+percentile = 99
+scene = "redstone_stress"
+preset = "n/a"
+tier = "server"
+gate = "gate"
+tolerance_pct = 10.0
+owner_ms = "MS-11"
+status = "active"
+notes = "Redstone and block updates in the reference circuits scene; update-order hash also recorded."
+
+[[budget]]
 id = "PERF-TICK-005"
 area = "tick"
 metric = "cpu_time"
@@ -173,7 +193,7 @@ gate = "gate"
 tolerance_pct = 10.0
 owner_ms = "MS-15"
 status = "active"
-notes = "Replication and interest at 50 players; tick-thread share (phase total is PERF-NET-016)."
+notes = "Replication and interest at 50 co-located players on the default 256-block render/simulation distance; tick-thread share (phase total is PERF-NET-016)."
 
 [[budget]]
 id = "PERF-TICK-009"
@@ -188,9 +208,9 @@ preset = "n/a"
 tier = "server"
 gate = "gate"
 tolerance_pct = 10.0
-owner_ms = "MS-15"
+owner_ms = "MS-02, MS-15"
 status = "active"
-notes = "Total tick, 2,000 columns and 50 players (PERF-ARCH-002)."
+notes = "Total tick, 2,000 loaded columns and 50 co-located players (PERF-ARCH-002)."
 
 [[budget]]
 id = "PERF-SRV-001"
@@ -207,7 +227,7 @@ gate = "gate"
 tolerance_pct = 10.0
 owner_ms = "MS-07"
 status = "active"
-notes = "16 bots, 4 vCPU / 8 GiB, 20 TPS; RSS <= 2 GiB + 20 MB/player."
+notes = "16 co-located bots, 4 vCPU / 8 GiB, 20 TPS; RSS <= 2 GiB + 20 MB/player."
 
 [[budget]]
 id = "PERF-SRV-003"
@@ -222,9 +242,9 @@ preset = "n/a"
 tier = "server"
 gate = "gate"
 tolerance_pct = 10.0
-owner_ms = "MS-15"
+owner_ms = "MS-07, MS-15"
 status = "active"
-notes = "Server RSS at 50 players, including per-player connection buffers."
+notes = "Server RSS at 50 co-located players on the 256-block default, including per-player connection buffers; distributed capacity is a separate Report row."
 
 # --- Memory and loading --------------------------------------------------
 
@@ -243,7 +263,7 @@ gate = "gate"
 tolerance_pct = 10.0
 owner_ms = "MS-04"
 status = "active"
-notes = "Client RSS target at 512 blocks including a 15% fragmentation allowance; ceiling is PERF-MEM-011 (4 GiB)."
+notes = "Client RSS target at a 512-block radius including a 15% fragmentation allowance; 256-block value is 1,400 MB; 1024-block value 4,500 MB is post-1.0 Report. Ceiling is PERF-MEM-011 (4 GiB at 256/512, 6 GiB post-1.0)."
 
 [[budget]]
 id = "PERF-MEM-012"
@@ -260,7 +280,7 @@ gate = "gate"
 tolerance_pct = 10.0
 owner_ms = "MS-04"
 status = "active"
-notes = "GPU allocated total at 512 blocks."
+notes = "GPU allocated total at a 512-block radius; 1024-block value 1,750 MB is post-1.0 Report."
 
 [[budget]]
 id = "PERF-LOAD-001"
@@ -313,12 +333,12 @@ gate = "report"
 tolerance_pct = 15.0
 owner_ms = "MS-06"
 status = "active"
-notes = "Full 512-block interest set, fresh terrain, at 10 Mbit/s; <= 150 s for built worlds; background and cancellable."
+notes = "Full 512-block-radius interest set (4,225 columns), fresh terrain, at 10 Mbit/s; <= 150 s for built worlds; background and cancellable."
 
 [[budget]]
 id = "PERF-NET-009"
 area = "net"
-metric = "rss"
+metric = "connection_bytes"
 direction = "lower_is_better"
 limit = 512.0
 unit = "kb"
@@ -354,16 +374,16 @@ notes = "PR CI wall time excluding queue; full benchmark suite (five scenes x th
 [[budget]]
 id = "PERF-MOD-001"
 area = "mod"
-metric = "cpu_time"
+metric = "tick_p99"
 direction = "lower_is_better"
-limit = 0.30
+limit = 1.5
 unit = "ms"
-percentile = 95
+percentile = 99
 scene = "mods"
-preset = "high"
-tier = "reference"
+preset = "n/a"
+tier = "server"
 gate = "gate"
 tolerance_pct = 10.0
 owner_ms = "MS-09"
 status = "active"
-notes = "Single WASM mod, client per-frame; server counterpart <= 1.5 ms/tick p99."
+notes = "Single server-side WASM mod; client 0.30 ms/frame is a reserved post-1.0 envelope (DEC-049), not a 1.0 gate. Reference-set aggregate PERF-MOD-002 is server-only at 1.0."

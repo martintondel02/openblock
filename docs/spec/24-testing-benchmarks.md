@@ -1,7 +1,7 @@
 # 24 — Testing and Benchmarks
 
 > Status: normative - Last updated: 2026-11-24
-> Depends on: [DEC-003](../decisions.md), [DEC-007](../decisions.md), [DEC-021](../decisions.md), [DEC-029](../decisions.md), [DEC-035](../decisions.md), [DEC-038](../decisions.md), [DEC-042](../decisions.md); [conventions](00-conventions.md), [engine core](02-engine-core.md), [rendering](03-rendering.md), [world model](05-world-model.md), [world generation](06-worldgen.md), [inventory](11-inventory-crafting-items.md), [persistence](17-persistence.md), [networking](18-networking-multiplayer.md), [security](20-security-and-anti-cheat.md), [performance budgets](25-performance-budgets.md)
+> Depends on: [DEC-003](../decisions.md), [DEC-007](../decisions.md), [DEC-021](../decisions.md), [DEC-029](../decisions.md), [DEC-035](../decisions.md), [DEC-038](../decisions.md), [DEC-042](../decisions.md), [DEC-049](../decisions.md), [DEC-051](../decisions.md), [DEC-052](../decisions.md); [conventions](00-conventions.md), [engine core](02-engine-core.md), [rendering](03-rendering.md), [world model](05-world-model.md), [world generation](06-worldgen.md), [inventory](11-inventory-crafting-items.md), [persistence](17-persistence.md), [networking](18-networking-multiplayer.md), [security](20-security-and-anti-cheat.md), [performance budgets](25-performance-budgets.md)
 > Implements: MS-00 (harness and CI from day one), then every milestone (continuous)
 
 ## 1. Purpose and scope
@@ -60,7 +60,7 @@ loudly; anything else is a demo.
 | REQ-TEST-020 | The mod sandbox corpus and a test for every public host function run on every modding change. | Sandbox job | MS-09 |
 | REQ-TEST-021 | Every UI screen has screenshot tests at three resolutions × two UI scales plus a keyboard-navigation smoke test. | UI job | MS-13 |
 | REQ-TEST-022 | Accessibility checks run automatically where possible (contrast, focus order, labels), and the two-tester audit of [23 §3.17](23-accessibility-localization.md#317-the-accessibility-audit-checklist) is recorded before each release. | Test + audit record | MS-14 |
-| REQ-TEST-023 | The parity corpus is generated, covers ≥ 90% of Tier 2, and every row maps to a test or a documented divergence. | Manifest diff | MS-14 |
+| REQ-TEST-023 | The parity corpus is built from a hand-authored behavioural checklist (never a copied registry dump). At 1.0 the Tier-0/1 in-scope checklist passes 100% and the Tier-2 coverage report is ≥ 85% of pinned-baseline vanilla behaviours; at 2.0 both numbers gate full Tier-2, with every uncovered row a documented divergence. | Checklist assertions + manifest diff | MS-14 |
 | REQ-TEST-024 | Repository test data stays ≤ 300 MiB; larger fixtures are generated or fetched by `xtask` from a content-addressed manifest. | Repo size check | MS-13 |
 | REQ-TEST-025 | Coverage is reported per area; world/sim core ≥ 85% line, protocol decoder ≥ 90% branch, workspace ≥ 70% reported, never gamed. | Coverage report | MS-02 |
 | REQ-TEST-026 | Mutation testing is sampled nightly on inventory, lighting, protocol and save modules; surviving mutants are triaged. | Mutation report | MS-10 |
@@ -272,7 +272,7 @@ recover later.
 | Mod sandbox | Known escapes blocked, quotas enforced, trap leaves host alive, every host call tested | Escape corpus + per-function tests + trap injection | PR |
 | UI | Every screen renders, navigates by keyboard, respects UI scale, never traps focus | Screenshot + navigation tests at 3 resolutions × 2 scales | PR subset, nightly full |
 | Accessibility | Contrast, focus order, labels, remap conflicts, reduced motion | Automated checks + the [23 §3.17](23-accessibility-localization.md#317-the-accessibility-audit-checklist) audit with two external testers | Release |
-| Parity | Every Tier-1/2 row has a test or a documented divergence | Generated manifest assertions | Weekly |
+| Parity | Every in-scope Tier-0/1 check passes at 1.0; Tier-2 coverage is reported at ≥ 85% for 1.0 and both numbers gate full Tier-2 at 2.0; uncovered rows are documented divergences | Hand-authored checklist assertions, never a generated registry dump | Weekly |
 | Network feel | Corrections converge, no ghost blocks, inventory never desyncs under loss | Scenario + simulator profiles | PR |
 
 The table is the index, not the specification: each row's owning chapter defines
@@ -305,24 +305,33 @@ outside that split.
 
 | Scene | Kind | Stresses | Duration | Recorded metrics |
 | --- | --- | --- | --- | --- |
-| `empty` | frame | baseline CPU/GPU, sky and UI | 60 s | frame p50/p95/p99, draw calls |
+| `empty` | frame | baseline CPU/GPU, sky and UI | 10 s | frame p50/p95/p99, draw calls |
 | `flythrough` | frame | streaming, remesh, upload, cull | 120 s at 30 blocks/s | frame p50/p95/p99, upload bytes, hitches |
 | `tnt` | frame | remesh bursts, light updates, particles | 30 s, 64 explosions | frame p99, max, queue drain |
-| `water` | frame | translucent sort, SSR, underwater fog | 60 s | frame p95, sort spike |
-| `cave` | frame | occlusion, overdraw, block light | 60 s | frame p95, Hi-Z rejection |
+| `water` | frame | translucent sort, SSR, underwater fog | 30 s | frame p95, sort spike |
+| `cave` | frame | occlusion, overdraw, block light | 30 s | frame p95, Hi-Z rejection |
 | `megabuild` | frame | merged clusters, large surfaces | 60 s | frame p95, quad count |
-| `tick50` | headless | 50 players, entities, scheduled ticks | 600 ticks | tick p95/p99, validation share |
+| `ui_stress` | frame | 46-slot inventory with cursor, 1,000-widget settings with search, 100 chat lines, tooltip, 5 toasts and HUD at 1080p `auto` and 4K `ui_scale = 2` ([13 §5](13-ui-and-ux.md#5-performance-budgets)) | 30 s | frame and UI pass p50/p95/p99, draw calls, allocations |
+| `tick50` | headless | 50 co-located players, entities, scheduled ticks | 600 ticks | tick p95/p99, validation share |
+| `tick16` | headless | 16 players, 4 vCPU / 8 GiB, 20 TPS | 3,600 s | tick p50/p95/p99, RSS |
 | `join` | headless | progressive join, chunk compression | until stable | join-to-playable p95, bytes sent, tick during join |
 | `save` | headless | dirty regions, autosave pause | 60 s | pause p99, throughput |
-| `gen` | headless | chunk generation across dimensions | fixed 512-chunk set | chunks/s, per-chunk p99 |
-| `relight` | headless | 4,096 edits in one region | 200 ticks | propagation time, tick share |
+| `gen` | headless | chunk generation across dimensions | 1,000 seeds | chunks/s, per-chunk p99 |
+| `relight` | headless | 200 edits in one region | 200 ticks | propagation time, tick share |
 | `redstone_stress` | headless | reference circuits: clocks, dust nets, repeaters, pistons, hoppers ([12 §7](12-redstone-and-logic.md#7-testing-strategy)) | 10 min | tick p50/p95/p99/max, update-order hash |
 | `pack` | headless | pack validation and registry freeze | 100-pack corpus | validate ms/pack, load p95 |
+| `mods` | headless | reference server-side WASM mod set: world write, entity spawn, server-computed UI data, scheduled callbacks | 120 s | per-mod tick CPU, host-call counts |
 
-The set above is the current one; chapter 25's budget manifest is authoritative
-and may add a scene behind a new budget row. Scene names, seeds, camera paths,
-input logs and content locks live in `perf/scenes.toml` and are hashed into
-`scene_hash`; a rename is a new scene and needs a new baseline. A run is recorded in the `openblock.bench/1` JSON of
+`perf/scenes.toml` is the single normative catalogue for these scenes: seeds, camera paths, input
+logs, content locks, warm-up and the durations above live there. A budget row that names a scene
+absent from that catalogue fails the manifest load ([25 §4.1](25-performance-budgets.md#41-budget-manifest));
+if this table and the manifest disagree on a duration, the manifest wins and this table is
+corrected in the same change. The catalogue also carries the harness self-test entry `ci`, which
+is the PR lane that PERF-TOOL-003 times, not a benchmark workload.
+
+The set above is the current one. Scene names, seeds, camera paths, input logs and content locks
+live in `perf/scenes.toml` and are hashed into `scene_hash`; a rename is a new scene and needs a
+new baseline. A run is recorded in the `openblock.bench/1` JSON of
 [25 §4.2](25-performance-budgets.md#42-bench-report) and compared with
 [25 §4.3](25-performance-budgets.md#43-comparison-algorithm). Chapter 24 adds no
 second report format and no second tolerance rule; instead, a per-milestone
@@ -375,7 +384,7 @@ headroom.
 | `soak_24h` | 24 h, weekly and pre-release | 50 bots + join/leave churn | RSS slope ≈ 0, save growth bounded, zero crashes, zero corruption |
 | `join_storm` | until stable | 50 simultaneous joins | join p95 ≤ 30 s on 10 Mbit/s, tick p99 ≤ 35 ms during joins |
 | `churn` | 4 h | 500 joins/leaves | interest sets freed, no handle leak, entity count bounded |
-| `scale_matrix` | 30 min per cell | 10/25/50/100 bots × 128/256/512 blocks | p99 tick and RSS recorded in the matrix |
+| `scale_matrix` | 30 min per cell | 10/25/50/100 bots × 128/256/512-block radii | p99 tick and RSS recorded in the matrix |
 
 The soak driver records the metric series, not just the endpoints, because a
 leak that starts at hour 18 is invisible in a start/end comparison. A failed
@@ -613,7 +622,7 @@ which is exactly when it is most important to notice.
 
 ## 9. References
 
-- Decisions: [DEC-003](../decisions.md), [DEC-007](../decisions.md), [DEC-021](../decisions.md), [DEC-029](../decisions.md), [DEC-035](../decisions.md), [DEC-038](../decisions.md), [DEC-042](../decisions.md).
+- Decisions: [DEC-003](../decisions.md), [DEC-007](../decisions.md), [DEC-021](../decisions.md), [DEC-029](../decisions.md), [DEC-035](../decisions.md), [DEC-038](../decisions.md), [DEC-042](../decisions.md), [DEC-049](../decisions.md), [DEC-051](../decisions.md), [DEC-052](../decisions.md).
 - Chapters: [00](00-conventions.md), [01 §4.5](01-technical-architecture.md#45-crash-report-contents), [02 §3.10](02-engine-core.md#310-determinism-harness), [03 §3.12](03-rendering.md#312-profiling-workflow), [05](05-world-model.md), [06](06-worldgen.md), [11](11-inventory-crafting-items.md), [17 §7](17-persistence.md#7-testing-strategy), [18](18-networking-multiplayer.md), [20 §7](20-security-and-anti-cheat.md#7-testing-strategy), [25](25-performance-budgets.md).
 - Research: [Weft teardown](../research/01-weft-teardown.md) §9 and lesson 19 (188 tests CI never ran; budgets hard-coded instead of derived); [networking SOTA](../research/04-networking-sota.md) §2–3 and §8.2 (network simulator, phased exit criteria); [voxel rendering SOTA](../research/03-voxel-rendering-sota.md) (meshing benchmarks).
 - Milestones: [MS-00](../plan/01-milestones.md), [MS-06](../plan/01-milestones.md), [MS-13](../plan/01-milestones.md), [MS-15](../plan/01-milestones.md), [MS-16](../plan/01-milestones.md).

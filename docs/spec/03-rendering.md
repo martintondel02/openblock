@@ -1,7 +1,7 @@
 # 03 — Rendering: Device, Render Graph and the Voxel Geometry Pipeline
 
 > Status: normative - Last updated: 2026-11-24
-> Depends on: DEC-002, DEC-004, DEC-005, DEC-011, DEC-012, DEC-013, DEC-014, DEC-016, DEC-017, DEC-018, DEC-035, DEC-038; [conventions](00-conventions.md), [technical architecture](01-technical-architecture.md), [world model](05-world-model.md), [performance budgets](25-performance-budgets.md)
+> Depends on: DEC-002, DEC-004, DEC-005, DEC-011, DEC-012, DEC-013, DEC-014, DEC-016, DEC-017, DEC-018, DEC-035, DEC-038, DEC-048; [conventions](00-conventions.md), [technical architecture](01-technical-architecture.md), [world model](05-world-model.md), [performance budgets](25-performance-budgets.md)
 > Implements: MS-03, MS-04
 
 ## 1. Purpose and scope
@@ -15,10 +15,13 @@ for `ob_render`, the only crate that may link `wgpu` (DEC-003). Shading behaviou
 transfer is [18](18-networking-multiplayer.md); UI layout is [13](13-ui-and-ux.md);
 whole-frame budget authority is [25](25-performance-budgets.md).
 
-Requirements marked **(provisional)** depend on provisional register entries — the
-32³ mesh cluster (DEC-004, OPEN-001) and GPU-driven visibility (DEC-013) — ship behind
-a configuration switch and are re-baselined at MS-04. Render distance is always stated
-in blocks; the default is 512 blocks = 32 chunk columns of 16 blocks.
+Requirements marked **(provisional)** depend on provisional register entries — GPU-driven
+visibility (DEC-013) — and ship behind a configuration switch and are re-baselined at
+MS-04. The 32³ mesh cluster is not provisional: 2×2×2 sections is the default from MS-04
+(DEC-048), while the 16³ section remains the storage, edit, light and network unit, and
+the 1×1×1 per-section mesher is retained as a debug/fallback path. Render distance is
+always stated as a **block radius**; 512 blocks = a 32-chunk radius = 65×65 = 4,225
+chunk columns, never a 512-block diameter.
 
 ## 2. Requirements
 
@@ -38,12 +41,12 @@ in blocks; the default is 512 blocks = 32 chunk columns of 16 blocks.
 | REQ-RENDER-012 | Voxel quads are exactly 16 B in the §4.1 layout; position, normal, UV, AO and corner light are derived, with no vertex attributes. | `size_of` test plus golden image |
 | REQ-RENDER-013 | Three buckets (opaque, cutout, translucent); opaque and cutout are never sorted per frame, translucent is sorted per cluster back to front. | Image test plus sort unit test |
 | REQ-RENDER-014 | Meshes are cached under (dimension, cluster position, content epoch, mesher version) and invalidated on edit, border change, content reload and eviction; a stale mesh is never drawn. | Cache test plus edit-latency test |
-| REQ-RENDER-015 | At 512 blocks: ≤ 12 geometry draws and ≤ 32 draws including shadow, post and UI per frame. | Frame statistics gate |
-| REQ-RENDER-016 | No per-frame main-thread loop iterates over individual sections; visibility cost scales with region and cluster counts only. | 512-vs-1024-block scaling benchmark |
-| REQ-RENDER-017 | **(provisional)** CPU region+cluster frustum culling at MVP; Hi-Z compute culling with GPU compaction by 1.0; the zero-instance portable path selects the same visible set as the counted path. | A/B image diff across paths |
-| REQ-RENDER-018 | **(provisional)** 32³ cluster meshing is a configuration option, per-section meshing the default until OPEN-001 closes; both paths agree on face visibility. | A/B diff plus quad-count report |
+| REQ-RENDER-015 | At a 512-block radius: ≤ 12 geometry draws and ≤ 32 draws including shadow, post and UI per frame. | Frame statistics gate |
+| REQ-RENDER-016 | No per-frame main-thread loop iterates over individual sections; visibility cost scales with region and 32³-cluster counts only. | 512-vs-1024-block-radius scaling benchmark |
+| REQ-RENDER-017 | CPU region+cluster frustum culling is the MVP path; the Hi-Z compute culling with GPU compaction is **(provisional)** until MS-04; the zero-instance portable path selects the same visible set as the counted path. | A/B image diff across paths |
+| REQ-RENDER-018 | 2×2×2 sections (32³) is the default mesh cluster from MS-04 (DEC-048); `mesh.cluster_sections = 1` remains a debug/fallback option. Both paths agree on face visibility and differ only in merge factor. | A/B diff plus quad-count report |
 | REQ-RENDER-019 | Chunk buffers come from a size-classed arena with coalescing, bounded defragmentation and distance/LRU eviction; allocation failure degrades per §3.6 and never panics. | Arena unit tests plus soak |
-| REQ-RENDER-020 | The §3.6 caps are enforced: ≤ 768 MB at 512 blocks, ≤ 1.75 GB at 1024. | VRAM accounting on a 4 GiB adapter |
+| REQ-RENDER-020 | The §3.6 caps are enforced: ≤ 768 MB at a 512-block radius, ≤ 1.75 GB at a 1024-block radius (post-1.0, Report). | VRAM accounting on a 4 GiB adapter |
 | REQ-RENDER-021 | Block and item textures are 2D arrays with offline mips; sampler state follows §3.7; the 1.0 path has no atlas. | Asset validator plus image test |
 | REQ-RENDER-022 | At most four bind groups with the fixed §3.7 table for every voxel, entity, particle and post pipeline. | Pipeline layout inspection |
 | REQ-RENDER-023 | Entities, items and particles are instanced or vertex-pulled from shared buffers; no per-entity uniform, bind group or pipeline switch in the frame loop. | Draw counter with 500 entities |
@@ -52,7 +55,7 @@ in blocks; the default is 512 blocks = 32 chunk columns of 16 blocks.
 | REQ-RENDER-026 | No LOD inside the render distance at 1.0; beyond-view terrain is visual-only (DEC-018). | Config inspection plus parity test |
 | REQ-RENDER-027 | Present mode, limiter and vsync map to the §3.10 settings; default `Mailbox` else `Fifo`, vsync off. | Settings schema plus frame trace |
 | REQ-RENDER-028 | Upload bytes, mesh jobs, defrag copies and sorts have hard per-frame caps; exceeding one defers work rather than extending the frame. | p99 gate during streaming |
-| REQ-RENDER-029 | Presets are data (potato, low, medium, high, ultra) mapping to §3.11 settings; no automatic preset changes state unreported in the UI. | Settings schema test |
+| REQ-RENDER-029 | Presets are data (potato, low, medium, high, performance, ultra) mapping to §3.11 settings; `performance` is the 144 FPS mode, not a quality tier above `high`; no automatic preset changes state unreported in the UI. | Settings schema test |
 | REQ-RENDER-030 | Profiling exposes per-pass timestamps, CPU scopes, per-pass markers and the §3.12 scenes with p50/p95/p99. | CI artifact check |
 | REQ-RENDER-031 | Device loss, surface loss and OOM recover without a process restart; meshes rebuild from world state. | Fault-injection test |
 | REQ-RENDER-032 | Golden-image and validation-layer gates pass on all three desktop backends; the performance envelope is gated on the reference machine, with macOS Metal a `Warn` tier until MS-13 proves it ([25 §3.1](25-performance-budgets.md#31-hardware-tiers)). | CI job |
@@ -220,30 +223,32 @@ portable tier issues one draw per cluster with an immediate carrying the index (
 
 Cutout is a bucket rather than a shader permutation because discarded fragments must not
 write depth and sorting it is pointless; it shares the opaque argument layout.
-`mesh.cluster_sections = 1` (default) meshes each 16³ section, `= 2` meshes a 2×2×2 cluster
-from a 34³ padded volume: a cluster owns quads whose origin lies inside its extent, so
-cross-seam faces vanish and flat builds merge further, at 8× remesh work per edit (still
+`mesh.cluster_sections = 2` is the default from MS-04 (DEC-048) and meshes a 2×2×2 cluster
+from a 34³ padded volume; `= 1` remains a debug/fallback that meshes each 16³ section. A
+cluster owns quads whose origin lies inside its extent, so cross-seam faces vanish and flat
+builds merge further, at up to 8× the section volume of remesh work per edit (still
 100–300 µs estimated). Both paths must agree on visible faces and differ only where quads
-merged; §7 tests exactly that. OPEN-001 closes after the MS-04 corner-edit benchmark.
+merged; §7 tests exactly that. The MS-04 corner-edit benchmark tunes the cluster
+implementation (latency, eviction, Metal fallback), not the default.
 
 ### 3.5 Visibility and submission
 
-| Level | Extent | Count at 512 blocks | Tested by |
+| Level | Extent | Count at 512-block radius | Tested by |
 | --- | --- | --- | --- |
 | Region | 8×4×8 sections = 128×64×128 blocks | 486 | CPU, every frame |
-| Cluster | 32³ blocks, or one section | 12,675 (32³) | CPU at MVP, GPU at 1.0 |
+| Cluster | 32³ blocks (2×2×2 sections); 1×1×1 debug fallback | 12,675 (32³) | CPU at MVP, GPU at 1.0 |
 | Quad | one face rectangle | 100k–200k visible | Backface culling in raster |
 
-At 512 blocks the field is 65×65 = 4,225 columns; at 384 blocks of height that is 24
-sections per column and 101,400 sections. A region covers 8 chunks a side, giving 9×9
-region columns (the edge cell is partial) and 6 vertical rows: 486 regions. Culling them is
-always affordable;
-section-level culling is not — at ~19 ns per section it would spend the whole 144 FPS CPU
-budget (DEC-013). Frustum planes are extracted from the view-projection matrix in world
-space and normalised; AABBs live in packed `[f32; 6]` structure-of-arrays form so a batch
-test is six dot products on eight lanes. Regions are tested first and a culled region
-contributes no cluster work; cluster bounds are inflated by one block so geometry reaching
-a boundary is not clipped by rounding.
+At a 512-block radius the field is 65×65 = 4,225 columns; at 384 blocks of height that is
+24 sections per column and 101,400 sections. A 0.30 ms visibility budget allows about
+3 ns per section — not credible on the main thread even with a job pool — so 32³ clusters
+cut the tested count to 12,675, or roughly 24 ns per cluster (DEC-048). A region covers 8
+chunks a side, giving 9×9 region columns (the edge cell is partial) and 6 vertical rows:
+486 regions. Culling them is always affordable. Frustum planes are extracted from the
+view-projection matrix in world space and normalised; AABBs live in packed `[f32; 6]`
+structure-of-arrays form so a batch test is six dot products on eight lanes. Regions are
+tested first and a culled region contributes no cluster work; cluster bounds are inflated
+by one block so geometry reaching a boundary is not clipped by rounding.
 
 **Hi-Z at 1.0 (provisional).** The cull pass builds a min-pyramid from the previous frame's
 depth in reverse-Z convention (far = 0.0, so the conservative test reads the pyramid's
@@ -266,7 +271,7 @@ capacity.
 | Submission path | Gate | Draws per frame | Notes |
 | --- | --- | --- | --- |
 | counted | `MULTI_DRAW_INDIRECT_COUNT` | 1 `multi_draw_indirect_count` per bucket | Vulkan 1.2+/DX12; counts stay on the GPU |
-| portable zero-instance | `MULTI_DRAW_INDIRECT` | 1 `multi_draw_indirect` per bucket over a lagged, clamped capacity; culled entries carry `instance_count = 0` | Metal, GLES/WebGPU. wgpu 30 **loops** MDI arguments on Metal, so capacity is the visible count read back two frames earlier plus 25%, and cluster size rises to 64³ on this path to keep arguments under 2,000 at the 1024-block ceiling |
+| portable zero-instance | `MULTI_DRAW_INDIRECT` | 1 `multi_draw_indirect` per bucket over a lagged, clamped capacity; culled entries carry `instance_count = 0` | Metal, GLES/WebGPU. wgpu 30 **loops** MDI arguments on Metal, so capacity is the visible count read back two frames earlier plus 25%; at the 1024-block ceiling the 64³ escalation that would keep arguments under 2,000 is blocked by OPEN-009 until the 16 B quad record can encode 64³ merges, so 1024 is refused on this path until then |
 | per-cluster | `INDIRECT_FIRST_INSTANCE` absent | one indirect draw per cluster | Portable tier only, not shipped at 1.0 |
 
 The Metal constraint shapes the design: `indirect_count` is a no-op stub in wgpu 30's Metal
@@ -279,15 +284,18 @@ re-sorted inside a cluster — greedy quads in 32³ are small enough that intra-
 are sub-pixel for glass and invisible for water, and the water sub-bucket draws last so its
 refraction input is complete.
 
-| Render distance | Columns | Sections | Clusters (32³) | Visible (≈25%) | Regions visible | Geometry draws | CPU cull |
+| Render distance (block radius) | Columns | Sections | Clusters (32³) | Visible (≈25%) | Regions visible | Geometry draws | CPU cull |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 blocks (16 chunks) | 1,089 | 26,136 | 3,267 | 817 | 37 of 150 | 3 | 0.08 ms |
-| **512 blocks (32 chunks)** | **4,225** | **101,400** | **12,675** | **3,169** | **121 of 486** | **3** | **0.30 ms** |
-| 1024 blocks (64 chunks) | 16,641 | 399,384 | 49,923 | 12,481 | 434 of 1,734 | 3 | 1.10 ms |
+| 256-block radius (16 chunks) | 1,089 | 26,136 | 3,267 | 817 | 37 of 150 | 3 | 0.08 ms |
+| **512-block radius (32-chunk radius)** | **4,225** | **101,400** | **12,675** | **3,169** | **121 of 486** | **3** | **0.30 ms** |
+| 1024-block radius (64 chunks) | 16,641 | 399,384 | 49,923 | 12,481 | 434 of 1,734 | 3 | 1.10 ms |
 
-At 1024 blocks the CPU cull alone exceeds the 0.30 ms visibility budget — the quantitative
-reason DEC-013 moves culling to compute by 1.0. Per-section meshing multiplies the cluster
-column by 8 and cull time by roughly 5.
+At a 1024-block radius the CPU cull alone exceeds the 0.30 ms visibility budget — the
+quantitative reason DEC-013 moves culling to compute; per DEC-018 that row is a post-1.0
+(MS-20) report, not a 1.0 gate. The 1×1×1 debug path multiplies the cluster count by 8
+(101,400 at a 512-block radius) and the cull time to roughly 1.9 ms. The 32³ default does not
+change the three bucket draws; it changes the argument count, from 12,675 clusters at a
+512-block radius to about 3,169 visible.
 
 ### 3.6 Buffer arenas and GPU memory
 
@@ -313,7 +321,7 @@ it fits, (4) otherwise the request fails, the cluster is marked unmeshed, geomet
 for it, the overlay shows the count, and the mesher requeues it at low priority. Eviction
 bumps the cache epoch so a late mesher result cannot resurrect a stale handle.
 
-| Category | 512 blocks | 1024 blocks | Notes |
+| Category | 512-block radius | 1024-block radius | Notes |
 | --- | ---: | ---: | --- |
 | Quad arenas | 192 MB | 768 MB | includes entity/model arena; evicts at the cap |
 | Staging ring + readback | 48 MB | 64 MB | 3 × 16 MiB plus timestamp/count readbacks |
@@ -325,9 +333,12 @@ bumps the cache epoch so a late mesher result cannot resurrect a stale handle.
 | **Subtotal** | **600 MB** | **1,248 MB** | |
 | **Cap (REQ-RENDER-020)** | **768 MB** | **1,750 MB** | eviction triggers before the cap |
 
+The 1024-block column is the post-1.0 (MS-20, DEC-018) extrapolation and is Report only; the
+1.0 caps are the 512-block column.
+
 On `DeviceLost` the renderer drops all GPU resources, recreates device, surface and cache
-handle and re-requests meshes for loaded clusters. No CPU mesh copy is retained — 200 MB at
-512 blocks to serve a rare event is not worth it; the client's world data is the source of
+handle and re-requests meshes for loaded clusters. No CPU mesh copy is retained — 200 MB at a
+512-block radius to serve a rare event is not worth it; the client's world data is the source of
 truth and remeshing 12,675 clusters at ~40 µs on 8 threads is ~63 ms of worker time. A blocking
 "graphics device lost, recovering" overlay explains the pause.
 
@@ -421,10 +432,10 @@ and the graph re-derives barriers and aliasing.
 
 ### 3.10 LOD, frame pacing and latency
 
-No LOD inside the render distance at 1.0: every cluster within 512 blocks draws at full detail
-(DEC-018). Beyond it the world ends in atmospheric fog and sky — no impostor tiles, no
-heightfield rings, no GPU-generated far terrain. LOD becomes necessary at 128+ chunks, not 32,
-and client-side generation is an information leak. Post-1.0 (MS-20) adds visual-only tiles
+No LOD inside the render distance at 1.0: every cluster within the 512-block radius draws at
+full detail (DEC-018). Beyond it the world ends in atmospheric fog and sky — no impostor tiles,
+no heightfield rings, no GPU-generated far terrain. LOD becomes necessary at 128+ chunks, not
+32, and client-side generation is an information leak. Post-1.0 (MS-20) adds visual-only tiles
 allocated as whole pages and excluded from the shadow pass; they can never feed collision,
 spawning, drops, ore knowledge or anti-cheat.
 
@@ -434,6 +445,8 @@ spawning, drops, ore knowledge or anti-cheat.
 | `render.vsync` | off (default), on | `on` forces `Fifo` |
 | `render.fps_limit` | `display` (refresh − 3), `60`, `120`, `144`, `off` | Sleep-based limiter, 0.5 ms granularity, never busy-waits |
 | `render.frames_in_flight` | 2 (default), 3 | §3.3 |
+| `render.distance_blocks` | 128, 256, 384, 512 (default), 768; 1024 post-1.0 | Radius in blocks; the settings row also shows the 16-block chunk radius (8/16/24/32/48; 64 post-1.0) and the 65×65 column count at 512 |
+| `render.preset` | `potato`, `low`, `medium`, `high` (default), `performance`, `ultra` | Selects the §3.11 column; `performance` is the 144 FPS mode, not a quality tier; a change is persisted and reported in the HUD |
 
 The limiter targets `refresh − 3`: driving `Fifo` at exactly the refresh rate leaves a standing
 queue and adds a frame of latency without improving smoothness. Adaptive vsync is not exposed
@@ -445,23 +458,26 @@ periods, with p50/p99 recorded at MS-04.
 
 ### 3.11 Quality presets
 
-| Setting | potato | low | medium | high (default) | ultra |
-| --- | --- | --- | --- | --- | --- |
-| render distance (blocks) | 128 | 256 | 384 | **512** | 768 |
-| render scale | 0.60 | 0.75 | 0.85 | 1.00 | 1.00 |
-| shadows | off | 1 × 1024² | 2 × 2048² | 3 × 2048² | 3 × 4096² |
-| shadow distance (blocks) | — | 48 | 64 | 96 | 128 |
-| GTAO | off | off | off | half-res | full-res |
-| SSR water | off | off | quarter | half | half + refine |
-| volumetric fog / clouds | off | off | off | fog (half) | fog + clouds |
-| TAA | off (FXAA) | on | on | on | on |
-| particle budget | 1,024 | 4,096 | 8,192 | 16,384 | 16,384 (cap) |
-| anisotropy | 1× | 4× | 8× | 8× | 16× |
-| entity distance (blocks) | 48 | 64 | 80 | 96 | 128 |
-| estimated GPU time | 1.9 ms | 2.2 ms | 3.4 ms | **5.7 ms** | 7.6 ms |
+| Setting | potato | low | medium | high (default) | performance | ultra |
+| --- | --- | --- | --- | --- | --- | --- |
+| render distance (block radius) | 128 | 256 | 384 | **512** | **512** | 768 |
+| render scale | 0.60 | 0.75 | 0.85 | 1.00 | **0.85** | 1.00 |
+| shadows | off | 1 × 1024² | 2 × 2048² | 3 × 2048² | **1 × 1024²** | 3 × 4096² |
+| shadow distance (blocks) | — | 48 | 64 | 96 | **48** | 128 |
+| GTAO | off | off | off | half-res | **off** | full-res |
+| SSR water | off | off | quarter | half | **off** | half + refine |
+| volumetric fog / clouds | off | off | off | fog (half) | **off** | fog + clouds |
+| TAA | off (FXAA) | on | on | on | **on** | on |
+| particle budget | 1,024 | 4,096 | 8,192 | 16,384 | **8,192** | 16,384 (cap) |
+| anisotropy | 1× | 4× | 8× | 8× | 8× | 16× |
+| entity distance (blocks) | 48 | 64 | 80 | 96 | 96 | 128 |
+| estimated GPU time | 1.9 ms | 2.2 ms | 3.4 ms | **5.7 ms** | **3.3 ms** | 7.6 ms |
 
 `potato` is the integrated-GPU preset: it drops memory-bandwidth-bound effects and lowers render
-scale, the cheapest lever on any GPU. `ultra` is not a 1.0 gate; it exists so quality can scale
+scale, the cheapest lever on any GPU. `performance` is the 144 FPS mode: 512-block radius, 0.85
+render scale, one 1024² cascade at 48 blocks, no GTAO/SSR/volumetric fog or clouds, an 8,192
+particle cap and TAA on. It is a verified mode (`PERF-FRAME-003`), not a sixth quality tier, and
+it does not replace the `high` default. `ultra` is not a 1.0 gate; it exists so quality can scale
 past the reference machine.
 
 ### 3.12 Profiling workflow
@@ -470,17 +486,20 @@ Per-pass timestamps with budget assertions appear in the debug overlay as a sort
 export as JSON per run, alongside counters for draw calls, arguments written, bytes uploaded,
 fragmentation and pipeline compiles; CPU scopes surround prepare, visibility, upload, encode and
 submit. Captures use RenderDoc (Windows/Linux) and the Metal tools (macOS), legible without a
-legend thanks to §3.2's markers. Five scenes, each with fixed seed, camera path and input log, no
-vsync, 10 s warm-up:
+legend thanks to §3.2's markers. Five renderer scenes, each with fixed seed, camera path and input
+log, no vsync, 10 s warm-up:
 
 | Scene | Stresses | Duration | Gate |
 | --- | --- | --- | --- |
 | `flythrough` | streaming, upload, cull at speed, mesh churn | 120 s at 30 blocks/s | p95; no frame > 33 ms |
 | `tnt` | simultaneous remeshes, light updates, particles | 30 s, 64 explosions | p99; queue drained |
-| `water` | translucent sort, SSR, underwater fog | 60 s | p95; sort spike ≤ 0.05 ms |
-| `cave` | occlusion, overdraw, block-light shading | 60 s | p95; Hi-Z rejection ≥ 40% |
+| `water` | translucent sort, SSR, underwater fog | 30 s | p95; sort spike ≤ 0.05 ms |
+| `cave` | occlusion, overdraw, block-light shading | 30 s | p95; Hi-Z rejection ≥ 40% |
 | `megabuild` | cluster merge factor, large translucent surfaces | 60 s | p95; quad-count report |
 
+The renderer scenes above are a subset of the single catalogue in `perf/scenes.toml`, which also
+defines `empty` and the frame-based `ui_stress` scene. A budget row naming a scene absent from
+that catalogue fails the manifest load ([25 §4.1](25-performance-budgets.md#41-budget-manifest)).
 Every run stores the JSON report, current reference images and adapter/driver identity; a PR fails
 on a > 10% p95 regression in any scene (DEC-035).
 
@@ -489,9 +508,10 @@ on a > 10% p95 regression in any scene (DEC-035).
 | Condition | Behaviour |
 | --- | --- |
 | Integrated GPU, shared memory | `potato` offered at first run; arenas capped at 128 MB; shadows and GTAO off; render scale 0.6 |
-| 4 GiB VRAM | 512 blocks allowed; 1024 refused in settings with an explanation; eviction at 85% of cap |
+| 4 GiB VRAM | 512-block radius allowed; 1024 refused in settings with an explanation (post-1.0 MS-20); eviction at 85% of cap |
+| `mesh.cluster_sections = 1` | Debug/fallback per-section meshing only: 101,400 clusters at a 512-block radius (8×), selected for A/B and bisection, never the shipping default |
 | No `MULTI_DRAW_INDIRECT_COUNT` | Zero-instance arguments over a lagged, clamped capacity (§3.5) |
-| No `INDIRECT_FIRST_INSTANCE` | Per-cluster indirect draws with cluster size raised to 64³ |
+| No `INDIRECT_FIRST_INSTANCE` | Per-cluster indirect draws at 32³; 1024 is refused on this path and the 64³ escalation stays blocked by OPEN-009 until the quad record can encode 64³ merges |
 | No `TIMESTAMP_QUERY` | CPU scopes only; budgets unchecked with a warning; benchmark gate CPU-only |
 | No BC compression | Uncompressed textures, 512 MB texture cap, `medium` forced |
 | `max_texture_array_layers < 1024` | Layer budget clamped; content validation names textures that cannot load rather than substituting silently |
@@ -503,7 +523,7 @@ on a > 10% p95 regression in any scene (DEC-035).
 
 | Word | Bits | Field | Meaning |
 | ---: | --- | --- | --- |
-| 0 | 0..5 | `x` | origin X, cluster-local blocks, 0..47 |
+| 0 | 0..5 | `x` | origin X, cluster-local blocks, 0..63 (32³ clusters use 0..31) |
 | 0 | 6..11 | `y` | origin Y |
 | 0 | 12..17 | `z` | origin Z |
 | 0 | 18..22 | `w-1` | extent along the face's U axis minus 1 (1..32) |
@@ -519,7 +539,9 @@ on a > 10% p95 regression in any scene (DEC-035).
 Corners are counter-clockwise from outside: `(u0,v0), (u1,v0), (u1,v1), (u0,v1)`, so triangles are
 `(0,1,2)` and `(0,2,3)`. A monochrome-light variant packs each corner into 8 bits (sky4 << 4 \|
 block4) for 12 B; a lightless LOD variant drops words 2–3 for 8 B. Each bucket uses exactly one
-layout, so no pipeline branches on it.
+layout, so no pipeline branches on it. The six-bit origins address a 64³ cluster, but the
+five-bit extents cap one merged quad at 32 blocks; that is why OPEN-009 blocks the 64³ Metal
+escalation without a wider record.
 
 ### 4.2 Draw records
 
@@ -540,7 +562,7 @@ pub struct ClusterDraw {                             // CPU side, ~80 B with bou
 
 The cache is an `IndexMap<MeshKey, ClusterDraw>` keyed by (dimension, cluster position, content
 epoch, mesher version), ordered for deterministic iteration and carrying an LRU list; it holds
-metadata only, about 1 MB at 512 blocks.
+metadata only, about 1 MB at a 512-block radius.
 
 `FrameUniforms` is 256 B, matching dynamic-offset alignment on all three backends: the two
 view-projection matrices, camera position (fractional and block-aligned `i32`), time and frame
@@ -550,7 +572,7 @@ the first stays within one cache line per draw.
 
 ## 5. Performance budgets
 
-p95 unless stated, `flythrough`, 1080p, 512 blocks, `high`, on the reference machine of
+p95 unless stated, `flythrough`, 1080p, 512-block radius, `high`, on the reference machine of
 [vision §9](../vision.md#9-platforms-and-hardware). The whole-frame envelope is owned by
 [performance budgets](25-performance-budgets.md).
 
@@ -561,18 +583,18 @@ p95 unless stated, `flythrough`, 1080p, 512 blocks, `high`, on the reference mac
 | PERF-RENDER-003 | CPU encode + submit | ≤ 0.40 ms |
 | PERF-RENDER-004 | Upload | ≤ 8 MiB and ≤ 0.20 ms/frame; 24 MiB burst for one frame after a teleport |
 | PERF-RENDER-005 | Draw calls | ≤ 12 geometry, ≤ 32 total |
-| PERF-RENDER-006 | GPU time, all passes | ≤ 6.0 ms (120 FPS gate), ≤ 4.0 ms (144 FPS mode) |
-| PERF-RENDER-007 | p99 frame time, CPU-bound | ≤ 12 ms |
+| PERF-RENDER-006 | GPU time, all passes | ≤ 6.0 ms (120 FPS gate), ≤ 4.0 ms (144 FPS performance mode) |
+| PERF-RENDER-007 | p99 frame time, CPU-bound | ≤ 11.1 ms (the 90 FPS 1% low) |
 | PERF-RENDER-008 | Hitch gate | no frame > 33 ms in `flythrough` |
-| PERF-RENDER-009 | Edit-to-visible | ≤ 2 frames at the camera, ≤ 100 ms at 256 blocks |
+| PERF-RENDER-009 | Edit-to-visible | ≤ 2 frames at the camera, ≤ 100 ms at a 256-block radius |
 | PERF-RENDER-010 | Defrag copy | ≤ 4 MiB and ≤ 0.15 ms/frame, ≤ 64 MiB/s |
 | PERF-RENDER-011 | Pipeline compile inside a frame | 0 ms |
 | PERF-RENDER-012 | Warm-start pipeline cache | ≥ 90% hit, ≤ 300 ms load |
-| PERF-RENDER-013 | GPU memory | ≤ 768 MB at 512 blocks, ≤ 1.75 GB at 1024 |
+| PERF-RENDER-013 | GPU memory | ≤ 768 MB at a 512-block radius; ≤ 1.75 GB at a 1024-block radius (post-1.0, Report) |
 | PERF-RENDER-014 | Arena fragmentation | < 20% per class |
 | PERF-RENDER-015 | Mesh job duration | ≤ 1 ms |
 | PERF-RENDER-016 | Translucent sort | ≤ 0.05 ms |
-| PERF-RENDER-017 | Cull scaling 512 → 1024 blocks | ≤ 2.5× CPU time (linear in regions, not sections) |
+| PERF-RENDER-017 | Cull scaling 512 → 1024-block radius | ≤ 4× CPU time (linear in regions and clusters, not sections; 12,675 → 49,923 clusters) |
 | PERF-RENDER-018 | Device-loss recovery | ≤ 2 s to the first recovered frame |
 
 ## 6. Failure modes, risks and edge cases
@@ -583,7 +605,7 @@ p95 unless stated, `flythrough`, 1080p, 512 blocks, `high`, on the reference mac
 | Fragmentation stall | Multi-millisecond hitch on a large allocation | Incremental compaction, then eviction, then "unmeshed" (§3.6) |
 | Ring overrun | Meshes appear late | Backpressure before recording the copy; 3 × 16 MiB ring; budget checked first |
 | First-draw pipeline compile | 10–400 ms freeze | Background queue, load pre-warm, ≤ 2 skipped frames, disk cache |
-| Metal MDI blow-up | Frame collapse on macOS | Lagged count clamp plus larger clusters (§3.5) |
+| Metal MDI blow-up | Frame collapse on macOS | Lagged count clamp (§3.5); the 64³ escalation is blocked by OPEN-009 |
 | Hi-Z ghosting on fast turns | Geometry disappears for a frame | Swept-AABB expansion, debug switch, accepted one-frame lag |
 | Reverse-Z sign error | Scene empty or fully occluded after the prepass | One depth convention in `View::proj`, near/far golden images, debug assertion |
 | Aliased transient still referenced | Flicker on post targets | Aliasing requires disjoint lifetimes *and* retired fences |
@@ -594,7 +616,7 @@ p95 unless stated, `flythrough`, 1080p, 512 blocks, `high`, on the reference mac
 | --- | --- | --- | --- |
 | RISK-201 | The Metal lagged-count clamp mispredicts the visible set, causing pop-in or a submission spike | Two-frame readback lag, +25% clamp, per-backend measurement | MS-04 |
 | RISK-202 | Arena fragmentation and defrag copies cause hitches the frame budget cannot absorb | 4 MiB/frame cap, retired-generation test, per-region arenas as a fallback | MS-04 |
-| RISK-203 | Draw-argument capacity is sized for 1024 blocks while the cluster default shifts the count 8× | Capacity derived from the ceiling, never from settings; A/B test at both cluster sizes | MS-04 |
+| RISK-203 | Draw-argument capacity is sized for the 1024-block ceiling (49,923 32³ clusters) while the default ships 12,675 | Capacity derived from the ceiling, never from settings; A/B test at 512 and 1024 and at both cluster sizes | MS-04 |
 | RISK-204 | wgpu 30's Metal MDI emulation changes cost with a driver update | Per-adapter submit policy; the benchmark gate fails the PR | MS-04 / MS-13 |
 | RISK-205 | Golden images become flaky across drivers and block unrelated PRs | Software-adapter references, ±1 LSB hardware tolerance, separate gates | MS-04 |
 
@@ -606,8 +628,8 @@ alias legality), frustum and AABB maths against a reference, quad packing round-
 Property tests use `proptest`, and every test names the requirement it verifies.
 
 **Validation and golden images.** `VALIDATION` plus Vulkan backend layers run in CI, where any
-validation error fails the run. Five scenes × five presets are compared with SSIM ≥ 0.99 and
-mean absolute error ≤ 2/255 against lavapipe references, with a hardware set tolerating ±1 LSB
+validation error fails the run. Five scenes × every preset in §3.11 are compared with SSIM ≥ 0.99
+and mean absolute error ≤ 2/255 against lavapipe references, with a hardware set tolerating ±1 LSB
 of driver difference; coverage is day, night, underwater, cave, rain and a loaded shader pack.
 
 **Gates and equivalence.** Each scene records p50/p95/p99 CPU and GPU times, draw calls, upload
@@ -615,32 +637,32 @@ bytes, peak allocation and fragmentation; a > 10% p95 regression fails the PR (D
 A/B checks are mandatory: cluster meshing on/off, Hi-Z on/off, and counted versus zero-instance
 submission, which must be bit-identical on one backend.
 
-**Stress.** 1024 blocks on a 4 GiB card for 30 minutes with continual teleports: no OOM, no
-frame > 50 ms after the first second, fragmentation < 25%. `device.destroy()` mid-frame must
-recover within 2 s, and cull time must track region count rather than section count.
+**Stress.** Post-1.0 (MS-20) stress: a 1024-block radius on a 4 GiB card for 30 minutes with
+continual teleports: no OOM, no frame > 50 ms after the first second, fragmentation < 25%. At
+1.0 the same run at a 512-block radius is the Gate. `device.destroy()` mid-frame must recover
+within 2 s, and cull time must track region and cluster count rather than section count.
 
 ## 8. Open questions
 
-1. **Metal submission policy.** The lagged-count clamp and 64³ cluster override are judgement,
-   not measurement. Register item needed: Metal submits zero-instance arguments over a lagged
-   visible count, raising cluster size to 64³ when the argument count would exceed 1,024
-   (owner MS-04); closing it needs macOS sub-draw measurements before MS-12.
+1. **Metal submission policy.** The lagged-count clamp is judgement, not measurement. The 64³
+   escalation it needs at 1024 is blocked by OPEN-009 (the 16 B quad record cannot encode 64³
+   merges), so 1024 is refused on that path until OPEN-009 closes; the open part is the macOS
+   sub-draw measurement before MS-12 (owner MS-04).
 2. **Frames in flight default.** Register item needed: default to 2 frames in flight and expose 3
    only under high/ultra (owner MS-04). Closed with MS-06 latency data.
 3. **Behaviour above 768 MB.** Register item needed: render distances above 768 blocks require
    ≥ 4 GiB device-local memory and accept mesh eviction (owner MS-12).
-4. **Cluster default after OPEN-001.** Both paths exist; OPEN-001 sets the deadline before the
-   save/network format freeze even though cluster position appears in mesh cache keys only, not
-   on disk. Owner: MS-04.
-5. **Render-distance gate.** OPEN-003 decides whether 512 blocks at 144 FPS is a ship gate or a
-   performance mode; a different answer re-baselines PERF-RENDER-006 and §3.11. Owner: MS-04.
+4. **Render-distance gate.** OPEN-003 decides whether a 512-block radius at 144 FPS is a ship
+   gate or a performance mode; a different answer re-baselines PERF-RENDER-006 and §3.11. Owner:
+   MS-04.
 
 ## 9. References
 
 Decisions: [DEC-002](../decisions.md), [DEC-003](../decisions.md), [DEC-004](../decisions.md),
 [DEC-011](../decisions.md), [DEC-012](../decisions.md), [DEC-013](../decisions.md),
 [DEC-014](../decisions.md), [DEC-016](../decisions.md), [DEC-017](../decisions.md),
-[DEC-018](../decisions.md), [DEC-035](../decisions.md), [DEC-038](../decisions.md).
+[DEC-018](../decisions.md), [DEC-035](../decisions.md), [DEC-038](../decisions.md),
+[DEC-048](../decisions.md).
 
 Research: [voxel rendering state of the art](../research/03-voxel-rendering-sota.md) (meshing
 costs, visibility, memory arithmetic), [Weft teardown](../research/01-weft-teardown.md) (GPU

@@ -59,12 +59,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Markdown lint
-        uses: DavidAnson/markdownlint-cli2-action@v19
+      - name: Link, structure and identifier checks
+        run: python3 .github/scripts/check-docs.py
+
+  dco:
+    # Pull requests only: the project's own history predates the DCO requirement.
+    name: DCO sign-off
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
         with:
-          globs: "**/*.md"
-      - name: Link check
-        uses: lycheeverse/lychee-action@v2
-        with:
-          args: --no-progress --offline --include-fragments "docs/**/*.md" "README.md" "CONTRIBUTING.md"
-          fail: true
+          fetch-depth: 0
+      - name: Every PR commit must carry a Signed-off-by trailer
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          missing=0
+          for commit in $(git rev-list "$base..$head"); do
+            if ! git log -1 --format=%B "$commit" | grep -q "^Signed-off-by: "; then
+              echo "::error::commit $commit is missing a Signed-off-by trailer (see DCO)"
+              missing=1
+            fi
+          done
+          exit $missing

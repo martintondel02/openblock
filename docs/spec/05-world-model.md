@@ -30,9 +30,9 @@ Out of scope: generation ([06](06-worldgen.md)), light, sky and weather ([07](07
 | REQ-WORLD-014 | Batch edits are applied in canonical sort order; duplicates collapse to the last write while the event log keeps the first old state. | Property test over random batches |
 | REQ-WORLD-015 | A transaction records `(pos, old, new)` and rolls back in reverse order, emitting events with cause `Rollback`. | Unit test including nested transactions |
 | REQ-WORLD-016 | Client prediction mutates only the prediction overlay and local player state; the base world changes only when a server message is applied. | Integration test with injected corrections |
-| REQ-WORLD-017 | Scheduled ticks are keyed by `(due_tick, sequence)`, persisted with the chunk, and executed in key order. | Save/load test + ordering test |
+| REQ-WORLD-017 | Scheduled ticks are keyed by `(due_tick, packed block key, kind)` with no sequence number; they persist as a remaining delay with the chunk and execute in canonical key order, identical before and after save. | Save/load-at-every-tick test + ordering test |
 | REQ-WORLD-018 | Random ticks derive their RNG from `(world seed, dimension, section key, tick, index)` and never from iteration order. | Replay hash test with shuffled worker scheduling |
-| REQ-WORLD-019 | Chunks outside simulation distance execute no ticks; their due ticks and timers are retained with absolute times. | Simulation-distance test |
+| REQ-WORLD-019 | Chunks outside simulation distance execute no ticks; their due ticks and timers are retained as remaining delays and rebased on load. | Simulation-distance test |
 | REQ-WORLD-020 | Catch-up after a reload is bounded by a fixed window and rate, deterministic, and recorded in world metadata. | Catch-up test with a scripted clock |
 | REQ-WORLD-021 | Chunk status advances `Empty → Generating → Decorated → Lit → Ready`; `Ready` implies `Lit`; only unload/reload may repeat a status. | Lifecycle state-machine test |
 | REQ-WORLD-022 | Streaming uses distinct load and unload radii with at least one chunk of hysteresis and deterministic priority ordering. | Boundary-thrash test |
@@ -99,11 +99,11 @@ pub struct DimensionType {
 | Dimension | Height | Sections | Sky | Weather | Ambient | Scale |
 | --- | --- | ---: | --- | --- | ---: | ---: |
 | `openblock:overworld` | −64..320 | 24 | yes | yes | 0 | 1 |
-| `openblock:nether` | 0..256 | 16 | no | no | 2 | 8 |
-| `openblock:end` | 0..256 | 16 | no | no | 3 | 1 |
+| `openblock:underworld` (nether-like) | 0..256 | 16 | no | no | 2 | 8 |
+| `openblock:terminus` (end-like) | 0..256 | 16 | no | no | 3 | 1 |
 | content-defined | configurable | ≤ 64 | flag | flag | 0–15 | ≥ 0 |
 
-At registry freeze: `min_y < max_y`, both multiples of 16, `min_y ≥ −2048`, `max_y ≤ 2048`, `max_y − min_y ≤ 1024` ([DEC-004](../decisions.md), ceiling confirmed by [OPEN-005](../decisions.md)). `ambient_light` enters only the presentation light query, never gameplay light: a dark nether must not spawn hostile mobs in a lit room because of a rendering constant. `coordinate_scale` is consumed by portal linking ([08](08-gameplay-survival.md)).
+At registry freeze: `min_y < max_y`, both multiples of 16, `min_y ≥ −2048`, `max_y ≤ 2048`, `max_y − min_y ≤ 1024` ([DEC-004](../decisions.md), ceiling confirmed by [OPEN-005](../decisions.md)). `ambient_light` enters only the presentation light query, never gameplay light: a dark underworld must not spawn hostile mobs in a lit room because of a rendering constant. `coordinate_scale` is consumed by portal linking ([08](08-gameplay-survival.md)); the base-pack IDs are `openblock:underworld` (nether-like) and `openblock:terminus` (end-like) ([DEC-053](../decisions.md)).
 
 ### 3.3 Chunk columns and sections
 
@@ -150,7 +150,7 @@ pub struct PackedSection {
 
 **Why light is separate.** Light is 2 bytes per block in its own container ([DEC-005](../decisions.md), layout in [07](07-light-and-weather.md)). Separate storage means a block edit never rewrites unaffected light words, the light uniform path hits more often (open sky is one value), and a network delta can carry changed light for a section without resending blocks. The light container is not a palette over block states and must never be indexed by palette index.
 
-**Mesh clusters are not storage.** A 2×2×2 section cluster is a render-side grouping ([DEC-004](../decisions.md), [OPEN-001](../decisions.md)) with no save, protocol or content identity; the world never exposes it.
+**Mesh clusters are not storage.** A 2×2×2 section cluster is a render-side grouping, default from MS-04 ([DEC-004](../decisions.md), [DEC-048](../decisions.md)): the renderer culls and meshes 32³ clusters while storage, editing, lighting and network deltas stay 16³. The cluster has no save, protocol or content identity; the world never exposes it.
 
 ### 3.4 Block states
 
@@ -167,7 +167,7 @@ A block state is `BlockStateId(u32)`, a dense session-local index whose tables a
 
 Properties are sorted by name (ASCII byte order) and packed little-endian at increasing bit offsets; unused high bits are zero. Total property bits per block type MUST be ≤ 16; a schema needing more is a content error at freeze, not a runtime fallback. Derived properties MUST NOT be stored, so they can never desynchronise from the world.
 
-**State ID assignment.** The freeze walks block types in registry index order; for each it enumerates every *valid* property combination in canonical order (properties in packed-word order, values in declaration order), skipping combinations the schema rejects (for example `waterlogged=true` on a block that cannot hold water). IDs are assigned consecutively from 0. State IDs are therefore deterministic given the pack hash ([DEC-019](../decisions.md)), identical on client and server, and stable for the session — but meaningless outside it, which is why they are never serialised ([DEC-006](../decisions.md)).
+**State ID assignment.** The freeze walks block types in registry index order; for each it enumerates every *valid* property combination in canonical order (properties in packed-word order, values in declaration order), skipping combinations the schema rejects (for example `waterlogged=true` on a block that cannot hold water). IDs are assigned consecutively from 0. State IDs are therefore deterministic given the content hash ([DEC-019](../decisions.md)), identical on client and server, and stable for the session — but meaningless outside it, which is why they are never serialised ([DEC-006](../decisions.md)).
 
 **Waterlogging and fluids.** There is no second block layer and no "extras" side table; co-occupancy is a property. A fluid block's own state carries `level` (0–7, 8 = source) and `falling`, and the fluid kind comes from the block type. Any other block with `waterlogged=true` reports a full water source in addition to itself. Content that wants "snow on a slab" expresses a `snowy` boolean on the slab, not a stack of blocks. This keeps a block read to one array lookup and makes network deltas unambiguous.
 
@@ -234,17 +234,17 @@ flowchart LR
 
 | Kind | Scheduled by | Typical delay | Ordering | Persistence |
 | --- | --- | --- | --- | --- |
-| Block tick | Repeater, sapling, gravity block, observer | 1–1,600 ticks | `(due, seq)` | Saved per chunk |
-| Fluid tick | Flow, waterlogging updates | content-defined, 5–30 ticks | `(due, seq)`, separate queue | Saved per chunk |
+| Block tick | Repeater, sapling, gravity block, observer | 1–1,600 ticks | `(due, key, kind)` | Saved per chunk as a delay |
+| Fluid tick | Flow, waterlogging updates | content-defined, 5–30 ticks | `(due, key, kind)`, separate queue | Saved per chunk as a delay |
 | Random tick | Per-section random selection | immediate | derived RNG, stateless | Not saved |
 
-`TickQueue` is a `BTreeMap<(due: i64, seq: u64), ScheduledTick>`; scheduling and cancellation are O(log n) with a side index by `(pos, kind)`. Ticks execute at the start of the `Tick` stage in key order, interleaved with redstone updates but never with entity movement ([12](12-redstone-and-logic.md) owns the cross-system order). A tick scheduled with delay 0 during the tick phase runs in the *next* tick; that rule prevents infinite same-tick loops and is what the loop detector relies on.
+`TickQueue` is a `BTreeMap<(due: i64, key: u64, kind: u16), ScheduledTick>`; scheduling and cancellation are O(log n) with a side index by `(pos, kind)`. There is no sequence number: two ticks that fall due in the same tick are ordered by packed block position and then kind, so the order is determined entirely by world state and is identical before and after a save ([REQ-WORLD-017](#2-requirements), [17 §3.3](17-persistence.md#33-chunk-payload)). Ticks execute at the start of the `Tick` stage in key order, interleaved with redstone updates but never with entity movement ([12](12-redstone-and-logic.md) owns the cross-system order). A tick scheduled with delay 0 during the tick phase runs in the *next* tick; that rule prevents infinite same-tick loops and is what the loop detector relies on.
 
 **Random ticks.** For every section in simulation distance with `random_ticks` enabled, the engine picks `random_tick_speed` local indices per tick (base-pack default 3) and dispatches a random tick to each. The RNG is `splitmix64(world_seed ^ dim_seed ^ section_key ^ tick ^ i)`: stateless, so no PRNG state is stored and a replayed tick makes identical choices. Only blocks opting into random ticking are affected, so an empty section costs one branch.
 
-**Region awareness.** Ticks are owned by their chunk; chunks are grouped into 32×32-chunk regions (the same grouping as region files, [17](17-persistence.md)). With parallel region ticking — an unresolved register item, see §8 — each region executes its ticks in key order on one worker, and a neighbour or shape update that would cross a region boundary is deferred to the next tick and ordered by destination region key. Cross-region redstone is therefore not simultaneous, and [12](12-redstone-and-logic.md) must state that contract rather than imply vanilla ordering.
+**Region awareness.** Ticks are owned by their chunk; chunks are grouped into 32×32-chunk regions (the same grouping as region files, [17](17-persistence.md)), and the partition exists in every configuration, including a single worker. Within a region, ticks execute in key order; a neighbour or shape update that would cross a region boundary is always deferred to the next tick and ordered by destination region key, whether regions run on one worker or eight. The deferral is therefore part of the model rather than a race: region ticking on and off produce identical state hashes, and a circuit crossing a boundary has a fixed, repeatable +1-tick latency ([12 §3.8.3](12-redstone-and-logic.md#38-scheduled-ticks-saveload-and-region-boundaries), [REQ-RED-023](12-redstone-and-logic.md#2-requirements)).
 
-**Unloaded chunks and catch-up.** A chunk outside simulation distance executes nothing; its queue is persisted with due times (the remaining delay against the saved world tick, [17](17-persistence.md)) and its `last_simulated` tick is stored. On promotion back to `Ready`:
+**Unloaded chunks and catch-up.** A chunk outside simulation distance executes nothing; its queue is persisted as remaining delays against the payload's `saved_tick` and rebased on load ([17 §3.3–§3.4](17-persistence.md#34-sidecar-files)), and its `last_simulated` tick is stored as that same `saved_tick`. On promotion back to `Ready`:
 
 ```text
 missed = clamp(now_tick - last_simulated, 0, CATCHUP_WINDOW)   // 1_200 ticks (60 s)
@@ -281,19 +281,19 @@ stateDiagram-v2
 
 Worldgen subdivides `Generating` into `Biomes → Shaped → Surfaced → Carved → Structured` ([06 §3.3](06-worldgen.md)); those are internal pipeline stages, and streaming, queries and networking observe only the coarse status. A stored chunk with valid light may skip from `Decorated` to `Ready` on load, but the status still passes through `Lit` so the state machine has no unaudited shortcut.
 
-**Streaming policy.** The client keeps `load_radius_chunks = ceil(render_distance_blocks / 16) + 1` and unloads at `load_radius_chunks + 1`; the extra rings are the hysteresis that stops a player pacing on a chunk boundary from thrashing generate→save→evict. The server uses its own radius derived from simulation distance and keeps a column resident while any player's ticket covers it. Priorities are a total order, so the queue is deterministic: (1) chunks the player stands in or edits, (2) ascending radius rings, (3) the client's view cone before stable key order, (4) spawn and forced chunks, (5) everything else. A budget limits completions per frame or tick; cancellation is safe because results are integrated atomically.
+**Streaming policy.** The client keeps `load_radius_chunks = ceil(render_distance_blocks / 16) + 1` and unloads at `load_radius_chunks + 1`; the extra rings are the hysteresis that stops a player pacing on a chunk boundary from thrashing generate→save→evict. The server keeps a column resident while any player's ticket covers it, and a player ticket covers that player's render distance (§3.8), not the simulation distance. Priorities are a total order, so the queue is deterministic: (1) chunks the player stands in or edits, (2) ascending radius rings, (3) the client's view cone before stable key order, (4) spawn and forced chunks, (5) everything else. A budget limits completions per frame or tick; cancellation is safe because results are integrated atomically.
 
 **Simulation distance versus render distance.** They answer different questions and are configured separately.
 
 | | Render distance | Simulation distance |
 | --- | --- | --- |
 | Question | "What do I draw?" | "What does the game simulate?" |
-| Default | 512 blocks (32 chunks) ([OPEN-003](../decisions.md)) | 256 blocks (16 chunks) |
-| Consumer | Client mesh and streaming | Server ticks, entities, random and block ticks |
-| Cost when raised | Memory, meshes, draw work | Tick time, entity AI, bandwidth |
+| Default | Client 512 blocks (32 chunks) ([OPEN-003](../decisions.md)); dedicated server 256 blocks (16 chunks), equal to simulation distance ([DEC-052](../decisions.md)) | 256 blocks (16 chunks) |
+| Consumer | Client mesh and streaming; server replication and interest management | Server ticks, entities, random and block ticks |
+| Cost when raised | Memory, meshes, draw work, per-player bandwidth | Tick time, entity AI, bandwidth |
 | Constraint | ≥ simulation distance | ≤ render distance (REQ-WORLD-023) |
 
-A 512-block client may render chunks the server only simulates out to 256, which is how a 50-player server stays affordable ([DEC-025](../decisions.md), [MS-15](../plan/01-milestones.md)). Chunks between the radii are `Lit` and networked but not `Ready`; they are frozen as in §3.9.
+**Replication follows the render distance.** The replicated interest set is the union of the chunks inside each player's *render* distance: a client cannot render what it has not received, so a simulation-distance-only interest set would put a fog wall at 256 blocks. The dedicated-server default is a 256-block render distance equal to the simulation distance; 512 blocks is an opt-in server setting whose cost is published in the server documentation ([19](19-server-administration.md)) and the capacity matrix ([25 §3.6](25-performance-budgets.md#36-server-capacity-model)). A client may be configured to 512 blocks, but on a 256-block server it simply sees the server's 256-block world. Chunks between simulation and render distance are generated and streamed but not `Ready` and not ticked; they are frozen as in §3.9, and they still cost generation, lighting, memory and per-player bandwidth, which is the published cost of raising the server render distance alone. Capacity claims MUST state the player distribution, because co-located players share the chunk cache (the 50-player row of [25 §3.6](25-performance-budgets.md#36-server-capacity-model)) while distributed players each need their own columns and take a separate, lower row.
 
 ### 3.9 Unloaded-chunk semantics
 
@@ -338,7 +338,7 @@ The world is single-writer, many-reader. Each resident column lives in a `ChunkC
 
 1. All chunk, section and tick iteration is by sorted key; `HashMap` iteration over world data is forbidden.
 2. Edit events are numbered by a monotonic sequence and applied in that order.
-3. Scheduled ticks execute in `(due, seq)` order; `seq` is assigned at schedule time.
+3. Scheduled ticks execute in `(due_tick, packed block key, kind)` order; no sequence number is assigned at schedule time or persisted.
 4. Random ticks are stateless, keyed by `(seed, dimension, section, tick, index)`.
 5. Palette promotion and demotion never change a state ID; hashes cover canonical states, light words, block-entity bytes and tick keys, never storage bytes.
 6. Light is a fixed point of a monotone operator, so the tick-visible field does not depend on worker scheduling ([07](07-light-and-weather.md)).
@@ -373,19 +373,19 @@ The light word is identical in memory, save and network: `[sky:4][R:4][G:4][B:4]
 | Uniform | 0 | 0 | inline 2 B | **16 B** (inline `Section`) |
 | Packed 4-bit, 16-state palette | 48 B | 2,048 + 64 B | 8,208 B | **10,368 B** |
 | Packed 8-bit, 256-state palette | 48 B | 4,096 + 1,024 B | 8,208 B | **13,376 B** |
-| Packed 16-bit | 48 B | 8,192 + ≤ 256 KiB palette | 8,208 B | **8,256 B + palette** |
+| Packed 16-bit | 48 B | 8,192 + ≤ 256 KiB palette | 8,208 B | **16,448 B + palette** |
 
-Column metadata is separate: status 1 B, tickets 32 B, dirty bitset 8 B (2 bits × 24 sections), four height arrays 2,048 B, biome cells 3,072 B, chunk header ≈ 200 B, empty tick queue 24 B. The world memory model assumes the distribution MS-01 must measure: a 384-block overworld column has 24 sections, 18 uniform (air above, solid rock below), 5 at 4 bits and 1 at 8 bits.
+Column metadata is separate: status 1 B, tickets 32 B, dirty bitset 8 B (2 bits × 24 sections), four height arrays 2,048 B, biome cells 3,072 B, chunk header ≈ 200 B, empty tick queue 24 B. The world memory model assumes the distribution MS-01 must measure: a 384-block overworld column has 24 sections, 18 uniform (air above, solid rock below), 5 at 4 bits and 1 at 8 bits — 6 of 24 sections, 25%, non-uniform. **Light costs 2 B/block, so a non-uniform section holds 8,192 B (8 KiB) of light plus a 16 B header**, not the 2 KiB that a 4-bit *block* payload occupies; a shorthand that counts only block data understates the light term by roughly a factor of four for a 4-bit section. The light row is therefore `6 × 8,208 B + 18 × 2 B = 49,284 B` per column, and every total depends on the 25% assumption: a 50% non-uniform world roughly doubles the light term, while an all-uniform world needs only ≈0.2 MB of light at 512 blocks.
 
 | Component | Bytes/column | 256 blocks (1,089 col) | 512 blocks (4,225 col) | 1024 blocks (16,641 col) |
 | --- | ---: | ---: | ---: | ---: |
 | Block containers | 16,112 | 17.5 MB | 68.1 MB | 268.1 MB |
-| Light containers | 49,392 | 53.8 MB | 208.7 MB | 821.9 MB |
+| Light containers | 49,284 | 53.7 MB | 208.2 MB | 820.1 MB |
 | Column metadata | 5,385 | 5.9 MB | 22.8 MB | 89.6 MB |
-| **Total** | **70,889** | **77.2 MB** | **299.5 MB** | **1,179.7 MB** |
+| **Total** | **70,781** | **77.1 MB** | **299.0 MB** | **1,177.9 MB** |
 | Bytes per block | 0.72 | | | |
 
-MB = 10⁶ bytes. Meshes, GPU buffers, entities and block-entity payloads are excluded; block entities are ≤ 256 B typical and capped per column. The 512-block total leaves ~50 MB of headroom under the 350 MB MS-01 exit criterion for worlds with more non-uniform sections. Doubling render distance quadruples the total, which is why [DEC-018](../decisions.md) makes LOD visual-only rather than a way to hide a memory problem.
+MB = 10⁶ bytes. Meshes, GPU buffers, entities and block-entity payloads are excluded; block entities are ≤ 256 B typical and capped per column. The 512-block total leaves ~51 MB of headroom under the 350 MB MS-01 exit criterion for worlds with more non-uniform sections. Doubling render distance quadruples the total, which is why [DEC-018](../decisions.md) makes LOD visual-only rather than a way to hide a memory problem.
 
 ## 5. Performance budgets
 
@@ -397,7 +397,7 @@ MB = 10⁶ bytes. Meshes, GPU buffers, entities and block-entity payloads are ex
 | PERF-WORLD-004 | 512-block raycast ≤ 20 µs p99 with one non-full-cube shape test per 8 blocks | Obstacle-scene benchmark |
 | PERF-WORLD-005 | AABB query ≤ 2 µs p99 for a player box, ≤ 80 µs p99 for a 16³ box | Criterion bench |
 | PERF-WORLD-006 | 64-block batch edit end-to-end, excluding light cascade, ≤ 200 µs p95 | Mixed-terrain benchmark |
-| PERF-WORLD-007 | World data ≤ 90 MB at 256 blocks, ≤ 350 MB at 512, ≤ 1.4 GB at 1024 | Allocation-counter integration bench |
+| PERF-WORLD-007 | World data ≤ 90 MB at 256 blocks, ≤ 350 MB at 512, ≤ 1.4 GB at 1024, at the 25 % non-uniform section assumption of §4.2 | Allocation-counter integration bench |
 | PERF-WORLD-008 | Uniform section ≤ 16 B; packed section header ≤ 64 B | `size_of` assertions in CI |
 | PERF-WORLD-009 | 10,000 block-entity ticks ≤ 3 ms p99; overflow deferred, never unbounded | Tick benchmark |
 | PERF-WORLD-010 | Snapshot of 4,225 resident columns ≤ 150 µs p95 | Criterion bench |
@@ -428,6 +428,7 @@ MB = 10⁶ bytes. Meshes, GPU buffers, entities and block-entity payloads are ex
 | Lifecycle | Status transitions, rejection of illegal transitions, cancellation at every status | Model-based test |
 | Concurrency | N readers + 1 writer under a snapshot; no torn reads, no deadlock; loom on epoch publication | `loom` + a stress binary |
 | Determinism | The same edit/tick log under 1, 2 and 8 workers yields identical hashes at every tick | Replay harness ([02](02-engine-core.md)) |
+| Ticks | Two ticks that fall due on the same tick (`(due, key, kind)` tie) save and load in the same order at every tick of a scripted sequence, with no sequence number in the payload | save/load-at-every-tick fixture |
 | Fuzz | Section parser, chunk parser, batch API, block-entity codec: no panic, no out-of-bounds, no unbounded allocation | `cargo-fuzz`, 24 h nightly corpus |
 | Memory + integration | `size_of::<Section>() ≤ 16`, header accounting and the 512-block allocation counter; save → quit → relaunch restores every block, light word, tick key and block entity; unload/reload returns the light hash | CI assertion, [MS-03](../plan/01-milestones.md) exit criteria, [MS-13](../plan/01-milestones.md) |
 
@@ -435,15 +436,15 @@ A test-only `SlowWorld` (`BTreeMap<BlockPos, BlockStateId>` plus recompute-from-
 
 ## 8. Open questions
 
-1. **Simulation-distance default and its coupling to render distance.** This chapter assumes 256 blocks, but the choice interacts with server capacity ([MS-15](../plan/01-milestones.md)) and prediction. Register item needed: simulation-distance default (256 blocks, capped at render distance, and a per-world setting; clients predict only within simulation distance) (owner **MS-04** with MS-07).
-2. **Block-state encoding freeze.** The 16-property-bit budget and canonical ordering become save-format-adjacent once content ships. Register item needed: block-state encoding freeze (a dense registry-frozen ID over a canonical ≤ 16-bit property word, persisted as resource ID plus property map) (owner **MS-13**, before the world format freezes).
-3. **Parallel region ticking and cross-region ordering.** §3.7 defers cross-region updates by one tick, a gameplay-visible semantic that needs a decision, not an optimisation note. Register item needed: parallel region ticking and cross-region ordering (parallel region ticking ships at 1.0; cross-region block and redstone updates are deferred to the next tick and ordered by destination region key) (owner **MS-15** with MS-11 and [12](12-redstone-and-logic.md)).
+1. **Simulation-distance default and its coupling to render distance — settled by [DEC-052](../decisions.md).** The dedicated-server default is a 256-block render distance equal to the simulation distance, with 512 blocks opt-in and its cost published; simulation distance stays capped at render distance (REQ-WORLD-023), and clients predict only within simulation distance. What remains is the per-world override policy for integrated worlds, which does not need a new decision (owner **MS-04** with MS-07).
+2. **Block-state encoding freeze.** The 16-property-bit budget and canonical ordering become save-format-adjacent once content ships. Register item needed: block-state encoding freeze (a dense registry-frozen ID over a canonical ≤ 16-bit property word, persisted as block resource ID plus the canonical property word) (owner **MS-13**, before the world format freezes).
+3. **Parallel region ticking and cross-region ordering.** §3.7 now fixes the semantic instead of leaving it conditional: region partitions exist even with one worker, and cross-region block and redstone updates are always deferred by one tick and ordered by destination region key, so region ticking on and off hash identically. **Register item needed: parallel region ticking at 1.0**, with the unconditional deferral quoted in the entry so the two chapters cannot drift apart again (owner **MS-15** with MS-11 and [12](12-redstone-and-logic.md)).
 4. **Timed block entities while unloaded.** Wall-clock progress rewards infrastructure players; paused matches the parity expectation and simplifies the save. Register item needed: timed block entities while unloaded (paused unless their content type opts into wall-clock progress, recorded in the payload) (owner **MS-10**).
 5. **Chunk ticket taxonomy.** The four ticket kinds in §3.9 are a proposal; spawn-chunk retention and command-forceload semantics need a documented cap and lifecycle policy. Owner: **MS-07**.
 
 ## 9. References
 
-- Decisions: [DEC-004](../decisions.md) (section size), [DEC-005](../decisions.md) (palette and light storage), [DEC-006](../decisions.md) (numeric IDs), [DEC-007](../decisions.md) (fixed tick), [DEC-008](../decisions.md) (authority), [DEC-015](../decisions.md) (CPU flood-fill light), [DEC-019](../decisions.md) (content registries), [DEC-025](../decisions.md) (interest management), [DEC-033](../decisions.md) (save format).
+- Decisions: [DEC-004](../decisions.md) (section size), [DEC-005](../decisions.md) (palette and light storage), [DEC-006](../decisions.md) (numeric IDs), [DEC-007](../decisions.md) (fixed tick), [DEC-008](../decisions.md) (authority), [DEC-015](../decisions.md) (CPU flood-fill light), [DEC-019](../decisions.md) (content registries), [DEC-025](../decisions.md) (interest management), [DEC-033](../decisions.md) (save format), [DEC-048](../decisions.md) (32³ mesh clusters), [DEC-052](../decisions.md) (server render distance), [DEC-053](../decisions.md) (base-pack dimension names).
 - [Specification conventions](00-conventions.md); [world generation](06-worldgen.md); [light and weather](07-light-and-weather.md); [persistence](17-persistence.md); [networking](18-networking-multiplayer.md); [physics](10-physics-and-collision.md); [redstone](12-redstone-and-logic.md).
 - [Weft teardown](../research/01-weft-teardown.md) §4 — paletted sections, uniform fast path, light as the dominant memory term, region-parallel ticking and timer catch-up.
 - [Voxel rendering SOTA](../research/03-voxel-rendering-sota.md) §2 — 4/8/16-bit packing, promotion thresholds, 30-chunk memory budgets.

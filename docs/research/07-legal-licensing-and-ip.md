@@ -19,6 +19,26 @@ The rest of this document records the evidence behind these decisions and the ex
 
 Confidence: high on the license texts, crate metadata and pages observed here; medium on how MPL/CC obligations apply to a specific artifact and on reported takedown outcomes; low on trademark clearance, patent risk and whether a particular visual is confusingly similar. No full transitive dependency audit or trademark search was run.
 
+### Repository status (2026-11-24)
+
+This is a snapshot of the repository, not a change to the analysis above.
+
+- **Done:** the DCO 1.1 text is present at [`DCO`](../../DCO) and is referenced by
+  [`CONTRIBUTING.md`](../../CONTRIBUTING.md) and the pull-request template;
+  every commit must carry a `Signed-off-by` trailer. [`REUSE.toml`](../../REUSE.toml)
+  covers code, documentation, the DCO and the perf manifests, with
+  `LicenseRef-DCO-1.1` for the standard text.
+- **Not done:** there is no asset pack, asset register, `THIRD-PARTY-NOTICES.md`
+  or `docs/legal/` evidence pack yet, and `reuse lint` plus the DCO workflow are
+  not yet wired into CI in this tree. No CDLA exception is enabled in
+  [`deny.toml`](../../deny.toml); the package-scoped exception stays commented
+  out until a dependency actually needs it.
+- **Open:** the "OpenBlock" name clearance search is still a launch gate
+  (§7.3 and §11); the working name may change.
+
+Where a table below still lists a now-present file as missing, this note is the
+later status. This note is not legal advice; the caveats at the top still apply.
+
 ## 2. What Minecraft IP actually protects
 
 ### 2.1 Protected subject matter
@@ -440,7 +460,7 @@ For app stores, add the exact uppercase line where the guidelines require it:
 2. **Code license:** confirm `MIT OR Apache-2.0`, or choose MPL-2.0 for the engine? This changes contributor expectations, notices and the modding story. Owner: Lead / ADR-0008.
 3. **Asset license:** CC BY 4.0 for the core, or CC BY-SA 4.0 for a stronger commons? Who funds commissioned art and under what contract? Owner: Art / MS-15.
 4. **Relicensing:** DCO forever, or a CLA to preserve the option of a future license change or commercial license? Owner: Lead.
-5. **Minecraft compatibility:** confirm no protocol, world or resource-pack import in v1. If any is wanted, scope a legal review first. Owner: MS-17/MS-18.
+5. **Minecraft compatibility:** confirm no protocol, world or resource-pack import in v1. If any is wanted, scope a legal review first. Owner: MS-23 (compatibility gateway, post-1.0).
 6. **Trademark/entity:** who owns the mark, who signs filings, and do we form an entity before revenue? Owner: Lead.
 7. **AI assets:** allowed with disclosure, or banned for art/audio? If allowed, what review proves no Minecraft lookalikes? Owner: Art / Legal.
 8. **Hosted content:** will we run an official mod portal or server? If yes, who is the DMCA agent and privacy owner? Owner: MS-19/MS-20.

@@ -1,7 +1,7 @@
 # 04 — Shaders and Visuals: Lighting, Shadows, Sky, Post and Shader Packs
 
 > Status: normative - Last updated: 2026-11-24
-> Depends on: DEC-005, DEC-011, DEC-014, DEC-015, DEC-016, DEC-017, DEC-022, DEC-029, DEC-032, DEC-045; [conventions](00-conventions.md), [rendering](03-rendering.md), [light and weather](07-light-and-weather.md), [performance budgets](25-performance-budgets.md)
+> Depends on: DEC-005, DEC-011, DEC-014, DEC-015, DEC-016, DEC-017, DEC-022, DEC-029, DEC-032, DEC-045, DEC-048, DEC-051; [conventions](00-conventions.md), [rendering](03-rendering.md), [light and weather](07-light-and-weather.md), [performance budgets](25-performance-budgets.md)
 > Implements: MS-04, MS-12
 
 ## 1. Purpose and scope
@@ -38,8 +38,8 @@ are stated at 1080p on the reference machine of [vision §9](../vision.md#9-plat
 | REQ-VIS-005 | At most 256 dynamic lights are active, clustered forward+, with gameplay-independent selection and a documented fallback when the cap is hit. | Cluster-cap test plus debug view |
 | REQ-VIS-006 | One sun and one moon directional light, driven by world time; a dimension may disable either through content. | Config test |
 | REQ-VIS-007 | Sky and atmosphere use precomputed LUTs; no per-pixel atmosphere raymarch is permitted in the default path. | Shader inspection plus perf gate |
-| REQ-VIS-008 | Fog is height- and distance-based, colour-matched to the sky in the view direction, and reaches ≥ 0.9 opacity at the render distance so no hard boundary is visible. | Golden image at 512 blocks |
-| REQ-VIS-009 | Shadows are engine-owned cascaded shadow maps: 1 cascade at a 48-block shadow distance, 2 at 64, 3 beyond, 2048² (1024² on `low`, 4096² on `ultra`), 16-bit depth, 3×3 PCF, texel-stabilised. | Shadow unit tests plus image test |
+| REQ-VIS-008 | Fog is height- and distance-based, colour-matched to the sky in the view direction, and reaches ≥ 0.9 opacity at the render distance so no hard boundary is visible. | Golden image at a 512-block radius |
+| REQ-VIS-009 | Shadows are engine-owned cascaded shadow maps: 1 cascade at a 48-block shadow distance, 2 at 64, 3 beyond, 2048² (1024² on `low` and the `performance` mode, 4096² on `ultra`), 16-bit depth, 3×3 PCF, texel-stabilised. | Shadow unit tests plus image test |
 | REQ-VIS-010 | The shadow distance is a setting (off, 48, 64, 96, 128 blocks; the `low` preset uses 48); the default is 96 blocks. | Settings schema test |
 | REQ-VIS-011 | Shader packs receive a stable shadow contract (matrices, atlas, cascade selection, comparison sampler) and never a world-occupancy query. | API inspection plus negative test |
 | REQ-VIS-012 | Water renders with animated normals, Fresnel, SSR with a sky fallback, refraction, intersection foam and an underwater volume with caustics. | Golden images above and below water |
@@ -467,31 +467,37 @@ prefix; pack symbols are namespaced by pack id, and a collision is a validation 
 Estimates at 1080p on the reference GPU; replaced by measured values at MS-12
 (REQ-VIS-026).
 
-| Feature | low | medium | high (default) | ultra |
-| --- | ---: | ---: | ---: | ---: |
-| shadow map (3×2048², PCF) | 0.35 (1×1024²) | 0.60 (2×2048²) | 0.90 | 1.40 (3×4096²) |
-| depth prepass | 0.20 | 0.28 | 0.35 | 0.40 |
-| opaque + cutout | 0.55 | 0.75 | 1.20 | 1.45 |
-| sky + clouds | 0.20 | 0.30 | 0.45 | 0.80 (volumetric) |
-| translucent + water + SSR | 0.15 | 0.35 | 0.70 | 0.95 |
-| volumetric fog | 0 | 0 | 0.35 | 0.45 |
-| GTAO | 0 | 0 | 0.35 | 0.55 |
-| TAA + upscale | 0.15 (FXAA) | 0.30 | 0.35 | 0.35 |
-| bloom + tonemap + grade | 0.10 | 0.20 | 0.25 | 0.30 |
-| particles | 0.05 | 0.10 | 0.25 | 0.45 |
-| UI | 0.15 | 0.18 | 0.20 | 0.20 |
-| **Total** | **1.90** | **3.06** | **5.35** | **7.30** |
+| Feature | low | medium | high (default) | performance | ultra |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| shadow map (3×2048², PCF) | 0.35 (1×1024²) | 0.60 (2×2048²) | 0.90 | 0.35 (1×1024²) | 1.40 (3×4096²) |
+| depth prepass | 0.20 | 0.28 | 0.35 | 0.30 | 0.40 |
+| opaque + cutout | 0.55 | 0.75 | 1.20 | 1.00 | 1.45 |
+| sky + clouds | 0.20 | 0.30 | 0.45 | 0.25 | 0.80 (volumetric) |
+| translucent + water + SSR | 0.15 | 0.35 | 0.70 | 0.45 (no SSR) | 0.95 |
+| volumetric fog | 0 | 0 | 0.35 | 0 | 0.45 |
+| GTAO | 0 | 0 | 0.35 | 0 | 0.55 |
+| TAA + upscale | 0.15 (FXAA) | 0.30 | 0.35 | 0.28 | 0.35 |
+| bloom + tonemap + grade | 0.10 | 0.20 | 0.25 | 0.18 | 0.30 |
+| particles | 0.05 | 0.10 | 0.25 | 0.12 | 0.45 |
+| UI | 0.15 | 0.18 | 0.20 | 0.15 | 0.20 |
+| **Total** | **1.90** | **3.06** | **5.35** | **3.08** | **7.30** |
 
 These are the shading and post stages only; adding the 0.30 ms of upload, Hi-Z build and cull
-([chapter 03 §3.9](03-rendering.md#39-pass-inventory)) gives the preset totals in
-[chapter 03 §3.11](03-rendering.md#311-quality-presets), and the two tables are updated together
-(REQ-RENDER-025). Every row must be measurable by
-toggling exactly that feature in the `flythrough` scene and recording the delta.
+(0.25 ms in `performance`) ([chapter 03 §3.9](03-rendering.md#39-pass-inventory)) gives the preset
+totals in [chapter 03 §3.11](03-rendering.md#311-quality-presets), and the two tables are updated
+together (REQ-RENDER-025). The `performance` column is the 144 FPS mode of
+[chapter 03 §3.11](03-rendering.md#311-quality-presets): its 3.08 ms plus 0.25 ms of upload,
+Hi-Z build and cull is the 3.33 ms pass sum inside the 4.00 ms envelope. Every row must be
+measurable by toggling exactly that feature in the `flythrough` scene and recording the delta.
 
 ### 3.11 Visual parity and deliberate divergence
 
 Parity items are verified by the parity corpus ([MS-14](../plan/01-milestones.md)); the
-divergences are product decisions, not omissions.
+divergences are product decisions, not omissions. 1.0 is Early Access: Tier-1 parity plus
+Tier-2 infrastructure, with full Tier-2 parity at 2.0. The full parity gate at 2.0 is two
+numbers: 100% of in-scope checks passing and ≥85% vanilla behavioural coverage from a
+hand-authored checklist, never a copied registry dump; 1.0 gates the Tier-0/1 checklist and
+reports Tier-2 coverage (DEC-051).
 
 | Baseline behaviour | OpenBlock | Class |
 | --- | --- | --- |
@@ -585,8 +591,8 @@ p95 at 1080p, `high` unless stated, matching the pass budgets in
 | PERF-VIS-006 | GTAO, half-res + denoise | ≤ 0.35 ms |
 | PERF-VIS-007 | TAA + upscale | ≤ 0.35 ms |
 | PERF-VIS-008 | Bloom + tonemap + grade | ≤ 0.25 ms |
-| PERF-VIS-009 | Particles | ≤ 0.25 ms at 16,384 live |
-| PERF-VIS-010 | Shading + post GPU, `high` preset | ≤ 5.35 ms (5.65 ms with upload, Hi-Z build and cull; 6.0 ms envelope) |
+| PERF-VIS-009 | Particles | ≤ 0.25 ms at 16,384 live (`high`); ≤ 0.12 ms at the 8,192 `performance` cap |
+| PERF-VIS-010 | Shading + post GPU, `high` preset | ≤ 5.35 ms (5.65 ms with upload, Hi-Z build and cull; 6.0 ms envelope); `performance` preset 3.08 ms (3.33 ms; 4.0 ms envelope) |
 | PERF-VIS-011 | Shader compile, per variant | p95 ≤ 250 ms |
 | PERF-VIS-012 | Base-pack warm-up on 8 threads | ≤ 2.0 s |
 | PERF-VIS-013 | Shader compiles after the first frame | 0 |
@@ -616,7 +622,7 @@ p95 at 1080p, `high` unless stated, matching the pass budgets in
 
 | Risk | Description | Mitigation | Owner |
 | --- | --- | --- | --- |
-| RISK-301 | The coloured-light decode and CSM cost exceed the 0.9 ms shadow and 1.2 ms shading budgets at 512 blocks | Per-pass timestamps, the preset table as the tuning surface, and shadow cascades reduced before resolution | MS-04 |
+| RISK-301 | The coloured-light decode and CSM cost exceed the 0.9 ms shadow and 1.2 ms shading budgets at a 512-block radius | Per-pass timestamps, the preset table as the tuning surface, and shadow cascades reduced before resolution | MS-04 |
 | RISK-302 | Shader-pack hook surface grows until it becomes a shadow engine API with world access | Frozen hook list at API 1.0, negative tests for every forbidden access, register review of each addition | MS-12 |
 | RISK-303 | Pipeline permutation count explodes with content and mods, blowing the compile and cache budget | Enumerated keys, 64-variant cap per family, background compile, measured variant count in CI | MS-04 |
 | RISK-304 | TAA and sharpening blur the pixel-art look players expect | The crisp FXAA mode, a sharpening control, and a side-by-side review before the default is frozen (open question 5 in §8) | MS-12 |
@@ -624,9 +630,9 @@ p95 at 1080p, `high` unless stated, matching the pass budgets in
 
 ## 7. Testing strategy
 
-**Golden images.** Five scenes × five presets, each in day, night, underwater and rain
-where applicable: ~40 images compared with SSIM ≥ 0.99 and mean absolute error ≤ 2/255.
-The per-preset images double as the visual contract for the preset table.
+**Golden images.** Five scenes × every preset in [chapter 03 §3.11](03-rendering.md#311-quality-presets),
+each in day, night, underwater and rain where applicable, compared with SSIM ≥ 0.99 and mean
+absolute error ≤ 2/255. The per-preset images double as the visual contract for the preset table.
 
 **Per-effect cost.** Every row of §3.10 is toggled independently in the `flythrough` and
 `water` scenes; the delta is recorded in `benchmarks/visuals.md` and a regression above 10%
@@ -661,7 +667,7 @@ review of block and ore legibility at 720p with the lowest texture tier.
    lights are presentation-only with a 256-light cap and absolute priority for held and
    player-attached lights (owner MS-12). Closed with visual review.
 4. **Coloured versus monochrome block light (OPEN-004).** The shader supports both under
-   `light mode`, but the default preset depends on the memory decision (~100 MB at 512 blocks).
+   `light mode`, but the default preset depends on the memory decision (~100 MB at a 512-block radius).
    Owner: MS-05 before 0.1; the shader decode table is final either way.
 5. **Default antialiasing and sharpening.** TAA at 0.9 history with 0.2 sharpening is a
    judgement; the "crisp" FXAA mode exists as the alternative. Resolution needs a side-by-side
@@ -676,7 +682,7 @@ review of block and ore legibility at 720p with the lowest texture tier.
 Decisions: [DEC-005](../decisions.md), [DEC-011](../decisions.md), [DEC-014](../decisions.md),
 [DEC-015](../decisions.md), [DEC-016](../decisions.md), [DEC-017](../decisions.md),
 [DEC-022](../decisions.md), [DEC-029](../decisions.md), [DEC-032](../decisions.md),
-[DEC-045](../decisions.md).
+[DEC-045](../decisions.md), [DEC-048](../decisions.md), [DEC-051](../decisions.md).
 
 Research: [voxel rendering state of the art](../research/03-voxel-rendering-sota.md) (lighting
 costs, CSM, water and post technique comparison), [Weft teardown](../research/01-weft-teardown.md)

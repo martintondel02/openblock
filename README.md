@@ -27,8 +27,10 @@ promises:
   that runs on a GPU-less VPS, with self-signed identity, content-hash
   verification and progressive world streaming.
 
-Minecraft Java Edition's feature set is the **floor**, not the ceiling. Beyond
-it, OpenBlock is designed to express content and systems Minecraft cannot:
+Minecraft Java Edition's feature set is the reference, delivered in stages: the
+**1.0 Early Access** release targets Tier-1 parity plus the platform (modding,
+multiplayer, visuals), and **2.0** targets full Tier-2 parity. Beyond parity,
+OpenBlock is designed to express content and systems Minecraft cannot:
 programmable logic blocks, first-class energy/fluid networks, scriptable mob
 AI, procedural dungeons, server-side minigames and more.
 
@@ -73,31 +75,24 @@ Read the full reasoning in [`docs/vision.md`](docs/vision.md).
 
 ## What is planned
 
-Target feature set for **1.0** (Tier 2 parity, see
-[`docs/vision.md`](docs/vision.md#6-scope-what-all-the-features-of-minecraft-means-here)):
+**1.0 is an Early Access release** ([DEC-051](docs/decisions.md)): Tier-1 parity,
+the Tier-2 infrastructure, and the modding platform. Full Tier-2 parity is the
+**2.0** track. The split matters, so it is explicit here:
 
-- **World**: infinite deterministic terrain, biomes with climate blending,
-  caves, aquifers, ores, villages and structures, nether and end dimensions,
-  day/night, weather, flowing water and lava.
-- **Survival**: health, hunger and XP; tools, armor and durability; crafting,
-  smelting, brewing, enchanting, anvils and trading; mobs with pathfinding;
-  bosses and progression; redstone and automation; farming and breeding.
-- **Creative**: unlimited palette, fast block picker, structure/clipboard tools,
-  undo, spectator.
-- **Multiplayer**: authoritative dedicated server, LAN play, invite tickets,
-  content-hash verification, interest-managed replication, prediction and
-  reconciliation, anti-cheat validation, admin console and metrics.
-- **Modding**: content packs (blocks, items, recipes, loot, worldgen, biomes,
-  sounds, models, UI, translations), sandboxed WASM mods with capabilities,
-  hot reload, per-mod profiling, and a stable API with a compatibility promise
-  from 1.0.
-- **Beyond Minecraft**: a platform for programmable blocks, energy/fluid
-  networks, scriptable AI, procedural dungeons, per-biome shaders and ambience,
-  and server-side minigame scripting.
+| Area | 1.0 Early Access | 2.0 / post-1.0 |
+| --- | --- | --- |
+| **World** | Infinite deterministic terrain, climate-blended biomes, caves, aquifers, ores, villages and major structures, the underworld and terminus dimensions and portals, day/night, weather, flowing fluids | The remaining biomes, structures and dimensions content, full worldgen edge cases |
+| **Survival** | Health, hunger and XP; tools, armor and durability; crafting, smelting, brewing and enchanting basics, anvils and trading basics; common mobs with pathfinding; basic redstone; farming and breeding; boats and minecarts | Full Tier-2 mob set, full redstone, bosses and terminus progression, raids, potions, advancements/statistics, commands and game rules |
+| **Creative** | Unlimited palette, fast block picker, structure/clipboard tools, undo; spectator as a Tier-3 item delivered early | — |
+| **Multiplayer** | Authoritative dedicated server, LAN play, invite tickets, content-hash verification, interest-managed replication, prediction and reconciliation, anti-cheat validation, admin console and metrics; 50 **co-located** players at 20 TPS, with a separate distributed-player capacity row | Proxy/lobby, native-plugin servers, web client |
+| **Modding** | Content packs (blocks, items, recipes, loot, worldgen, biomes, sounds, models, UI, translations), server-side WASM mods with capabilities, hot reload, per-mod profiling; **1.0 clients run no mod code** ([DEC-049](docs/decisions.md)) | Client code tier (needs a new decision), native plugins |
+| **Visuals** | Render graph, CSM shadows, GTAO, TAA, water, volumetric atmosphere, shader-pack API, controller support | Far-terrain LOD at 1,024 blocks, ray-traced quality tier |
+| **Beyond Minecraft** | — | Programmable blocks, energy/fluid networks, scriptable AI, procedural dungeons, per-biome shaders and ambience, server-side minigame scripting |
 
 The specification is explicit about what is **not** planned: no Minecraft
-client/protocol compatibility at launch, no Minecraft assets, no paywall or
-marketplace, no blockchain. See the
+client/protocol compatibility at launch, no Minecraft assets or names in shipped
+content (base-pack dimensions are `openblock:underworld` and
+`openblock:terminus`), no paywall or marketplace, no blockchain. See the
 [non-goals](docs/vision.md#7-non-goals).
 
 ## Documentation
@@ -110,8 +105,8 @@ around.
 | [Vision](docs/vision.md) | The product, pillars, scope tiers, success metrics, non-goals |
 | [Decision register](docs/decisions.md) | Every binding technical decision (`DEC-xxx`) with rationale |
 | [Specification](docs/spec/00-conventions.md) | Terminology, then 25 chapters from architecture to performance budgets |
-| [Roadmap](docs/plan/00-roadmap.md) | Phases, releases and the effort model |
-| [Milestones](docs/plan/01-milestones.md) | `MS-00 … MS-16` with testable exit criteria |
+| [Roadmap](docs/plan/00-roadmap.md) | Phases, releases, the two-track effort model and the critical path |
+| [Milestones](docs/plan/01-milestones.md) | `MS-00 … MS-16` for 1.0, `MS-17` for the 2.0 track, and the post-1.0 releases |
 | [Research](docs/research/01-weft-teardown.md) | Prior-art teardowns and technology surveys used to make the decisions |
 
 Full document map: [`docs/README.md`](docs/README.md).
@@ -136,8 +131,9 @@ Crates:     ob_core   app loop, scheduler, config, diagnostics, platform
             ob_client / ob_server / ob_tools  binaries
 
 Key decisions: Rust + wgpu 30 (not Bevy), 16×16×16 paletted sections with
-packed 4-bit light, GPU-driven multi-draw-indirect submission, 20 Hz fixed tick,
-server-authoritative QUIC multiplayer, MIT OR Apache-2.0.
+packed 4-bit light, 32³ default render mesh clusters, GPU-driven
+multi-draw-indirect submission, 20 Hz fixed tick, server-authoritative QUIC
+multiplayer, MIT OR Apache-2.0.
 ```
 
 - [`spec/01-technical-architecture.md`](docs/spec/01-technical-architecture.md)
@@ -153,13 +149,17 @@ server-authoritative QUIC multiplayer, MIT OR Apache-2.0.
 | B | `0.1.0-alpha` | Play at 512 blocks of view with a real UI, inventory and content packs |
 | C | `0.2.0-alpha` | Play with friends on your own headless server |
 | D | `0.3.0-beta` | Survive: biomes, caves, structures, dimensions, crafting, hunger, combat |
-| E | `0.4`–`0.5` | Mobs, redstone, enchanting, bosses; WASM mods; shadows and audio |
-| F | `0.6`, `1.0-rc` | Tier-2 parity, 50-player servers, anti-cheat, accessibility |
-| G | `1.0` | Signed installers, updater, docs, mod API 1.0 freeze, launch |
+| E | `0.4`–`0.5` | Common mobs, basic redstone, enchanting and trading basics; WASM mods; shadows and audio |
+| F | `0.6`, `1.0-rc` | Tier-1 parity gate, parity-corpus infrastructure, 50 co-located players, anti-cheat, accessibility |
+| G | `1.0` | **Early Access** launch: signed installers, updater, docs, mod API 1.0 freeze |
+| H | `2.0` | Full Tier-2 parity on the funded post-1.0 track (`MS-17`, ~500–800 dev-weeks) |
 
-Nominal effort to 1.0 is ~160 engineering dev-weeks plus content and QA — about
-15–18 months for a three-person team, or 2.5–3 years solo. The plan and its
-assumptions are public: [`docs/plan/00-roadmap.md`](docs/plan/00-roadmap.md).
+Nominal effort to **1.0 Early Access** is ~200–240 engineering dev-weeks plus
+content and QA — about 20–23 months for a three-person team (24–28 with the
+risk allowance), or roughly 4.5–5.5 years solo full-time before the
+risk-register delay. The 2.0 Tier-2 track is a further ~500–800 dev-weeks and
+needs a funded 6–10 person team for 2–3 years. The plan and its assumptions are
+public: [`docs/plan/00-roadmap.md`](docs/plan/00-roadmap.md).
 
 ## Performance targets
 
@@ -168,14 +168,15 @@ NVMe, 1080p) and enforced by benchmarks in CI:
 
 | Metric | Target |
 | --- | --- |
-| 512-block render distance (32 chunks), default quality | ≥ 120 FPS average, 1% low ≥ 90 FPS |
+| 512-block render radius (32 chunks), default quality | ≥ 120 FPS average, 1% low ≥ 90 FPS |
 | 512 blocks, performance mode | ≥ 144 FPS verified |
-| 1024-block render distance | ≥ 60 FPS |
+| 1024-block render distance (post-1.0, `MS-20`) | ≥ 60 FPS |
 | CPU main-thread frame time | ≤ 2.0 ms |
 | Client memory at 512 blocks | ≤ 4 GiB |
 | Join time, pregenerated world | ≤ 5 s to playable |
 | Worldgen throughput (8 threads) | ≥ 250 columns/s |
-| Dedicated server | 50 players at 20 TPS on 4 vCPU / 8 GiB |
+| Dedicated server, 50 **co-located** players (shared column cache), 256-block render/simulation distance | 20 TPS on 4 vCPU / 8 GiB |
+| Dedicated server, **distributed** players (each needs their own columns) | Separate, lower published row (`MS-15`) |
 
 Budgets and their enforcement: [`spec/25-performance-budgets.md`](docs/spec/25-performance-budgets.md).
 
@@ -204,7 +205,18 @@ cost. We use a purpose-built engine on wgpu; see
 
 **When can I play?**
 The first playable tech preview (`0.0.1`) is the `MS-03` milestone. Until then
-the repository is the specification and plan.
+the repository is the specification and plan. `1.0` is an **Early Access**
+release with Tier-1 parity; full Tier-2 parity is the `2.0` track.
+
+**Is 1.0 "all of Minecraft"?**
+No, and the plan no longer claims it. 1.0 ships Tier-1 parity, the Tier-2
+infrastructure and the modding platform; full Tier-2 parity is 2.0
+([DEC-051](docs/decisions.md)). The parity gate is two numbers — 100% of
+in-scope checks passing, and at least 85% vanilla behavioural coverage on a
+hand-authored checklist — and both are published with every release. 1.0 must
+pass its Tier-1 in-scope checklist and meet the 85% behavioural coverage floor;
+full Tier-2 content (every remaining block, mob, structure and command) is the
+2.0 promise.
 
 **Is it free? Can I run a server commercially?**
 Yes. Code is MIT OR Apache-2.0; self-hosting and commercial hosting are allowed.

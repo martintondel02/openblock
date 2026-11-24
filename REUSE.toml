@@ -7,10 +7,18 @@ path = [
   "README.md", "CONTRIBUTING.md", "SECURITY.md", "CODE_OF_CONDUCT.md",
   "MAINTAINERS.md", "docs/**", "crates/**", "xtask/**", "justfile",
   "Cargo.toml", "rust-toolchain.toml", "rustfmt.toml", "deny.toml",
+  "architecture.toml", "REUSE.toml", "perf/**",
   ".github/**", ".editorconfig", ".markdownlint.jsonc", ".gitignore",
 ]
 SPDX-FileCopyrightText = "2026 OpenBlock contributors"
 SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+# The DCO is standard text: it may be copied verbatim but not modified.
+# REUSE 3.3 needs a custom license reference for that permission.
+[[annotations]]
+path = ["DCO", "LICENSES/LicenseRef-DCO-1.1.txt"]
+SPDX-FileCopyrightText = "2004, 2006 The Linux Foundation and its contributors"
+SPDX-License-Identifier = "LicenseRef-DCO-1.1"
 
 [[annotations]]
 path = ["LICENSE-MIT", "LICENSES/MIT.txt"]

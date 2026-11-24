@@ -1,7 +1,7 @@
 # 16 — Modding
 
 > Status: normative - Last updated: 2026-11-24
-> Depends on: [DEC-003](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-023](../decisions.md), [DEC-027](../decisions.md), [DEC-035](../decisions.md), [DEC-040](../decisions.md), [DEC-042](../decisions.md), [DEC-043](../decisions.md), [conventions](00-conventions.md), [architecture](01-technical-architecture.md), [content system](15-content-system.md)
+> Depends on: [DEC-003](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-023](../decisions.md), [DEC-027](../decisions.md), [DEC-035](../decisions.md), [DEC-040](../decisions.md), [DEC-042](../decisions.md), [DEC-043](../decisions.md), [DEC-049](../decisions.md), [conventions](00-conventions.md), [architecture](01-technical-architecture.md), [content system](15-content-system.md)
 > Implements: MS-09; native tier MS-21
 
 ## 1. Purpose and scope
@@ -16,7 +16,7 @@ Content that is *only* data is [15](15-content-system.md); this chapter adds cod
 nothing else. Three consequences shape every rule below:
 
 - **Server-side authority.** Mods run in the authoritative host, never on a client (DEC-008). A
-  client receives content and prediction descriptors, never code (DEC-020, OPEN-006).
+  client receives content and prediction descriptors, never code (DEC-020, DEC-049).
 - **No ambient authority.** A mod can do exactly what its granted capabilities and quotas allow:
   no filesystem, no sockets, no clock, no process APIs, no way to reach another mod (DEC-020).
 - **Budgeted, attributed, containable.** Every callback has a deadline, every host call has a
@@ -46,7 +46,7 @@ and the general threat model ([20](20-security-and-anti-cheat.md)).
 | REQ-MOD-013 | Mod actions MUST be recorded in the replay log; deterministic mode MUST additionally meter fuel and use a seeded per-mod RNG so re-execution reproduces the same action log (DEC-007). | Replay comparison tests |
 | REQ-MOD-014 | Per-mod storage MUST be a versioned key-value store, namespaced by mod ID, quota-bounded, surviving reloads, and MUST NOT contain world pointers or NetIds as durable references. | Storage tests, save round-trip |
 | REQ-MOD-015 | Commands registered by a mod MUST live under its namespace, declare a permission level, be rate-limited, and be validated exactly like built-in commands (REQ-GAME-029). | Command abuse corpus |
-| REQ-MOD-016 | UI data binding MUST be declarative and client-side, updated at most 10 times per second, and MUST NOT write gameplay state; UI actions are intents the host validates. | UI integration test |
+| REQ-MOD-016 | UI data binding MUST be declarative display data computed by the host and delivered through the host UI binding, updated at most 10 times per second; the client runs no mod code, the binding MUST NOT write gameplay state, and UI actions are intents the host validates. | UI integration test |
 | REQ-MOD-017 | Mod network messages MUST be namespaced and negotiated by schema hash; an unknown channel is a protocol error, payloads are rate-limited, and no message may carry code. | Protocol tests |
 | REQ-MOD-018 | A client MUST receive only content packs the server authorises, verified against the content root; it MUST NOT receive, install or execute mod code ([15](15-content-system.md) §3.10). | Two-client join tests |
 | REQ-MOD-019 | Prediction descriptors MUST be content-hash-covered data; a client predicts only from them, and undocumented behaviour stays server-authoritative with correction. | Prediction/correction tests |
@@ -56,7 +56,7 @@ and the general threat model ([20](20-security-and-anti-cheat.md)).
 | REQ-MOD-023 | An operator MUST be able to allowlist by `(id, version, hash, signer)`, grant or revoke capabilities, disable and quarantine a mod, and audit every decision. | Admin integration tests |
 | REQ-MOD-024 | The native tier MUST use a small versioned C ABI, an operator allowlist, a signature check, crash containment and no auto-download; it ships post-1.0 (DEC-020, OPEN-007). | Native harness |
 | REQ-MOD-025 | Mods MUST NOT add scheduler systems, change stage order or timing, open windows, or link GPU or audio code; `ob_modding` MUST NOT depend on `wgpu`, `winit` or `cpal` (REQ-ARCH-014, DEC-003). | `arch-guard`, inspection |
-| REQ-MOD-026 | Mod code MUST NOT run on a client in the 1.0 tier; any future client presentation tier is gated on OPEN-006 and reuses this ABI's capability model. | Binary inspection, review |
+| REQ-MOD-026 | Mod code MUST NOT run on a client in the 1.0 tier; [OPEN-006](../decisions.md) is closed by [DEC-049](../decisions.md), a client tier is post-1.0, and any such tier would need a new decision and this ABI's capability model. | Binary inspection, review |
 | REQ-MOD-027 | Every host function MUST have a threat-model entry, a capability, a quota, error codes, a fuzz corpus seed and two reviewing maintainers before it ships. | Review checklist |
 | REQ-MOD-028 | Deprecations MUST be announced for at least two minor releases or six months, the previous major MUST be hostable in parallel for twelve months, and the previous release's example mods MUST run in CI. | Compatibility suite |
 | REQ-MOD-029 | Guest logging MUST be structured, attributed, rate-limited and size-capped; guest-controlled bytes MUST never be interpolated into a log line unescaped. | Log-forging corpus |
@@ -70,7 +70,7 @@ and the general threat model ([20](20-security-and-anti-cheat.md)).
 
 | Tier | Artifact | Runs | Sandbox | Trust | Ships |
 | --- | --- | --- | --- | --- | --- |
-| **T0 content pack** | `.obpack` with `data/`, `assets/`, `ui/`, `lang/` | client and server | none needed: validated data | untrusted data | MS-05 |
+| **T0 content pack** | `.obpack` with `data/`, `assets/`, `ui/`, `lang/` | client and server, as validated data | none needed: validated data | untrusted data | MS-05 |
 | **T1 WASM mod** | `.obpack` with `scripts/mod.wasm` | server host only | wasmtime instance, capabilities, quotas | untrusted code | MS-09 |
 | **T2 native plugin** | `.so`/`.dll`/`.dylib` | supervised worker process by default | none; operator-allowlisted | trusted by operator | post-1.0, MS-21 |
 
@@ -78,6 +78,10 @@ The tiers are cumulative: a mod is a content pack plus an executable artifact, s
 manifest, hash, layer, dependency and reload machinery. A pack with `scripts/mod.wasm` but no `[mod]`
 table is a pack error; a `[mod]` table without the artifact is an error. A mod may contribute
 content only through [15](15-content-system.md)'s loader, at load time, under its own namespace.
+
+**No code on the client at 1.0.** T0 is data and is validated and rendered on a client; T1 and T2 run
+only in the host. The 1.0 client contains no wasm engine, no mod runtime and no per-screen code, so a
+mod reaches a client only as content: data, view assets and prediction descriptors ([DEC-049](../decisions.md)).
 
 ```mermaid
 sequenceDiagram
@@ -311,8 +315,18 @@ BlockDef(
 The client predicts movement on a belt, a moving platform or a custom collision shape from these
 fields and reconciles against the host like any other predicted motion. Anything without a
 descriptor is server-authoritative and may correct; that is the explicit price of not shipping mod
-code to clients (DEC-008, DEC-020). UI values sent with `ui_bind` are display data: the client renders
-them in the screen's declared widgets and returns actions as intents.
+code to clients (DEC-008, DEC-020).
+
+**UI values are computed on the host.** `ui_bind` and `ui_open` run only in the host process. The host
+resolves the screen document's declared `bind` paths against its own state, applies any `ui_bind`
+values the mod sets, at most 10 times per second, and sends the resulting values as data over the same
+UI binding that core screens use
+([13 §3.10](13-ui-and-ux.md#310-data-driven-ui-for-content-packs-and-mods)); the client renders them in the declared
+widgets and returns actions as intents. Nothing is evaluated where the player is: the client has no
+module runtime and no per-screen code path, and a mod cannot ship a UI callback that a client
+executes ([DEC-049](../decisions.md)). The value model and its 10 Hz rule are shared with
+[13](13-ui-and-ux.md), and the update is coalesced with ordinary state replication rather than sent
+per widget.
 
 ### 3.8 Developer experience
 
@@ -609,9 +623,13 @@ Aggregate mod budgets are owned by [25](25-performance-budgets.md) §5.6 and are
 `PERF-MOD-001` caps any single WASM mod at 0.30 ms/frame p95 on the client, measured against that
 frame, and 1.5 ms/tick p99 on the server; `PERF-MOD-002` caps the reference eight-mod set at
 0.15 ms/frame p95 client aggregate and 1.5 ms/tick p99 server aggregate; `PERF-MOD-003` caps load,
-validation, compile and hot reload at 5 s each; `PERF-MOD-004` caps per-mod memory at 64 MB. In 1.0
-the client half is an envelope reserved for UI data binding, because no mod code runs on a client
-(REQ-MOD-026); if OPEN-006 later allows a presentation tier, it inherits these ceilings unchanged.
+validation, compile and hot reload at 5 s each; `PERF-MOD-004` caps per-mod memory at 64 MB. At 1.0
+the client half of `PERF-MOD-001`/`002` is a **reserved envelope, not a gate**: no mod code runs on a
+client (REQ-MOD-026), so nothing draws on it in 1.0. The host-computed UI data of §3.7 arrives as
+replicated display values and is charged to the ordinary client network and UI budgets, not to the
+mod envelope. [OPEN-006](../decisions.md) is closed by [DEC-049](../decisions.md): a client code tier
+is post-1.0, would need a new decision, and would inherit these ceilings unchanged rather than raise
+them.
 This chapter owns the ABI-level measurements that make those aggregates achievable:
 
 | ID | Budget | Measurement |
@@ -669,9 +687,10 @@ This chapter owns the ABI-level measurements that make those aggregates achievab
 
 ## 8. Open questions
 
-1. **OPEN-006 — client presentation code.** This chapter assumes 1.0 ships none. If UI WASM is later
-   allowed, does it reuse `openblock:mod@1.x` with the same capabilities and the 0.3 ms/frame budget,
-   or does it need a separate rendering-only ABI? Owner: **MS-09**, before 0.1.
+1. **Client presentation code (post-1.0; OPEN-006 is closed by DEC-049).** 1.0 ships none and the client
+   contains no module runtime. If a post-1.0 tier is later proposed, does it reuse `openblock:mod@1.x`
+   with the same capabilities and the reserved envelope of §5, or does it need a separate
+   rendering-only ABI and a new decision? Owner: **MS-09**, post-1.0.
 2. **Register item needed: fuel default.** Guarded mode is cheap but makes re-execution
    non-reproducible; deterministic mode costs the measured fuel overhead. Is fuel mandatory for
    competitive servers, or opt-in? Owner: **MS-09** with MS-15.
@@ -684,7 +703,8 @@ This chapter owns the ABI-level measurements that make those aggregates achievab
    not yet place it: inside the save for portability, or beside it under `mods/<namespace>/kv/`
    (recommended) with the world's lifecycle? Owner: **MS-13**.
 6. **UI binding protocol ownership.** The `ui_bind` value model is shared with [13](13-ui-and-ux.md);
-   one owner for the schema and its 10 Hz update rule is needed. Owner: **MS-05** with MS-09.
+   one owner for the schema and its 10 Hz update rule is needed. Execution is settled (host-only,
+   DEC-049), so what is left is schema ownership, not a client ABI. Owner: **MS-05** with MS-09.
 7. **Network egress limits.** 32 KiB/s per player is a first guess; measure against a minigame and a
    map-sync mod before fixing it in the protocol. Owner: **MS-06** with MS-09.
 8. **Deprecation window.** Two minors or six months is the proposal; confirm whether a twelve-month
@@ -697,7 +717,7 @@ This chapter owns the ABI-level measurements that make those aggregates achievab
 - Decisions: [DEC-003](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md),
   [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-023](../decisions.md),
   [DEC-027](../decisions.md), [DEC-035](../decisions.md), [DEC-040](../decisions.md),
-  [DEC-042](../decisions.md), [DEC-043](../decisions.md).
+  [DEC-042](../decisions.md), [DEC-043](../decisions.md), [DEC-049](../decisions.md).
 - Chapters: [00](00-conventions.md), [01](01-technical-architecture.md), [02](02-engine-core.md),
   [05](05-world-model.md), [06](06-worldgen.md), [08](08-gameplay-survival.md),
   [09](09-entities-ai.md), [11](11-inventory-crafting-items.md), [13](13-ui-and-ux.md),

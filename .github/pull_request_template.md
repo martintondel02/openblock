@@ -12,6 +12,8 @@
 
 - [ ] Scope is one coherent change; unrelated work is split out.
 - [ ] Normative docs changed only with a `DEC-*` added or cited.
+- [ ] Every commit carries a DCO `Signed-off-by` trailer (`git commit -s`); I license the contribution under `MIT OR Apache-2.0` (see [`DCO`](../DCO)).
+- [ ] Shipped identifiers and base-pack data use original names; no Minecraft proper nouns (DEC-053).
 - [ ] `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` pass locally.
 - [ ] New behaviour has tests, or the PR explains why not.
 - [ ] Performance-sensitive code has a budget note or benchmark.

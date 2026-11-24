@@ -12,22 +12,30 @@
 | ID | Name | Phase | Effort (dev-weeks) | Depends on | Release |
 | --- | --- | --- | --- | --- | --- |
 | MS-00 | Foundation | A | 1 | — | — |
-| MS-01 | World core | A | 4 | MS-00 | — |
-| MS-02 | Engine core | A | 4 | MS-00 | — |
-| MS-03 | First playable | A | 10 | MS-01, MS-02 | `0.0.1` |
-| MS-04 | GPU rendering | B | 8 | MS-03 | — |
-| MS-05 | Content + UI | B | 10 | MS-03 | `0.1.0-alpha` |
-| MS-06 | Networking | C | 12 | MS-04, MS-05 | — |
-| MS-07 | Dedicated server | C | 5 | MS-06 | `0.2.0-alpha` |
-| MS-08 | Worldgen | D | 14 | MS-05 | — |
-| MS-10 | Survival loop | D | 12 | MS-05 | — |
-| MS-13 | Persistence maturity | D | 5 | MS-03 | `0.3.0-beta` |
-| MS-09 | Modding | E | 10 | MS-05, MS-07 | — |
-| MS-11 | Depth (mobs, redstone, …) | E | 24 | MS-08, MS-10 | — |
-| MS-12 | Visuals + audio | E | 10 | MS-04 | `0.4.0-beta`, `0.5.0-beta` |
-| MS-14 | Parity + polish | F | 14 | MS-09, MS-11, MS-12 | `0.6.0-beta` |
-| MS-15 | Scale + anti-cheat | F | 8 | MS-07 | `1.0.0-rc` |
-| MS-16 | 1.0 launch | G | 8 | MS-14, MS-15 | `1.0.0` |
+| MS-01 | World core | A | 6–7 | MS-00 | — |
+| MS-02 | Engine core | A | 5–6 | MS-00 | — |
+| MS-03 | First playable | A | 14–16 | MS-01, MS-02 | `0.0.1` |
+| MS-04 | GPU rendering | B | 12–15 | MS-03 | — |
+| MS-05 | Content + UI | B | 14–17 | MS-03 | `0.1.0-alpha` |
+| MS-06 | Networking | C | 16–20 | MS-04, MS-05 | — |
+| MS-07 | Dedicated server | C | 7–9 | MS-06 | `0.2.0-alpha` |
+| MS-08 | Worldgen | D | 20–24 | MS-05 | — |
+| MS-10 | Survival loop | D | 16–20 | MS-05 | — |
+| MS-13 | Persistence maturity | D | 7–9 | MS-03, MS-05 | `0.3.0-beta` |
+| MS-09 | Modding | E | 14–17 | MS-05, MS-07, MS-11 | — |
+| MS-11 | Tier-1 depth (mobs, redstone, …) | E | 18–21 | MS-06, MS-08, MS-10 | — |
+| MS-12 | Visuals + audio | E | 12–15 | MS-04 | `0.4.0-beta`, `0.5.0-beta` |
+| MS-14 | Tier-1 parity + corpus infrastructure | F | 18–21 | MS-09, MS-11, MS-12 | `0.6.0-beta` |
+| MS-15 | Scale + anti-cheat | F | 10–12 | MS-07 | `1.0.0-rc` |
+| MS-16 | 1.0 Early Access launch | G | 10 | MS-14, MS-15 | `1.0.0` |
+| | **Total to 1.0** | | **200–240** | | |
+| MS-17 | **2.0 Tier-2 parity track** | post-1.0 | **500–800** | MS-16 | `2.0` |
+
+The 1.0 figures are the roadmap's bottom-up re-baseline (§11 there); they replace
+the previous 159 dev-week total, which was 5–8× below the research inventory.
+`MS-17` is a separate funded track, not part of the 1.0 total; it needs a
+6–10 person team for 2–3 years (OPEN-019). Milestone IDs are stable, not
+chronological.
 
 ## 2. Definition of done (applies to every milestone)
 
@@ -46,6 +54,9 @@ A milestone is complete only when **all** of these hold:
       (DEC-003) and starts/ticks headlessly.
 - [ ] Documentation is updated in the same PR: the relevant spec chapter(s),
       the decision register if a decision changed, and the changelog.
+- [ ] Parity work reports the two DEC-051 numbers separately — in-scope pass
+      rate and vanilla coverage from the hand-authored behavioural checklist —
+      and never turns coverage into a pass claim.
 - [ ] Saves written before the milestone load after it (or a migration exists).
 - [ ] No new `unsafe` outside audited modules (see [spec/02](../spec/02-engine-core.md)
       for the audited list); any new `unsafe` has a safety comment and a test.
@@ -112,7 +123,8 @@ serializable, independent of rendering.
       written, and save→load→save is byte-identical (deterministic encoding).
 - [ ] Palette overflow behaves correctly at 256 and 65,536 distinct states, and
       a malformed palette never panics or reads out of bounds (fuzz target).
-- [ ] Section memory is ≤ 2 KiB + 2 KiB (data + light) for typical terrain, and
+- [ ] Section memory is **≤ 2 KiB block data + 8 KiB light (≈ 10 KiB total)** for
+      a typical mixed 4-bit section (2 B/block light × 4,096 blocks = 8 KiB), and
       uniform sections are ≤ 16 bytes in memory.
 - [ ] `ob_world` has no dependency on `ob_render`, `wgpu`, `winit` or `cpal`.
 
@@ -197,15 +209,16 @@ publicly and to recruit with.
 
 ### MS-04 — GPU rendering
 
-**Goal:** 512 blocks of view at 120+ FPS with a renderer that has headroom, and
+**Goal:** a 512-block render radius at 120+ FPS with a renderer that has headroom, and
 a benchmark suite that makes regressions visible.
 
 **Deliverables**
 
 - Render graph v1 with pass/resource contracts, transient aliasing, barriers,
   and per-pass GPU timestamp queries.
-- Section mesh caching, 32³ cluster meshing (provisional, DEC-004/OPEN-001),
-  per-layer opaque/translucent buckets, 16 B/quad vertex pulling, texture arrays.
+- Section mesh caching, **32³ cluster meshing enabled by default from MS-04**
+  (DEC-048; 16³ remains the storage/edit/light/network unit), per-layer
+  opaque/translucent buckets, 16 B/quad vertex pulling, texture arrays.
 - Streaming/upload: staging ring buffers, budgeted per-frame uploads, buffer
   arena with size classes, defragmentation, eviction policy (LRU per distance).
 - Visibility: region+cluster frustum culling, occlusion (section-level at first,
@@ -219,12 +232,16 @@ a benchmark suite that makes regressions visible.
 **Exit criteria**
 
 - [ ] 512-block render distance at 1080p on the reference machine: ≥ 120 FPS
-      average, p99 frame ≤ 12 ms, CPU main-thread ≤ 2.0 ms in the benchmark.
-- [ ] The 144 FPS performance mode is hit at 512 blocks with the documented
+      average, p99 frame ≤ 11.1 ms, CPU main-thread ≤ 2.0 ms in the benchmark.
+- [ ] 32³ clusters are the default: the visibility pass visits ~12,700 clusters
+      rather than 101,400 sections at a 512-block radius, and the CPU visibility
+      pass stays inside its 0.30 ms budget (DEC-048). A per-section fallback is
+      available behind a setting (OPEN-009, Metal escalation).
+- [ ] The 144 FPS performance mode is hit at a 512-block radius with the documented
       preset (OPEN-003), or the preset/threshold is re-baselined with data.
 - [ ] Fly-through benchmark shows no frame > 33 ms (hitch) during streaming at
       30 blocks/s movement.
-- [ ] GPU memory at 512 blocks ≤ 768 MB; client RSS ≤ 4 GiB (DEC-035).
+- [ ] GPU memory at a 512-block radius ≤ 768 MB; client RSS ≤ 4 GiB (DEC-035).
 - [ ] Zero GPU validation errors in debug builds across the whole benchmark suite
       (`wgpu` validation enabled).
 - [ ] Benchmark regression gate is wired into CI and fails on a > 10% regression
@@ -305,13 +322,15 @@ protocol, and a test harness that can reproduce bad networks.
 - [ ] Movement at 80 ms RTT + 2% loss: local player input-to-photon ≤ 1 frame of
       additional latency vs single-player; no rubber-banding during normal
       movement; corrections logged and bounded.
-- [ ] A 512-block-radius join reaches playable in ≤ 5 s and streams the full interest
-      set in ≤ 90 s on a 10 Mbit/s link (PERF-NET-004/005), with the loading UI
-      showing progress and p99 tick ≤ 35 ms during join.
+- [ ] A 512-block-radius join (opt-in server setting; the default is 256 blocks,
+      DEC-052) reaches playable in ≤ 5 s and streams the full render-distance
+      interest set in ≤ 90 s on a 10 Mbit/s link (PERF-NET-004/005), with the
+      loading UI showing progress and p99 tick ≤ 35 ms during join.
 - [ ] Protocol fuzz: 10 million mutated packets over 24 h produce no panic, no
       OOM, no hang; malformed input closes the connection with a reason.
 - [ ] Content-hash mismatch is rejected with a message naming the mismatched
-      packs (tested).
+      packs (tested). A locale/view-only difference (`view_hash`) joins with a
+      notice unless the server enabled strict view matching (DEC-050).
 - [ ] The documented protocol spec is generated and builds in CI.
 
 ### MS-07 — Dedicated server (`0.2.0-alpha`)
@@ -369,7 +388,8 @@ dimensions, generated fast and deterministically.
 - Structures: jigsaw-style structure API, a first set (villages, ruins, temples,
   strongholds, ocean monuments, woodland mansions, ancient cities, trial
   chambers equivalents), structure placement and spacing rules.
-- Nether and End dimensions with portals; dimension-relative seed derivation.
+- Underworld and terminus dimensions (`openblock:underworld`,
+  `openblock:terminus`) with portals; dimension-relative seed derivation.
 - Parallel generation pipeline: staged (biomes → terrain → surface → carvers →
   features → structures) with neighbor-aware scheduling, chunk status levels,
   and a budgeted consumer on the client.
@@ -508,53 +528,59 @@ run untrusted mods safely.
 - [ ] Malicious mod corpus (infinite loop, memory bomb, filesystem traversal,
       network exfiltration, registry corruption, panic) is contained: host stays
       alive, offending mod is disabled with a log entry, no capability escape.
-- [ ] Per-mod overhead ≤ 0.3 ms/frame client, ≤ 1.5 ms/tick server with the
-      reference mod set (budgets from [spec/25](../spec/25-performance-budgets.md)).
+- [ ] Per-mod overhead ≤ 1.5 ms/tick server with the reference mod set. The
+      0.3 ms/frame client budget is a **reserved envelope** for the post-1.0
+      client code tier, not a 1.0 gate (DEC-049).
 - [ ] The base game passes the "no private hooks" CI check; deleting the mod
       loading code would be a compile error only in `ob_modding`, not in
       gameplay crates.
 - [ ] Hot reload of a WASM mod preserves world state and completes in ≤ 5 s.
 
-### MS-11 — Depth (mobs, redstone, magic, progression)
+### MS-11 — Tier-1 depth (mobs, redstone, magic, progression)
 
 **Goal:** the systems that turn a sandbox into a world with things happening in
-it.
+it, at **Tier-1 depth**. The full Tier-2 mob, block, structure, boss and command
+sets are `MS-17`; MS-11 must not absorb them.
 
 **Deliverables**
 
 - Entity framework: entity definitions as data, component-based AI behaviours,
   goals/priority system, pathfinding (A*, 3D, jump/cost-aware), sensory model,
   navigation budgets, spawning rules (light level, biome, height, structures),
-  mob caps and persistence, boss bars.
-- Mobs: the Tier-2 set — passive animals, neutral mobs, hostile mobs, villagers
-  with professions/trades, golems, aquatic, nether and end mobs, two bosses
-  (dragon and wither equivalents), pet/breeding behaviours, mounted mobs.
-- Redstone: signal model (power 0–15, weak/strong), dust, torches, repeaters,
-  comparators, pistons/sticky pistons with block movement, observers,
-  dispensers/droppers, hoppers, note blocks, daylight sensors, pressure plates,
-  tripwire, rails, buttons/levers/targets, redstone lamps, update ordering and
-  quasi-connectivity decisions documented, deterministic across regions,
-  update budget and loop detection.
-- Farming and husbandry: crops, bonemeal behaviour, bee/animal products,
-  villagers as farmers.
-- Enchanting/anvil/brewing/potions/trading full loops; loot chests; structures
+  mob caps and persistence.
+- Mobs: the **Tier-1 set** — common passive, neutral and hostile mobs (about
+  25–35), villagers with basic professions and trades, breeding and taming
+  behaviours. Bosses, aquatic, underworld/terminus-specific mobs and mounted
+  mobs move to `MS-17`.
+- Redstone: the **Tier-1 component set** — signal model (power 0–15,
+  weak/strong), dust, torches, repeaters, comparators, pistons, observers,
+  buttons/levers, pressure plates, lamps — with deterministic update ordering,
+  a documented divergence from Java's update-order accidents, an update budget
+  and loop detection. Full component parity (dispensers, hoppers, note blocks,
+  daylight sensors, tripwire, rails, targets) is `MS-17`.
+- Farming and husbandry: crops, bonemeal behaviour, animal breeding and products.
+- Enchanting, anvil and brewing basics; trading basics; loot chests and structure
   loot.
-- Dimensions progression: portal activation, nether/end travel, dragon fight,
-  end cities, elytra, respawn anchors.
-- Commands and game rules; statistics and advancements; spectator mode.
-- Minecarts, rails, boats; projectiles; falling blocks; TNT.
+- Dimensions: portal activation and underworld/terminus travel with deterministic
+  link selection and state that survives save/load. The terminus progression
+  loop (bosses, terminus cities, elytra, respawn anchors) is `MS-17`.
+- Statistics and a small guided advancement chain (new-player guidance); full
+  advancement/statistics parity is `MS-17`.
+- Minecarts, rails and boats; projectile and falling-block basics; TNT.
 
 **Exit criteria**
 
-- [ ] Parity corpus: mob, redstone, enchanting, trading and command checklists
-      pass at Tier 2 (with documented deliberate divergences).
-- [ ] Reference redstone circuits (door, flush piston door, clock, comparator
-      logic, item sorter, observer-driven farm) behave deterministically across
-      save/load and region boundaries; a cross-region redstone test suite passes.
+- [ ] The Tier-1 parity corpus: mob, redstone-basics, enchanting, trading and
+      portal checklists pass (with documented deliberate divergences). Full
+      Tier-2 sets are measured separately as coverage for `MS-17`, not gated here.
+- [ ] Tier-1 reference redstone circuits (door, clock, comparator logic) behave
+      deterministically across save/load and region boundaries; a cross-region
+      redstone test suite passes. Piston extenders and full component parity are
+      `MS-17` work.
 - [ ] 500 mobs in a loaded area tick within 25% of the tick budget; pathfinding
       has a per-tick budget and degrades gracefully (no tick death spiral).
-- [ ] Two players fight the dragon and complete End progression in a recorded
-      session; boss state persists through save/load.
+- [ ] Two players complete the Tier-1 dimension loop — portal to the underworld
+      and back — and the portal state persists through save/load.
 - [ ] Entity replication: 200 visible entities at 20 Hz stay within 20 KB/s per
       player in the benchmark.
 
@@ -582,7 +608,7 @@ a real contract.
 
 **Exit criteria**
 
-- [ ] Ultra preset at 512 blocks holds 120 FPS on the reference GPU; measured
+- [ ] `high` preset at a 512-block radius holds 120 FPS on the reference GPU, `ultra` holds 60 FPS; measured
       cost per effect documented and bounded by [spec/25](../spec/25-performance-budgets.md).
 - [ ] Frame-time p99 stays within budget with 200 mobs + weather + particles in
       the stress scene.
@@ -596,17 +622,29 @@ a real contract.
 
 ## 8. Phase F — Parity, scale and polish
 
-### MS-14 — Parity + polish (`0.6.0-beta`)
+### MS-14 — Tier-1 parity + corpus infrastructure (`0.6.0-beta`)
 
-**Goal:** close the Tier-2 parity gap and make the whole thing feel finished.
+**Goal:** close the Tier-1 parity gate, build the parity-corpus infrastructure
+that 2.0 will run on, and make the game feel finished rather than
+feature-complete. MS-14 must **meet both DEC-051 numbers for 1.0's declared
+Tier-0/1 scope**; it does not close Tier-2 content.
 
 **Deliverables**
 
-- Generated parity checklist from registry dumps; executable parity corpus:
-  golden worlds, scripted scenarios, screenshot comparisons, mechanic assertions.
-- Closure of the remaining Tier-2 items: spectator, remaining blocks/items/mobs,
-  structures, commands/game rules, statistics/advancements, full UI screens,
-  world creation options (seeds, gamemode, difficulty, generator settings).
+- **Hand-authored behavioural parity checklist** (DEC-051): one row per
+  behaviour with tier, test or demonstration, status and exception reason.
+  Registry dumps are a coverage cross-check only, never copied into the corpus.
+  Executable parity corpus: golden worlds, scripted scenarios, screenshot
+  comparisons, mechanic assertions.
+- **Tier-1 parity closure**: spectator (a Tier-3 item delivered early), the
+  remaining Tier-1 blocks/items/mobs/structures, full UI screens, world creation
+  options (seeds, gamemode, difficulty, generator settings), and the Tier-3
+  items already scheduled before 1.0 (spectator, controller delivered in MS-12,
+  full localization, adopted datapack semantics).
+- **Tier-2 coverage reporting**: publish the weighted vanilla-coverage number and
+  the gap list `MS-17` will close, against the hand-authored checklist. The
+  coverage number is measured for 1.0's declared scope as well; it is not a
+  registry-ID percentage and it does not claim Tier-2 content.
 - Accessibility: narrator (menu + chat + HUD), full remapping, colour-blind
   palettes, subtitles/captions, reduced motion, UI scale, controller glyphs,
   hold-to-toggle options, one-handed layouts where feasible.
@@ -616,12 +654,18 @@ a real contract.
   crash recovery UI, telemetry-free diagnostics export.
 - Performance presets that actually target hardware tiers, plus an auto-detect
   setting.
-- Parity delta process documented for future Minecraft drops (DEC-022).
+- Parity delta process documented for future Minecraft drops (DEC-022, OPEN-020).
 
 **Exit criteria**
 
-- [ ] Parity corpus ≥ 90% of Tier 2 checks pass; every failure is either fixed
-      or documented as a deliberate divergence with a replacement.
+- [ ] The parity gate is met, both numbers reported separately: **100% of 1.0's
+      in-scope Tier-0/1 checks pass**, each with a linked automated test or
+      recorded demonstration, and **vanilla behavioural coverage of the pinned
+      baseline is ≥ 85%** on the hand-authored checklist. No percentage is used in
+      place of a pass rate, and the checklist is behavioural, not a registry-ID
+      count.
+- [ ] The Tier-2 content gap list is published and labelled as the 2.0
+      commitment (DEC-051).
 - [ ] Accessibility checklist passes with a manual audit by two external testers.
 - [ ] A player who has never played OpenBlock completes the onboarding and first
       night without external help (5-user usability test, recorded).
@@ -631,13 +675,15 @@ a real contract.
 
 ### MS-15 — Scale + anti-cheat (`1.0.0-rc`)
 
-**Goal:** public servers run stably with 50+ players and cheaters do not ruin it.
+**Goal:** public servers run stably with 50 **co-located** players, the lower
+**distributed** row is honestly published, and cheaters do not ruin it
+(DEC-052).
 
 **Deliverables**
 
 - Performance at scale: parallel region ticking (if not already), interest-set
-  tuning, replication batching, entity culling, chunk send budgeting, tick
-  slicing, memory pressure handling.
+  tuning for both player distributions, replication batching, entity culling,
+  chunk send budgeting, tick slicing, memory pressure handling.
 - Anti-cheat validation suite: movement (speed, acceleration, collision, noclip,
   fly), reach and line of sight, block-break speed, placement rules, inventory
   transactions, combat (range, cooldown, rotation), chat rate, packet rate;
@@ -645,16 +691,24 @@ a real contract.
 - Moderation: chat filter hooks, mute/ban/kick with reasons, report command,
   admin audit log, server-side screenshots not required (privacy).
 - Scale harness: bot swarm (500 bots), join storm (50 simultaneous joins),
-  world with 20k loaded chunks, memory leak detection over 24 h.
+  world with 20k loaded chunks, memory leak detection over 24 h, one co-located
+  configuration and one distributed configuration.
 - DDoS/abuse hardening: connection limits, handshake rate limits, Retry,
   per-IP quotas, decompression bomb guards, log-flood protection.
-- Server capacity calculator and published benchmark matrix (vCPU × players ×
-  simulation distance).
+- Server capacity calculator and published benchmark matrix by vCPU × players ×
+  render/simulation distance, **with a separate co-located and distributed row**
+  (DEC-052).
 
 **Exit criteria**
 
-- [ ] 50 bots at 256-block simulation distance on the 4 vCPU reference: 1 hour,
-      20 TPS, p99 tick ≤ 35 ms, RSS within budget, no leak (RSS slope ≈ 0).
+- [ ] 50 **co-located** bots at 256-block render/simulation distance on the
+      4 vCPU reference: 1 hour, 20 TPS, p99 tick ≤ 35 ms, RSS within budget, no
+      leak (RSS slope ≈ 0).
+- [ ] The **distributed** player row is measured on its own published
+      configuration (not the co-located 4 vCPU box; [spec/25](../spec/25-performance-budgets.md)
+      §3.6 currently models 50 players at 64-block render/simulation on 8 vCPU)
+      and published as a separate, lower number with the configuration that
+      produced it; it is never implied by the co-located 50.
 - [ ] 500-bot join storm and 24-hour soak test pass without crash or save
       corruption.
 - [ ] Anti-cheat suite: scripted cheater bots (fly, speed, reach, nuker,
@@ -664,11 +718,12 @@ a real contract.
 - [ ] Security review completed with no open high-severity findings (see
       [spec/20](../spec/20-security-and-anti-cheat.md)).
 
-## 9. Phase G — Launch
+## 9. Phase G — 1.0 Early Access launch
 
-### MS-16 — 1.0 launch (`1.0.0`)
+### MS-16 — 1.0 Early Access launch (`1.0.0`)
 
-**Goal:** a release a stranger can install, run and trust.
+**Goal:** a release a stranger can install, run and trust, with the Early Access
+scope stated plainly rather than buried.
 
 **Deliverables**
 
@@ -680,10 +735,13 @@ a real contract.
 - Website: download, docs, server list (opt-in), mod/content index (curated
   links), roadmap, contributor guide; documentation site generated from
   `docs/`.
+- Early Access positioning: store page, release notes and an in-game notice
+  state the Tier-1 scope, both DEC-051 parity numbers, and that full Tier-2
+  parity is the 2.0 track.
 - Save migration tooling from every `0.x` release; protocol documented; mod API
   1.0 frozen with compatibility promise and migration guide.
-- Launch content: completed base pack art/audio, tutorial world, 2–3 showcase
-  worlds and a showcase mod pack.
+- Launch content: completed Tier-1 base pack art/audio, tutorial world, 2–3
+  showcase worlds and a showcase mod pack.
 - Trademark clearance sign-off (DEC-037), EULA/terms, privacy policy (no
   telemetry by default), security disclosure policy, support process.
 - Launch trailer, devlog, press kit, and community channels (Discord/Matrix,
@@ -692,6 +750,11 @@ a real contract.
 **1.0 ship criteria**
 
 - [ ] All prior milestone criteria hold on the release candidate.
+- [ ] The DEC-051 parity gate holds, both numbers published separately: **100%
+      of the in-scope Tier-0/1 checks pass**, each with a linked artifact, and
+      **vanilla behavioural coverage of the pinned baseline is ≥ 85%** on the
+      hand-authored checklist. The Tier-2 content gap list is labelled as the 2.0
+      commitment.
 - [ ] A `0.1.0-alpha` save migrates to `1.0.0` losslessly and a `1.0` save opens
       in the next patch release.
 - [ ] 30 consecutive days of release-candidate play with no P0 bug; no known
@@ -705,12 +768,17 @@ a real contract.
 
 ## 10. Post-1.0 milestones
 
+`MS-17` is the first post-1.0 commitment and the only one that requires a funded
+team. IDs are stable identifiers, not release order: flagship content takes the
+next free id (`MS-24`) because `MS-17`–`MS-23` were already allocated.
+
 | ID | Theme | Exit criteria sketch | Effort |
 | --- | --- | --- | --- |
-| MS-17 | Flagship content I (1.1) | Programmable logic blocks + energy/fluid networks shipped as first-party packs, built only on the public API; docs and showcase world | 10–14 |
+| MS-17 | **2.0 full Tier-2 parity** | 100% of in-scope Tier-2 checks pass and vanilla coverage ≥ 85% on the hand-authored checklist (DEC-051); full-parity mobs, blocks, structures, redstone, bosses, commands and progression; Modern Delta re-baseline (OPEN-020); funded 6–10 person team for 2–3 years (OPEN-019) | **500–800** |
+| MS-24 | Flagship content I (1.1) | Programmable logic blocks + energy/fluid networks shipped as first-party packs, built only on the public API; docs and showcase world | 10–14 |
 | MS-18 | Dungeons and map sharing (1.2) | Procedural dungeon API; adventure showcase; map/structure sharing format; in-game browser for local content | 8–12 |
 | MS-19 | Android (1.3) | Play Store release, touch UI, mobile perf tier (30 FPS on a 2023 mid-range phone), save compatibility with desktop | 8–12 |
-| MS-20 | Far terrain (1.4) | Visual-only LOD out to 128+ chunks, stable 120 FPS at 1024 blocks | 4–6 |
+| MS-20 | Far terrain (1.4) | Visual-only LOD out to a 1024-block radius, ≥60 FPS at 1024 blocks (120 FPS at 512) | 4–6 |
 | MS-21 | Native plugins + proxy (1.5) | Signed native plugin tier in a supervised process; multi-server proxy/lobby with transfer | 6–10 |
 | MS-22 | Web and reach (1.6) | WebTransport feasibility report + web client spike; accessibility deep pass; Steam Deck verified | 8–12 |
 | MS-23 | Compatibility gateway (TBD) | Optional isolated Minecraft-client gateway for one pinned MC version, best-effort, never core | 10–16 |
@@ -724,9 +792,10 @@ a real contract.
 2. **Whether `MS-03`'s pre-1.0 save format is ever migrated (owner: MS-03/MS-13).**
    The plan says pre-`0.1` saves may break; if the tech preview attracts players,
    we may promise a one-time migration.
-3. **Staffing assumptions per phase (owner: project lead).** The effort numbers
-   assume one experienced engineer; a team of hobbyists with uneven availability
-   changes phase durations, not exit criteria.
+3. **Staffing assumptions per phase (owner: project lead).** The 1.0 effort
+   numbers assume one experienced engineer as the unit; the two-track model in
+   the roadmap §11 gives the calendar for solo, three and six people. The 2.0
+   track assumes a funded 6–10 person team that does not exist yet.
 4. **Benchmark hardware ownership (owner: MS-04).** Gates require a stable
    reference machine and runner; no budget line exists yet.
 5. **Content-production milestone boundaries (owner: MS-14).** Art/audio/level
@@ -738,6 +807,12 @@ a real contract.
 7. **Android timing (owner: MS-19/post-1.0).** The mobile port is post-1.0 in this
    plan; if player demand concentrates there, the order of post-1.0 milestones
    changes.
+8. **2.0 staffing and funding (OPEN-019, owner: lead).** The Tier-2 parity track
+   is ~500–800 dev-weeks and needs 6–10 funded people for 2–3 years; the plan
+   states the requirement, not a source.
+9. **Modern Delta (OPEN-020, owner: MS-17).** 1.21.11 is the pinned 1.0 baseline;
+   re-baseline to the then-current Minecraft release before the 2.0 claim, using a
+   separate delta manifest.
 
 ## 12. References
 

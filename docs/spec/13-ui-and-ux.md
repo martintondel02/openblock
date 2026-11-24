@@ -1,7 +1,7 @@
 # 13 — UI and UX
 
 > Status: draft for review · Last updated: 2026-11-24
-> Depends on: [DEC-003](../decisions.md), [DEC-008](../decisions.md), [DEC-011](../decisions.md), [DEC-017](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-023](../decisions.md), [DEC-026](../decisions.md), [DEC-030](../decisions.md), [DEC-032](../decisions.md), [DEC-034](../decisions.md), [DEC-035](../decisions.md), [DEC-041](../decisions.md), [DEC-044](../decisions.md), [00-conventions](00-conventions.md), [02](02-engine-core.md), [03](03-rendering.md), [11](11-inventory-crafting-items.md), [17](17-persistence.md)
+> Depends on: [DEC-003](../decisions.md), [DEC-008](../decisions.md), [DEC-011](../decisions.md), [DEC-017](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-023](../decisions.md), [DEC-026](../decisions.md), [DEC-030](../decisions.md), [DEC-032](../decisions.md), [DEC-034](../decisions.md), [DEC-035](../decisions.md), [DEC-041](../decisions.md), [DEC-044](../decisions.md), [DEC-049](../decisions.md), [DEC-052](../decisions.md), [00-conventions](00-conventions.md), [02](02-engine-core.md), [03](03-rendering.md), [11](11-inventory-crafting-items.md), [17](17-persistence.md)
 > Implements: MS-05 (framework, screens, HUD, inventory interaction, localization scaffolding), MS-12 (visual polish, toasts, motion settings), MS-14 (parity polish)
 
 ## 1. Purpose and scope
@@ -43,7 +43,7 @@ The governing decisions are already made: screens are **retained and data-define
 | REQ-UI-023 | Per-screen UI state (selection, scroll, tab, draft text) persists in the client config keyed by screen ID and is never replicated. | Restart test | MS-05 |
 | REQ-UI-024 | Hot reload validates on a worker, swaps at a frame boundary, preserves state by ID, defers while a drag or IME composition is active, and rolls back with a visible error on failure. | Reload-while-dragging test | MS-05 |
 | REQ-UI-025 | Pack screens cannot execute code, issue draw commands, open files or sockets, or imitate trusted chrome. They render inside a frame that names the owning pack. | Capability test + spoof fixtures | MS-09 |
-| REQ-UI-026 | Mod-supplied values refresh at ≤10 Hz and are applied atomically per screen revision; mod actions are rate-limited and attributed per mod. | Quota test | MS-09 |
+| REQ-UI-026 | Server-computed mod-supplied values refresh at ≤10 Hz and are applied atomically per screen revision; mod actions are rate-limited and attributed per mod. The client executes no mod code (DEC-049). | Quota test | MS-09 |
 | REQ-UI-027 | Themes are token tables with per-class states; contrast is validated at pack compile (4.5:1 normal text, 3:1 large text) and a failing pair rejects the theme with both colours named. | Theme compiler + contrast test | MS-05 |
 | REQ-UI-028 | Animation is declarative, disabled by the reduced-motion preset, capped at 16 animated nodes per screen, and never changes gameplay or focus order. | Motion-off snapshot equality | MS-05 |
 | REQ-UI-029 | The join flow shows named phases, determinate progress where the server provides it, and a cancel action in every phase; it never blocks the window or the frame loop. | Scripted join with injected stalls | MS-06 |
@@ -308,10 +308,10 @@ A pack may add screens, classes, styles, icons and translations. It may not add 
 | --- | --- | --- |
 | New screen | A `ui/<name>.ron` document with a namespaced ID and `openblock.ui/v1` | Same caps as base screens; must not be named `openblock:*` |
 | New widget arrangement | Any composition of the closed widget set | Depth 32; no recursion; no includes that resolve at runtime |
-| New values | `bind` to a path the client publishes for packs: player state, inventory view, scoreboard, time, world name, mod values | Paths are enumerated in the schema; unknown paths fail validation |
-| New actions | Typed action IDs registered by the pack or by a mod; the UI emits them, the client or host validates them | Action registry is namespaced; unknown actions fail validation |
+| New values | `bind` to a path the client publishes for packs: player state, inventory view, scoreboard, time, world name, server-computed mod values | Paths are enumerated in the schema; unknown paths fail validation |
+| New actions | Typed action IDs registered by the pack, or by a server-side mod and exposed through the host UI binding; the UI emits them, the client or host validates them | Action registry is namespaced; unknown actions fail validation |
 | New theme | Token overrides per class and state, with pack layering per [DEC-019](../decisions.md) | Contrast validation; no shader or draw-call access |
-| Mod values | WASM `ui_values(screen, revision)` at ≤10 Hz, `ui_action(screen, action, args)` | 1 ms per call, 64 MiB, kill-and-disable on trap ([16](16-modding.md)) |
+| Mod values | Host UI binding: the server computes the screen view model and sends values and action results; the client executes no mod or WASM code ([DEC-049](../decisions.md), [16](16-modding.md)) | ≤ 10 Hz, schema-validated and bounded by the screen document cap; action results are attributed per mod and rate-limited |
 
 Validation runs on the whole resolved pack set at load and on hot reload: schema, caps, class references, binding paths, action IDs, message keys, icon references, contrast. Errors are collected per document, not fail-fast, because a mod author needs the whole list.
 
@@ -354,7 +354,7 @@ Animation is declarative and presentation-only. A transition names a property (`
 
 ### 3.13 UX principles and flows
 
-**3.13.1 Low-friction first launch.** No account, no login, no launcher. First run probes the device (GPU tier, display size, RAM, input devices), picks a preset, and lands on the main menu with "Create world" focused and a name already suggested. Onboarding cards appear only in the first world and are dismissible forever with one click. Render distance is expressed in blocks: 512 blocks (32 chunks of 16) by default, and 128 blocks (8 chunks) on the minimum spec, with the settings row showing both the block value and the chunk count.
+**3.13.1 Low-friction first launch.** No account, no login, no launcher. First run probes the device (GPU tier, display size, RAM, input devices), picks a preset, and lands on the main menu with "Create world" focused and a name already suggested. Onboarding cards appear only in the first world and are dismissible forever with one click. Render distance is expressed as a block radius: a 512-block radius (a 32-chunk radius; 65×65 = 4,225 columns) by default, and a 128-block radius (8 chunks; 17×17 = 289 columns) on the minimum spec, with the settings row showing the block value, the chunk radius and the column count. The same rule applies to the server default: a dedicated server starts at a 256-block radius equal to its simulation distance, and a 512-block radius is opt-in ([DEC-052](../decisions.md)).
 
 **3.13.2 Joining a server.** A ticket is `host:port#fingerprint` or an `openblock://` link ([DEC-026](../decisions.md)). The join flow has named phases, each cancellable:
 
@@ -423,23 +423,23 @@ pub enum UiIntent {
 
 ## 5. Performance budgets
 
-The `ui_stress` scene is a 46-slot inventory with a full cursor, a 1,000-widget settings page with search open, 100 chat lines, a tooltip visible, 5 toasts and a HUD, measured at 1080p with `ui_scale = auto` and at 4K with `ui_scale = 2` (a 200 % effective scale).
+The `ui_stress` scene is a 46-slot inventory with a full cursor, a 1,000-widget settings page with search open, 100 chat lines, a tooltip visible, 5 toasts and a HUD, measured at 1080p with `ui_scale = auto` and at 4K with `ui_scale = 2` (a 200 % effective scale). It is defined in `perf/scenes.toml`, the single scene catalogue; a budget row naming a scene absent there fails the manifest load ([25 §4.1](25-performance-budgets.md#41-budget-manifest)). The rows below are measured in `ui_stress` unless the measurement column names a microbenchmark.
 
 | ID | Budget | Measurement |
 | --- | --- | --- |
-| PERF-UI-001 | UI CPU ≤ 0.15 ms p95 in a gameplay frame (the PERF-CPU-004 attribution of [25 §5](25-performance-budgets.md)), and ≤ 0.5 ms p99 for a full-screen 1,000-widget menu measured alone | `bench_ui_cpu`, GPU timestamps off |
-| PERF-UI-002 | UI GPU ≤ 0.20 ms p99 at 1080p high preset, ≤ 0.30 ms absolute ceiling at 4K | pass 16 timestamps |
-| PERF-UI-003 | ≤ 64 draw calls and ≤ 200,000 vertices for any base screen plus the HUD | RenderDoc + frame stats |
-| PERF-UI-004 | Zero heap allocations per frame in steady state (after warm-up) in the UI thread | allocation counter in CI |
+| PERF-UI-001 | UI CPU ≤ 0.15 ms p95 in a gameplay frame (the PERF-CPU-004 attribution of [25 §3.3](25-performance-budgets.md#33-cpu-frame-budget)), and ≤ 0.5 ms p99 for a full-screen 1,000-widget menu measured alone | `ui_stress` gameplay-HUD and full-screen variants; `bench_ui_cpu`, GPU timestamps off |
+| PERF-UI-002 | UI GPU ≤ 0.20 ms p99 at 1080p high preset, ≤ 0.30 ms absolute ceiling at 4K | `ui_stress`, pass 16 timestamps |
+| PERF-UI-003 | ≤ 64 draw calls and ≤ 200,000 vertices for any base screen plus the HUD | `ui_stress`, RenderDoc + frame stats |
+| PERF-UI-004 | Zero heap allocations per frame in steady state (after warm-up) in the UI thread | `ui_stress`, allocation counter in CI |
 | PERF-UI-005 | Layout ≤ 0.5 ms for 1,000 nodes; incremental relayout of a 46-slot inventory ≤ 50 µs | `bench_ui_layout` |
 | PERF-UI-006 | Hit test ≤ 20 µs for 1,000 nodes | `bench_ui_hit` |
 | PERF-UI-007 | Text layout ≤ 50 µs for an uncached 80-character line; ≤ 2 µs for a cached label refresh | `bench_ui_text` |
 | PERF-UI-008 | Widget atlas ≤ 16 MiB GPU; glyph pages ≤ 16 MiB; UI CPU memory ≤ 8 MiB | allocation counter + size assertions |
-| PERF-UI-009 | Screen open to interactive ≤ 16.7 ms for a 500-node document, including validation and first layout | scripted open test |
+| PERF-UI-009 | Screen open to interactive ≤ 16.7 ms for a 500-node document, including validation and first layout | `ui_stress`, scripted open test |
 | PERF-UI-010 | Hot reload validation ≤ 250 ms for the base pack, and ≤ 1 s for a 20-pack set | reload benchmark |
 | PERF-UI-011 | Container round trip: the local optimistic change is visible in ≤ 16 ms; the confirmed state converges within one RTT | network simulator |
 
-PERF-UI-001 has two measurements and they must not be added. The gameplay attribution is PERF-CPU-004 (0.15 ms p95 at 200 visible widgets, 4K, UI scale 200 %) in [25 §5](25-performance-budgets.md), where the HUD is the only UI; the 0.5 ms ceiling applies to full-screen menus and container screens, where the world contributes a camera and a background rather than a simulation. Both obey the 2.0 ms CPU main-thread frame target of [vision §8](../vision.md).
+PERF-UI-001 has two measurements and they must not be added. The gameplay attribution is PERF-CPU-004 (0.15 ms p95 at 200 visible widgets, 4K, UI scale 200 %) in [25 §3.3](25-performance-budgets.md#33-cpu-frame-budget), where the HUD is the only UI; the 0.5 ms ceiling applies to full-screen menus and container screens, where the world contributes a camera and a background rather than a simulation. Both obey the 2.0 ms CPU main-thread frame target of [vision §8](../vision.md).
 
 Budgets are gates, not goals ([DEC-035](../decisions.md)); the authoritative table is [25](25-performance-budgets.md), which may tighten but not loosen them without a new decision.
 
@@ -495,7 +495,7 @@ Screenshot tests run against a deterministic clock and a fixed random seed, with
 
 ## 9. References
 
-- Decisions: [DEC-003](../decisions.md) (GPU-free server), [DEC-008](../decisions.md) (host authority), [DEC-011](../decisions.md) (render graph passes), [DEC-017](../decisions.md) (texture arrays and atlases), [DEC-019](../decisions.md) (pack layering), [DEC-020](../decisions.md) (mod tiers and capabilities), [DEC-023](../decisions.md) (inventory transactions), [DEC-026](../decisions.md) (server identity and tickets), [DEC-030](../decisions.md) (retained data-driven UI), [DEC-032](../decisions.md) (localization and accessibility from day one), [DEC-034](../decisions.md) (platforms and touch), [DEC-035](../decisions.md) (budgets as gates), [DEC-041](../decisions.md) (typed item components), [DEC-044](../decisions.md) (snake_case setting keys).
+- Decisions: [DEC-003](../decisions.md) (GPU-free server), [DEC-008](../decisions.md) (host authority), [DEC-011](../decisions.md) (render graph passes), [DEC-017](../decisions.md) (texture arrays and atlases), [DEC-019](../decisions.md) (pack layering), [DEC-020](../decisions.md) (mod tiers and capabilities), [DEC-023](../decisions.md) (inventory transactions), [DEC-026](../decisions.md) (server identity and tickets), [DEC-030](../decisions.md) (retained data-driven UI), [DEC-032](../decisions.md) (localization and accessibility from day one), [DEC-034](../decisions.md) (platforms and touch), [DEC-035](../decisions.md) (budgets as gates), [DEC-041](../decisions.md) (typed item components), [DEC-044](../decisions.md) (snake_case setting keys), [DEC-049](../decisions.md) (no client mod code at 1.0), [DEC-052](../decisions.md) (dedicated-server render default).
 - Chapters: [00](00-conventions.md), [01](01-technical-architecture.md) (crate edges), [02](02-engine-core.md) (`Prepare` stage and diagnostics), [03](03-rendering.md) (render graph and pass 16), [11](11-inventory-crafting-items.md) (slot model and transactions), [14](14-audio.md) (UI sound events), [23](23-accessibility-localization.md) (accessibility and localization), [24](24-testing-benchmarks.md) (golden images and the UI test matrix), [25](25-performance-budgets.md).
 - [UI, audio and localization research](../research/08-ui-audio-localization.md) §3–4 (retained UI, layout, text, atlas maths) and §7 (input and accessibility), [feature inventory](../research/05-minecraft-feature-inventory.md) §3.16 (screen and HUD parity list).
 - External facts cited through the research documents: taffy flex/grid layout engine <https://crates.io/crates/taffy>; cosmic-text shaping, bidi and fallback <https://crates.io/crates/cosmic-text>; glyphon wgpu text rendering <https://crates.io/crates/glyphon>; AccessKit accessibility semantics <https://accesskit.dev/>; WCAG 2.1 AA contrast thresholds <https://www.w3.org/TR/WCAG21/#contrast-minimum>.

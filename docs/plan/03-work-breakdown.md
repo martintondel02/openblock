@@ -1,8 +1,8 @@
-# Work breakdown — epics and tasks from MS-00 to MS-16
+# Work breakdown — epics and tasks from MS-00 to MS-16, plus the MS-17 2.0 track
 
 > Status: normative planning · Last updated: 2026-11-24
-> Depends on: [DEC-010](../decisions.md), [DEC-035](../decisions.md), [DEC-036](../decisions.md), [roadmap](00-roadmap.md), [milestones](01-milestones.md), [MVP definition](02-mvp.md)
-> Implements: MS-00 – MS-16 (all milestones), including the `0.0.1`, `0.1` and `0.2` checkpoints
+> Depends on: [DEC-010](../decisions.md), [DEC-035](../decisions.md), [DEC-036](../decisions.md), [DEC-048](../decisions.md), [DEC-051](../decisions.md), [roadmap](00-roadmap.md), [milestones](01-milestones.md), [MVP definition](02-mvp.md)
+> Implements: MS-00 – MS-16 (the 1.0 Early Access track), including the `0.0.1`, `0.1` and `0.2` checkpoints; MS-17 (the 2.0 Tier-2 parity track) is scoped in §3 but not broken down task-by-task here
 
 ## 1. Purpose, scope and sizing
 
@@ -14,17 +14,18 @@ not activities: "the palette round-trips" is a task, "work on storage" is not.
 | Size | Meaning | Nominal effort | Rule |
 | --- | --- | --- | --- |
 | **S** | Under one day | 0.5 dev-day | One sitting, one file or test. |
-| **M** | One to three days | 1.5 dev-days | One crate, a few files, tests included. |
-| **L** | About one week | 3 dev-days | One subsystem slice; needs a short design note. |
-| **XL** | Two weeks or more | 5 dev-days | Must be split before work starts; an epic, not a task. |
+| **M** | A few days | 2 dev-days | One crate, a few files, tests included. |
+| **L** | **About one week** | 5 dev-days (1 dev-week) | One subsystem slice; needs a short design note. |
+| **XL** | **Two weeks or more** | 10 dev-days (2 dev-weeks) | Must be split before work starts; an epic, not a task. |
 
 Effort uses the roadmap's **dev-weeks** (5 dev-days) for milestones and epics and
 dev-days for tasks. Sizes are estimates with the usual ±25% accuracy before design;
 each milestone's task list is reconciled against the roadmap budget at grooming, and a
 projected overrun above 20% is re-scoped or re-baselined in the roadmap, never hidden.
 Engineering effort only: art, audio, level design and QA are budgeted separately
-(roadmap §12) and are not counted in the 159 dev-weeks. A task that cannot be finished
-in a week is an epic.
+(roadmap §12) and are not counted in the **200–240 dev-week 1.0 track** (or the
+separate **500–800 dev-week 2.0 track**). A task that cannot be finished in a week
+is an epic.
 
 ## 2. Requirements
 
@@ -43,43 +44,56 @@ in a week is an epic.
 
 ## 3. Milestone to epic map
 
-Effort is from [milestones §1](01-milestones.md) and sums to 159 dev-weeks. Tracks are
-the three parallel lanes from [roadmap §14](00-roadmap.md): **A** engine/rendering,
-**B** world/simulation, **C** content/networking/tools.
+Effort is from [milestones §1](01-milestones.md) and sums to the roadmap's
+**200–240 dev-week 1.0 track** (the previous 159-week total was 5–8× below the
+research inventory; see roadmap §11). Tracks are the three parallel lanes from
+[roadmap §14](00-roadmap.md): **A** engine/rendering, **B** world/simulation,
+**C** content/networking/tools.
 
 | MS | Name | Release | Effort | Epics | Count | Tracks |
 | --- | --- | --- | --- | --- | --- | --- |
 | MS-00 | Foundation | — | 1 | EPIC-001–004 | 4 | A, C |
-| MS-01 | World core | — | 4 | EPIC-005–010 | 6 | B |
-| MS-02 | Engine core | — | 4 | EPIC-011–016 | 6 | A |
-| MS-03 | First playable | `0.0.1` | 10 | EPIC-017–025 | 9 | A, B, C |
-| MS-04 | GPU rendering | — | 8 | EPIC-026–033 | 8 | A |
-| MS-05 | Content + UI | `0.1.0-alpha` | 10 | EPIC-034–042 | 9 | B, C |
-| MS-06 | Networking | — | 12 | EPIC-043–052 | 10 | C |
-| MS-07 | Dedicated server | `0.2.0-alpha` | 5 | EPIC-053–057 | 5 | C |
-| MS-08 | Worldgen | — | 14 | EPIC-058–066 | 9 | B |
-| MS-10 | Survival loop | — | 12 | EPIC-067–075 | 9 | B |
-| MS-13 | Persistence maturity | `0.3.0-beta` | 5 | EPIC-076–080 | 5 | C |
-| MS-09 | Modding | — | 10 | EPIC-081–088 | 8 | C |
-| MS-11 | Depth | — | 24 | EPIC-089–099 | 11 | B |
-| MS-12 | Visuals + audio | `0.4`, `0.5` | 10 | EPIC-100–106 | 7 | A |
-| MS-14 | Parity + polish | `0.6.0-beta` | 14 | EPIC-107–114 | 8 | A, B, C |
-| MS-15 | Scale + anti-cheat | `1.0.0-rc` | 8 | EPIC-115–120 | 6 | C |
-| MS-16 | 1.0 launch | `1.0.0` | 8 | EPIC-121–127 | 7 | A, C |
-| | **Total** | | **159** | | **127** | |
+| MS-01 | World core | — | 6–7 | EPIC-005–010 | 6 | B |
+| MS-02 | Engine core | — | 5–6 | EPIC-011–016 | 6 | A |
+| MS-03 | First playable | `0.0.1` | 14–16 | EPIC-017–025 | 9 | A, B, C |
+| MS-04 | GPU rendering | — | 12–15 | EPIC-026–033 | 8 | A |
+| MS-05 | Content + UI | `0.1.0-alpha` | 14–17 | EPIC-034–042 | 9 | B, C |
+| MS-06 | Networking | — | 16–20 | EPIC-043–052 | 10 | C |
+| MS-07 | Dedicated server | `0.2.0-alpha` | 7–9 | EPIC-053–057 | 5 | C |
+| MS-08 | Worldgen | — | 20–24 | EPIC-058–066 | 9 | B |
+| MS-10 | Survival loop | — | 16–20 | EPIC-067–075 | 9 | B |
+| MS-13 | Persistence maturity | `0.3.0-beta` | 7–9 | EPIC-076–080 | 5 | C |
+| MS-09 | Modding | — | 14–17 | EPIC-081–088 | 8 | C |
+| MS-11 | Tier-1 depth | — | 18–21 | EPIC-089–099 | 11 | B |
+| MS-12 | Visuals + audio | `0.4`, `0.5` | 12–15 | EPIC-100–106 | 7 | A |
+| MS-14 | Tier-1 parity + corpus | `0.6.0-beta` | 18–21 | EPIC-107–114 | 8 | A, B, C |
+| MS-15 | Scale + anti-cheat | `1.0.0-rc` | 10–12 | EPIC-115–120 | 6 | C |
+| MS-16 | 1.0 Early Access launch | `1.0.0` | 10 | EPIC-121–127 | 7 | A, C |
+| | **Total to 1.0** | | **200–240** | | **127** | |
+
+**MS-17 — 2.0 Tier-2 parity track.** A separate post-1.0 track of **~500–800
+dev-weeks** plus art/audio, staffed by a funded 6–10 person team for 2–3 years
+(OPEN-019). It is not broken into epics here because it cannot be estimated
+honestly until MS-14's parity-coverage report exists; the first planning task of
+the track is to turn that report into an epic map.
+
+The task lists for MS-00–MS-03 are the build order and the work that is known up
+front; milestone budgets include integration, hardening, review and the
+demo/release tasks that are not itemized below, so task estimates sum below the
+milestone budget. Grooming reconciles the difference (REQ-WBS-002).
 
 ### 3.1 Phase reconciliation
 
 | Phase | Milestones | Dev-weeks | Epics | Share of total |
 | --- | --- | --- | --- | --- |
-| A | MS-00 – MS-03 | 19 | 25 | 12% |
-| B | MS-04, MS-05 | 18 | 17 | 11% |
-| C | MS-06, MS-07 | 17 | 15 | 11% |
-| D | MS-08, MS-10, MS-13 | 31 | 23 | 19% |
-| E | MS-09, MS-11, MS-12 | 44 | 26 | 28% |
-| F | MS-14, MS-15 | 22 | 14 | 14% |
-| G | MS-16 | 8 | 7 | 5% |
-| | **Total** | **159** | **127** | **100%** |
+| A | MS-00 – MS-03 | 26–30 | 25 | 13% |
+| B | MS-04, MS-05 | 26–32 | 17 | 13% |
+| C | MS-06, MS-07 | 23–29 | 15 | 11% |
+| D | MS-08, MS-10, MS-13 | 43–53 | 23 | 22% |
+| E | MS-09, MS-11, MS-12 | 44–53 | 26 | 22% |
+| F | MS-14, MS-15 | 28–33 | 14 | 14% |
+| G | MS-16 | 10 | 7 | 5% |
+| | **Total** | **200–240** | **127** | **100%** |
 
 ## 4. MS-00 — Foundation (1 dev-week, tasks ≈ 5 dev-days)
 
@@ -97,7 +111,7 @@ parallelised away.
 | T-M00-06 Benchmark harness skeleton | 004 | M | 02 | `xtask/src/bench.rs`, `benches/` | `cargo xtask bench --scene empty` writes p50/p95/p99 to a report and uploads it as an artifact. |
 | T-M00-07 Release dry run and repo policy docs | 004 | S | 02 | `.github/workflows/release.yml`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `MAINTAINERS.md` | A tag produces a signed-release dry run with a changelog check; contributor, security and provenance rules are committed. |
 
-## 5. MS-01 — World core (4 dev-weeks, ≈ 20 dev-days)
+## 5. MS-01 — World core (6–7 dev-weeks, ≈ 30–35 dev-days)
 
 | Task | Epic | Size | Deps | Target | Done when |
 | --- | --- | --- | --- | --- | --- |
@@ -106,7 +120,7 @@ parallelised away.
 | T-M01-03 Seeded RNG with per-subsystem derivation | 005 | S | 01 | `crates/math` | Same `(seed, dim, subsystem, coords, tick)` yields the same stream across platforms; golden vectors committed. |
 | T-M01-04 Paletted section storage: uniform, 4/8/16-bit, overflow | 006 | L | 01 | `crates/world/src/section` | All modes pass get/set property tests at 256 and 65,536 states; uniform section ≤16 B; packed section ≤2 KiB + palette. |
 | T-M01-05 Section access, dirty tracking, neighbours | 006 | L | 04 | `crates/world/src/section` | Neighbour iteration is ordered and allocation-free; dirty sets dedupe; fuzz target does not panic on malformed palettes. |
-| T-M01-06 Light containers, packed 2 B per block | 007 | M | 04 | `crates/world/src/light` | Nibble read/write for sky and RGB is branch-free and property-tested; memory measured at 2 KiB/section. |
+| T-M01-06 Light containers, packed 2 B per block | 007 | M | 04 | `crates/world/src/light` | Nibble read/write for sky and RGB is branch-free and property-tested; memory measured at **8 KiB per mixed section** (2 B/block × 4,096 blocks), matching the MS-01 criterion. |
 | T-M01-07 Chunk columns and dimension height model | 008 | M | 04 | `crates/world/src/column` | `min_y`/`max_y` validated as multiples of 16 ≤1024; section indexing is O(1) and bounds-checked. |
 | T-M01-08 Block-change records and batching | 008 | M | 05 | `crates/world/src/edit` | A batched edit produces one ordered change list; replaying it reproduces the section bytes exactly. |
 | T-M01-09 Serializer v0 with deterministic encoding | 009 | L | 05 | `crates/world/src/serialize` | save→load→save is byte-identical; encoding is stable across platforms and hashable. |
@@ -114,12 +128,12 @@ parallelised away.
 | T-M01-11 Fuzz targets for malformed input | 009 | M | 09 | `fuzz/` | 24 h local fuzz without panic, OOB read or unbounded allocation; corpus committed. |
 | T-M01-12 Benchmarks, memory accounting, GPU-free guard | 010 | M | 06, 07 | `benches/`, `xtask` | 512-block-radius terrain ≤350 MB measured; `cargo tree -p ob_world` has no GPU/audio crates. |
 
-## 6. MS-02 — Engine core (4 dev-weeks, ≈ 20 dev-days)
+## 6. MS-02 — Engine core (5–6 dev-weeks, ≈ 25–30 dev-days)
 
 | Task | Epic | Size | Deps | Target | Done when |
 | --- | --- | --- | --- | --- | --- |
 | T-M02-01 App lifecycle, stages, plugin registration | 011 | M | T-M00-01 | `crates/core/src/app` | `App::run` drives `Input → PreTick → Tick → PostTick → Prepare → Render → Present`; a plugin registers systems with one call. |
-| T-M02-02 Fixed tick clock and interpolation alpha | 011 | M | 01 | `crates/core/src/clock` | 20 Hz default and 30 Hz option; alpha is exact under simulated jitter; no float tick comparison (test). |
+| T-M02-02 Fixed tick clock and interpolation alpha | 011 | M | 01 | `crates/core/src/clock` | Simulation tick fixed at 20 Hz (DEC-038); a 30 Hz snapshot option affects replication only; alpha is exact under simulated jitter; no float tick comparison (test). |
 | T-M02-03 Scheduler with read/write sets and conflict rejection | 012 | L | 01 | `crates/core/src/sched` | Conflicting write sets are rejected at startup with a readable error; ordering is deterministic across runs. |
 | T-M02-04 Job system with priority queues | 012 | L | 02 | `crates/core/src/jobs` | Scaling to 8 threads within 80% of ideal on the worldgen microbench; no work-stealing starvation under a priority flood. |
 | T-M02-05 Service registry with explicit lifecycles | 011 | S | 01 | `crates/core/src/service` | Services start/stop in dependency order; a panicking service reports and shuts down cleanly. |
@@ -131,7 +145,7 @@ parallelised away.
 | T-M02-11 Cross-platform hash job | 016 | M | 10 | CI | Linux and Windows runners produce equal hashes over 10,000 ticks on every PR touching `ob_sim`. |
 | T-M02-12 Sim fuzz runner and profiler overlay | 016 | M | 09 | `xtask`, `crates/client` | 100k random inputs show no NaN, tunnelling or out-of-bounds; per-system timing is visible in-game and headless. |
 
-## 7. MS-03 — First playable (10 dev-weeks, ≈ 50 dev-days)
+## 7. MS-03 — First playable (14–16 dev-weeks, ≈ 70–80 dev-days)
 
 The vertical slice. Everything here is on the critical path for `0.0.1`; the only
 parallelism is inside the milestone (render, mesher, physics, save), not across it.
@@ -161,9 +175,10 @@ parallelism is inside the milestone (render, mesher, physics, save), not across 
 
 ## 8. Coarse breakdown, MS-04 to MS-16
 
-Sizes are epic-level: L ≈ 1 week, XL ≈ 2.5 weeks. Each epic's first tasks are listed so a
-new contributor can see the shape; the epic issue expands them into `T-*` tasks with the
-template in §10.
+Sizes are epic-level: **L = 1 week (5 dev-days), XL = 2+ weeks (10 dev-days)**,
+consistent with §1. Each epic's first tasks are listed so a new contributor can
+see the shape; the epic issue expands them into `T-*` tasks with the template in
+§10.
 
 | Epic | MS | Scope and first tasks | Size | Depends |
 | --- | --- | --- | --- | --- |
@@ -204,7 +219,7 @@ template in §10.
 | EPIC-060 | 08 | Ore distribution, geodes, fossils, vegetation and decoration passes | L | 058 |
 | EPIC-061 | 08 | Data-driven biomes, climate blending, surface rules, per-biome ambience hooks | L | 058, 036 |
 | EPIC-062 | 08 | Jigsaw/template structure API and the first structure set | XL | 060 |
-| EPIC-063 | 08 | Nether and End dimensions, portals, dimension-relative seed derivation | L | 058 |
+| EPIC-063 | 08 | Underworld and terminus dimensions (`openblock:underworld`, `openblock:terminus`), portals, dimension-relative seed derivation | L | 058 |
 | EPIC-064 | 08 | Staged parallel generation, neighbour-aware scheduling, chunk status levels | XL | 058, 062 |
 | EPIC-065 | 08 | Pregeneration CLI and worldgen debug tools (top-down map, biome map, seed browser) | M | 064 |
 | EPIC-066 | 08 | Determinism suite, 10,000-seed nightly corpus, ≥250 columns/s performance gate | M | 064 |
@@ -231,15 +246,15 @@ template in §10.
 | EPIC-087 | 09 | Hot reload for packs and WASM, developer loop, in-game error overlay | M | 082, 042 |
 | EPIC-088 | 09 | API stability policy, deprecation process, conformance suite against previous release | M | 083 |
 | EPIC-089 | 11 | Entity framework: data-defined entities, goal/priority AI, A* pathfinding, sensory model | XL | MS-08, MS-10 |
-| EPIC-090 | 11 | Mob set: passive, neutral, hostile, villagers, golems, aquatic, nether, end, two bosses | XL | 089 |
-| EPIC-091 | 11 | Redstone signal model, dust, torches, repeaters, comparators, pistons, observers | XL | MS-10 |
+| EPIC-090 | 11 | Tier-1 mob set: common passive, neutral and hostile mobs, villagers, breeding and taming; full Tier-2 sets in MS-17 | XL | 089 |
+| EPIC-091 | 11 | Redstone signal model and the Tier-1 component set: dust, torches, repeaters, comparators, pistons, observers, lamps | XL | MS-10 |
 | EPIC-092 | 11 | Deterministic update ordering, cross-region circuits, loop detection, update budget | L | 091 |
-| EPIC-093 | 11 | Farming, breeding, bee and animal products, villager professions and trading | L | 090 |
-| EPIC-094 | 11 | Enchanting, anvil, brewing and potions, full loot-chest loop | L | 069, 093 |
-| EPIC-095 | 11 | Dimension progression: portals, dragon fight, end cities, elytra, respawn anchors | L | 063, 090 |
-| EPIC-096 | 11 | Commands, game rules, statistics, advancements | L | 075 |
+| EPIC-093 | 11 | Farming, breeding, animal products, villager professions and basic trading (full trading is MS-17) | L | 090 |
+| EPIC-094 | 11 | Enchanting, anvil, brewing and potion basics; the full loot-chest loop | L | 069, 093 |
+| EPIC-095 | 11 | Tier-1 dimension travel: portal activation, underworld/terminus travel, save-persistent link state; terminus progression (bosses, terminus cities, elytra) is MS-17 | L | 063, 090 |
+| EPIC-096 | 11 | Statistics and a guided advancement chain; commands and game rules move to MS-17 | L | 075 |
 | EPIC-097 | 11 | Minecarts, rails, boats, projectiles, falling blocks, TNT | L | 089 |
-| EPIC-098 | 11 | Spectator mode and creative-mode completeness | M | 089 |
+| EPIC-098 | 11 | Tier-1 creative-mode completeness; spectator mode ships in MS-14 | M | 089 |
 | EPIC-099 | 11 | Entity replication tuning and mob performance (200 visible entities ≤20 KB/s per player) | M | 089, 049 |
 | EPIC-100 | 12 | Post stack: GTAO, SSR water, volumetric fog and clouds, bloom, tone mapping options | XL | MS-04 |
 | EPIC-101 | 12 | Particle system, weather visuals, block-break and footstep effects, screen effects | L | 100 |
@@ -248,9 +263,9 @@ template in §10.
 | EPIC-104 | 12 | Controller support, input remapping polish, photo mode | M | 038 |
 | EPIC-105 | 12 | Quality presets per hardware tier, render scaling, auto-detect tuning | M | 100, 032 |
 | EPIC-106 | 12 | Visual parity review against the checklist; update the "deliberately different" list | M | 100, 102 |
-| EPIC-107 | 14 | Generate the parity checklist from registry dumps; build the executable parity corpus | XL | MS-11 |
-| EPIC-108 | 14 | Tier-2 closure for remaining blocks, items, mobs and structures | XL | 107 |
-| EPIC-109 | 14 | Commands, game rules, advancements and statistics parity | L | 096 |
+| EPIC-107 | 14 | Hand-author the behavioural parity checklist (DEC-051; registry dumps only as a cross-check) and build the executable corpus | XL | MS-11 |
+| EPIC-108 | 14 | Tier-1 parity closure for remaining blocks, items, mobs and structures; publish the Tier-2 coverage report and gap list for MS-17 | XL | 107 |
+| EPIC-109 | 14 | Tier-1 advancement and statistics completion; command/game-rule parity is MS-17 | L | 096 |
 | EPIC-110 | 14 | Accessibility: narrator, remap, colour-blind palettes, subtitles, reduced motion | L | 038, 103 |
 | EPIC-111 | 14 | Localization completeness, RTL rendering, CJK and emoji font fallback, translation workflow | L | 041 |
 | EPIC-112 | 14 | UX polish: onboarding, tooltips, recipe book, search, error dialogs, crash recovery | L | 075, 109 |
@@ -259,14 +274,14 @@ template in §10.
 | EPIC-115 | 15 | Parallel region ticking, interest-set tuning, replication batching, chunk send budgeting | XL | MS-07 |
 | EPIC-116 | 15 | Anti-cheat validation suite (movement, reach, break speed, placement, combat, chat) and replay evidence | XL | 115, 099 |
 | EPIC-117 | 15 | Moderation: mute, ban, kick with reasons, report command, admin audit log | M | 115 |
-| EPIC-118 | 15 | Scale harness: 500 bots, 50-player join storm, 20k-chunk world, 24 h soak and leak detection | M | 115 |
+| EPIC-118 | 15 | Scale harness: 500 bots, 50-player co-located join storm, a distributed-player configuration, 20k-chunk world, 24 h soak and leak detection | M | 115 |
 | EPIC-119 | 15 | DDoS and abuse hardening: connection limits, Retry, per-IP quotas, decompression bombs | M | 115 |
-| EPIC-120 | 15 | Capacity calculator and published benchmark matrix (vCPU × players × simulation distance) | M | 118 |
+| EPIC-120 | 15 | Capacity calculator and published benchmark matrix (vCPU × players × render/simulation distance) with separate co-located and distributed rows (DEC-052) | M | 118 |
 | EPIC-121 | 16 | Signed builds for Windows, Linux (AppImage/Flatpak/AUR) and macOS (universal, notarised) | L | MS-14, MS-15 |
 | EPIC-122 | 16 | Auto-updater: signed manifest, delta patches, rollback, stable/beta/nightly channels | L | 121 |
 | EPIC-123 | 16 | Website, docs site generated from `docs/`, download page, opt-in server list | L | 121 |
 | EPIC-124 | 16 | Save migration from every `0.x`, protocol and mod API 1.0 freeze with migration guide | M | 077, 088 |
-| EPIC-125 | 16 | Launch content: final art/audio, tutorial world, showcase worlds and mod pack | L | MS-12, MS-14 |
+| EPIC-125 | 16 | Launch content: final Tier-1 art/audio, tutorial world, showcase worlds and mod pack | L | MS-12, MS-14 |
 | EPIC-126 | 16 | Legal: trademark clearance sign-off, EULA/terms, privacy policy, security disclosure | M | 121 |
 | EPIC-127 | 16 | Launch communications: trailer, devlog, press kit, community channels | M | 123, 125 |
 
@@ -357,7 +372,7 @@ chapter and any spike result. One or two paragraphs at most.
 | `needs-design` | — | Blocks coding; names the spec chapter that must change first. |
 | `needs-triage` | — | Default for new issues; cleared within 3 working days. |
 | `security-embargo` | — | Private security work; exempt from the DEC comment window until disclosure. |
-| `parity` | — | Tracks a Tier-2 checklist item; links the generated checklist ID. |
+| `parity` | — | Tracks a hand-authored checklist row (DEC-051); links the row ID and its test. |
 
 Automation: a label-checker job fails PRs and issues without one `area:` and one
 `size:`; a PR-size comment warns above 400 changed lines (see [04](04-team-and-process.md));
@@ -377,7 +392,7 @@ list), `milestone:"MS-03" is:open` (burn-down), `label:good-first-issue` (onboar
 | Item | Why not now | Revisit when |
 | --- | --- | --- |
 | LOD and far terrain | Not needed at 512 blocks; visual-only by decision (DEC-018). | `1.4` (MS-20) or a measured frame-time need. |
-| Client-side WASM gameplay code | Breaks server authority and anti-cheat; OPEN-006 open. | MS-09 review, and only with a prediction descriptor. |
+| Client-side WASM gameplay code | **Excluded from 1.0 by DEC-049**: clients run no mod code; a client tier is post-1.0 and needs a new decision. | Post-1.0, with a new DEC, a determinism review and a prediction descriptor. |
 | Native plugins | Trust model unresolved (OPEN-007); operator-only, post-1.0. | MS-21, after the WASM tier is stable. |
 | Web/WebGPU client, Android | Platform expansion after 1.0 (DEC-034, OPEN-008). | MS-22 / MS-19. |
 | Minecraft import or protocol compatibility | Non-goal in v1; legal and product risk. | Never in `1.x`; only as an isolated community bridge. |
@@ -398,7 +413,7 @@ list), `milestone:"MS-03" is:open` (burn-down), `label:good-first-issue` (onboar
 | Parallel work without interfaces. | Two contributors edit the same crate in one week. | Interface-first tasks; crate ownership per track; land the trait before the implementations. |
 | Estimate drift inside XL epics. | An XL epic has no merged task after two weeks. | Split at the first missing merge; XL epics get a week-by-week task list up front. |
 | Task inflation from agents. | 100 tiny issues, few merged PRs. | One issue per outcome (REQ-WBS-003); maintainers merge issues rather than create more. |
-| The vertical slice grows forever. | MS-03 passes 12 dev-weeks of recorded effort. | Apply the [MVP cut lines](02-mvp.md) and ship `0.0.1` smaller. |
+| The vertical slice grows forever. | MS-03 passes 18 dev-weeks of recorded effort. | Apply the [MVP cut lines](02-mvp.md) and ship `0.0.1` smaller. |
 | Milestone closes on paper only. | Exit criteria are ticked without links. | REQ-WBS-003: no link, no tick; the definition of done in [01](01-milestones.md) is enforced by review. |
 | Stale backlog hides the real work. | Open issues grow faster than closed for two months. | Monthly grooming; close `P3` after 90 days; cap the milestone to work that fits the phase. |
 
@@ -418,8 +433,9 @@ list is wrong and must be split or re-scoped before work continues.
    Without it, estimates drift between trackers and the ±10% rule is unenforceable.
    Owner: MS-00.
 2. **Register item needed: content production is budgeted separately.** Art, audio, level
-   design and QA are not part of the 159 engineering dev-weeks; formalises roadmap §12
-   so planning cannot silently absorb them. Owner: MS-16.
+   design and QA are not part of the 200–240 engineering dev-weeks (or the 500–800
+   dev-week 2.0 track); formalises roadmap §12 so planning cannot silently absorb them.
+   Owner: MS-16.
 3. **Epic representation.** GitHub issues (`type: epic`) versus a project-board "Epic"
    field. Issues are linkable and searchable; fields are cheaper. Proposal: issues, with
    a board view. Owner: MS-00.
@@ -439,7 +455,7 @@ list is wrong and must be split or re-scoped before work continues.
 - [Team and process](04-team-and-process.md) for review rules, CI gates, labels,
   branch strategy and the AI-assistance policy referenced by the task template.
 - [Decision register](../decisions.md): DEC-005, DEC-010, DEC-020, DEC-023, DEC-033,
-  DEC-035, DEC-036.
+  DEC-035, DEC-036, DEC-048, DEC-049, DEC-051, DEC-052.
 - [Contributing](../../CONTRIBUTING.md), [maintainers](../../MAINTAINERS.md), and the
   existing [issue templates](../../.github/ISSUE_TEMPLATE/) and
   [PR template](../../.github/pull_request_template.md).

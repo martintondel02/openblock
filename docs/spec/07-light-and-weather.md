@@ -18,7 +18,7 @@ The status is **draft for review** for one reason: [OPEN-004](../decisions.md) h
 | --- | --- | --- |
 | REQ-LIGHT-001 | Sky light is a scalar 0–15 and block light is three independent 0–15 channels (R, G, B), packed as `[sky:4][R:4][G:4][B:4]` in one `u16` per block. | Layout test + save/network round-trip |
 | REQ-LIGHT-002 | Emission, per-channel attenuation and sky attenuation are block-state properties declared by content and validated to 0–15 at registry freeze. | Schema validator test |
-| REQ-LIGHT-003 | Propagating light loses `max(1, attenuation)` per step; sky light at level 15 travelling straight down through cells with `sky_attenuation == 0` does not decrease. | Table-driven propagation fixtures |
+| REQ-LIGHT-003 | Column seeding subtracts a cell's own `sky_attenuation` from a running level that starts at 15, so an opaque cell zeroes the column and every cell below it stays 0; lateral propagation loses `max(1, attenuation)` per step, so a step into a `sky_attenuation == 0` cell still costs 1 and can never restore a column to 15. | Table-driven seeding and propagation fixtures |
 | REQ-LIGHT-004 | The increment algorithm is a 16-bucket queue processed high level first; a cell is written only when the new level exceeds the stored level. | Unit test + invariant assertion |
 | REQ-LIGHT-005 | The decrement algorithm is a removal BFS that clears dependent cells and collects frontier cells for re-addition; it MUST handle the straight-down sky dependency (`level == 15` below a removed cell). | Removal fixtures + differential fuzz |
 | REQ-LIGHT-006 | A single edit relights a bounded volume: at most a 31³ box per channel around a level-15 change, never a whole-section relight. | Instrumented cell-write counter |
@@ -71,7 +71,7 @@ radiance(c) = block[c] × block_tint[c]
             + dimension_ambient[c]
 ```
 
-That separation is why a lit room in the nether is safe, why a thunderstorm darkens the sky without turning off lamps, and why a client with a different sky shader still spawns the same mobs as the server.
+That separation is why a lit room in the underworld is safe, why a thunderstorm darkens the sky without turning off lamps, and why a client with a different sky shader still spawns the same mobs as the server.
 
 ### 3.2 Opacity, emission and attenuation as content properties
 
@@ -102,14 +102,22 @@ Sky light is seeded per column from the top down; block light is seeded from emi
 
 ```rust
 fn seed_sky_column(col: &mut Column, x: usize, z: usize) {
-    let mut level = 15u8;
+    let mut level = 15u8;                          // open sky above the column
     for y in (col.min_y..col.max_y).rev() {
-        let att = col.sky_attenuation(x, y, z);       // 0..=15
-        level = if att == 0 { 15 } else { level.saturating_sub(att.max(1)) };
-        col.set_sky(x, y, z, level);                   // below an opaque cell this writes 0
+        let att = col.sky_attenuation(x, y, z);    // 0..=15; 15 = opaque
+        level = level.saturating_sub(att);         // an opaque cell zeroes everything below it
+        col.set_sky(x, y, z, level);               // transparent cells below stay 0
     }
 }
 ```
+
+The seed is a **running subtraction, not a per-cell reset**. `att == 0` leaves the
+running level untouched, so a clear shaft carries 15 from the sky to the bottom;
+`att == 15` drives it to 0 and every transparent cell beneath the opaque cell stays 0,
+which is what makes a sealed room dark. `max(1, attenuation)` belongs to *lateral*
+propagation only (the `add` loop of §3.4, and REQ-LIGHT-003), because a sideways step must always
+cost at least one; applying it to the vertical seed would resurrect the 15 below an
+opaque cell and light every cave and player-built room from above after each load.
 
 After seeding, every cell that has a neighbour with a lower value is pushed into the add queue; cells with no lower neighbour cannot propagate and are skipped. Block light is seeded by scanning the section's non-air list rather than all 4,096 cells, because emitters are rare (the generator records emitter positions when it writes a block).
 
@@ -167,6 +175,8 @@ When a chunk becomes `Lit` or is reloaded, its 1-block border with each resident
 
 **Sky columns.** A heightmap change is the only trigger for a column recompute. Building a roof at Y = 120 over a column whose old light-blocking height was 119 changes exactly the range `[119, 120)`: sky becomes 0 at the new roof and the cells below it lose direct sky, which the removal BFS then spreads. Digging a hole does the reverse and seeds new sky at 15, which the add BFS spreads sideways. The implementation recomputes only between the old and new `LIGHT_BLOCKING` heights; a change that does not move either height (a block replaced by an equally opaque one) does no sky work at all.
 
+Seeding is also the load path, not only the first-generation path: a column restored from a save is seeded with the same running subtraction, because a loader that re-seeds 15 below an opaque roof would make every sealed cave and player-built room sky-lit after every restart. The sealed-room fixture in §7 runs across a save/load cycle for exactly that reason.
+
 ### 3.7 Batching, workers, merge and latency
 
 Relighting is a latency problem, not a throughput problem: a visible edit must not stutter, and a new chunk must be lit before it is meshed. The pipeline is:
@@ -197,7 +207,7 @@ Light drives spawning, growth, sensors and melting. Every rule is a content tabl
 | `openblock:daylight_sensor` | output = `sky_gameplay`, inverted variant = `15 − sky_gameplay` | [12](12-redstone-and-logic.md) |
 | `openblock:plant_sky_access` | `sky_light ≥ 1` (direct sky at the plant's cell) | [08](08-gameplay-survival.md) |
 
-Thresholds are validated to 0–15 and the rule table is part of the pack hash, so a mod that changes spawning light changes it consistently on client and server and fails the handshake if the change is not installed everywhere ([DEC-019](../decisions.md), [DEC-027](../decisions.md)).
+Thresholds are validated to 0–15 and the rule table is part of the content hash, so a mod that changes spawning light changes it consistently on client and server and fails the handshake if the change is not installed everywhere ([DEC-019](../decisions.md), [DEC-027](../decisions.md), [DEC-050](../decisions.md)).
 
 ### 3.9 Client prediction of light
 
@@ -222,7 +232,7 @@ Recommendation to the decision: keep colored light as the default because tinted
 
 ### 3.11 Time and the celestial model
 
-Time is an integer tick count. `total_ticks` is monotonic and drives weather, growth and scheduled ticks; `day_time = total_ticks mod day_length` drives the sky. The default day length is **24,000 ticks** (20 minutes at 20 Hz), configurable from 1,000 to 240,000 ticks; the value is stored with the world because it changes the meaning of every scheduled tick, and changing it at runtime rescales `day_time` to preserve the time-of-day fraction.
+Time is an integer tick count. `total_ticks` is monotonic and drives weather, growth and scheduled ticks; `day_time = total_ticks mod day_length` drives the sky. The default day length is **24,000 ticks** (20 minutes at 20 Hz), configurable from 1,000 to 240,000 ticks; the value is stored with the world because it changes the meaning of every scheduled tick, and changing it at runtime rescales `day_time` to preserve the time-of-day fraction. `total_ticks`, `day_time`, `day_length` and the per-dimension weather state are the `world_state` block of `level.json` ([17 §3.4](17-persistence.md#34-sidecar-files)); a save that omits them cannot rebase scheduled ticks or reproduce the sky.
 
 With `t = day_time / day_length` (0 at sunrise, 0.25 at noon, 0.5 at sunset, 0.75 at midnight) and `ALT_MAX = π/3` rad (60°):
 
@@ -263,7 +273,7 @@ These stops are base-pack defaults (our estimate, reviewed visually), not measur
 
 ### 3.13 The weather state machine
 
-Each weather-enabled dimension owns one machine. It is deterministic: every duration and transition is drawn from `splitmix64(world_seed ^ dimension_seed ^ WEATHER_STREAM ^ epoch)`, where `epoch` increments on every transition and is persisted.
+Each weather-enabled dimension owns one machine. It is deterministic: every duration and transition is drawn from `splitmix64(world_seed ^ dimension_seed ^ WEATHER_STREAM ^ epoch)`, where `epoch` increments on every transition and is persisted per dimension in the `world_state` block of `level.json` ([17 §3.4](17-persistence.md#34-sidecar-files)), along with phase, intensity and remaining duration.
 
 ```mermaid
 stateDiagram-v2
@@ -332,7 +342,7 @@ EnvironmentDef(
 )
 ```
 
-Resolution order is biome over dimension over pack default. Unknown IDs are a pack validation error, not a silent fallback. `EnvironmentDef` is client-only: it is included in the pack hash (so client and server cannot silently disagree about content) but excluded from the simulation state hash, because it cannot affect gameplay ([DEC-019](../decisions.md), [DEC-027](../decisions.md)). A dedicated server parses and validates it and never evaluates it.
+Resolution order is biome over dimension over pack default. Unknown IDs are a pack validation error, not a silent fallback. `EnvironmentDef` is client-only: it is included in the view hash, not the content hash, because it cannot affect gameplay; a client with a different environment pack still joins and sees its own sky, fog and ambience, while the simulation state hash never includes it ([DEC-019](../decisions.md), [DEC-027](../decisions.md), [DEC-050](../decisions.md)). A dedicated server parses and validates it and never evaluates it.
 
 ### 3.17 Server–client synchronisation of time and weather
 
@@ -388,7 +398,7 @@ The light engine holds no light data itself: it reads and writes through the wor
 | PERF-LIGHT-001 | Torch-sized relight (≤ 8,000 cell writes, one channel group) median ≤ 150 µs, p99 ≤ 600 µs | Criterion bench on a cave scene |
 | PERF-LIGHT-002 | Sky cascade capped at 2 ms per server tick and 0.5 ms per client frame; overflow deferred in component key order | Instrumented roof-removal stress |
 | PERF-LIGHT-003 | Fresh 24-section column ≤ 1.2 ms p95 on one core; ≥ 4,000 columns/s on 8 workers | Worldgen-integrated benchmark |
-| PERF-LIGHT-004 | Light memory ≤ 2 B/block non-uniform; ≤ 210 MB at 512 blocks, ≤ 840 MB at 1024 (colored mode) | Allocation counter |
+| PERF-LIGHT-004 | Light memory ≤ 2 B/block for non-uniform sections (8 KiB per 16³ section); ≤ 210 MB at 512 blocks (≈ 208 MB at the assumed 25 % non-uniform distribution), ≤ 840 MB at 1024 (colored mode) | Allocation counter |
 | PERF-LIGHT-005 | Gameplay light query ≤ 10 ns; render fetch ≤ 20 ns | Criterion bench |
 | PERF-LIGHT-006 | Propagation queue ≤ 2 MB steady state, ≤ 24 B per entry, hard cap of 1 M entries with deferred overflow | Instrumented stress |
 | PERF-LIGHT-007 | Full relight of a resident 512-block world ≤ 1.5 s on 8 workers (debug and tooling path) | `cargo xtask bench --scene relight` |
@@ -401,6 +411,7 @@ The light engine holds no light data itself: it reads and writes through the wor
 | Failure | Detection | Behaviour |
 | --- | --- | --- |
 | Removal misses a straight-down sky column | Sky-shaft fixture, differential fuzz | Cells below a roof stay lit; caught by the fixture before release, never by a player |
+| Seeding restores sky light below an opaque roof | Sealed-room fixture across load/save + differential fuzz | Column seed subtracts attenuation from the running level; the fixture fails if an interior cell reads 15 instead of 0 |
 | Removal cascade larger than the per-tick budget | Budget counter | Remaining components deferred to the next tick, applied in key order, logged once per second |
 | Light at a chunk border after unload/reload | Border hash test | Border cells reconciled on promotion; the interior hash must match the pre-unload value |
 | Edit or emitter removal in a chunk that unloads | Status check at apply time; retained scheduled tick | Patch discarded, chunk reloads from the save with stored light, removal runs on reload |
@@ -416,7 +427,7 @@ The light engine holds no light data itself: it reads and writes through the wor
 
 | Level | What it proves | Tooling |
 | --- | --- | --- |
-| Fixtures | Hand-computed fields for a sealed-room lamp, 1-block sky shaft, water column attenuation, stained-glass RGB, glass roof and corner emitter | Golden arrays, table-driven `cargo test` |
+| Fixtures | Hand-computed fields for a sealed room and a sky shaft: with an opaque roof at y=120, sky is 15 only above the roof and exactly 0 in every interior cell, including transparent ones, after generation and after a save/load; down a 1-block shaft sky is 15 to the bottom and 0 in the cells beside it that only lateral light could reach; plus water column attenuation, stained-glass RGB, glass roof and corner emitter | Golden arrays, table-driven `cargo test` |
 | Differential fuzz | After each of 10⁵ random edits in a 3×3-chunk world, the full light field equals `SlowLight` recomputed from scratch; 10⁷ edits nightly | `proptest` + a seeded edit generator |
 | Borders | Sources on both sides of a section and chunk border; unload/reload restores the world light hash; propagation across a 4-chunk corner | Integration test |
 | Determinism | Same edit log under 1, 2 and 8 workers with shuffled completion order yields identical per-tick light hashes | Replay harness ([02](02-engine-core.md)) |
@@ -438,7 +449,7 @@ The light engine holds no light data itself: it reads and writes through the wor
 
 ## 9. References
 
-- Decisions: [DEC-005](../decisions.md) (packed light, 2 B/block, sky4 + RGB4), [DEC-007](../decisions.md) (fixed tick), [DEC-008](../decisions.md) (server authority), [DEC-015](../decisions.md) (CPU flood fill), [DEC-019](../decisions.md) (content data), [DEC-027](../decisions.md) (protocol and pack hash), [DEC-044](../decisions.md) (snake_case rule IDs).
+- Decisions: [DEC-005](../decisions.md) (packed light, 2 B/block, sky4 + RGB4), [DEC-007](../decisions.md) (fixed tick), [DEC-008](../decisions.md) (server authority), [DEC-015](../decisions.md) (CPU flood fill), [DEC-019](../decisions.md) (content data), [DEC-027](../decisions.md) (protocol), [DEC-044](../decisions.md) (snake_case rule IDs), [DEC-050](../decisions.md) (content and view hash).
 - [Specification conventions](00-conventions.md); [world model](05-world-model.md); [rendering](03-rendering.md); [shaders and visuals](04-shaders-and-visuals.md); [world generation](06-worldgen.md); [entities and AI](09-entities-ai.md); [networking multiplayer](18-networking-multiplayer.md); [performance budgets](25-performance-budgets.md).
 - [Weft teardown](../research/01-weft-teardown.md) §4.2 — flood fill with per-channel absorption, sky-down shortcut, prelight compared against a reference implementation; [voxel rendering SOTA](../research/03-voxel-rendering-sota.md) §6 — light storage tradeoffs (1/2/4 B per block), 50–300 µs edit relight, 1–3 ms per new column, Starlight-class batching as a latency optimisation.
 - [Minecraft feature inventory](../research/05-minecraft-feature-inventory.md) §3.9 — 0–15 sky/block light, per-dimension skylight, light-aware spawning, 24,000-tick day, biome-dependent snow, reduced sky light during weather.

@@ -29,24 +29,24 @@ In scope: `ob_world` storage, the `openblock-server` world manager, and the
 | ID | Requirement | Verification |
 | --- | --- | --- |
 | REQ-SAVE-001 | After a power loss or `kill -9`, the world MUST open and MUST lose at most the last save cycle. | Fault-injection suite, 1,000 iterations (§7.1) |
-| REQ-SAVE-002 | A committed region MUST never be modified in place: every commit writes new data and a new index, then publishes it by a header write. | Code inspection + torn-write test |
+| REQ-SAVE-002 | A committed chunk blob MUST never be overwritten: every commit appends new data and publishes a new index and header generation. The region file itself is mutable after commit, which is why backups copy or reflink whole files (§3.8). | Code inspection + torn-write test |
 | REQ-SAVE-003 | Every chunk blob MUST carry a CRC32C over its compressed bytes and one over its uncompressed payload; the reader MUST verify both. | Unit test with a flipped bit at every offset class |
 | REQ-SAVE-004 | A chunk failing validation MUST be quarantined, never dropped and never silently regenerated over edited data. | Corruption fixtures |
 | REQ-SAVE-005 | A world written by any released version MUST migrate forward automatically, with a durable pre-migration backup. | Fixture saves for every release (§7.2) |
 | REQ-SAVE-006 | Opening a world written by a newer format MUST fail with an actionable message naming the required version; it MUST NOT attempt a downgrade. | Negative test |
 | REQ-SAVE-007 | Canonical chunk payloads MUST be deterministic: load → save without edits MUST reproduce identical raw bytes and CRCs. | Round-trip test at 1 and 8 workers |
-| REQ-SAVE-008 | Numeric content indices MUST NOT be persisted. Chunk data references world-scoped dictionary ids that resolve to resource IDs through `ids.json`; dictionary ids are never reused. | Inspection + `ids.json` growth test |
-| REQ-SAVE-009 | Unknown content MUST round-trip as an opaque placeholder: remove a pack, load, save, re-add, load — data is intact. | Integration test |
+| REQ-SAVE-008 | Numeric content indices MUST NOT be persisted. Chunk data references world-scoped dictionary ids that resolve through `ids.json` to resource IDs — and, for a block state, to `(block resource id, canonical property word)`; dictionary ids are never reused. | Inspection + `ids.json` growth test |
+| REQ-SAVE-009 | Unknown content MUST round-trip as an opaque placeholder: remove a pack, load, save, re-add, load — data is intact, including every state of a multi-state block. | Integration test |
 | REQ-SAVE-010 | The region format v1 layout of §3.2–§3.3 is frozen at MS-13; changes require a format_version bump and a migration. | Format-freeze review |
 | REQ-SAVE-011 | All world writes MUST go through the region store; no subsystem may create ad-hoc files in the world directory. | Path allowlist test |
 | REQ-SAVE-012 | Block edits MUST NOT trigger `fsync`. Commits are batched, with at most two `fsync` per dirty region per cycle and one journal `fsync` per metadata transaction. | Syscall-counter test |
 | REQ-SAVE-013 | Graceful shutdown MUST flush all dirty state within 2 s for up to 256 MiB and set the clean-shutdown marker. | Shutdown benchmark |
 | REQ-SAVE-014 | `level.json` MUST be canonical JSON with an explicit `format_version` and `data_version`; unknown fields MUST be preserved on rewrite. | Round-trip test with an extra key |
 | REQ-SAVE-015 | Player data MUST be saved on logout, on death, on dimension change and at every autosave, keyed by stable player UUID. | Session script test |
-| REQ-SAVE-016 | Block entities, entities, scheduled ticks, heightmaps and light MUST round-trip exactly, including mod-defined fields. | Property test over random worlds |
+| REQ-SAVE-016 | Block entities, entities, scheduled ticks (with their delays rebased on load), heightmaps, light and the `world_state` clock and weather MUST round-trip exactly, including mod-defined fields. | Property test over random worlds |
 | REQ-SAVE-017 | Structure starts MUST be persisted before any block of that start is written (REQ-GEN-032). | Kill-mid-generation test |
 | REQ-SAVE-018 | Each dimension MUST have an independent directory; dimension IDs are resource IDs; copying a world directory MUST preserve the world UUID and all links. | Portability test |
-| REQ-SAVE-019 | Backups MUST be automatic before migration and on a schedule; retention MUST be bounded by count and age from config. | Backup/restore test |
+| REQ-SAVE-019 | Backups MUST be automatic before migration and on a schedule, and each MUST be a full copy, a reflink or an OS directory snapshot of the region files — never a hard link; retention MUST be bounded by count and age from config. | Backup/restore test |
 | REQ-SAVE-020 | Import/export MUST validate structure files and world archives before writing anything, and MUST reject traversal, absolute paths, symlinks, duplicate and case-colliding names. | Hostile-archive corpus |
 | REQ-SAVE-021 | Decompression MUST be bounded before allocation: a declared raw length above the cap or a stream exceeding it aborts the load. | Zip-bomb fixtures |
 | REQ-SAVE-022 | A world directory is untrusted input: no code, generator, shader or path from it may be loaded or executed. | Inspection + fuzz corpus |
@@ -76,7 +76,7 @@ saves/<world_uuid>/
   players/<uuid>.json        per-player state, atomic replace
   dimensions/openblock/overworld/region/r.<rx>.<rz>.obr
   dimensions/openblock/overworld/region/r.<rx>.<rz>.obs   structure starts
-  dimensions/openblock/nether/...                         same shape
+  dimensions/openblock/underworld/...                     same shape
   dimensions/<namespace>/<path>/...                       content dimensions
   quarantine/<region>/<cx>.<cz>.obc                        failed payloads
   backups/<utc-stamp>/                                    snapshots (§3.8)
@@ -205,17 +205,17 @@ skip what it does not understand and a writer can preserve what it never decoded
 | 24 | 2 | `component_count` |
 | 26 | 2 | `section_count` |
 | 28 | 4 | `body_len` |
-| 32 | 8 | reserved |
+| 32 | 8 | `saved_tick` — base tick for this payload's delays: the chunk's `last_simulated` at write time |
 
 Each component is `u16 id | u32 len | len bytes`. Known ids:
 
 | Id | Component | Encoding |
 | ---: | --- | --- |
 | 1 | biomes | varint palette length, palette of dictionary ids, `bits` (0/4/8/16), packed 4×4×4 indices per section, section-major |
-| 2 | sections | per section: `y i16`, mode `u8` (0 uniform, 1 packed), `bits u8`, palette length `u16`, `data_len u32`, then palette (varint ids) and packed `u64` words in YZX order |
+| 2 | sections | per section: `y i16`, mode `u8` (0 uniform, 1 packed), `bits u8`, palette length `u16`, `data_len u32`, then palette of block-state dictionary ids (each resolving to `(block resource id, canonical property word)`) and packed `u64` words in YZX order |
 | 3 | block entities | count, then `packed_pos u32`, type dictionary id (varint), payload length (varint), payload |
 | 4 | entities | count, then UUID (`16 B`), type dictionary id, payload |
-| 5 | scheduled ticks | count, then `packed_pos u32`, type dictionary id, `delay u32` ticks (remaining, against the saved world tick), `priority u8` |
+| 5 | scheduled ticks | count, then `packed_pos u32`, kind dictionary id (varint), `delay u32` ticks (remaining, against this payload's `saved_tick`); no sequence number |
 | 6 | heightmaps | three 16×16 maps at 9 bits per entry, packed (288 bytes each): surface, motion-blocking, ocean floor |
 | 7 | light | per section: `y i16`, mode (0 uniform, 1 packed), one `u16` for uniform or 4,096 × `u16` (sky4 + R4 + G4 + B4) |
 | 8 | structure refs | count, then `start_id u64`, structure dictionary id, `piece_mask u64` |
@@ -223,10 +223,30 @@ Each component is `u16 id | u32 len | len bytes`. Known ids:
 
 `packed_pos` is `x(4) | z(4) | y(12)` biased by `min_y`, valid for heights up to
 1,024 and any 16×16 column. Section records are sorted by `y`; block entities by
-position, entities by UUID and ticks by `(delay, position, type)` — this sorting is
+position, entities by UUID and ticks by `(delay, packed_pos, kind)` — which is the
+canonical `(due_tick, position, kind)` order of [05 §3.7](05-world-model.md#37-scheduled-ticks),
+because every delay in a payload is relative to that payload's single `saved_tick`. This sorting is
 what makes payload bytes canonical (REQ-SAVE-007). Palettes are sorted by
 dictionary id and indices remapped on encode, so an edit history cannot change the
 bytes of the same logical content.
+
+**Block-state identity.** A block state is not a resource ID: it is a block type plus a
+property word ([05 §3.4](05-world-model.md#34-block-states)). Every `block_state`
+dictionary entry is therefore the pair `(block resource id, canonical property word)`,
+where the word sorts properties by name and packs them little-endian at increasing bit
+offsets, so it is independent of registry order and of whichever pack is installed. The
+canonical state key `namespace:path[prop=value,…]` (properties sorted by name, every
+property listed) is written next to the entry in `ids.json`; it is what `/debug ids`, the
+pack validator and a human diff show, while the pair is what a palette id resolves to. A
+modded block with sixteen states therefore keeps sixteen dictionary entries and
+round-trips as sixteen states, not as one opaque blob.
+
+A palette id whose pack is absent decodes to `PaletteEntry::Opaque`: `original_id` is the
+block's resource ID taken from the dictionary entry, and `payload` is the two-byte
+canonical property word — nothing else, because a block entity carries its own component
+and item contents. Re-adding the pack resolves the key back to a frozen state ID. If the
+word is not valid for the returned pack's schema, the entry stays opaque and a warning
+names the pack and state key; the loader never substitutes a different state.
 
 ### 3.4 Sidecar files
 
@@ -240,32 +260,99 @@ bytes of the same logical content.
   "game_mode": "survival", "difficulty": "normal", "tick_rate": 20,
   "spawn": { "dimension": "openblock:overworld", "x": 128, "y": 71, "z": -42 },
   "game_rules": { "keep_inventory": false, "do_daylight_cycle": true },
-  "dimensions": ["openblock:overworld", "openblock:nether", "openblock:end"],
+  "dimensions": ["openblock:overworld", "openblock:underworld", "openblock:terminus"],
+  "world_state": {
+    "total_ticks": 1830000, "day_time": 6000, "day_length": 24000,
+    "dimensions": {
+      "openblock:overworld": { "weather": { "phase": "precipitating", "intensity": 0.65,
+                                            "thunder": 0.0, "remaining": 4200, "epoch": 17 } },
+      "openblock:underworld": { "weather": null },
+      "openblock:terminus": { "weather": null }
+    }
+  },
   "generators": { "openblock:overworld": { "fingerprint": "0x9a3f…", "generator_version": 1 } },
   "content_hash": "blake3:…", "ids_generation": 42,
   "world_border": 29999984, "clean_shutdown": true
 }
 ```
 
-`ids.json` maps dictionary ids to resource IDs per registry kind, with a
-`generation` counter, a tombstone list and a `next` allocator per kind:
+**`world_state` is the clock the whole save depends on.** `total_ticks` is the monotonic
+tick count; `day_time` and `day_length` are the celestial state of
+[07 §3.11](07-light-and-weather.md#311-time-and-the-celestial-model). A dimension whose
+`TimeMode` is `Fixed`/`Frozen` derives its sky from the frozen value and does not need a
+separate field. Each weather-enabled dimension stores its machine's phase, intensity,
+thunder, remaining duration and RNG `epoch` ([07 §3.13](07-light-and-weather.md#313-the-weather-state-machine));
+non-weather dimensions store `null`, not a zeroed machine.
+
+**Tick-delay rebasing.** Scheduled ticks are stored as a remaining `delay`, never as an
+absolute `due_tick` (§3.3 component 5), and every payload carries the tick its delays are
+relative to — the chunk's `last_simulated`, written as `saved_tick`. On load the order is:
+restore `world_state` first, then apply block states, block entities and chunk payloads,
+then convert each chunk's delays with `due_tick = saved_tick + delay`. Because the base is
+per chunk, the conversion is symmetric: a chunk last simulated at tick `T` and reloaded at
+`T + 5,000` keeps its pending ticks at their original due times, and the loader reports
+`missed = clamp(total_ticks − saved_tick, 0, CATCHUP_WINDOW)` so the bounded catch-up of
+[05 §3.7](05-world-model.md#37-scheduled-ticks) can run them; a world merely restarted at
+the same tick runs them exactly as before. Writing a chunk (save or unload) recomputes
+`delay = max(0, due_tick − saved_tick)` from its current `last_simulated`, so repeating
+save/load leaves the schedule unchanged and nothing ages against the wall clock. An
+already-due tick therefore becomes `delay = 0`, never dropped: on load it rebases to
+`saved_tick`, which is in the past, and the catch-up pass runs it once. This is what makes
+REQ-SAVE-016's "round-trip exactly" meaningful for ticks and what
+[05 §3.7](05-world-model.md#37-scheduled-ticks) assumes for catch-up.
+
+`world_state` participates in the canonical world hash recorded in the save manifest used
+by backup and export verification (§3.8), and in the expected `world_state` recorded by the
+migration fixtures (§3.7): the manifest hash is BLAKE3 over the canonical `level.json`
+bytes with the diagnostic `last_played` field excluded (including `world_state`),
+`ids.json` and the ordered per-chunk payload hashes. A loader that forgets the clock or
+re-seeds weather therefore fails a save test instead of drifting silently.
+
+A pre-`world_state` fixture migrates with `total_ticks = 0`, `day_time = 0`,
+`day_length = 24000`, `phase = "clear"`, `intensity = 0`, `epoch = 0`; the migration step is
+recorded in the journal like any other and is covered by the fixture in §7.2.
+
+`ids.json` maps dictionary ids to resource IDs — or, for a block state, to a resource ID
+plus property word — per registry kind, with a `generation` counter, a tombstone list and
+a `next` allocator per kind:
 
 ```jsonc
 { "format": 1, "generation": 42,
   "kinds": {
     "block": { "next": 1180, "ids": { "openblock:stone": 0, "openblock:dirt": 1 },
                "tombstones": ["mymod:removed_block"] },
+    "block_state": { "next": 1204,
+      "entries": {
+        "openblock:oak_stairs[facing=east,half=bottom,shape=straight,waterlogged=false]":
+          { "id": 1203, "block": "openblock:oak_stairs", "props": 4131 },
+        "mymod:pipe[axis=y,flow=3]":
+          { "id": 1202, "block": "mymod:pipe", "props": 26 } },
+      "tombstones": [] },
     "entity": { "next": 41, "ids": { "openblock:grazer": 0 }, "tombstones": [] },
     "biome": { "next": 65, "ids": { "openblock:plains": 0 }, "tombstones": [] } } }
 ```
 
-Dictionary ids are world-scoped, monotonic and never reused; a re-added ID gets a
-new id and the tombstone is kept for the world's lifetime (REQ-SAVE-008). Kinds
-covered: block state, item, entity, block entity, biome, feature, structure,
+`block_state` is the one kind that cannot be a plain string map, because a state has no
+resource ID of its own. Its key is the canonical state key and its value carries the
+dictionary id plus the `(block, props)` pair, where `props` is the 16-bit canonical
+property word of [05 §3.4](05-world-model.md#34-block-states), written in decimal. A
+removed pack leaves its entries in place: while the pack is absent, palette ids decode to
+`PaletteEntry::Opaque` with that pair, and when the pack returns the key resolves to the
+frozen state ID. A 16-state modded block therefore adds 16 entries and round-trips as 16
+states; it is never collapsed into a single opaque placeholder.
+
+Dictionary ids are world-scoped, monotonic and never reused for a different key. An
+entry that is retired because content was explicitly deleted leaves a tombstone for the
+world's lifetime, while a pack that is merely absent leaves its entries in place.
+`block_state` entries are retained while their block's pack is merely absent, because an
+opaque palette id must still resolve to a `(block, props)` pair; explicit deletion of a
+block retires its state entries with tombstones like any other kind. Re-adding an absent
+pack therefore reuses the existing keys and dictionary ids, and a 16-state block keeps
+all 16. Kinds covered: block state, item, entity, block entity, biome, feature, structure,
 particle, sound, damage type.
 
 Other sidecars: `players/<uuid>.json` (position, health, inventory, effects,
-advancements, ender chest; atomic replace), `dimensions/<id>/structures.obs`
+advancements, personal storage; atomic replace), `dimensions/<id>/structures.obs`
 (structure starts: `start_id`, structure ID, origin chunk, bounding box, piece
 count, seed, loot seed, status — written before any of its blocks, REQ-SAVE-017),
 `journal.obm` (metadata transaction and migration journal, §3.5 and §3.7), and a
@@ -307,6 +394,11 @@ sequenceDiagram
    `generation + 1`, `fsync`. Nothing else is needed: an uncommitted append is
    unreachable because the old index is still active, so recovery never has to
    reason about partially written chunk data.
+
+The region file is therefore **not immutable** after a commit: it keeps the same
+inode while its payload grows and its inactive index and header are rewritten. Backups
+must copy or reflink the file (§3.8); a hard link would follow those writes into the
+backup and silently change it.
 
 **Metadata transactions.** `level.json`, `ids.json` and player files cannot use an
 in-file double buffer, and a multi-file update must not land half-applied. They are
@@ -400,10 +492,14 @@ stateDiagram-v2
 Migrations are ordered steps `v(n) → v(n+1)`, each a pure function over a
 validated world, applied in memory and committed in one pass. They are engine
 code, never content or mod code. A step records itself in the journal before
-commit and is idempotent (REQ-SAVE-032). Fixture saves for every released version
+commit and is idempotent (REQ-SAVE-032). `world_state` is migrated like any other
+field: the step that introduces it fills the defaults of §3.4, and later steps preserve
+unknown weather fields verbatim. Fixture saves for every released version
 live in `tests/fixtures/saves/<release>/` with a manifest of expected per-chunk
-hashes; `cargo xtask save fixture` regenerates them from a scripted world, and
-they are at most 2 MiB each.
+hashes and the expected `world_state` (total ticks, day time, day length and
+per-dimension weather); one fixture deliberately predates `world_state` so the
+defaulting step is exercised. `cargo xtask save fixture` regenerates them from a
+scripted world, and they are at most 2 MiB each.
 
 `openblock-server save migrate --dry-run --verify <world>` runs the whole chain on
 a temporary copy, compares per-chunk CRCs before and after, and prints the plan;
@@ -422,15 +518,30 @@ the mechanism behind the opaque-placeholder round-trip.
 ### 3.8 Backups, restore, import and export
 
 **Backups.** A backup is a directory `backups/<utc-stamp>/` containing
-`level.json`, `ids.json` and hard links (or reflinks where the filesystem supports
-them) to the region files; a fully copied backup is the fallback. Because region
-files are immutable once committed, a hard link is a consistent snapshot of that
-file at that moment; a commit during the backup therefore costs one extra file,
-never a torn copy. Retention is `keep N` by count and age from config (default:
-24 hourly, 7 daily, 4 weekly), pruning oldest first and never deleting the
-pre-migration backup of the running version. Restore is a file-level operation on a
-stopped world, or a copy-then-swap under the lock; the tool verifies every copied
-region header and index before swapping.
+`level.json`, `ids.json` and a full copy of every region file, or a reflink
+(copy-on-write clone) where the filesystem supports it (APFS, btrfs, XFS with
+reflink). Hard links are **not** supported: a region file is not immutable once
+committed — a commit appends blobs and rewrites the inactive index and header in
+the same file (§3.2) — so a hard-linked backup would silently change with the live
+world. The supported modes are `copy` (portable, one full copy of the world per
+backup), `reflink` (only when the filesystem reports support, falling back to copy
+otherwise), and `auto` (the default: reflink when supported, else copy); `backups.mode`
+selects them and the backup UI states the space cost.
+
+*Consistency and RPO.* The backup copies each region file whole. With `copy`, each file
+is copied under that region's read lock, so a commit to the same region waits for one file
+copy while the rest of the simulation keeps running; with `reflink` each clone is O(1) and
+atomic per file; where the OS offers a directory snapshot, it replaces both. No commit can
+interleave with a file's copy, so every file in the backup is one committed generation and
+never a mix of two. A commit that lands after its region was copied is simply not in that
+backup. The RPO is the backup interval plus the autosave interval (default 60 s,
+REQ-SAVE-033): everything committed before the copy started is in the backup, and at most
+the in-flight autosave cycle is not.
+
+Retention is `keep N` by count and age from config (default: 24 hourly, 7 daily, 4
+weekly), pruning oldest first and never deleting the pre-migration backup of the
+running version. Restore is a file-level operation on a stopped world, or a
+copy-then-swap under the lock.
 
 **Import/export.** Structure files (`.obstruct`) are a single versioned,
 zstd-compressed blob: palette of resource IDs, dense block array, connector list,
@@ -509,6 +620,8 @@ pub struct Component { pub id: u16, pub bytes: Box<[u8]> }
 
 pub enum PaletteEntry {
     Known(BlockStateId),
+    /// Unknown pack: `original_id` is the block resource ID from `ids.json`,
+    /// `payload` is the 2-byte little-endian canonical property word.
     Opaque { dict_id: u32, original_id: Box<str>, payload: Box<[u8]> },
 }
 ```
@@ -516,8 +629,11 @@ pub enum PaletteEntry {
 Status and flags are stored as small integers, never as Rust enum discriminants, so
 the layout is stable across compiler versions and platforms (REQ-SAVE-031).
 `PaletteEntry::Opaque` renders as a checkerboard, collides as a solid block, blocks
-light, drops nothing, and re-encodes to the original dictionary id and payload
-unchanged, which is what makes the remove-pack/add-pack round trip exact.
+light, drops nothing, and re-encodes to the original block resource ID and property
+word unchanged, which is what makes the remove-pack/add-pack round trip exact. Because
+the entry is a `(block, property word)` pair rather than a bare dictionary id, a modded
+block with several states keeps them distinct: the remove-pack/load/save/re-add fixture in
+§7.4 places three states of one 16-state block, and each returns to its own state.
 
 ## 5. Performance budgets
 
@@ -557,7 +673,8 @@ with the same two-fsync protocol, so it is not a pause.
 | Player file torn | crash during replace | atomic rename leaves the previous file; the journal replays the rename |
 | Duplicate world UUID | copied directory | open refuses and asks for a clone operation that mints a new UUID |
 | Two servers on one world | missing lock check | lock refuses the second writer |
-| Unknown block after mod removal | dictionary id has no live pack | opaque placeholder; exact round-trip on return |
+| Unknown block state after mod removal | dictionary id has no live pack | opaque placeholder carrying the block resource ID and property word; exact round-trip on return, multi-state preserved |
+| Backup changes with the live world | hard link to an appended region file | unsupported: copy or reflink only (§3.8); restore verifies header and index generations |
 | Clock skew | timestamps in the future | timestamps are diagnostics only and must never drive logic |
 | Very large chunk | modded content | decode limit rejects with the chunk and field named |
 
@@ -579,7 +696,10 @@ during a migration.
 Every released version contributes a fixture save with a manifest of expected
 per-chunk CRCs; CI migrates each to `CURRENT`, compares CRCs, then loads and
 re-saves and requires identical canonical payloads (REQ-SAVE-007, MS-13 exit
-criterion). A deliberately newer fixture must be refused with the version message.
+criterion). The manifest also carries the expected `world_state` — total ticks, day
+time, day length and per-dimension weather — so a migration that drops the clock or
+re-seeds the weather fails even when every chunk CRC matches. A deliberately newer
+fixture must be refused with the version message.
 
 ### 7.3 Fuzzing and negative tests
 
@@ -592,7 +712,10 @@ traversal names, symlinks, case collisions, zip bombs and truncated archives.
 ### 7.4 Integration and syscall tests
 
 Round-trip of a generated 512-block world (generate → save → load → compare block
-hashes), the remove-pack/add-pack test, the two-process lock test, and a syscall
+hashes), the multi-state remove-pack/add-pack test (one 16-state modded block placed in
+three states: remove pack → load → save → re-add → load, comparing all three canonical
+state keys and positions), the `world_state` round-trip at a non-zero tick and
+mid-thunder, the two-process lock test, and a syscall
 counter that fails if an edit issues `fsync` or if a cycle exceeds the fsync budget
 (REQ-SAVE-012). A 24-hour soak with autosave asserts bounded RSS and no region
 growth beyond the compaction threshold.
@@ -602,9 +725,9 @@ growth beyond the compaction threshold.
 | # | Question | Proposal | Owner |
 | --- | --- | --- | --- |
 | 1 | What exactly does the 1.0 forward-compatibility promise cover — read forever, or migrate forever? | Register item needed: forward-compatibility scope for 1.x worlds (owner MS-16). Working position: every 1.x write is readable by every later 1.x through migrations, the chain is supported indefinitely, and a skipped-version migration is tested. | MS-16 |
-| 2 | How does a world report saved chunks whose generator fingerprint no longer matches the active generator? | The chunks load as saved and are never regenerated silently ([DEC-046](../decisions.md), [DEC-047](../decisions.md)); regeneration stays the explicit `world regen_chunks` action. Reporting cadence and whether `world list` flags the mismatch are unregistered. Register item needed: fingerprint-mismatch reporting policy (owner MS-13). | MS-13 |
+| 2 | How does a world report saved chunks whose generator fingerprint no longer matches the active generator? | The chunks load as saved and are never regenerated silently ([DEC-046](../decisions.md), [DEC-047](../decisions.md)); regeneration stays the explicit `world regen_chunks` action. The comparison covers `generator_version` as well as the 8-byte fingerprint, so a code-only terrain fix is reported too. Reporting cadence and whether `world list` flags the mismatch are unregistered. Register item needed: fingerprint-mismatch reporting policy (owner MS-13). | MS-13 |
 | 3 | Structure starts in a per-region `.obs` sidecar or in a level-wide index? | §3.4 keeps the per-dimension `.obs` sidecar and treats a level-wide index as a derived `/locate` cache; confirm at the MS-13 format freeze ([06 §8](06-worldgen.md#8-open-questions)). Register item needed: structure-start index placement (owner MS-13). | MS-13 |
-| 4 | Are hard-link backups acceptable on all target filesystems, or is a full copy the only supported mode? | Detect support at runtime, fall back to copy, and state the space cost in the backup UI. | MS-13 |
+| 4 | Backup mode default where reflinks are available: reflink or copy? Hard links are settled as unsupported (§3.8), because a committed region file is still appended to and its inactive index/header rewritten. | Default `backups.mode = auto` (reflink when the filesystem reports support, else copy); `copy` and `reflink` force a mode; the UI states the space cost. | MS-13 |
 | 5 | Default retention (24 hourly / 7 daily / 4 weekly) and whether backups count against the world-size budget. | Keep the default, exclude `backups/` from the budget, surface both numbers in the UI. | MS-13 / MS-16 |
 | 6 | Do we need a read-only "inspect" mode for a newer world without migrating? | Not in v1: refusing is safer than a partial decode; reconsider if tooling needs it. | MS-13 |
 | 7 | What is the exact atomic-publish contract for chunk commits versus whole-file writes? | [DEC-033](../decisions.md) fixes the split: chunk commits swap the in-file double-buffered index/header, while whole files and sidecars use temp + fsync + rename. Register item needed: formalise the two mechanisms and their fsync barriers in the save-format decision (owner MS-13 / MS-16). | MS-13 / MS-16 |
@@ -615,10 +738,12 @@ growth beyond the compaction threshold.
   (palettes and light), [DEC-006](../decisions.md) (resource IDs), [DEC-007](../decisions.md)
   (ticks), [DEC-033](../decisions.md) (save format), [DEC-035](../decisions.md)
   (performance gates), [DEC-046](../decisions.md) (integer-only generation),
-  [DEC-047](../decisions.md) (no silent regeneration).
+  [DEC-047](../decisions.md) (no silent regeneration), [DEC-053](../decisions.md)
+  (base-pack dimension names).
 - Spec: [00-conventions](00-conventions.md) §5–§6; [05-world-model](05-world-model.md);
   [06-worldgen](06-worldgen.md) §3.8 and §4 (structure starts, template format);
-  [15-content-system](15-content-system.md) (`ids.json`, pack hashes);
+  [07-light-and-weather](07-light-and-weather.md) §3.11 and §3.13 (`world_state` clock
+  and weather); [15-content-system](15-content-system.md) (`ids.json`, pack hashes);
   [18-networking-multiplayer](18-networking-multiplayer.md)
   (chunk streaming, not this format); [19-server-administration](19-server-administration.md)
   (backups, shutdown); [20-security-and-anti-cheat](20-security-and-anti-cheat.md);

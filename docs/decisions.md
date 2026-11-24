@@ -78,29 +78,31 @@ and no audio device.
 server the same simulation library the client embeds. The dependency rule makes
 that structural rather than a convention.
 
-### DEC-004 — World units: 16×16×16 sections, 16×16 chunk columns, optional 32³ mesh clusters
-**Status:** settled (section size), provisional (cluster size) · **Reversal cost:** high · **Owner:** MS-01
+### DEC-004 — World units: 16×16×16 sections, 16×16 chunk columns, 32³ default mesh clusters
+**Status:** settled · **Reversal cost:** high · **Owner:** MS-01
 
 - **Chunk column:** 16×16 blocks in XZ. It is the unit of streaming, loading,
   saving and interest management.
 - **Section:** 16×16×16 blocks. It is the unit of block storage, lighting,
   editing, meshing input and network deltas.
-- **Mesh cluster:** 2×2×2 adjacent sections (32×32×32 blocks) MAY be meshed as one
-  unit. Clusters are a render-side optimisation only; they are invisible to
-  content, save format and protocol.
+- **Mesh cluster:** 2×2×2 adjacent sections (32×32×32 blocks) is the **default**
+  render mesh unit from MS-04. Clusters are a render-side optimisation only;
+  they are invisible to content, save format and protocol. The cluster default
+  is settled by [DEC-048](#dec-048--render-mesh-clusters-of-32³-are-the-ms-04-default).
 - **Height:** dimensions define `min_y` and `max_y` in blocks, multiples of 16.
-  Base dimensions mirror Minecraft: overworld `-64..320` (384), nether and end
-  `0..256` (256). The engine supports arbitrary heights up to 1024.
+  Base dimensions mirror Minecraft: overworld `-64..320` (384), the underworld
+  and terminus dimensions `0..256` (256). The engine supports arbitrary heights
+  up to 1024.
 
 *Why:* research and prior art agree that 16³ is the right storage/edit/light
 granularity: 32³ storage makes a single corner edit dirty 8× the volume, grows
 light memory 8×, and makes recovery resends 8× larger, while every production
 voxel renderer inspected (Minecraft, Sodium, Weft) uses 16³. A 32³ **mesh**
 cluster captures the flat-build merge and draw-record savings without changing
-the simulation-visible unit. See [research/01](research/01-weft-teardown.md) §2
-and [research/03](research/03-voxel-rendering-sota.md) §2. The cluster decision
-stays provisional until the MS-04 mesh benchmark (corner-edit latency vs draw
-count).
+the simulation-visible unit. The default becomes 32³ at MS-04 because per-section
+culling at a 512-block radius cannot meet the visibility budget (DEC-048). See
+[research/01](research/01-weft-teardown.md) §2 and
+[research/03](research/03-voxel-rendering-sota.md) §2.
 
 ### DEC-005 — Paletted section storage with packed 4-bit light
 **Status:** settled · **Reversal cost:** high · **Owner:** MS-01
@@ -141,7 +143,7 @@ nameable by players and tools. See [research/06](research/06-modding-and-content
 
 The authoritative simulation advances only in fixed ticks at **20 Hz, fixed**
 for all gameplay. Servers may raise the *snapshot/replication rate* to 30 Hz,
-but the simulation tick never changes (amended by [DEC-038](#dec-038--simulation-tick-is-fixed-at-20-hz)).
+but the simulation tick never changes (amended by [DEC-038](#dec-038--simulation-tick-is-fixed-at-20-hz-30-hz-is-a-replication-rate)).
 64 Hz simulation is out of scope. Rendering and UI interpolate between ticks. Determinism rules
 are normative in [spec/00 §6](spec/00-conventions.md#6-determinism-rules):
 seeded per-subsystem RNG, ordered iteration, pinned transcendental math, no
@@ -175,7 +177,8 @@ placeholders CC0; fonts OFL 1.1. Contributions are inbound=outbound under DCO
 1.1; no CLA. **No Minecraft or Weft code, assets, names or data tables are
 copied.** Weft (MPL-2.0) is read for concepts and measured numbers only; file-
 level copyleft means any copied file would stay MPL and could not be relicensed
-under our dual license.
+under our dual license. Base-pack identifiers use original dimension and entity
+names, amended by [DEC-053](#dec-053--base-content-uses-original-dimension-and-entity-names).
 
 *Why:* the Rust convention, maximum adoption (including proprietary forks and
 hosting businesses), an express patent grant, and a clean story for mod authors.
@@ -223,7 +226,7 @@ are handled by the UV/tile encoding rather than by forbidding greedy merging.
 See [research/03](research/03-voxel-rendering-sota.md) §3.
 
 ### DEC-013 — GPU-driven visibility: CPU region culling at MVP, Hi-Z + MDI by 1.0
-**Status:** provisional · **Reversal cost:** medium · **Owner:** MS-04
+**Status:** provisional · **Reversal cost:** medium · **Owner:** MS-04 · **Amended by:** [DEC-048](#dec-048--render-mesh-clusters-of-32³-are-the-ms-04-default)
 
 - **MVP (`MS-04`):** CPU culls region batches (e.g. 8×4×8-section regions) and
   clusters against the frustum; one multi-draw-indirect call per layer.
@@ -232,7 +235,9 @@ See [research/03](research/03-voxel-rendering-sota.md) §3.
   arguments as the portable path (Metal loops MDI and lacks `indirect_count`).
 
 Draw calls must stay in the low tens per frame. No per-section main-thread loop
-at a 512-block render distance: the CPU budget there is ~19 ns per section.
+at a 512-block render distance: the 0.30 ms visibility budget is ~3 ns per
+section, which is why the 32³ cluster default (DEC-048) cuts the tested count to
+~12,700 and gives ~24 ns per cluster.
 
 *Why:* at 144 FPS the frame is 6.94 ms and the GPU budget is ~4 ms; visibility
 and submission must not scale with section count. This mirrors the working
@@ -292,11 +297,13 @@ and phones — we deliberately do not.
 ### DEC-018 — LOD is visual-only and ships after 1.0
 **Status:** settled · **Reversal cost:** low · **Owner:** MS-12
 
-At a 512-block default render distance, no LOD is required for parity; the MVP
-and 1.0 ship full-detail sections out to the render distance. Beyond-view
-terrain (impostor/heightfield LOD, optional GPU generation) is **visual only**:
-it never feeds collision, spawning, drops, ore knowledge or anti-cheat, so a
-generation mismatch can never become a gameplay bug or exploit.
+At a 512-block **client** render distance, no LOD is required for parity; the MVP
+and 1.0 ship full-detail sections out to the render distance. Dedicated servers
+default to a 256-block render distance (equal to simulation distance); 512 blocks
+is an opt-in server setting with a published cost ([DEC-052](#dec-052--dedicated-servers-default-to-a-256-block-render-distance)).
+Beyond-view terrain (impostor/heightfield LOD, optional GPU generation) is
+**visual only**: it never feeds collision, spawning, drops, ore knowledge or
+anti-cheat, so a generation mismatch can never become a gameplay bug or exploit.
 
 *Why:* LOD becomes mandatory at 128+ chunks, not 32; and client-side generated
 terrain leaks ungenerated ore to clients, as Weft's design demonstrates.
@@ -333,7 +340,9 @@ WASM mods receive **capabilities** (read world, write world, spawn entity, UI,
 network, storage) declared in the manifest and approved by the server operator,
 with per-mod CPU, memory, host-call and action quotas and per-mod cost
 attribution. The ABI is versioned by schema, not by source hash. No mixin-style
-binary patching, ever.
+binary patching, ever. **1.0 clients run no mod or WASM code**: mod UIs receive
+server-computed data through a host UI binding ([DEC-049](#dec-049--client-side-mod-code-is-not-part-of-10)),
+and a client code tier is post-1.0.
 
 *Why:* Weft's 226-function exact-hash native ABI is fast but unsandboxed and
 rebuilds the ecosystem on every ABI edit; Luanti's Lua is friendly but its own
@@ -355,21 +364,34 @@ drift; the test exists specifically to make that call with data.
 plus pinned functions reproduce state; but we refuse to guess — we measure.
 See [research/02](research/02-engine-and-render-stack.md) §3.
 
-### DEC-022 — Parity baseline: Minecraft Java Edition 1.21.11, Tier 2 by 1.0
-**Status:** settled · **Reversal cost:** low · **Owner:** MS-14
+### DEC-022 — Parity baseline: Minecraft Java Edition 1.21.11; Tier 1 at 1.0, full Tier 2 at 2.0
+**Status:** settled · **Reversal cost:** low · **Owner:** MS-14 · **Amended by:** [DEC-051](#dec-051--10-is-early-access-the-parity-gate-is-two-numbers)
 
 The parity reference is **Minecraft Java Edition 1.21.11 (2025-12-09)**: 1,166
-block IDs, 1,505 item IDs, 157 entity types, 65 biomes. The checklist is
-generated from registry dumps and lives in the repo; "latest version" is a moving
-target and is handled by an explicit delta process at each OpenBlock release.
-Tier definitions (0–4) are in [vision §6](vision.md#6-scope-what-all-the-features-of-minecraft-means-here);
-1.0 requires Tier 2 with ≥90% automated parity-corpus coverage. Minecraft-specific
-quirks we deliberately do not copy are listed with replacements in
+block IDs, 1,505 item IDs, 157 entity types, 65 biomes. The checklist is a
+**hand-authored behavioural checklist** that lives in the repo; registry dumps
+are a coverage cross-check only and are never copied into the corpus. "Latest
+version" is a moving target and is handled by an explicit delta process at each
+OpenBlock release.
+
+Tier definitions (0–4) are in [vision §6](vision.md#6-scope-what-all-the-features-of-minecraft-means-here).
+The parity gate is two numbers, never one ([DEC-051](#dec-051--10-is-early-access-the-parity-gate-is-two-numbers)):
+
+1. **100% of in-scope checks pass** for the release's declared tier; and
+2. **≥ 85% vanilla coverage** of the pinned baseline, measured by the
+   hand-authored behavioural checklist.
+
+1.0 is Early Access at Tier 1: it must pass **100% of its declared Tier-0/1
+in-scope checklist** and meet the **≥ 85% vanilla behavioural coverage** floor.
+Full Tier-2 parity — every remaining block, item, mob, structure and system — is
+**2.0** (`MS-17`), not 1.0. Pass rate and coverage are different metrics and are
+never averaged into a single "percent complete". Minecraft-specific quirks we
+deliberately do not copy are listed with replacements in
 [the feature inventory](research/05-minecraft-feature-inventory.md) §5.
 
-*Why:* unbounded parity is how clones die. A pinned baseline with a generated
-checklist is finishable and testable; "match whatever Mojang shipped last week"
-is not.
+*Why:* unbounded parity is how clones die. A pinned baseline with a
+hand-authored, finishable checklist is testable; "match whatever Mojang shipped
+last week" is not, and a copied registry dump measures names, not behaviour.
 
 ### DEC-023 — Server-authoritative inventory transactions on a reliable ordered stream
 **Status:** settled · **Reversal cost:** medium · **Owner:** MS-06
@@ -403,19 +425,22 @@ one lost chunk from stalling the tick. See
 [research/04](research/04-networking-sota.md) §1.
 
 ### DEC-025 — Interest-managed replication with progressive, rate-capped join
-**Status:** settled · **Reversal cost:** high · **Owner:** MS-07
+**Status:** settled · **Reversal cost:** high · **Owner:** MS-07 · **Amended by:** [DEC-052](#dec-052--dedicated-servers-default-to-a-256-block-render-distance)
 
-The host replicates per player only what that player's **interest set** contains
-(chunks within simulation distance, visible/relevant entities, events), using
-snapshot + delta encoding, 16³-granular block-change sets, priority scheduling
-and per-player bandwidth caps. A 512-block-radius join is tens of MB of
-compressed world data, so join is progressive: spawn ring first, then expanding
-rings, with precompressed chunk caches, a loading UI and an optional HTTP range
-download for large worlds.
+The host replicates per player only what that player's **interest set** contains:
+the chunks inside that player's **render distance** (equal to simulation distance
+by default, 256 blocks; 512 blocks is an opt-in setting), plus visible/relevant
+entities and events. You cannot render what you have not received. Replication
+uses snapshot + delta encoding, 16³-granular block-change sets, priority
+scheduling and per-player bandwidth caps. A 256-block join is ~25 MB of column
+data at 22 KiB/column before compression; a 512-block join is ~4× that. Join is
+progressive: spawn ring first, then expanding rings, with precompressed chunk
+caches, a loading UI and an optional HTTP range download for large worlds.
 
 *Why:* naive "send the world" joins stall both the tick and the player's uplink;
 budgets and prioritisation are the difference between a playable server and an
-unplayable one.
+unplayable one. Capacity claims must state the player distribution — co-located
+players share a chunk cache, distributed players do not (DEC-052).
 
 ### DEC-026 — Identity: self-signed server keys by default, no central account required
 **Status:** settled · **Reversal cost:** high · **Owner:** MS-07
@@ -432,19 +457,22 @@ single point of failure and a privacy liability. Key-based identity also enables
 peer-to-peer play and cryptographic mod/content verification later.
 
 ### DEC-027 — Protocol: bit-packed hot path, versioned messages, content-hash handshake
-**Status:** settled · **Reversal cost:** high · **Owner:** MS-06
+**Status:** settled · **Reversal cost:** high · **Owner:** MS-06 · **Amended by:** [DEC-050](#dec-050--translations-are-not-part-of-the-join-critical-hash)
 
 Per-tick messages are hand-written bit-packed encodings (block edits ~5 bytes,
 entity deltas ~12 bytes), while control/join/metadata messages use schema-based
 serialisation (postcard + versioned structs). The protocol is versioned
 semantically; every connection performs a handshake exchanging protocol version,
-content-pack hash set and mod manifest, and mismatches fail with an actionable
-message instead of desyncing. The wire format is documented publicly so
-third-party tools can be built.
+the **content-pack hash** and mod manifest, and mismatches fail with an
+actionable message instead of desyncing. Translations are not part of the
+join-critical hash: `content_hash` is strict, `view_hash` covers visuals and is
+advisory unless the server opts into strict view matching (DEC-050). The wire
+format is documented publicly so third-party tools can be built.
 
 *Why:* Serde struct layout is a poor wire contract for 20 Hz hot paths, and
 content mismatch is the top cause of "it works on my server" modded multiplayer
-bugs.
+bugs. Blocking a join because a client shipped a different locale is not a
+correctness requirement.
 
 ### DEC-028 — Dedicated server is a first-class product
 **Status:** settled · **Reversal cost:** medium · **Owner:** MS-07
@@ -566,14 +594,15 @@ license standards. Security reports follow `SECURITY.md`; moderation follows
 `CODE_OF_CONDUCT.md`.
 
 ### DEC-037 — Name and branding: OpenBlock is a working name pending clearance
-**Status:** provisional · **Reversal cost:** medium · **Owner:** MS-16 (1.0 launch)
+**Status:** provisional · **Reversal cost:** medium · **Owner:** MS-16 (1.0 launch) · **Amended by:** [DEC-053](#dec-053--base-content-uses-original-dimension-and-entity-names)
 
 "OpenBlock" is the project's working name. It is already used by unrelated
 software projects and a domain, so **a trademark clearance search is a launch
 gate**; if clearance fails, the name can change before 1.0 with a documented
 migration (repo org rename, domain, mod namespace reserved). In-game names avoid
-Mojang trademarks: the base pack uses original names, and the README carries the
-required disclaimer.
+Mojang trademarks: the base pack uses original dimension and entity names, and
+the README carries the required disclaimer. The naming rule is settled by
+DEC-053.
 
 *Why:* code licensing never grants trademark rights, and renaming after 1.0 is
 far more expensive than before it.
@@ -583,7 +612,11 @@ far more expensive than before it.
 The first full specification pass proposed many new decisions. They are
 registered here with canonical IDs; chapters that proposed provisional numbers in the
 038–046 and 060–065 ranges are reconciled to these IDs by the consistency pass.
-The register is authoritative.
+DEC-048–DEC-053 are the second-pass review-board re-baseline: they settle the
+cluster default, remove client mod code from 1.0, take translations out of the
+join-critical hash, define the parity gate and the Early Access scope, fix the
+server render-distance default, and name base content originally. The register is
+authoritative.
 
 ### DEC-038 — Simulation tick is fixed at 20 Hz; 30 Hz is a replication rate
 **Status:** settled · **Reversal cost:** high · **Owner:** MS-06 · **Amends:** DEC-007
@@ -676,19 +709,144 @@ version, content-defined worldgen data) differs from the one recorded with a
 chunk, the chunk is loaded as saved. Regeneration is an explicit operator command
 with a dry-run report. This protects player builds and modded worlds.
 
+### DEC-048 — Render mesh clusters of 32³ are the MS-04 default
+**Status:** settled · **Reversal cost:** medium · **Owner:** MS-04 · **Amends:** DEC-004 · **Closes:** OPEN-001
+
+From MS-04 the renderer meshes **2×2×2 sections (32×32×32 blocks) as the default
+cluster**. The 16³ section remains the unit of storage, editing, lighting,
+meshing input and network deltas; clusters are invisible to content, save format
+and protocol. A cluster A/B benchmark still runs at MS-04, but it tunes the
+implementation (corner-edit latency, eviction, Metal fallback) rather than
+choosing the default.
+
+*Why:* at a 512-block radius the interest set is 101,400 sections; a per-section
+visibility pass has ~0.30 ms to visit them all, and the renderer envelope is
+1.20 ms. That is 3 ns per section — not credible on the main thread even with a
+job pool. 32³ clusters cut the count to ~12,700 and make the budget reachable.
+The per-section culling in [DEC-013](#dec-013--gpu-driven-visibility-cpu-region-culling-at-mvp-hi-z--mdi-by-10)
+was written against the MVP distance assumption and does not scale to 512 blocks
+without clusters.
+
+### DEC-049 — Client-side mod code is not part of 1.0
+**Status:** settled · **Reversal cost:** medium · **Owner:** MS-09 · **Amends:** DEC-020 · **Closes:** OPEN-006
+
+**1.0 clients run no mod or WASM code.** Mod UIs get server-computed data through
+the host UI binding; a mod may describe a screen, but the client executes only
+engine UI code and validated pack data. A client code tier (presentation,
+prediction, or both) is **post-1.0** and requires a new decision with a
+determinism and anti-cheat review. The client mod CPU budget in
+[spec/25](spec/25-performance-budgets.md) is a reserved envelope for that future
+tier, not a 1.0 gate. [spec/18](spec/18-networking-multiplayer.md) and
+[spec/16](spec/16-modding.md) are reconciled to this decision.
+
+*Why:* running untrusted code on a client that must not leak world state,
+must reconcile deterministically and must not be a cheat surface is a hard
+problem, and it is not required for server-installed mods to have UIs. Shipping
+the server tier first keeps the 1.0 security story and the schedule honest.
+
+### DEC-050 — Translations are not part of the join-critical hash
+**Status:** settled · **Reversal cost:** low · **Owner:** MS-06/MS-09 · **Amends:** DEC-027
+
+The handshake carries two hashes: **`content_hash`** (registries, behaviours,
+gameplay data, base-pack data) and **`view_hash`** (visuals: textures, models,
+sounds, fonts, translations). `content_hash` is strict: a mismatch refuses the
+join with an actionable message. `view_hash` is **advisory by default**: locale
+and visual differences never block a join, and the client shows a notice. A
+server may opt into strict view matching (`strict_view = true`), in which case a
+`view_hash` mismatch refuses like a content mismatch. Translations are never part
+of `content_hash`.
+
+*Why:* a client with a different locale has identical gameplay behaviour; making
+it a join failure turns a language pack into a server-access bug. Keeping the two
+hashes separate preserves mod-verification strictness where it matters and makes
+visual packs cheap to mix.
+
+### DEC-051 — 1.0 is Early Access; the parity gate is two numbers
+**Status:** settled · **Reversal cost:** medium · **Owner:** MS-14/MS-16 · **Amends:** DEC-022
+
+**1.0 is an Early Access release**, not a "finished game" claim, and its scope is
+**Tier 1 parity + Tier-2 infrastructure + the modding platform**. Full Tier-2
+parity is **2.0** (`MS-17`). This supersedes the earlier "Tier 2 at 1.0" promise
+and the single coverage-percentage gate that stood in for a pass rate.
+
+The **parity gate** has two numbers, always reported separately:
+
+1. **In-scope pass rate = 100% of checks.** Every check in the release's declared
+   in-scope checklist passes; a failure is either fixed or removed from scope by
+   an explicit decision.
+2. **Vanilla coverage ≥ 85%** of the pinned baseline, measured by a **hand-authored
+   behavioural checklist** — never a copied registry dump, which measures names
+   rather than behaviour. Coverage is a weighted fraction whose published weights
+   the project controls.
+
+Coverage is not a pass rate and a pass rate is not coverage. **1.0 must pass 100%
+of its declared Tier-0/1 in-scope checklist and meet the 85% vanilla behavioural
+coverage floor; 2.0 must pass 100% of the full Tier-2 checklist and meet the same
+coverage floor.** Because the checklist is behavioural and weighted by behaviour
+families rather than by registry ID count, 1.0 can meet 85% coverage while the
+full Tier-2 *content* set (every remaining block, item, mob, structure and
+command) is still 2.0. The `MS-14` milestone builds the parity-corpus
+infrastructure, closes the Tier-1 checklist, and publishes the Tier-2 coverage
+report and gap list; it does not close Tier-2 content.
+
+*Why:* the previous plan contradicted itself four ways (Tier 2 at 1.0, one
+coverage percentage used as a pass gate, Tier-1 "parity essentials" shipping at
+0.1, and Tier-3 items already scheduled before 1.0). One scope + one gate makes
+the public promise testable and makes the effort model honest.
+
+### DEC-052 — Dedicated servers default to a 256-block render distance
+**Status:** settled · **Reversal cost:** high · **Owner:** MS-07/MS-15 · **Amends:** DEC-025
+
+A dedicated server's **default render distance is 256 blocks, equal to the
+simulation distance**. 512 blocks is an **opt-in server setting** whose memory,
+bandwidth and CPU cost is published in the server documentation and the capacity
+matrix. A client cannot render a chunk it has not received, so the replicated
+**interest set is the union of the chunks inside each player's render distance**
+(not simulation distance alone), plus relevant entities and events.
+
+Every capacity claim MUST state the player distribution:
+
+- **Co-located** players share a loaded column cache and a spawn region; the
+  published 50-player row is this case.
+- **Distributed** players each need their own columns; the plan publishes a
+  separate, lower row with its own measurement.
+
+*Why:* the previous 512-block default silently multiplied server memory and
+join bandwidth by 4× versus 256 blocks while the capacity numbers assumed a
+shared world. Making 256 the default and 512 explicit keeps the $5 VPS promise
+and stops the benchmark from describing a server most operators will not run.
+
+### DEC-053 — Base content uses original dimension and entity names
+**Status:** settled · **Reversal cost:** medium · **Owner:** MS-05/MS-16 · **Amends:** DEC-009, DEC-037
+
+The base content pack uses **original identifiers**: the nether-like dimension is
+`openblock:underworld` and the end-like dimension is `openblock:terminus`. Entity
+names follow the same rule (for example the iconic exploding mob is the
+*Blaster*, not a Minecraft name). Minecraft names such as "Nether", "End" and
+"Creeper" **must not appear in shipped content identifiers or base-pack data**;
+they may appear in research prose as the comparison being made. Translations and
+display names in the base pack use the original names; content packs may rename
+anything.
+
+*Why:* identifiers are the ecosystem contract and the save/mod data surface, so
+renaming after a public release is expensive; and clean-room provenance
+([DEC-009](#dec-009--license-mit-or-apache-20-code-cc-by-40-assets-clean-room-provenance))
+is weaker if shipped data uses the incumbent's names. Original names cost nothing
+before content freeze and are a legal launch gate afterwards.
+
 ## 7. Open decisions (must close before their milestone)
 
 | ID | Question | Owner | Deadline |
 | --- | --- | --- | --- |
-| OPEN-001 | Mesh clusters: 32³ clusters on or off by default after the MS-04 benchmark? | MS-04 | before save/network format freeze |
+| OPEN-001 | **Closed by [DEC-048](#dec-048--render-mesh-clusters-of-32³-are-the-ms-04-default).** Mesh clusters: 32³ is the MS-04 default; the cluster benchmark now tunes implementation, not the choice. | MS-04 | closed 2026-11-24 |
 | OPEN-002 | Fixed-point vs f64 simulation math after the MS-02 cross-platform determinism test | MS-02 | before MS-06 |
-| OPEN-003 | Default render distance and FPS gate: 512 blocks at 144 FPS performance mode / 120 FPS default — confirm with MS-04 benchmark | MS-04 | before 0.1 |
+| OPEN-003 | Client default render distance and FPS gate: 512 blocks at 144 FPS performance mode / 120 FPS default — confirm with MS-04 benchmark. (Dedicated servers default to 256 blocks; DEC-052.) | MS-04 | before 0.1 |
 | OPEN-004 | Colored (RGB) block light vs monochrome: ~100 MB more at 512 blocks; decide after visual review | MS-05 | before 0.1 |
 | OPEN-005 | World height: 384 default (parity) with 1024 engine ceiling — confirm content needs | MS-01 | before world format freeze |
-| OPEN-006 | Whether WASM mods may ship client presentation code (vs server-only) | MS-09 | before 0.1 |
+| OPEN-006 | **Closed by [DEC-049](#dec-049--client-side-mod-code-is-not-part-of-10).** 1.0 clients run no mod/WASM code; a client code tier is post-1.0 and needs a new decision. | MS-09 | closed 2026-11-24 |
 | OPEN-007 | Native plugin policy details (signing, separate process, crash containment) | MS-09 | post-1.0 |
 | OPEN-008 | Whether to support WebTransport/web client at all | MS-13 | post-1.0 |
-| OPEN-009 | Metal (and any adapter without indirect-first-instance) must escalate render mesh clusters to 64³; DEC-004 caps clusters at 32³ and the 16 B/quad record cannot encode 64³ merges. Either amend DEC-004 for a Metal-only escalation or accept extra sub-draws. | MS-04 | before MS-12 |
+| OPEN-009 | Metal (and any adapter without indirect-first-instance) must escalate render mesh clusters to 64³; DEC-004 fixes clusters at 32³ and the 16 B/quad record cannot encode 64³ merges. Either amend DEC-004 for a Metal-only escalation or accept extra sub-draws. | MS-04 | before MS-12 |
 | OPEN-010 | The dynamic-light binning pass (up to 256 lights, 16×16-pixel tiles) has no row in the ch03 pass inventory or the 5.65 ms GPU sum; assign it a pass budget or fold it into cull/upload. | MS-04/MS-12 | before 0.1 |
 | OPEN-011 | Anti-cheat enforcement defaults: default mode, kick/ban thresholds, opt-in auto-ban. | MS-15 | before 1.0 |
 | OPEN-012 | Whether server-side ore obfuscation ships as an opt-in anti-cheat setting and how it interacts with DEC-018/DEC-045. | MS-15 | before 1.0 |
@@ -698,6 +856,8 @@ with a dry-run report. This protects player builds and modded worlds.
 | OPEN-016 | Which Gate-class benchmark scenes run on every PR inside the 8-minute bench lane. | MS-02 | before 0.1 |
 | OPEN-017 | Evidence-bundle retention and access model for anti-cheat (default 7 days, max 30, operator-only export). | MS-15 | before 1.0 |
 | OPEN-018 | When the forward-compatibility promise for saves starts (at 1.0, or at the first public alpha). | MS-13 | before 0.1 |
+| OPEN-019 | 2.0 staffing and funding: who pays for the ~500–800 dev-week Tier-2 parity track and the 6–10 person team for 2–3 years? | Lead | before the MS-17 track starts |
+| OPEN-020 | Modern Delta: re-baseline parity from the pinned 1.21.11 baseline to the then-current Minecraft release before the 2.0 claim, with a separate delta manifest that cannot destabilise the pinned acceptance corpus. | MS-17 | before the 2.0 parity claim |
 
 ## 8. Rejected alternatives (recorded so we don't relitigate)
 

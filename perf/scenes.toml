@@ -1,10 +1,16 @@
 # OpenBlock benchmark scene manifest.
 #
 # Normative definition: docs/spec/25-performance-budgets.md (section 4) and
-# docs/spec/24-testing-benchmarks.md. A scene is a reproducible workload: a
-# golden world + input log + preset + warm-up + measurement window. Scenes are
-# content-addressed by hash; a changed scene hash invalidates its baseline (the
-# harness records instead of gating until a new baseline exists).
+# docs/spec/24-testing-benchmarks.md. This file is the single scene catalogue:
+# a budget row that names a scene absent here fails the manifest load.
+# A scene is a reproducible workload: a golden world + input log + preset +
+# warm-up + measurement window. Scenes are content-addressed by hash; a changed
+# scene hash invalidates its baseline (the harness records instead of gating
+# until a new baseline exists).
+#
+# render_distance_blocks is a block RADIUS, never a diameter: 512 blocks =
+# 32-chunk radius = 65x65 = 4,225 columns. simulation_distance_blocks is a
+# separate radius and defaults to 256 on dedicated servers (DEC-052).
 
 schema = "openblock.scenes/1"
 
@@ -67,7 +73,7 @@ duration_s = 30
 
 [[scene]]
 id = "megabuild"
-description = "Large player-built city at 512 blocks; stresses draw counts, cluster meshing and occlusion."
+description = "Large player-built city at a 512-block radius; stresses draw counts, cluster meshing and occlusion."
 world = "golden/megabuild_512.obworld"
 input = "inputs/city_walk_60s.input"
 preset = "high"
@@ -76,18 +82,29 @@ warmup_s = 10
 runs = 3
 duration_s = 60
 
+[[scene]]
+id = "ui_stress"
+description = "UI-only stress: 46-slot inventory with a full cursor, a 1,000-widget settings page with search open, 100 chat lines, a visible tooltip, 5 toasts and the HUD, at 1080p ui_scale=auto and 4K ui_scale=2."
+world = "golden/empty.obworld"
+input = "inputs/ui_stress_30s.input"
+preset = "high"
+render_distance_blocks = 128
+warmup_s = 10
+runs = 3
+duration_s = 30
+
 # --- Headless scenes (server, IO, generation, content) ---
 
 [[scene]]
 id = "tick50"
-description = "Server tick: 50 bots, 2,000 loaded chunks, 256-block simulation distance, mobs and redstone active."
+description = "Server tick: 50 co-located bots on the 2,000-column baseline (4,225-column shared-cache bound), 256-block render and simulation distance, mobs and redstone active. 600 ticks = 30 s at 20 Hz."
 world = "golden/server_50.obworld"
-input = "inputs/tick50_120s.input"
+input = "inputs/tick50_600ticks.input"
 preset = "n/a"
 simulation_distance_blocks = 256
 warmup_s = 10
 runs = 3
-duration_s = 120
+duration_ticks = 600
 tier = "server"
 
 [[scene]]
@@ -104,7 +121,7 @@ tier = "server"
 
 [[scene]]
 id = "join"
-description = "Network join from login to playable and to full 512-block interest set on a shaped 10 Mbit/s, 40 ms RTT link."
+description = "Network join from login to playable and to the full 512-block-radius interest set (4,225 columns) on a shaped 10 Mbit/s, 40 ms RTT link."
 world = "golden/mixed_512.obworld"
 input = "inputs/idle_10s.input"
 preset = "high"
@@ -116,7 +133,7 @@ duration_s = 150
 
 [[scene]]
 id = "save"
-description = "Region save/load throughput, save pause time and fsync budget on a pregenerated 512-block world."
+description = "Region save/load throughput, save pause time and fsync budget on a pregenerated 512-block-radius world."
 world = "golden/mixed_512.obworld"
 input = "inputs/edit_1000.ops"
 preset = "n/a"
@@ -126,7 +143,7 @@ duration_s = 60
 
 [[scene]]
 id = "gen"
-description = "Worldgen throughput on 8 threads over the 10,000-seed corpus subset; deterministic hash check included."
+description = "Worldgen throughput on 8 threads over a fixed 1,000-seed subset of the 10,000-seed corpus; deterministic hash check included."
 world = "seeds/gen_corpus_1000.txt"
 input = "n/a"
 preset = "n/a"
@@ -136,13 +153,25 @@ duration_s = 300
 
 [[scene]]
 id = "relight"
-description = "Incremental lighting after scripted block edits, including sky-light column and cross-section propagation."
+description = "Incremental lighting after exactly 200 scripted block edits in one region, including sky-light column and cross-section propagation."
 world = "golden/mixed_512.obworld"
 input = "inputs/relight_200_edits.ops"
 preset = "n/a"
 warmup_s = 0
 runs = 5
 duration_s = 60
+
+[[scene]]
+id = "redstone_stress"
+description = "Reference redstone circuits: clocks, dust nets, repeaters, pistons and hoppers; deterministic update-order hash plus tick percentiles."
+world = "golden/flat_256.obworld"
+input = "inputs/redstone_stress_10min.input"
+preset = "n/a"
+simulation_distance_blocks = 256
+warmup_s = 10
+runs = 3
+duration_s = 600
+tier = "server"
 
 [[scene]]
 id = "pack"
@@ -154,19 +183,20 @@ warmup_s = 0
 runs = 5
 duration_s = 60
 
-# --- Harness self-tests ---
+# --- Server mods and harness self-tests ---
 
 [[scene]]
 id = "mods"
-description = "Reference WASM mod set on the client: world read/write, entity spawn, UI data binding and scheduled callbacks."
-world = "golden/mixed_512.obworld"
-input = "inputs/flythrough_120s.input"
-preset = "high"
-render_distance_blocks = 512
+description = "Reference server-side WASM mod set: world read/write, entity spawn, server-computed UI data and scheduled callbacks. No client mod code at 1.0 (DEC-049)."
+world = "golden/server_50.obworld"
+input = "inputs/tick50_600ticks.input"
+preset = "n/a"
+simulation_distance_blocks = 256
 mods = ["reference/tech", "reference/farming", "reference/minigame"]
 warmup_s = 10
 runs = 3
 duration_s = 120
+tier = "server"
 
 [[scene]]
 id = "ci"

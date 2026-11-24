@@ -1,7 +1,7 @@
 # 20 — Security and Anti-Cheat
 
 > Status: normative - Last updated: 2026-11-24
-> Depends on: [DEC-008](../decisions.md), [DEC-020](../decisions.md), [DEC-023](../decisions.md), [DEC-024](../decisions.md), [DEC-026](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md), [DEC-038](../decisions.md), [DEC-040](../decisions.md), [DEC-041](../decisions.md), [DEC-042](../decisions.md), [DEC-044](../decisions.md), [DEC-045](../decisions.md); [conventions](00-conventions.md), [architecture](01-technical-architecture.md), [gameplay](08-gameplay-survival.md), [inventory](11-inventory-crafting-items.md), [modding](16-modding.md), [persistence](17-persistence.md), [networking](18-networking-multiplayer.md), [server administration](19-server-administration.md)
+> Depends on: [DEC-008](../decisions.md), [DEC-020](../decisions.md), [DEC-023](../decisions.md), [DEC-024](../decisions.md), [DEC-026](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md), [DEC-038](../decisions.md), [DEC-040](../decisions.md), [DEC-041](../decisions.md), [DEC-042](../decisions.md), [DEC-044](../decisions.md), [DEC-045](../decisions.md), [DEC-049](../decisions.md), [DEC-050](../decisions.md); [conventions](00-conventions.md), [architecture](01-technical-architecture.md), [gameplay](08-gameplay-survival.md), [inventory](11-inventory-crafting-items.md), [modding](16-modding.md), [persistence](17-persistence.md), [networking](18-networking-multiplayer.md), [server administration](19-server-administration.md)
 > Implements: MS-06 (transport hardening, validation hooks), MS-09 (sandbox policy), MS-13 (untrusted data), MS-15 (anti-cheat, moderation, abuse), MS-16 (disclosure)
 
 ## 1. Purpose and scope
@@ -278,10 +278,11 @@ enthusiastic child should not be banned by an estimator.
 The ladder is a state machine per player: a kick never escalates itself, bans
 carry an expiry (default 7 days, `0` = permanent), and every transition appends
 to the audit log with the triggering evidence case. `/ob pardon` restores access
-and is itself audited. Config keys are snake_case ASCII ([DEC-044](../decisions.md)),
-registered in the server configuration schema ([19](19-server-administration.md));
-hyphenated spellings from older documentation are accepted on input and
-normalised on output.
+and is itself audited. Config keys are snake_case ASCII ([DEC-044](../decisions.md));
+the normative key list, types, defaults and reload classes are the `[anti_cheat]`
+section of [19 §3.2](19-server-administration.md#32-configuration-surface), which this
+chapter consumes and does not restate; hyphenated spellings from older documentation are
+accepted on input and normalised on output.
 
 ### 3.8 Evidence bundles and privacy
 
@@ -334,6 +335,7 @@ Both are checked before allocation.
 | Unreliable datagram payload | `max_datagram_size() − 40` (≈1,160 B) | before decode ([18 §3.3](18-networking-multiplayer.md#33-transport-layer)) |
 | Control message | 64 KiB | before allocation |
 | `ChunkColumn` on the wire / `SectionResend` | 256 KiB / 16 KiB | catalog maximum, checked before send and after decode ([18 §3.4](18-networking-multiplayer.md#34-protocol-versioning-and-message-catalog)) |
+| `StateChannel` record | 16 KiB body per channel record; per-channel maxima in the catalog | before decode, against the channel id's declared maximum ([18 §3.4](18-networking-multiplayer.md#34-protocol-versioning-and-message-catalog)) |
 | Decoded chunk payload | 8 MiB raw; 64 sections; 65,536 palette entries; 4,096 entities; 65,536 ticks | before allocation ([17 §3.10](17-persistence.md#310-security-and-untrusted-input)) |
 | Component nesting / components per stack | depth 4 / 256 | schema validator |
 | Decompression ratio | 200:1, abort on exceed | streaming decoder |
@@ -345,7 +347,7 @@ Both are checked before allocation.
 - Default `max_connections = 256`, `max_connections_per_ip = 4`, plus a
   per-subnet cap of 32 (IPv4 `/24`, IPv6 `/64`) with an explicit allowlist for
   LAN proxies ([18 §3.3](18-networking-multiplayer.md#33-transport-layer)).
-- QUIC Retry is required under load at [18](18-networking-multiplayer.md)'s
+- QUIC Retry is required under load above [18](18-networking-multiplayer.md)'s
   threshold (70% of the connection budget or the endpoint handshake admission
   rate, `network.handshake_rate_per_second`, default 20/s in
   [19](19-server-administration.md) §3.2); address-validation tokens are keyed
@@ -438,7 +440,10 @@ Mods and packs ship a signed manifest (Ed25519) listing every file's BLAKE3 hash
 the server records the manifest hash and sends it in the content handshake. The
 client verifies before loading and quarantines a mismatch under
 `<data>/quarantine/`. Servers allowlist WASM modules by hash; packs from a server
-are downloaded only over the authenticated session and never executed. A public
+are downloaded only over the authenticated session and never executed. At 1.0 there
+is no client-side mod runtime at all ([DEC-049](../decisions.md)), so the only
+executable artifacts in this threat model are server-side: the WASM host of
+[16](16-modding.md) and the operator-allowlisted native tier. A public
 mod index is curated and links to source and hashes; "verified" means "hash
 recorded and source reviewed", never "reproducible build" — we do not claim
 reproducibility we cannot test. A quarantined mod is never retried automatically.
@@ -471,7 +476,7 @@ sequenceDiagram
   participant P as Player client
   participant S as Server
   P->>S: TLS 1.3 (SPKI pinned on first use)
-  S-->>P: Nonce, protocol version, content hash
+  S-->>P: Nonce, protocol version, content hash, view hash (advisory)
   P->>S: Ed25519 signature over nonce + transcript hash
   S->>S: Look up public key, verify signature
   S-->>P: Session token (HMAC, short TTL), permissions
@@ -806,7 +811,7 @@ stop testing anything.
 
 ## 9. References
 
-- Decisions: [DEC-008](../decisions.md), [DEC-020](../decisions.md), [DEC-023](../decisions.md), [DEC-024](../decisions.md), [DEC-026](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md), [DEC-038](../decisions.md), [DEC-040](../decisions.md), [DEC-041](../decisions.md), [DEC-042](../decisions.md), [DEC-044](../decisions.md), [DEC-045](../decisions.md).
+- Decisions: [DEC-008](../decisions.md), [DEC-020](../decisions.md), [DEC-023](../decisions.md), [DEC-024](../decisions.md), [DEC-026](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md), [DEC-038](../decisions.md), [DEC-040](../decisions.md), [DEC-041](../decisions.md), [DEC-042](../decisions.md), [DEC-044](../decisions.md), [DEC-045](../decisions.md), [DEC-049](../decisions.md), [DEC-050](../decisions.md).
 - Chapters: [00](00-conventions.md), [08 §3.14](08-gameplay-survival.md#314-authority-and-anti-cheat-boundaries), [09](09-entities-ai.md), [11 §3.4](11-inventory-crafting-items.md#34-the-inventory-transaction-protocol), [15](15-content-system.md), [16](16-modding.md), [17 §3.10](17-persistence.md#310-security-and-untrusted-input), [18](18-networking-multiplayer.md), [19](19-server-administration.md), [24](24-testing-benchmarks.md), [25](25-performance-budgets.md).
 - Research: [networking SOTA](../research/04-networking-sota.md) §6 (transport, identity, rate limiting, anti-cheat, mods); [Weft teardown](../research/01-weft-teardown.md) §7 and lesson 20 (client-authoritative movement as the counter-example); [modding and content](../research/06-modding-and-content-system.md).
 - Milestones: [MS-06](../plan/01-milestones.md), [MS-09](../plan/01-milestones.md), [MS-15](../plan/01-milestones.md), [MS-16](../plan/01-milestones.md).

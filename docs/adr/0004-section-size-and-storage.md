@@ -1,6 +1,6 @@
 # ADR-0004 — 16³ sections with paletted storage
 
-> Status: accepted · Date: 2026-11-24 · Decision: DEC-004, DEC-005 · Open: OPEN-001
+> Status: accepted; amended by DEC-048 (32³ mesh clusters are the default from MS-04) · Date: 2026-11-24 · Decision: DEC-004, DEC-005
 
 ## Context
 
@@ -34,7 +34,7 @@ Key numbers from the research:
    relighting does not rewrite block data and light memory is halved versus the
    naive 4 B/block layout.
 4. **Meshing may cluster 2×2×2 sections (32³).** This is a render-side
-   optimisation only and is provisional pending the MS-04 benchmark (OPEN-001);
+   optimisation and, per DEC-048, the default meshing unit from MS-04 (the MS-04 benchmark sets its tuning, not whether it is used);
    content, saves and protocol never see clusters.
 
 ## Consequences

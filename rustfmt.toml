@@ -1,7 +1,8 @@
+# Stable-only rustfmt options. Nightly-only options (imports_granularity,
+# group_imports) are intentionally omitted so `cargo fmt --check` is clean on
+# the pinned stable toolchain.
 edition = "2024"
 max_width = 120
 use_field_init_shorthand = true
 use_try_shorthand = true
-imports_granularity = "Module"
-group_imports = "StdExternalCrate"
 newline_style = "Unix"

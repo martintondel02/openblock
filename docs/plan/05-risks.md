@@ -1,8 +1,8 @@
 # Risk Register
 
 > Status: normative planning - Last updated: 2026-11-24
-> Depends on: [DEC-009](../decisions.md), [DEC-022](../decisions.md), [DEC-034](../decisions.md), [DEC-035](../decisions.md), [DEC-036](../decisions.md), [DEC-037](../decisions.md), [roadmap](00-roadmap.md), [milestones](01-milestones.md), [team and process](04-team-and-process.md)
-> Implements: MS-00 onward; the risk gate at every milestone, the MS-16 launch sign-off and the escalation rules of §7
+> Depends on: [DEC-009](../decisions.md), [DEC-022](../decisions.md), [DEC-034](../decisions.md), [DEC-035](../decisions.md), [DEC-036](../decisions.md), [DEC-037](../decisions.md), [DEC-048](../decisions.md), [DEC-051](../decisions.md), [DEC-052](../decisions.md), [roadmap](00-roadmap.md), [milestones](01-milestones.md), [team and process](04-team-and-process.md)
+> Implements: MS-00 onward; the risk gate at every milestone, the MS-16 launch sign-off and the escalation rules of §7. Re-scored against the two-track re-baseline in [review findings](07-review-findings.md).
 
 ## 1. Purpose and how to use this register
 
@@ -20,6 +20,14 @@ The register has three jobs:
    three weeks, or GPU p95 stays above 8 ms after two optimisation passes" is.
 3. **Price the risk.** Each row carries an estimated schedule impact in dev-weeks so the roadmap
    can be re-baselined with a number instead of a feeling.
+
+**2026-11-24 review re-baseline.** The review board found the plan's 159 dev-week total to be
+5–8× below the project's own research inventory and re-based it as two tracks: 1.0 Early Access at
+**200–240 dev-weeks** and 2.0 Tier-2 parity at **~500–800** (roadmap §11,
+[review findings](07-review-findings.md)). Several rows below are re-scored against that change:
+RISK-011 is now a Tier-1-at-1.0 plus 2.0-funding risk, RISK-004 is mitigated by DEC-048, RISK-001's
+schedule impact is re-priced, and RISK-010 must state its player distribution (DEC-052). RISK-013
+and RISK-018 are unchanged in cause and larger in consequence.
 
 **Status vocabulary.** `open` (live, not yet triggered), `monitoring` (trigger partially visible),
 `occurred` (trigger fired; a contingency or recovery plan is running), `mitigated` (the cause is
@@ -55,13 +63,13 @@ Rows are impact, columns are likelihood; cells list risk IDs and bold marks the 
 
 | Impact \ Likelihood | 1 rare | 2 unlikely | 3 possible | 4 likely | 5 near-certain |
 | --- | --- | --- | --- | --- | --- |
-| **5 severe** | — | 004, 006, 008, 015, 032, 040 | 005, 018 | 013 | — |
+| **5 severe** | — | 006, 008, 015, 032, 040 | 005, 018 | 013 | — |
 | **4 major** | — | 023, 024, 030, 031, 035 | 002, 010, 014, 016, 019, 020, 034, 037 | **001, 003, 009, 012** | **011** |
 | **3 moderate** | — | 029, 036 | 007, 021, 022, 025, 026, 027, 028, 033, 038, 039 | 017 | — |
 | **2 minor** | — | — | — | — | — |
 | **1 negligible** | — | — | — | — | — |
 
-The shape is the message: four of the five severe-impact risks are unlikely, while the critical
+The shape is the message: the severe-impact risks are mostly unlikely, while the critical
 band is dominated by scope and people risks that are likely and slow-moving. The project is more
 likely to be ended by **011** (parity scope) or **013** (burnout) than by any single bug.
 
@@ -73,17 +81,17 @@ likely to be ended by **011** (parity scope) or **013** (burnout) than by any si
 
 | ID | Risk | Cat | L | I | E | Δ dev-wk | Owner | Status |
 | --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- |
-| RISK-001 | The custom renderer takes longer than planned, delaying Phase B and every dependent milestone | S | 4 | 4 | 16 | 6–10 | MS-04 | open |
+| RISK-001 | The custom renderer takes longer than planned, delaying Phase B and every dependent milestone; the two-track re-baseline carries the overrun instead of hiding it | S | 4 | 4 | 16 | 8–12 | MS-04 | monitoring |
 | RISK-002 | The 120/144 FPS gate at 512 blocks is missed, forcing a public re-baseline of the headline promise | T | 3 | 4 | 12 | 4–8 | MS-04/MS-15 | open |
 | RISK-003 | Netcode "feel" needs iteration: corrections, rubber-banding or input lag at 60–100 ms RTT | T | 4 | 4 | 16 | 5–6 | MS-06 | open |
-| RISK-004 | 16³ storage or the 32³ mesh cluster is revisited late (OPEN-001), reopening save, mesh and perf work | T | 2 | 5 | 10 | 8–12 | MS-04 | monitoring |
+| RISK-004 | 16³ storage or the 32³ mesh cluster is revisited late, reopening save, mesh and perf work (mitigated: DEC-048 settles the 32³ cluster default and 16³ storage is fixed) | T | 2 | 5 | 10 | 8–12 | MS-04 | mitigated |
 | RISK-005 | Determinism drifts across platforms, forcing fixed-point simulation maths (OPEN-002) | T | 3 | 5 | 15 | 8–12 | MS-02/MS-08 | monitoring |
 | RISK-006 | A save is corrupted or lost in the field, destroying the product's most valuable promise | Q | 2 | 5 | 10 | 4–6 | MS-13 | open |
 | RISK-007 | A wgpu or GPU-driver change regresses Metal or Vulkan p95 on a supported platform | T | 3 | 3 | 9 | 2–4 | MS-04/MS-13 | open |
 | RISK-008 | A WASM mod escapes the sandbox or exhausts host resources | Sec | 2 | 5 | 10 | 4–8 | MS-09 | open |
 | RISK-009 | The mod ecosystem does not adopt the API, leaving the differentiation promise unproven | C | 4 | 4 | 16 | 4–8 | MS-09/MS-16 | open |
-| RISK-010 | Server scale or hosting cost misses: 50 players per 4 vCPU, $0.02 per player-hour | T | 3 | 4 | 12 | 3–6 | MS-15/MS-07 | open |
-| RISK-011 | Parity scope and content velocity outrun the team: Tier 2 at 1.0 is not reached | Sc | 5 | 4 | 20 | 10–20 | MS-14 | open |
+| RISK-010 | Server scale or hosting cost misses: 50 **co-located** players per 4 vCPU, $0.02 per player-hour; the distributed row is lower by design | T | 3 | 4 | 12 | 3–6 | MS-15/MS-07 | open |
+| RISK-011 | Parity scope and content velocity outrun the team: Tier-1 in-scope parity at 1.0 or the funded Tier-2 track at 2.0 is not reached | Sc | 5 | 4 | 20 | 15–25 | MS-14/MS-17 | open |
 | RISK-012 | Art or audio production blocks a release, or the commissioned pack does not arrive in time | S | 4 | 4 | 16 | 6–10 | MS-12/MS-16 | open |
 | RISK-013 | Solo-founder burnout or bus factor stops the project | S | 4 | 5 | 20 | 12–24 | Lead/MS-16 | open |
 | RISK-014 | Trademark clearance fails and the project must rename before 1.0 (DEC-037) | L | 3 | 4 | 12 | 2–4 | MS-16 | open |
@@ -106,7 +114,7 @@ likely to be ended by **011** (parity scope) or **013** (burnout) than by any si
 | RISK-031 | World height changes after the format freeze (OPEN-005), or 1,024 blocks is adopted late | T | 2 | 4 | 8 | 3–6 | MS-01/MS-13 | monitoring |
 | RISK-032 | The save format must change after `0.1`, breaking the migration promise | Q | 2 | 5 | 10 | 4–8 | MS-13 | open |
 | RISK-033 | A launch-day operations incident: bad update, CDN failure or crash spike | S | 3 | 3 | 9 | 1–4 | MS-16 | open |
-| RISK-034 | Post-1.0 flagship content expands beyond its gate and pulls engineers off parity or fixes | Sc | 3 | 4 | 12 | 6–12 | MS-17 | open |
+| RISK-034 | Post-1.0 flagship content expands beyond its gate and pulls engineers off parity or fixes | Sc | 3 | 4 | 12 | 6–12 | MS-24 | open |
 | RISK-035 | A privacy incident from crash reports, logs or telemetry | L | 2 | 4 | 8 | 2–5 | MS-16 | open |
 | RISK-036 | Architecture erosion: the GPU-free server rule or the platform boundary is bypassed | T | 2 | 3 | 6 | 3–6 | MS-00 | open |
 | RISK-037 | An item duplication or economy exploit reaches a public server | Q | 3 | 4 | 12 | 3–6 | MS-10/MS-15 | open |
@@ -118,17 +126,17 @@ likely to be ended by **011** (parity scope) or **013** (burnout) than by any si
 
 | ID | Trigger / early warning | Mitigation (prevention) | Contingency (if it fires) |
 | --- | --- | --- | --- |
-| RISK-001 | MS-04 slips three weeks, or GPU p95 stays above 8 ms after two optimisation passes | Vertical slice first; render graph before effects; presets as the tuning surface; buy UI/audio; weekly frame-time dashboard | Ship 384 blocks at the 120 FPS gate, cut shadows/post to `medium`, publish measured numbers; `ash` backend only with a > 20% measured gap (DEC-002) |
+| RISK-001 | MS-04 slips three weeks, or GPU p95 stays above 8 ms after two optimisation passes | Vertical slice first; render graph before effects; presets as the tuning surface; buy UI/audio; weekly frame-time dashboard; the 200–240 dev-week 1.0 track is the re-baselined budget and carries an 8–12 week allowance | Ship 384 blocks at the 120 FPS gate, cut shadows/post to `medium`, publish measured numbers; `ash` backend only with a > 20% measured gap (DEC-002) |
 | RISK-002 | Two consecutive nightly gates red; p99 above 10 ms for a week | Budgets from MS-04 (DEC-035); bench box; per-pass attribution; early preset work | Re-baseline the default distance with data (OPEN-003), make 144 FPS a mode, publish the honest matrix |
 | RISK-003 | More than one correction per 10 s of sprinting at 80 ms RTT; input-to-photon penalty above one frame | In-process network simulator from day one; prediction and lag compensation in MS-06; recorded feel sessions | Cut fast features (boats, item entities, elytra) before cutting prediction; cap supported RTT; document the correction budget |
-| RISK-004 | MS-04 cluster A/B shows < 1.3× merge benefit, or corner-edit latency above 100 ms | 16³ storage is fixed; clusters are render-only and provisional; A/B at MS-04 before format freeze | Cluster meshing off by default; per-section meshing; re-run the memory and draw-call budgets |
+| RISK-004 | The MS-04 cluster default fails the 512-block visibility budget (> 0.30 ms) or corner-edit latency exceeds 100 ms | 32³ cluster default settled by DEC-048; 16³ storage fixed; the MS-04 benchmark tunes implementation, eviction and the Metal fallback (OPEN-009) | Per-section fallback behind a setting; re-run the memory and draw-call budgets; escalate the Metal path only with measured data |
 | RISK-005 | Cross-platform hash mismatch in nightly; drift after a toolchain or dependency bump | Pinned transcendentals, integer worldgen, golden hashes, three-OS CI, negative tests | Fixed-point maths for the divergent subsystem only (OPEN-002); freeze features until green |
 | RISK-006 | Any CRC or quarantine event in soak; a migration fixture failure; `kill -9` test failing | Double-buffered headers, CRC per record, 1,000-iteration fault injection, migrations on copies, backups | Halt rollout, ship `world repair`, publish recovery steps; rollback requires the pre-update backup |
 | RISK-007 | macOS or Vulkan p95 regression above 10% after a driver or wgpu bump | Pin wgpu and drivers on the bench box; per-adapter baselines; nightly macOS smoke | Hold the old wgpu for a release; ship a platform-specific submission path; mark macOS a known issue |
 | RISK-008 | Sandbox escape reproduced; wasmtime advisory; quota bypass in fuzz | Capabilities, fuel/memory/epoch quotas, pinned wasmtime, external review before `0.4`, escape corpus | Disable the WASM tier by config and in the container; emergency patch and advisory; preserve evidence |
 | RISK-009 | Fewer than 20 external packs after `0.4`; template-to-block time above 30 min | SDK, template, docs, examples, base game dogfooding, content index, showcase packs | Invest in first-party content built on the API; commission seed mods; simplify the API surface |
-| RISK-010 | 50 bots below 20 TPS; cost per player-hour above $0.02; RSS above budget | Parallel region ticking, interest tuning, replication batching, published capacity matrix | Publish a lower supported count (16), raise the recommended vCPU, lower the default simulation distance |
-| RISK-011 | Tier-2 coverage below 90% at MS-14; more than two unfixed deltas per upstream drop | Pinned 1.21.11 baseline (DEC-022), generated checklist, tier gates, cut lines | Ship `0.6` as Tier 2 minus a documented list, defer to `1.1`, never claim full parity; publish the delta |
+| RISK-010 | 50 co-located bots below 20 TPS; cost per player-hour above $0.02; RSS above budget; no measured distributed row | Parallel region ticking, interest tuning, replication batching, published capacity matrix with co-located and distributed rows (DEC-052) | Publish a lower supported count for each distribution (the distributed row is lower by design), raise the recommended vCPU, lower the default render distance |
+| RISK-011 | Tier-1 in-scope pass rate below 100% or behavioural coverage below 85% at MS-14; more than two unfixed deltas per upstream drop; no funded 2.0 plan by MS-16 | Pinned 1.21.11 baseline (DEC-022), hand-authored checklist (DEC-051), tier gates, cut lines, two-track plan with the 2.0 track costed | Ship 1.0 Early Access with a documented Tier-1 gap, defer Tier-2 content to 2.0, never claim full parity; publish the delta |
 | RISK-012 | Under 60% of block textures final at MS-12; music not delivered by MS-14 | Placeholder pack at MS-03; commission in Phase D; CC0 fallback; style guide; asset register | Ship with the placeholder/CC0 subset and add art in `1.1`; state it in the release notes |
 | RISK-013 | Two consecutive missed weeks; devlog gap over three weeks; stated loss of motivation | Public milestones, playable builds, scope tiers, weekly cadence, 20% slack, delegate early | Publicly pause the roadmap, recruit a co-maintainer, move to maintenance and LTS the last release |
 | RISK-014 | Clearance search shows a conflict; domain or org dispute; store rejection on name grounds | Clearance as a 1.0 launch gate (DEC-037); reserve the mod namespace; migration plan | Rename before 1.0 with redirects, reserve the new namespace and a migration note; rebrand marketing |
@@ -151,7 +159,7 @@ likely to be ended by **011** (parity scope) or **013** (burnout) than by any si
 | RISK-031 | Content needs more than 384 blocks; 1,024 adopted after the format freeze | Engine ceiling 1,024, per-dimension height field, memory measured before freeze | Per-dimension height with a migration; delay the format freeze rather than force a rewrite |
 | RISK-032 | A migration fixture fails after a data-model change; a released save cannot open | Format freeze at MS-13, migrations from `0.1`, fixture saves in the repo | Migration plus a published repair tool; keep the last compatible branch for reads |
 | RISK-033 | Updater serves a bad build; CDN down; crash spike on launch day | Staged rollout, health check, N−1/N−2 retention, signed manifests, runbook and status page | Pull the artifact, revert the manifest, publish rollback instructions, postmortem |
-| RISK-034 | A flagship exceeds 18 EM; a gate slips; parity engineers are pulled | Three flagships maximum, explicit gates and cut order, no new systems after the gate | Ship Workshop + Hearth, move Delve to `1.1`; re-baseline publicly |
+| RISK-034 | A flagship exceeds 18 EM; a gate slips; parity engineers are pulled | Three flagships maximum, explicit gates and cut order, no new systems after the gate; the 2.0 track is staffed separately (OPEN-019) | Ship Workshop + Hearth, move Delve to `1.1`; re-baseline publicly |
 | RISK-035 | A crash report contains paths, chat or identities; telemetry enabled against policy | Opt-in only, redaction fixtures, self-hosted collector, no server minidumps by default | Purge the data, notify affected users, audit retention, publish the incident |
 | RISK-036 | `wgpu`/`winit` appear in the server tree; platform types leak upward | Dependency guard in CI on all targets and features; trait boundary; review checklist | Revert the offending change, add a regression test, refactor before the next milestone |
 | RISK-037 | One fuzz seed duplicates an item; a public server reports a dupe | One host transaction, conservation assertion, 100k-sequence fuzz, audit trail | Roll back the affected inventory range from backups, patch, publish the policy and compensation |
@@ -167,8 +175,8 @@ not by being forgotten.
 | # | Risk | Exposure | Current signal | Threshold to escalate | Next decision |
 | ---: | --- | ---: | --- | --- | --- |
 | 1 | RISK-013 burnout / bus factor | 20 | Solo, full-time, public cadence | Two missed weeks or a devlog gap > 3 weeks | Recruit a co-maintainer; cut scope to `0.1` plus modding |
-| 2 | RISK-011 parity scope | 20 | Tier-2 checklist being generated | Coverage < 70% at MS-12; > 2 deltas per upstream drop | Cut the Tier-2 list, publish the delta, move items to `1.1` |
-| 3 | RISK-001 renderer schedule | 16 | MS-04 at 120 FPS prototype | Slip > 3 weeks; p95 > 8 ms after two passes | Apply the cut order, re-baseline the preset |
+| 2 | RISK-011 parity scope | 20 | Tier-1 checklist and Tier-2 coverage report being built | Tier-1 in-scope pass < 100% or behavioural coverage < 85% at MS-14; no funded 2.0 plan at MS-16 | Ship Tier-1 Early Access with a published gap; fund or descope the 2.0 track |
+| 3 | RISK-001 renderer schedule | 16 | MS-04 at 120 FPS prototype | Slip > 3 weeks; p95 > 8 ms after two passes | Apply the cut order; the 200–240 dev-week track already carries the overrun |
 | 4 | RISK-003 netcode feel | 16 | Simulator and prediction design | > 1 correction per 10 s sprinting | Cut fast features, cap supported RTT |
 | 5 | RISK-009 mod adoption | 16 | SDK and template planned | < 20 external packs after `0.4` | Commission seed mods; simplify the API |
 | 6 | RISK-012 art/audio | 16 | Placeholder pack first | < 60% textures at MS-12 | Ship CC0 subset; delay art to `1.1` |
@@ -181,25 +189,27 @@ not by being forgotten.
 
 Expected delay is approximated as `P(occur) × Δ`, with `P = L / 5`. This is an order-of-magnitude
 estimate to compare risks, not a budget line. The point is not the exact total; it is that the
-technical and scope risks alone are of the same size as the roadmap's coordination allowance.
+technical and scope risks alone exceed the roadmap's 20% coordination allowance.
 
 | Risk | P | Δ mid | Expected dev-weeks |
 | --- | ---: | ---: | ---: |
-| RISK-011 parity scope | 1.00 | 15 | 15.0 |
-| RISK-001 renderer | 0.80 | 8 | 6.4 |
+| RISK-011 parity scope (Tier 1 at 1.0 + funded 2.0) | 1.00 | 20 | 20.0 |
+| RISK-001 renderer | 0.80 | 10 | 8.0 |
 | RISK-005 determinism | 0.60 | 10 | 6.0 |
 | RISK-012 art/audio | 0.80 | 8 | 6.4 |
 | RISK-003 netcode | 0.80 | 5.5 | 4.4 |
-| RISK-004 section/cluster | 0.40 | 10 | 4.0 |
 | RISK-002 perf gate | 0.60 | 6 | 3.6 |
 | RISK-010 server scale | 0.60 | 4.5 | 2.7 |
-| **Technical, scope and content total** | | | **≈ 48.5** |
+| **Technical, scope and content total** | | | **≈ 51.1** |
 
-That is roughly 30% of the 159 dev-week plan. The roadmap's 20% figure is coordination overhead,
-not contingency, so **the cut lines in [the MVP definition](02-mvp.md) and the tier gates are the
-actual contingency**. The people risks (013, 017, 018) are excluded from the total because they
-do not delay the project so much as stop it; they are tracked as viability risks, not schedule
-risks.
+That is roughly 21–26% of the **200–240 dev-week** 1.0 track (it was ~30% of the old
+159-week figure) and a smaller share of the combined ~700–1,040 two-track total. The
+roadmap's 20% figure is coordination overhead, not contingency, so **the cut lines in
+[the MVP definition](02-mvp.md), the tier gates and the two-track split are the actual
+contingency**. RISK-004 is excluded from the total because DEC-048 settles the cluster
+default; its remaining implementation risk is carried inside MS-04. The people risks
+(013, 017, 018) are excluded because they do not delay the project so much as stop it;
+they are tracked as viability risks, not schedule risks.
 
 ## 7. Review cadence and escalation
 
@@ -337,15 +347,23 @@ different chapter.
 8. **Register item needed:** an incident-response severity scale shared by security, save
    corruption and bad updates, referenced by both this register and release operations. Owner:
    MS-16.
+9. **2.0 funding (OPEN-019, owner: lead).** RISK-011 is now partly a funding risk: the
+   ~500–800 dev-week Tier-2 track needs 6–10 funded people for 2–3 years. Decide the
+   funding path before MS-16, or descope the 2.0 claim explicitly.
+10. **Modern Delta (OPEN-020, owner: MS-17).** The pinned 1.21.11 baseline is a 1.0
+    decision; re-baselining to a newer release before the 2.0 claim changes RISK-011's
+    trigger and delta size.
 
 ## 10. References
 
 Decisions: [DEC-009](../decisions.md), [DEC-022](../decisions.md), [DEC-034](../decisions.md),
-[DEC-035](../decisions.md), [DEC-036](../decisions.md), [DEC-037](../decisions.md).
+[DEC-035](../decisions.md), [DEC-036](../decisions.md), [DEC-037](../decisions.md),
+[DEC-048](../decisions.md), [DEC-051](../decisions.md), [DEC-052](../decisions.md).
 
 Planning: [roadmap](00-roadmap.md) · [milestones](01-milestones.md) · [MVP](02-mvp.md) ·
 [work breakdown](03-work-breakdown.md) · [team and process](04-team-and-process.md) ·
-[release and operations](06-release-and-operations.md).
+[release and operations](06-release-and-operations.md) ·
+[review findings](07-review-findings.md).
 
 Chapters with local risk tables: [01](../spec/01-technical-architecture.md),
 [02](../spec/02-engine-core.md), [03](../spec/03-rendering.md), [04](../spec/04-shaders-and-visuals.md),

@@ -120,7 +120,7 @@ D''' = D'' * (100 - 20 * resistance_level) / 100
 
 Divisions round half-up to 1/1,024 HP. EPF is 1 per level for generic protection and 2 for a specific protection, capped at 20; the reduction caps at 80%, so armor plus enchantments never grant immunity. Absorption is a separate pool spent before armor and never heals. Resistance applies last and reaches 0 damage at level 5, which still counts as a hit for stats. Golden vectors: 10 HP against 15 armor and 8 toughness gives 5.00; against 20 armor and 8 toughness 3.00; adding EPF 4 gives 2.52; EPF 20 gives 0.60.
 
-**Damage types.** `DamageTypeDef` is content data: family, default amount, armor flag, protection flag, i-frame bypass, knockback rule, death-message key. Tier 2 requires every damage type in the parity manifest classified (51 in the latest registry at the time of writing), even when several map to one row.
+**Damage types.** `DamageTypeDef` is content data: family, default amount, armor flag, protection flag, i-frame bypass, knockback rule, death-message key. Tier 2 requires every damage type in the hand-authored parity checklist classified (51 at the pinned 1.21.11 baseline, from published facts and our own tests), even when several map to one row.
 
 | Type / family | Default | Armor | Protection | I-frames | Knockback |
 | --- | --- | --- | --- | --- | --- |
@@ -208,11 +208,11 @@ Sprinting is a request: the host clears it when food ≤ 6, on wall collision, i
 | 3 | diamond | 1,561 | 8.0 | 7 | 3 | 60–180 min |
 | 4 | embersteel | 2,031 | 9.0 | 8 | 4 | 180–400 min |
 
-Embersteel is the netherite-equivalent tier; the name is provisional pending [DEC-037](../decisions.md) and the parity mapping is fixed. Mining time is `hardness * (harvestable ? 1.5 : 5.0) / speed` seconds, rounded up to the next ct; a block above the tool's harvest level yields no drop but still breaks. Tools lose 1 durability per block and per attack; armor loses 1 per 4 HP absorbed. "Target time" is measured by the scripted playthrough (§7), not promised.
+Embersteel is the top-tier metal; the name is provisional pending [DEC-037](../decisions.md) and the parity mapping is fixed. Mining time is `hardness * (harvestable ? 1.5 : 5.0) / speed` seconds, rounded up to the next ct; a block above the tool's harvest level yields no drop but still breaks. Tools lose 1 durability per block and per attack; armor loses 1 per 4 HP absorbed. "Target time" is measured by the scripted playthrough (§7), not promised.
 
 ### 3.9 Dimensions and travel
 
-| Property | overworld | nether | end |
+| Property | overworld | underworld | terminus |
 | --- | --- | --- | --- |
 | Height (`min_y..max_y`) | −64..320 | 0..256 | 0..256 |
 | Horizontal link scale | 1 | 8 | 1 |
@@ -220,7 +220,7 @@ Embersteel is the netherite-equivalent tier; the name is provisional pending [DE
 | Bed / respawn anchor | sleep / explodes | explodes / sets spawn | explodes / explodes |
 | Arrival frame | obsidian 4×5 | obsidian 4×5 | 12-eye stronghold portal |
 
-The ideal link target is `(floor_div(x,8), clamp(y, min_y+8, max_y-8), floor_div(z,8))` from overworld to nether and the inverse `(x*8, y, z*8)` back, clamped to the target border; only overworld↔nether links scale. The host searches `target ± 128` in X/Z and `± 16` in Y, matches portal blocks in `(distance², y, x, z)` order, and stores the link in `level.json` so re-entry is stable ([06 §3.9](06-worldgen.md#39-dimensions-and-portals)). If none exists, a 4-block spiral out to 128 blocks accepts the first column with a 3×3 solid floor, four air blocks above and no lava or water in the frame footprint, and builds a 4×5 obsidian frame with a 2×3 interior facing X. Search and creation run on a worker with a 5 ms budget; the player waits in `Transferring`, outside the tick.
+The ideal link target is `(floor_div(x,8), clamp(y, min_y+8, max_y-8), floor_div(z,8))` from overworld to underworld and the inverse `(x*8, y, z*8)` back, clamped to the target border; only overworld↔underworld links scale. The host searches `target ± 128` in X/Z and `± 16` in Y, matches portal blocks in `(distance², y, x, z)` order, and stores the link in `level.json` so re-entry is stable ([06 §3.9](06-worldgen.md#39-dimensions-and-portals)). If none exists, a 4-block spiral out to 128 blocks accepts the first column with a 3×3 solid floor, four air blocks above and no lava or water in the frame footprint, and builds a 4×5 obsidian frame with a 2×3 interior facing X. Search and creation run on a worker with a 5 ms budget; the player waits in `Transferring`, outside the tick.
 
 ```mermaid
 sequenceDiagram
@@ -244,7 +244,7 @@ The change is one host transaction: the entity is moved, never copied; inventory
 
 A day defaults to 24,000 ct (20 minutes at 20 ct/s) and is configurable per [07](07-light-and-weather.md); time 0 is sunrise. Day 0–12,000 has full sky light, sunset 12,000–13,000 ramps it down, night 13,000–23,000 is the hostile spawning window, and sunrise 23,000–24,000 ramps it up.
 
-Sleep requires a bed, an unobstructed bed, and time in `12,500..=23,500` or an active thunderstorm (a base-profile extension); the first use sets the spawn point regardless of time. In multiplayer, when the fraction of non-spectator players sleeping in that dimension reaches `players_sleeping_percentage` (default 100), the host fast-forwards `day_time` to the next sunrise over 100 ct, clears precipitation with the base profile's 0.5 probability ([07](07-light-and-weather.md)), and wakes the players; otherwise the sleeper wakes after 100 ct with no skip. Damage wakes a sleeper. Beds in the nether or end explode; anchors take 0–4 glowstone charges, set spawn, consume one and explode elsewhere.
+Sleep requires a bed, an unobstructed bed, and time in the sleep window (12,600..=23,400, derived from the same day formula as [07 §3.11](07-light-and-weather.md)) or an active thunderstorm (a base-profile extension); the first use sets the spawn point regardless of time. In multiplayer, when the fraction of non-spectator players sleeping in that dimension reaches `players_sleeping_percentage` (default 100), the host fast-forwards `day_time` to the next sunrise over 100 ct, clears precipitation with the base profile's 0.5 probability ([07](07-light-and-weather.md)), and wakes the players; otherwise the sleeper wakes after 100 ct with no skip. Damage wakes a sleeper. Beds in the underworld or terminus explode; anchors take 0–4 glowstone charges, set spawn, consume one and explode elsewhere.
 
 World spawn is selected once by the worldgen spawn search ([06 §3.3](06-worldgen.md#33-the-staged-pipeline)): a deterministic scan of chunk rings from `(0,0)` with at most 4,096 candidate columns, accepting the first column whose surface is solid, dry, above sea level, inside the `openblock:spawnable` biome tag, has slope ≤ 2 over 5×5, four air blocks above, lies outside every structure bounding box and has sky light ≥ 7 at noon; the result is stored in `level.json`. Player spawn and respawn spiral around that point up to 16 blocks and 128 candidates, requiring two air blocks, a solid non-damaging floor, no fluid, no cactus or fire, and non-damaging light. If none exists the host places a 3×3 platform of the dimension's surface block and logs the event.
 
@@ -398,8 +398,8 @@ Every requirement in §2 names its layer. The playthrough harness fails if the f
 
 1. **Combat rewind window.** Is 200 ms permanent, or may competitive servers configure 0–250 ms? Register item needed: combat-rewind window configurability (owner **MS-06/MS-15**).
 2. **Sleep denominator.** Keep 100% of non-spectator players by default, or scale with server population? Register item needed: sleep-denominator scaling (owner **MS-10**).
-3. **Portal creation policy.** May the host carve blocks to place a return portal, and is the nether roof permanently excluded? Owner: **MS-08/MS-10**.
-4. **Embersteel naming and tier count.** Final netherite-equivalent name, and whether copper is a tier or an iron side-grade (DEC-037, DEC-022). Owner: **MS-16 content lock**.
+3. **Portal creation policy.** May the host carve blocks to place a return portal, and is the underworld roof permanently excluded? Owner: **MS-08/MS-10**.
+4. **Embersteel naming and tier count.** Final top-tier metal name, and whether copper is a tier or an iron side-grade (DEC-037, DEC-022). Owner: **MS-16 content lock**.
 5. **Hardcore on servers.** One life per player or per world, and does the spectator state survive reconnect? Owner: **MS-11**.
 
 ## 9. References

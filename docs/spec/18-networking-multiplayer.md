@@ -1,7 +1,7 @@
 # 18 — Networking and Multiplayer
 
 > Status: normative - Last updated: 2026-11-24
-> Depends on: [DEC-004](../decisions.md), [DEC-006](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-023](../decisions.md), [DEC-024](../decisions.md), [DEC-025](../decisions.md), [DEC-026](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md), [DEC-038](../decisions.md), [DEC-040](../decisions.md), [DEC-043](../decisions.md), [DEC-044](../decisions.md), [DEC-046](../decisions.md); [architecture](01-technical-architecture.md), [engine core](02-engine-core.md), [world model](05-world-model.md), [light](07-light-and-weather.md), [gameplay](08-gameplay-survival.md), [items](11-inventory-crafting-items.md), [persistence](17-persistence.md), [server admin](19-server-administration.md), [security](20-security-and-anti-cheat.md); [research 04](../research/04-networking-sota.md)
+> Depends on: [DEC-004](../decisions.md), [DEC-006](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-023](../decisions.md), [DEC-024](../decisions.md), [DEC-025](../decisions.md), [DEC-026](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md), [DEC-038](../decisions.md), [DEC-040](../decisions.md), [DEC-043](../decisions.md), [DEC-044](../decisions.md), [DEC-046](../decisions.md), [DEC-048](../decisions.md), [DEC-049](../decisions.md), [DEC-050](../decisions.md), [DEC-052](../decisions.md); [architecture](01-technical-architecture.md), [engine core](02-engine-core.md), [world model](05-world-model.md), [light](07-light-and-weather.md), [gameplay](08-gameplay-survival.md), [items](11-inventory-crafting-items.md), [persistence](17-persistence.md), [server admin](19-server-administration.md), [security](20-security-and-anti-cheat.md); [research 04](../research/04-networking-sota.md)
 > Implements: MS-06, MS-07, MS-15
 
 ## 1. Purpose and scope
@@ -32,7 +32,7 @@ enforcement ([20](20-security-and-anti-cheat.md)); the server's configuration su
 | REQ-NET-005 | Transport MUST be TLS 1.3 only; the default identity MUST be a self-signed Ed25519 key pinned by SPKI; a key change MUST require explicit user re-pin. | Pin-change and ticket tests | MS-07 |
 | REQ-NET-006 | Player identity MUST be a keypair with challenge-response; whitelists and bans MUST be keyed on the public key, never on IP alone. | Two-key auth, ban tests | MS-07 |
 | REQ-NET-007 | QUIC 0-RTT MUST carry only a resume request; any other early message MUST be rejected with `replay_rejected` ([DEC-026](../decisions.md)). | Early-data replay corpus | MS-06 |
-| REQ-NET-008 | The handshake MUST compare protocol version, `pack_hash` (content and view roots), the balance-profile hash and the mod manifest; a mismatch MUST close with an actionable kick naming the differing packs. | Mismatch fixtures per field | MS-06 |
+| REQ-NET-008 | The handshake MUST compare protocol version, `content_hash` (join-critical and strict), the balance-profile hash and the mod manifest, and MUST close with an actionable kick naming the differing packs; `view_hash` is advisory by default and is compared only when the server opts into strict view matching ([DEC-050](../decisions.md)). | Mismatch fixtures per field | MS-06 |
 | REQ-NET-009 | Message IDs MUST be stable and never reused; an unknown ID MUST be a protocol error; a lower minor peer MUST simply not receive newer messages. | Golden catalog digest, negotiation test | MS-06 |
 | REQ-NET-010 | The message catalog MUST generate encoder, decoder, size table and Markdown documentation; documentation drift MUST fail CI. | `cargo xtask gen-protocol --check` | MS-06 |
 | REQ-NET-011 | Hot-path messages MUST be hand-written bit-packed codecs; every decoder MUST enforce its maximum size before allocating. | Size-table test, fuzz | MS-06 |
@@ -52,7 +52,7 @@ enforcement ([20](20-security-and-anti-cheat.md)); the server's configuration su
 | REQ-NET-025 | Only presentation effects MAY be predicted; damage, loot, durability, block permanence and inventory results MUST NOT be. | Predicted-action matrix | MS-06 |
 | REQ-NET-026 | Remote entities MUST render at `now − interp_delay`, adapted from jitter in 50–250 ms, with extrapolation capped at 250 ms; the host tick offset MUST come from snapshot arrivals, never from wall-clock reads in simulation. | Jitter matrix, clock-skew tests | MS-06 |
 | REQ-NET-027 | Combat rewind MUST clamp at 200 ms and MUST NOT hit through current solid geometry or resurrect a dead entity ([REQ-GAME-018](08-gameplay-survival.md)). | Rewind corpus at 0/80/150 ms | MS-06 |
-| REQ-NET-028 | At 1.0 no mod code MUST run on a client; prediction MUST come from content-hash-covered descriptors, and a later both-sides code tier MUST be deterministic and disable itself above a 0.1% correction rate. | Descriptor and desync tests | MS-09 |
+| REQ-NET-028 | At 1.0 no mod code MUST run on a client ([DEC-049](../decisions.md)); prediction MUST come from content-hash-covered descriptors, and a post-1.0 both-sides code tier would need a new decision, determinism and a 0.1% correction cutoff. | Descriptor and desync tests | MS-09 |
 | REQ-NET-029 | Dimension transfer MUST be atomic: removed from the source and spawned in the destination exactly once, with no item loss or duplication. | Fault-injected transfer | MS-08 |
 | REQ-NET-030 | Spectators MUST receive chunks and entities but no owner state, container stream or edit intents; ignored intents MUST be counted. | Spectator corpus | MS-11 |
 | REQ-NET-031 | Chat and commands MUST use the ordered control stream, be rate-limited, permission-checked before argument parsing, and rendered as plain text. | Rate, permission, injection tests | MS-07 |
@@ -103,6 +103,7 @@ does not fit is a design error, not a new channel.
 | Section resends | S→C | uni, one per section | on request | retransmit |
 | Chunk columns | S→C | uni, one per column | join and streaming | retransmit or cancel |
 | Entity spawn/despawn/attach | S→C | reliable uni | on change | retransmit |
+| Public replicated state: scoreboard, teams, advancements, statistics, boss bars, status effects, entity metadata and equipment, world border, game mode and abilities | S→C | reliable uni, StateChannel `0x54` | on change, coalesced ≤ 4 Hz per channel | retransmit; full channel snapshot on join |
 | Owner state: vitals, XP, air, timers | S→C | reliable uni | 20 Hz | retransmit |
 | Container traffic | both | reliable bidi | on intent | retransmit ([11](11-inventory-crafting-items.md)) |
 | Chat and commands | both | reliable bidi | on input | retransmit |
@@ -110,8 +111,8 @@ does not fit is a design error, not a new channel.
 | Session control: join, kick, transfer | both | reliable bidi | on change | retransmit |
 
 A client never receives another client's inventory, owner state or command feedback. Public entity
-metadata (name, pose, equipment) is a reliable event on change; anything private stays on the owner
-stream. At `snapshot_rate_hz = 30` the host emits entity snapshots by sampling its two most recent
+metadata (name, pose, equipment, visible effects, leash and seat) travels on the entity-metadata and
+equipment channels of §3.4 on change; anything private stays on the owner stream. At `snapshot_rate_hz = 30` the host emits entity snapshots by sampling its two most recent
 tick states and interpolating between them at the snapshot instant; simulation state, tick numbering
 and the state hash are unchanged ([DEC-038](../decisions.md)). Block events and owner state stay
 tick-cadenced.
@@ -222,7 +223,7 @@ dictionaries are derived from `content_hash` on both sides and never transmitted
 
 | ID | Message | Dir | Channel | Cadence | Budget | Encoding |
 | --- | --- | --- | --- | --- | --- | --- |
-| `0x01` | `ClientHello`: version, pack hashes, mod manifest, player key | C→S | control | once | 16 KiB | postcard |
+| `0x01` | `ClientHello`: version, `content_hash`/`view_hash`, mod manifest, player key | C→S | control | once | 16 KiB | postcard |
 | `0x02` | `ServerHello`: version, session, identity mode | S→C | control | once | 1 KiB | postcard |
 | `0x03` | `AuthChallenge` / `AuthResponse` | both | control | 1 | 256 B | fixed |
 | `0x04` | `ResumeRequest` / `ResumeResult` | both | control | 1 | 128 B | fixed |
@@ -232,13 +233,14 @@ dictionaries are derived from `content_hash` on both sides and never transmitted
 | `0x20` | `JoinWorld`: world UUID, dimensions, rules hash, spawn | S→C | control | 1 | 4 KiB | postcard |
 | `0x21` | `JoinProgress`: stage, ready/total columns | S→C | control | 4 Hz | 16 B | fixed |
 | `0x30` | `InputFrame`: 1–3 input commands | C→S | datagram | 20 Hz | 48 B | bit-packed |
-| `0x31` | `TickAck`: tick, fragment bitmap, input sequence | C→S | datagram | 20 Hz | 16 B | bit-packed |
-| `0x40` | `TickPacket`: fragment 0–3 | S→C | datagram | 20/30 Hz | 1,160 B | bit-packed |
+| `0x31` | `TickAck`: tick, 16-bit fragment bitmap, input sequence | C→S | datagram | 20 Hz | 16 B | bit-packed |
+| `0x40` | `TickPacket`: fragment 0–15 of ≤ 16 | S→C | datagram | 20/30 Hz | 1,160 B per fragment, 18,560 B per packet | bit-packed |
 | `0x50` | `SectionDelta`: section, version, indices + states | S→C | reliable uni | per tick | 16 KiB | bit-packed |
 | `0x51` | `SectionRequest`: chunk, sy, known version | C→S | control | on gap | 24 B | bit-packed |
 | `0x52` | `SectionResend`: full section | S→C | uni | on request | 16 KiB | bit-packed |
 | `0x53` | `ChunkColumn`: header, sections, heightmaps, light | S→C | uni | streaming | 256 KiB | bit-packed + zstd |
-| `0x60` | `EntitySpawn`: NetId, type, transform, public metadata | S→C | reliable uni | on change | 64 B | bit-packed |
+| `0x54` | `StateChannel`: channel id, schema version, revision, typed body | S→C | reliable uni (events stream) | on change, coalesced ≤ 4 Hz per channel | 16 KiB body | bit-packed header + postcard body |
+| `0x60` | `EntitySpawn`: NetId, type, transform, initial metadata | S→C | reliable uni | on change | 64 B | bit-packed |
 | `0x61` | `EntityDespawn`: NetId, reason | S→C | reliable uni | on change | 8 B | bit-packed |
 | `0x62` | `EntityAttach`: passenger, vehicle, seat | S→C | reliable uni | on change | 12 B | bit-packed |
 | `0x70` | `OwnerState`: vitals, XP, air, timers | S→C | reliable uni | 20 Hz | 24 B | bit-packed |
@@ -255,7 +257,44 @@ dictionaries are derived from `content_hash` on both sides and never transmitted
 
 The catalog is declared once with `ob_protocol::catalog!`; the macro generates dispatch, the size
 table used by tests, and `docs/protocol/wire.md`. `openblock-tools wire decode` reads the same catalog,
-so a third party can decode a capture without the engine.
+so a third party can decode a capture without the engine. It is also the only wire surface: a core
+feature that changes client-visible state MUST register its message or state channel in the same
+commit, and `cargo xtask gen-protocol --check` fails a replicated value that no catalogued message
+carries (REQ-NET-010).
+
+`StateChannel` (`0x54`) is the generic carrier for low-rate state that is neither a transform delta
+nor a spawn/despawn event. Records are length-prefixed on the reliable `Events` uni stream, so the
+message adds no stream and no per-peer buffer; ordering is per channel, a record whose `revision` does
+not advance is dropped, and a full channel snapshot is sent at join, on dimension transfer and on
+resume. Channel ids are their own `u16` namespace, not message IDs, and an id absent from the catalog is
+a protocol error. Channels are entries in the same `catalog!` declaration — it generates their
+dispatch and size table too — and are never negotiated as strings:
+
+| Channel | Carries | Owner | Max body |
+| --- | --- | --- | --- |
+| `0x0001` `scoreboard_objects` | objectives, criteria, display slots | [08 §3.12](08-gameplay-survival.md#312-commands-permissions-statistics-and-onboarding) | 8 KiB |
+| `0x0002` `scoreboard_scores` | per-holder score deltas | [08 §3.12](08-gameplay-survival.md#312-commands-permissions-statistics-and-onboarding) | 8 KiB |
+| `0x0003` `teams` | team membership, colours, rules | [08 §3.12](08-gameplay-survival.md#312-commands-permissions-statistics-and-onboarding) | 8 KiB |
+| `0x0004` `advancements` | progressed criteria, completion ticks, toasts | [08 §3.12](08-gameplay-survival.md#312-commands-permissions-statistics-and-onboarding) | 16 KiB |
+| `0x0005` `statistics` | changed `(StatId, u64)` entries, owner-only | [08 §3.12](08-gameplay-survival.md#312-commands-permissions-statistics-and-onboarding) | 16 KiB |
+| `0x0006` `boss_bar` | name key, colour, segments, phase | [09 §3.17](09-entities-ai.md#317-replication) | 256 B |
+| `0x0007` `status_effects` | visible effect id, amplifier, remaining ct | [09 §3.17](09-entities-ai.md#317-replication) | 64 B |
+| `0x0008` `entity_metadata` | custom name, variant, profession, leash, seat | [09 §3.17](09-entities-ai.md#317-replication) | 128 B |
+| `0x0009` `entity_equipment` | held item and armour stacks | [09 §3.17](09-entities-ai.md#317-replication) | 256 B |
+| `0x000A` `world_border` | centre, radius, warning distances | [19 §3.3](19-server-administration.md#33-world-management) | 32 B |
+| `0x000B` `game_mode_abilities` | mode, flags, flying and invulnerability | [08 §3.2](08-gameplay-survival.md#32-player-state-machine-and-replication) | 32 B |
+
+All channels are S→C, reliable and ordered; nothing on them is predicted, and a client never writes
+one. Advancement and statistics records are host-computed awards
+([AC-META-11](20-security-and-anti-cheat.md#35-validation-matrix)), never client claims.
+
+**Join admission.** `content_hash` is the join-critical root: a mismatch closes with
+`content_mismatch` and a Merkle leaf diff. `view_hash` travels in `ContentManifest` for that diff and
+for display, but it is advisory by default; a view-only difference is reported in the join screen and
+never blocks a join unless the server sets `server.strict_view = true`
+([19 §3.2](19-server-administration.md#32-configuration-surface)). Translations are view leaves only,
+so two clients with different locale packs join a default server and render the same world
+([DEC-050](../decisions.md)).
 
 Combat has no separate message: `AttackIntent` is the validator-facing name of the use/attack command
 carried in `InputFrame` (`0x30`), decoded and checked as `AC-COMBAT-05`
@@ -272,7 +311,7 @@ never retried; a close with a hint or a backoff may be retried only as described
 | --- | --- | --- | --- |
 | `0x00` | `protocol_error` | message ID and offset | no |
 | `0x01` | `version_mismatch` | supported client range | no |
-| `0x02` | `content_mismatch` | pack IDs and hashes | no |
+| `0x02` | `content_mismatch` | pack IDs and content hashes; a view-only difference is advisory unless strict view matching is on | no |
 | `0x03` | `auth_failed` | generic; never reveals whether a key exists | no |
 | `0x04` | `banned` | expiry and appeal text | no |
 | `0x05` | `not_whitelisted` | none | no |
@@ -307,8 +346,11 @@ messages use postcard with versioned structs and a 64 KiB cap; nothing in the ho
 | `actions` | 8 | edge events: break start/stop, place, use, drop, swap, inventory |
 | `flags` | 8 | stale repeat, spectator, reserved |
 
-**Tick packet.** Header 16 B: message ID, flags (`full_state`, snapshot rate), fragment index/count,
-`tick u32`, `baseline_tick u32`, `ack_seq u32`. Fragment 0 adds the world clock (day time `u32`,
+**Tick packet.** Header 16 B: message ID, flags (`full_state`, snapshot rate), fragment index 0–15 and
+fragment count−1 in 4 bits each, `tick u32`, `baseline_tick u32`, `ack_seq u32`. A tick packet is at
+most 16 fragments of 1,160 B — an 18,560 B wire maximum — and the per-tick budget of §5
+(`PERF-NET-011`, `PERF-NET-008` in [25](25-performance-budgets.md)) caps what is actually sent at
+16 KiB. Fragment 0 adds the world clock (day time `u32`,
 weather `u8`, flags `u8`) and the local player's authoritative transform (position 3×`i32` at 1/32
 block, velocity 3×`i16` at 1/256 block/tick, yaw/pitch, flags = 24 B), then entity deltas by descending
 priority and ascending NetId. Every fragment repeats the header and is independently applicable
@@ -331,6 +373,11 @@ when present, and three 16-bit heightmaps. The payload is zstd level 1 and cappe
 a **wire** encoding, not the save layout ([17](17-persistence.md)); the host caches it keyed by
 `(chunk, generation, content_epoch)` and most columns never need re-encoding.
 
+**State channel record.** Stream record header: `channel u16`, `schema_version u16`, `revision u32`,
+`body_len` varint, then the postcard body for that channel (§3.4). A body larger than its channel's
+catalogue maximum is rejected before decode; a channel the client did not receive in its join snapshot
+is a protocol error.
+
 **Control messages** carry `schema_version`, `#[serde(default)]` fields and a declared maximum.
 `ModMessage` carries `(namespace, message_id, schema_hash, bytes)`; a message whose namespace or schema
 hash was not negotiated in `ClientHello` is rejected, and a mod never defines a core ID.
@@ -342,7 +389,7 @@ stateDiagram-v2
   [*] --> Connecting: ticket or LAN entry
   Connecting --> Authenticating: TLS 1.3, ALPN openblock/1
   Authenticating --> VerifyingContent: challenge-response ok
-  VerifyingContent --> SelectingWorld: manifests equal
+  VerifyingContent --> SelectingWorld: content roots equal (view advisory)
   SelectingWorld --> Streaming: JoinWorld accepted
   Streaming --> Playing: 3×3 spawn columns complete
   Playing --> Draining: kick, shutdown, transfer, timeout
@@ -354,7 +401,7 @@ stateDiagram-v2
 | --- | --- | --- |
 | TLS handshake | 5 s | close `timeout`, count a failed handshake |
 | Authentication | 5 s | close `auth_failed` |
-| Content verification | 30 s | close `content_mismatch`, naming the last verified pack |
+| Content verification | 30 s | close `content_mismatch` on a content-root difference, naming the last verified pack; a view-only difference is advisory unless strict view matching is configured |
 | Join streaming | no global limit; 10 s with no completed column warns, 30 s closes | `join_stalled` |
 | Playing | idle 30 s, keepalive 10 s | entity persists 120 s for resume |
 | Draining | 5 s | force close |
@@ -369,13 +416,18 @@ client drops prediction history and starts from a full snapshot.
 ### 3.7 World streaming and replication
 
 **Interest set.** Recomputed every 4 ticks and when the player crosses a chunk boundary. *Columns:*
-all chunks within `min(client_view_distance, server_view_distance)`, with a 2-chunk unload ring; the
-player's chunk and its 3×3 neighbours are always included, even under a rate cap. *Entities:* those
-whose expanded AABB intersects the replication radius (`min(simulation_distance, view_distance)`),
-with 1 s visibility hysteresis, plus attachments and dimension bosses. *Events:* block edits,
-block-entity changes and effects inside the column set, while weather, time, chat and the player list
-are always sent. Interest is a `BTreeSet`, so the diff yields `Add`/`Remove` work and the scheduler
-never rescans the world per player.
+all chunks within `min(client_view_distance, server_view_distance)` — the **render** distance, because a
+client cannot render a column it does not have — with a 2-chunk unload ring; the player's chunk and its
+3×3 neighbours are always included, even under a rate cap. On a dedicated server both distances
+default to 256 blocks ([DEC-052](../decisions.md)); 512 is an opt-in setting whose cost is published
+in [19 §3.2](19-server-administration.md#32-configuration-surface). *Entities:* those whose expanded
+AABB intersects the replication radius (`min(simulation_distance, view_distance)`), with 1 s
+visibility hysteresis, plus attachments and dimension bosses. *Events:* block edits, block-entity
+changes and effects inside the column set, while weather, time, chat and the player list are always
+sent. *State channels* (§3.4) are filtered by interest where they name an entity or a holder, sent only
+to their owner for `statistics` and `advancements`, and otherwise session-scoped. Interest is a
+`BTreeSet`, so the diff yields `Add`/`Remove` work and the scheduler never rescans the world per
+player.
 
 | Queue | Contents | Share of the per-tick byte budget | May exceed the cap |
 | --- | --- | --- | --- |
@@ -391,12 +443,12 @@ round-robin so `Safety` cannot starve. Compression runs on the I/O pool; a full 
 `Background`, never blocks the tick.
 
 **Snapshot and delta.** Entity state is replicated against the last tick whose fragments the client
-fully acknowledged; `TickAck` carries the tick and a 4-bit fragment bitmap. The host keeps per-entity
-dirty bits for that baseline, encodes only dirty entities, and promotes a full state when the baseline
-is older than 40 ticks (2 s) or the client reconnects. The per-player byte budget, not the four-fragment
-wire maximum, decides how much a snapshot carries: deltas that do not fit are deferred to the next
-snapshot and marked `not_updated`. The local player's transform is always sent in full because the
-client predicts it.
+fully acknowledged; `TickAck` carries the tick and a 16-bit fragment bitmap (one bit per fragment of
+§3.5). The host keeps per-entity dirty bits for that baseline, encodes only dirty entities, and
+promotes a full state when the baseline is older than 40 ticks (2 s) or the client reconnects. The
+per-player byte budget, not the sixteen-fragment wire maximum, decides how much a snapshot carries:
+deltas that do not fit are deferred to the next snapshot and marked `not_updated`. The local player's
+transform is always sent in full because the client predicts it.
 
 **Block edits** are reliable events applied in per-section version order: a batch applies only when
 `version == known + 1`, otherwise the client sends `SectionRequest` and the host answers with a delta
@@ -411,11 +463,18 @@ endpoint for a content-addressed `.obworld` archive ([17](17-persistence.md) §3
 it and then still joins through the handshake. It is a bandwidth optimisation, not a second protocol.
 
 **Entities.** Spawn, despawn and attach are reliable events with NetId, dictionary type ID, initial
-transform and public metadata; transforms then ride datagrams. A tick packet carries at most
+transform and metadata; transforms then ride datagrams and non-transform metadata rides the
+`entity_metadata`/`entity_equipment` state channels. A tick packet carries at most
 `entities_per_snapshot` (default 256) deltas: nearest, recently changed, then ascending NetId.
 Entities beyond the cap update on alternate ticks and are marked `not_updated`; the client
 extrapolates them for at most 250 ms and then holds. The host caps tracked entities per client
 (default 512) and never sends another dimension's entities.
+
+The bandwidth model assumes **60 of 200 visible entities change on a typical tick** (30 %, the
+[09 §3.17](09-entities-ai.md#317-replication) figure), which is 60 × 13–15 B ≈ 780–900 B per tick, or
+15.6–18 KB/s at 20 Hz. A crowded fight changes more than that; the host then defers low-priority deltas
+to later ticks rather than raising the rate, which is `RISK-251`, and the 20 KB/s cap of
+`PERF-NET-007` is what the benchmark asserts.
 
 **Save interaction.** Join and streaming read the precompressed cache and the immutable
 `Arc<ChunkColumn>` snapshots published by the world store, never a lock the save thread holds. When
@@ -476,17 +535,18 @@ query before confirmation.
 Content may ship **prediction descriptors** — content-hash-covered data describing a custom shape,
 belt velocity, friction and use timing — and the client simulates movement over them with the
 engine's own controller, reconciling exactly like vanilla movement. Anything a descriptor cannot
-express stays host-authoritative and may correct; that is the price of not shipping mod code. A later
-both-sides code tier is gated on [OPEN-006](../decisions.md), must be deterministic with an RNG
-derived from `(tick, action_seq, mod_id)`, and is disabled for the session above a 0.1% correction
-rate over 1,000 actions.
+express stays host-authoritative and may correct; that is the price of not shipping mod code. A
+post-1.0 both-sides code tier would need a new decision ([OPEN-006](../decisions.md) is closed by
+[DEC-049](../decisions.md)), must be deterministic with an RNG derived from
+`(tick, action_seq, mod_id)`, and would be disabled for the session above a 0.1% correction rate over
+1,000 actions.
 
 ### 3.9 Session and player lifecycle
 
 | Player state | May send | Receives | Notes |
 | --- | --- | --- | --- |
 | `Connecting` | handshake only | handshake only | tight limits, no compression |
-| `Joining` | ping, ack | chunks, world clock | cannot act or chat |
+| `Joining` | ping, ack | chunks, world clock, the state-channel snapshot | cannot act or chat |
 | `Playing` | inputs, chat, commands, containers, edit intents | interest-set state | full validation |
 | `Spectator` | camera inputs | chunks, entities, effects | no owner state, containers or edits |
 | `Transferring` | ping | transfer progress | invulnerable, no actions, 10 s cap |
@@ -536,7 +596,8 @@ never TLS keys, player private keys or session tokens, is capped at 64 MiB and i
 automatically. `openblock-tools wire decode` and `wire stats` read it with the generated catalog.
 
 All numbers below are **models**, replaced by the MS-15 capacity report and reconciled with the
-canonical join budgets of [25 §5.3](25-performance-budgets.md). Assumptions: 16³ sections, 8–14
+canonical join budgets of [25 §5.3](25-performance-budgets.md). Assumptions: 16³ sections — the storage,
+edit, light and network unit ([DEC-048](../decisions.md) clusters them to 32³ for rendering only) — 8–14
 non-empty sections per column, zstd level 1 giving 3–4× on a built column, 200-byte column header and
 three heightmaps, so ~22 KiB compressed per built column (research 09's surface-explored figure).
 
@@ -549,7 +610,7 @@ three heightmaps, so ~22 KiB compressed per built column (research 09's surface-
 | 1024 blocks | 16,641 | 45–90 KiB | 18–26 KiB | 320–430 MB | 4.3–5.7 min (discouraged) |
 
 These rows model **full interest completion**, not time-to-playable. The gate is two numbers: spawn
-playable within 5 s p95 (`PERF-NET-004`) and the full 512-block interest set within 90 s fresh /
+playable within 5 s p95 (`PERF-NET-004`) and the full interest set at the server's render distance (256 blocks by default, 512 when opted in per DEC-052) within 90 s fresh /
 150 s built (`PERF-NET-005`). [MS-06](../plan/01-milestones.md#ms-06--networking) still says
 "≤ 60 s at 10 Mbit/s"; that milestone wording is stale against this model and will be reconciled at
 MS-06 (§8 question 6), not by changing the model here.
@@ -557,18 +618,24 @@ MS-06 (§8 question 6), not by changing the model here.
 | Per-player traffic, 256-block simulation distance | Steady KB/s | Note |
 | --- | --- | --- |
 | Tick header, world clock, local player | 1.0 | 20 Hz × 50 B |
-| Entity deltas, 64 tracked / 20 changed | 5–8 | 13 B per changed entity |
+| Entity deltas, 64 tracked / 20 changed (light scene) | 5–8 | 13 B per changed entity; the 200-entity gate assumes 60 changed, §3.7 |
+| State channels, coalesced ≤ 4 Hz | 0.2–1.0 | scoreboard, boss bar, effects, metadata |
 | Owner state | 0.6 | 24 B per tick |
 | Block edits, 10/s | 0.2 | 3.5 B per edit |
 | Chat, commands, player list | < 0.1 | bursty |
 | Streaming while walking at 5 m/s | 6–12 | ~0.31 new columns/s |
-| **Total steady** | **13–22** | cap 64 KB/s |
+| **Total steady** | **13–23** | cap 64 KB/s |
 | Streaming while flying at 30 m/s | 40–80 | capped, pop-in accepted |
 | Join burst | up to 2,048 | 2 MiB/s for ≤ 60 s |
 
-At 512-block simulation distance the entity count roughly triples: 25–40 KB/s steady, same 64 KB/s
-cap, same 2 MiB/s burst. Upstream stays under 1.5 KB/s per player (inputs 20 × 48 B plus acks and
-control), which is why the protocol is deliberately asymmetric.
+The table is a **co-located** model: every player shares one chunk cache and one interest union, which
+is the published 50-player tier of [19 §3.9](19-server-administration.md#39-capacity-planning). Players
+scattered across the world each need their own columns — the replicated set is the union of render
+distances, and a client cannot render a column it does not have — so the distributed case is a separate,
+lower row with its own numbers ([DEC-052](../decisions.md)). At the opt-in 512-block simulation
+distance the entity count roughly triples: 25–40 KB/s steady, under the 64 KB/s p95 / 128 KB/s peak cap
+of `PERF-NET-001`, with the same 2 MiB/s join burst. Upstream stays under 1.5 KB/s per player (inputs
+20 × 48 B plus acks and control), which is why the protocol is deliberately asymmetric.
 
 | Path | RTT | Perceived latency, 20 Hz snapshot, 100 ms interpolation |
 | --- | --- | --- |
@@ -596,7 +663,7 @@ pub struct InterestSet {
 
 pub struct Baseline {
     pub tick: u32,                    // last fully acknowledged tick
-    pub fragments: u8,                // bitmap of received fragments
+    pub fragments: u16,               // bitmap of received fragments, one bit per §3.5 fragment
     pub entity_count: u16,
     pub unacked_sections: Box<[(SectionPos, u32)]>,
 }
@@ -638,10 +705,10 @@ p99 ([25 §5.2](25-performance-budgets.md#52-simulation-tick)); the two are not 
 | ID | Budget | Measurement |
 | --- | --- | --- |
 | PERF-NET-010 | Client receive, decode and apply ≤ 0.4 ms p95 main-thread at 200 entities and 64 KB/s (with PERF-CPU-005) | `net_client_apply` |
-| PERF-NET-011 | Tick datagram ≤ 1,200 B payload and ≤ 16 KB per player per tick across ≤ 4 fragments (PERF-NET-008) | fragment test, capture assertion |
+| PERF-NET-011 | Tick datagram ≤ 1,200 B payload; ≤ 16 KB per player per tick across ≤ 16 fragments of 1,160 B (18,560 B wire maximum; PERF-NET-008) | fragment test, capture assertion |
 | PERF-NET-012 | Steady down ≤ 32 KB/s p95 and ≤ 64 KB/s peak at 256 blocks; ≤ 64/128 KB/s at 512 (PERF-NET-001) | per-peer meter |
 | PERF-NET-013 | Join to playable ≤ 5 s p95 at 10 Mbit/s (PERF-NET-004); full 512 interest ≤ 90 s fresh and ≤ 150 s built (PERF-NET-005) | join benchmark |
-| PERF-NET-014 | 200 visible entities at 20 Hz ≤ 20 KB/s per player (PERF-NET-007) | entity bench |
+| PERF-NET-014 | 200 visible entities at 20 Hz ≤ 20 KB/s per player, with ≤ 60 changed per tick at 13–15 B (15.6–18 KB/s; PERF-NET-007) | entity bench |
 | PERF-NET-015 | Per-peer buffers ≤ 512 KiB and ≤ 8 MiB server-wide plus the per-player share (PERF-NET-009) | idle/active bench |
 | PERF-NET-016 | Host replication for 50 players at 256 blocks ≤ 8 ms p95 per tick on the 4 vCPU reference | load harness, phase metrics |
 | PERF-NET-017 | Client input encode and send ≤ 20 µs p99 per tick, zero allocations after warm-up | `net_input_encode` |
@@ -649,6 +716,7 @@ p99 ([25 §5.2](25-performance-budgets.md#52-simulation-tick)); the two are not 
 | PERF-NET-019 | Handshake to `Playing` ≤ 2 RTT plus verification; warm-cache reconnect ≤ 5 s at 256 blocks | scripted join |
 | PERF-NET-020 | 1,000 idle + 200 active peers ≤ 1 core and ≤ 1.5 GiB (model, MS-15) | capacity benchmark |
 | PERF-NET-021 | A lost datagram costs at most one snapshot; convergence within 2 s | loss matrix |
+| PERF-NET-022 | State channel: ≤ 16 KiB body per record, ≤ 1 KB/s per player steady, ≤ 128 KiB for the join snapshot of all channels | size-table test, state-channel bench |
 
 ## 6. Failure modes and edge cases
 
@@ -657,7 +725,8 @@ p99 ([25 §5.2](25-performance-budgets.md#52-simulation-tick)); the two are not 
 | Partition | idle timeout, missing acks | entity kept 120 s; client freezes after 500 ms of prediction | reconnecting overlay | resume token + full snapshot |
 | Loss or reorder | ack bitmap, sequence rings | deltas recomputed from the old baseline | briefly stale remote motion | automatic |
 | Section gap | `version != known + 1` | `SectionRequest`, ring or full resend | brief pop-in | automatic |
-| Content mismatch | digests differ | close before world data | kick naming the packs | install or update packs |
+| Content mismatch | content digests differ | close before world data | kick naming the packs | install or update packs |
+| View-only mismatch | `view_hash` differs, content equal | join proceeds, difference reported | advisory note in the join screen | install the matching view pack, or the server enables strict view matching |
 | Mod mismatch | manifest hash | close `mod_rejected` | kick naming the mod | fix the allowlist |
 | Cheat attempt | validation, token buckets | reject, count, optionally kick | rubber-band or kick | policy ([20](20-security-and-anti-cheat.md)) |
 | DDoS or amplification | handshake rate, Retry, caps | stateless Retry, 3× limit, per-IP quotas, provider scrubbing | new peers fail to connect | provider mitigation |
@@ -694,6 +763,8 @@ The harness, profile catalogue and nightly/weekly tiers are owned by
 | Fuzzing | datagram, stream framing, handshake, control postcard, column, section batch, mod message: 10 M mutations/24 h, no panic, OOM or hang | `cargo fuzz`, nightly |
 | Capacity | 1,000 idle + 200 active: CPU, memory, pps, handshake rate, Retry | `bench_net_capacity` |
 | Capture round-trip | decode and re-encode produce identical bytes; the catalog covers every message | `tests/wire_capture.rs` |
+| State channels | join snapshot for every channel, revision ordering, coalescing, per-channel size maxima, unknown channel rejected | `tests/state_channel.rs` |
+| Handshake matching | a content difference closes with a diff; a view-only difference joins by default and is refused under strict view matching | `tests/handshake_match.rs` |
 | Version matrix | N and N−1 clients; unknown IDs rejected; older minors do not receive newer messages | CI matrix |
 
 The simulator owns a virtual clock and a seeded network model, so a failing scenario is reproducible
@@ -705,7 +776,7 @@ convergence rather than absence of a crash.
 | # | Question | Proposal | Owner |
 | --- | --- | --- | --- |
 | 1 | Protocol support window: N−1, N−2, or current minor only? | Accept the current major and the last two minors, enforced in the handshake and visible in config. Register item needed: protocol support window and deprecation policy. | MS-06 |
-| 2 | May a both-sides WASM mod run client code and predict after 1.0? It is gated on [OPEN-006](../decisions.md) and would widen the authority model. | Behind a manifest flag, deterministic mode and a correction cutoff; a register entry is needed first. Register item needed: client-side mod presentation/prediction tier. | MS-09 |
+| 2 | May a both-sides WASM mod run client code and predict after 1.0? [OPEN-006](../decisions.md) is closed by [DEC-049](../decisions.md): no client code in 1.0, and a client tier is post-1.0 work that would widen the authority model. | A post-1.0 tier would need a manifest flag, deterministic mode and a correction cutoff, plus its own decision before any implementation. Register item needed only when that tier is proposed. | MS-09 (post-1.0) |
 | 3 | Should a "seed + edit log" join mode cut bandwidth for vanilla dimensions? | Not in 1.x: it couples clients to generator versions and leaks ungenerated terrain ([DEC-008](../decisions.md), [DEC-046](../decisions.md)). Register item needed only if the bandwidth model is later judged unacceptable. | MS-15 |
 | 4 | May a client view distance above the server's chunk-send distance join with pop-in? | Allow with a warning and a visible server cap; refusing punishes good hardware on small servers. | MS-07 |
 | 5 | Is UDP 443 a supported alternative port, and is IPv6-only hosting supported at 1.0? | Document and test both in the container smoke test; no protocol change. | MS-13 |
@@ -718,7 +789,9 @@ convergence rather than absence of a crash.
   [DEC-008](../decisions.md), [DEC-023](../decisions.md), [DEC-024](../decisions.md),
   [DEC-025](../decisions.md), [DEC-026](../decisions.md), [DEC-027](../decisions.md),
   [DEC-029](../decisions.md), [DEC-038](../decisions.md), [DEC-040](../decisions.md),
-  [DEC-043](../decisions.md), [DEC-044](../decisions.md), [DEC-046](../decisions.md).
+  [DEC-043](../decisions.md), [DEC-044](../decisions.md), [DEC-046](../decisions.md),
+  [DEC-048](../decisions.md), [DEC-049](../decisions.md), [DEC-050](../decisions.md),
+  [DEC-052](../decisions.md).
 - Chapters: [00](00-conventions.md) §3.4; [01](01-technical-architecture.md) §3.1, §3.8;
   [02](02-engine-core.md) §3.3, §3.7; [05](05-world-model.md) §3.8–§3.11; [07](07-light-and-weather.md)
   §3.12; [08](08-gameplay-survival.md) §3.2, §3.12, §3.14; [11](11-inventory-crafting-items.md) §3.4;

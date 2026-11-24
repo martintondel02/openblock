@@ -47,10 +47,10 @@ synonyms; when a new term is needed, add it here first.
 | Term | Definition |
 | --- | --- |
 | **World** | A saved universe: a set of dimensions, the players' persistent data, the world seed and global game rules. Identified by a stable world UUID. |
-| **Dimension** | An independently generated space with its own seed derivation, height limits, sky/ambience and generator. The vanilla-inspired set is `overworld`, `nether`, `end`, plus arbitrary content-defined dimensions. |
+| **Dimension** | An independently generated space with its own seed derivation, height limits, sky/ambience and generator. The vanilla-inspired set is `overworld`, `underworld` (nether-like) and `terminus` (end-like), plus arbitrary content-defined dimensions (DEC-053); shipped identifiers never use Minecraft proper nouns. |
 | **Chunk** (or **chunk column**) | The horizontally aligned column of blocks at integer `(cx, cz)`, 16×16 blocks in XZ unless DEC-004 changes it. The unit of streaming, loading, saving and interest management. |
 | **Section** | The vertical subdivision of a chunk and the unit of storage, editing, lighting, meshing input and network deltas. Size is 16³ (DEC-004). A chunk therefore contains `HEIGHT / 16` sections. |
-| **Mesh cluster** | An optional 2×2×2 group of sections (32³ blocks) meshed as one render unit. Render-only: invisible to content, save format and protocol (DEC-004). |
+| **Mesh cluster** | A 2×2×2 group of sections (32³ blocks) meshed as one render unit, and the default meshing unit from MS-04 (DEC-048). Render-only: invisible to content, save format and protocol. |
 | **Block type** | A registry entry describing block behaviour and appearance (for example `openblock:stone`). Immutable during a session. |
 | **Block state** | A specific configuration of a block type: type ID plus a compact set of property values (facing, waterlogged, growth stage, …). The unit stored in the world. |
 | **Palette** | A per-section mapping from dense local indices to block state IDs, plus the bit-packed array of indices. |
@@ -135,12 +135,14 @@ synonyms; when a new term is needed, add it here first.
 - **Chunk/local**: chunk coordinates are `i32` (`cx, cz`); in-chunk coordinates
   are `u8`; section coordinates are `i32` (`sx, sy, sz`).
 - **Dimensions**: a chunk column is 16×16 blocks; a section is 16×16×16 blocks;
-  an optional render-time *mesh cluster* is 2×2×2 sections. Height is
+  a render-time *mesh cluster* (default from MS-04, DEC-048) is 2×2×2 sections. Height is
   `[min_y, max_y)` in blocks, multiples of 16, at most 1024; the base dimensions
-  mirror Minecraft's overworld `-64..320`, nether and end `0..256` (DEC-004).
+  mirror the genre's overworld `-64..320` and the underworld/terminus `0..256` (DEC-004, DEC-053).
 - **Render distance** is always expressed in **blocks** in engineering
   documents, with the chunk equivalent in parentheses (default 512 blocks =
-  32 chunks). Never write "32 chunks" without saying which chunk width is meant.
+  32-chunk radius). A dedicated server defaults to 256 blocks, equal to its simulation
+  distance; 512 blocks is opt-in with the cost published in spec/25 (DEC-052). Never
+  write "32 chunks" without saying radius or diameter.
 - **Mass/velocity**: SI (kg, m/s, N), with block-collision AABBs defined in
   content data.
 

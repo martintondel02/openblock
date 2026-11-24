@@ -1,4 +1,4 @@
-# Roadmap — from empty repository to 1.0
+# Roadmap — from an empty repository to 1.0 Early Access and 2.0
 
 > Status: normative planning · Last updated: 2026-11-24
 > Depends on: [vision](../vision.md), [decision register](../decisions.md)
@@ -9,7 +9,7 @@
 - The unit of progress is a **milestone** (`MS-xx`), not a date. Each milestone
   ends in something runnable, demonstrable and measurable.
 - Effort is expressed in **dev-weeks** (one experienced, full-time engineer).
-  AI-assisted development improves some of this (see §11) but is not assumed for
+  AI-assisted development improves some of this (see §13) but is not assumed for
   hard debugging, driver work or game feel.
 - **Dependencies are real.** The milestone graph below is the critical path; the
   numbering is the recommended build order, not a strict sequence.
@@ -37,12 +37,13 @@ graph LR
   M08 --> M10[MS-10<br/>Survival loop]
   M10 --> M11[MS-11<br/>Depth: mobs/redstone/...]
   M04 --> M12[MS-12<br/>Visuals + audio]
-  M11 --> M14[MS-14<br/>Parity + polish]
+  M11 --> M14[MS-14<br/>Tier-1 parity + corpus]
   M12 --> M14
   M09 --> M14
   M07 --> M15[MS-15<br/>Scale + anti-cheat]
-  M14 --> M16[MS-16<br/>1.0 launch]
+  M14 --> M16[MS-16<br/>1.0 Early Access]
   M15 --> M16
+  M16 -.-> M17[MS-17<br/>2.0 parity track]
 ```
 
 ## 2. Release philosophy
@@ -67,14 +68,22 @@ graph LR
 
 | Phase | Milestones | Release | Player-visible outcome | Engineering effort |
 | --- | --- | --- | --- | --- |
-| **A — Foundation and first playable** | MS-00, MS-01, MS-02, MS-03 | `0.0.1` tech preview | A window, a generated world, a blocky person, mine and place | 19 dev-weeks |
-| **B — Engine maturity and content platform** | MS-04, MS-05 | `0.1.0-alpha` | 512-block view at high frame rates, inventory, HUD, content packs | 18 |
-| **C — Multiplayer and servers** | MS-06, MS-07 | `0.2.0-alpha` | Invite a friend or join a self-hosted server; 20 TPS server binary | 17 |
-| **D — World and survival** | MS-08, MS-10, MS-13 | `0.3.0-beta` | Biomes, caves, structures, dimensions; health/hunger/crafting/furnaces | 31 |
-| **E — Depth and ecosystem** | MS-09, MS-11, MS-12 | `0.4.0-beta`, `0.5.0-beta` | Mobs, redstone, enchanting/trading/bosses; WASM mods; shadows and audio | 44 |
-| **F — Parity, scale and polish** | MS-14, MS-15 | `0.6.0-beta`, `1.0.0-rc` | Tier-2 parity corpus green; 50-player servers; anti-cheat; accessibility | 22 |
-| **G — Launch** | MS-16 | `1.0.0` | Storefront builds, updater, docs, launch | 8 |
-| | | | **Total to 1.0** | **≈ 160 dev-weeks (nominal)** + content/QA |
+| **A — Foundation and first playable** | MS-00, MS-01, MS-02, MS-03 | `0.0.1` tech preview | A window, a generated world, a blocky person, mine and place | 26–30 dev-weeks |
+| **B — Engine maturity and content platform** | MS-04, MS-05 | `0.1.0-alpha` | 512-block view at high frame rates, inventory, HUD, content packs | 26–32 |
+| **C — Multiplayer and servers** | MS-06, MS-07 | `0.2.0-alpha` | Invite a friend or join a self-hosted server; 20 TPS server binary | 23–29 |
+| **D — World and survival** | MS-08, MS-10, MS-13 | `0.3.0-beta` | Biomes, caves, structures, dimensions; health/hunger/crafting/furnaces | 43–53 |
+| **E — Depth and ecosystem** | MS-09, MS-11, MS-12 | `0.4.0-beta`, `0.5.0-beta` | Common mobs, basic redstone, enchanting/trading basics; WASM mods; shadows and audio | 44–53 |
+| **F — Parity, scale and polish** | MS-14, MS-15 | `0.6.0-beta`, `1.0.0-rc` | Tier-1 parity gate green; parity-corpus infrastructure; 50 co-located players; anti-cheat; accessibility | 28–33 |
+| **G — Early Access launch** | MS-16 | `1.0.0` | Signed builds, updater, docs, Early Access launch | 10 |
+| | | | **Total to 1.0 (Early Access)** | **≈ 200–240 dev-weeks** + content/QA |
+| **2.0 track** | MS-17 | `2.0` | Full Tier-2 parity: the remaining blocks, items, mobs, structures, redstone, bosses and commands | **≈ 500–800 dev-weeks** + art/audio |
+
+The 1.0 column is a bottom-up engineering estimate for a deliberately scoped
+Tier-1 release. The previous 159-dev-week total was **5–8× below** the project's
+own research inventory; the honest comparison is the two-track total
+(200–240 + 500–800 ≈ **700–1,040 dev-weeks**), reconciled in §11. Content, art,
+audio and QA are budgeted separately (§12).
+
 
 ## 4. Phase A — Foundation and first playable (`0.0.1`)
 
@@ -85,9 +94,9 @@ not a tech demo with fake data.
 | Milestone | What it delivers | Effort |
 | --- | --- | --- |
 | **MS-00 Foundation** | Workspace, CI gates, conventions, decision register, benchmark harness skeleton, asset/license policy, `hello window` through wgpu, `hello headless server` process | 1 |
-| **MS-01 World core** | Paletted 16³ sections, chunk columns, dimension height model, world storage, block changes, light storage, deterministic RNG, serialization round-trip tests | 4 |
-| **MS-02 Engine core** | App loop, stages, fixed tick, scheduler, job system, platform abstraction, config, diagnostics/profiler, determinism test harness, `hecs` entity store | 4 |
-| **MS-03 First playable** | `openblock` window, wgpu device, naive mesher → greedy mesher, chunk streaming around the player, first-person controller with AABB voxel physics, break/place with raycast, minimal content registry, integrated server, save/load, HUD crosshair/FPS | 10 |
+| **MS-01 World core** | Paletted 16³ sections, chunk columns, dimension height model, world storage, block changes, light storage, deterministic RNG, serialization round-trip tests | 6–7 |
+| **MS-02 Engine core** | App loop, stages, fixed tick, scheduler, job system, platform abstraction, config, diagnostics/profiler, determinism test harness, `hecs` entity store | 5–6 |
+| **MS-03 First playable** | `openblock` window, wgpu device, naive mesher → greedy mesher, chunk streaming around the player, first-person controller with AABB voxel physics, break/place with raycast, minimal content registry, integrated server, save/load, HUD crosshair/FPS | 14–16 |
 
 **Phase A exit criteria**
 
@@ -111,8 +120,8 @@ of view at speed, with a content pipeline and a real UI".
 
 | Milestone | What it delivers | Effort |
 | --- | --- | --- |
-| **MS-04 GPU rendering** | Render graph, section/cluster meshing on worker threads, GPU upload ring, region/cluster culling, multi-draw-indirect submission, texture arrays, CSM shadows, basic post (tone map, TAA), streaming budgets, benchmark scenes and CI perf gates at p95/p99 | 8 |
-| **MS-05 Content + UI** | Registry/tags/pack loader and validator, `base` pack as data, retained UI (taffy + cosmic-text), main menu, HUD, inventory/containers with server-authoritative transactions, settings, localization scaffolding, audio event bus with placeholder sounds | 10 |
+| **MS-04 GPU rendering** | Render graph, 32³ default cluster meshing on worker threads (DEC-048), GPU upload ring, region/cluster culling, multi-draw-indirect submission, texture arrays, CSM shadows, basic post (tone map, TAA), streaming budgets, benchmark scenes and CI perf gates at p95/p99 | 12–15 |
+| **MS-05 Content + UI** | Registry/tags/pack loader and validator, `base` pack as data, retained UI (taffy + cosmic-text), main menu, HUD, inventory/containers with server-authoritative transactions, settings, localization scaffolding, audio event bus with placeholder sounds | 14–17 |
 
 **Phase B exit criteria**
 
@@ -135,15 +144,19 @@ that feels good on a 60 ms link.
 
 | Milestone | What it delivers | Effort |
 | --- | --- | --- |
-| **MS-06 Networking** | QUIC transport (quinn) with datagrams/streams, protocol v1 with content-hash handshake, join and progressive world streaming, interest management, entity replication, client prediction/reconciliation, LAN discovery, in-process network simulator, netem-style loss/latency tests | 12 |
-| **MS-07 Dedicated server** | `openblock-server` binary, TOML config, console commands, ops/whitelist/bans, backups, graceful shutdown, structured logs, Prometheus metrics, pregeneration CLI, Docker image, systemd unit, server administration docs | 5 |
+| **MS-06 Networking** | QUIC transport (quinn) with datagrams/streams, protocol v1 with content-hash + view-hash handshake (DEC-050), join and progressive world streaming, interest management by render distance (DEC-052), entity replication, client prediction/reconciliation, LAN discovery, in-process network simulator, netem-style loss/latency tests | 16–20 |
+| **MS-07 Dedicated server** | `openblock-server` binary, TOML config, console commands, ops/whitelist/bans, backups, graceful shutdown, structured logs, Prometheus metrics, pregeneration CLI, Docker image, systemd unit, server administration docs; 256-block render default (DEC-052) | 7–9 |
 
 **Phase C exit criteria**
 
 - Two clients join a dedicated server over the internet; movement feels local
   under 80 ms RTT and 2% packet loss; block edits from one player appear on the
   other within one tick.
-- A 4 vCPU / 8 GiB VPS runs a 16-player world at 20 TPS with 2,000 loaded chunks.
+- A 4 vCPU / 8 GiB VPS runs a 16-player world at 20 TPS with 2,000 loaded chunks,
+  with the players **co-located** in a shared spawn region (shared column cache;
+  DEC-052).
+- A 512-block-radius join (opt-in setting; DEC-052) reaches playable within the
+  published budget; the default 256-block join is materially cheaper.
 - The server survives a malicious-client fuzz corpus without crashing, and
   movement/reach violations are detected and logged.
 - `docker compose up` in an empty directory produces a joinable server in under
@@ -159,15 +172,15 @@ and a progression loop worth playing.
 
 | Milestone | What it delivers | Effort |
 | --- | --- | --- |
-| **MS-08 Worldgen** | Noise stack, terrain shapes, biomes (climate-based), caves/aquifers/ravines, ore distribution, vegetation and features, structures (villages, temples, strongholds, …), nether and end dimensions, deterministic parallel generation at ≥ 250 columns/s on 8 threads, pregeneration | 14 |
-| **MS-10 Survival loop** | Health/damage types/armor/combat, hunger and food, XP, tools and tiers, drops and block-breaking rules, crafting/stonecutting/furnaces/blast furnace/smoker, containers and hoppers, item entities, death/respawn, beds/anchors, difficulty, weather effects | 12 |
-| **MS-13 Persistence maturity** | Region file format v1 frozen, migrations, world management UI, backup/restore, corruption recovery, `ids.json` content mapping, import/export tooling, save-size benchmarks | 5 |
+| **MS-08 Worldgen** | Noise stack, terrain shapes, biomes (climate-based), caves/aquifers/ravines, ore distribution, vegetation and features, structures (villages, temples, strongholds, …), underworld and terminus dimensions (`openblock:underworld`, `openblock:terminus`), deterministic parallel generation at ≥ 250 columns/s on 8 threads, pregeneration | 20–24 |
+| **MS-10 Survival loop** | Health/damage types/armor/combat, hunger and food, XP, tools and tiers, drops and block-breaking rules, crafting/stonecutting/furnaces/blast furnace/smoker, containers and hoppers, item entities, death/respawn, beds/anchors, difficulty, weather effects | 16–20 |
+| **MS-13 Persistence maturity** | Region file format v1 frozen, migrations, world management UI, backup/restore, corruption recovery, `ids.json` content mapping, import/export tooling, save-size benchmarks | 7–9 |
 
 **Phase D exit criteria**
 
 - A player can start a world, survive a night, mine, smelt, craft tools and armor,
-  build a house, explore 2,000 blocks in every direction, and enter the nether —
-  all without admin commands.
+  build a house, explore 2,000 blocks in every direction, and enter the
+  underworld — all without admin commands.
 - Worldgen is deterministic across platforms and produces no floating structures,
   broken biomes or unplayable spawns over a 10,000-seed corpus (nightly run).
 - The save format round-trips a modded world with unknown content IDs without
@@ -177,24 +190,27 @@ and a progression loop worth playing.
 
 ## 8. Phase E — Depth and ecosystem (`0.4.0-beta`, `0.5.0-beta`)
 
-**Goal:** the content depth that makes it Minecraft, and the modding platform
-that makes it more than Minecraft.
+**Goal:** the Tier-1 depth that makes it a survival game, and the modding
+platform that makes it more than a clone. Full Tier-2 depth is the 2.0 track
+(`MS-17`).
 
 | Milestone | What it delivers | Effort |
 | --- | --- | --- |
-| **MS-09 Modding** | Content pack SDK and validator, WASM mod host (wasmtime) with capabilities and quotas, event/query host ABI v1, mod template and examples, server mod verification, per-mod profiler, `base` game fully migrated onto the public API, hot reload | 10 |
-| **MS-11 Depth** | Mobs and AI (pathfinding, spawning, behaviours), redstone (full component set, deterministic update ordering), farming/breeding, brewing/enchanting/anvil/trading/villagers, bosses and end progression, minecarts/boats, portals, statistics and advancements, commands and game rules, spectator/creative completeness | 24 |
-| **MS-12 Visuals and audio** | Full post stack (GTAO, SSR water, volumetric atmosphere, bloom), weather, particles, ambient sound and music system, dynamic range and spatialisation, quality presets, shader-pack API v1, controller support | 10 |
+| **MS-09 Modding** | Content pack SDK and validator, WASM mod host (wasmtime) with capabilities and quotas, event/query host ABI v1, mod template and examples, server mod verification, per-mod profiler, `base` game fully migrated onto the public API, hot reload | 14–17 |
+| **MS-11 Depth (Tier 1)** | Common mobs and AI (pathfinding, spawning, behaviours), basic redstone (wire, torch, repeater, comparator, pistons, lamps), farming/breeding, brewing/enchanting basics, anvil and trading basics, boats/minecarts, portals, statistics and a guided advancement chain; full Tier-2 mob/block/structure sets move to `MS-17` | 18–21 |
+| **MS-12 Visuals and audio** | Full post stack (GTAO, SSR water, volumetric atmosphere, bloom), weather, particles, ambient sound and music system, dynamic range and spatialisation, quality presets, shader-pack API v1, controller support | 12–15 |
 
 **Phase E exit criteria**
 
-- A Tier-2 feature checklist run passes for mobs, redstone, enchanting and
-  trading (the parity corpus is executable, see [MS-14](#10-phase-f--parity-scale-and-polish)).
+- The Tier-1 depth checklist passes for common mobs, basic redstone, enchanting
+  and trading basics, and portals (the parity corpus is executable, see
+  [MS-14](01-milestones.md)).
 - A mod written against the template adds a block, an item, a recipe, a mob and a
-  UI screen and runs on a server without any client installation; a misbehaving
-  mod is stopped by quotas instead of crashing the host.
+  UI screen (server-computed data, no client mod code; DEC-049) and runs on a
+  server with unmodified clients; a misbehaving mod is stopped by quotas instead
+  of crashing the host.
 - Redstone circuits behave deterministically and survive save/load; a suite of
-  reference circuits (door, clock, piston extender, comparator logic) passes.
+  Tier-1 reference circuits (door, clock, comparator logic) passes.
 - The audio mix has a documented voice/streaming budget and never drops the
   frame budget.
 
@@ -203,26 +219,30 @@ contraption showcase.
 
 ## 9. Phase F — Parity, scale and polish (`0.6.0-beta`, `1.0.0-rc`)
 
-**Goal:** close the parity gap, make servers scale, and make the game feel
-finished rather than feature-complete.
+**Goal:** clear the Tier-1 parity gate, build the parity-corpus infrastructure
+that 2.0 will need, make servers scale, and make the game feel finished rather
+than feature-complete. 1.0 does **not** close Tier 2; `MS-17` does.
 
 | Milestone | What it delivers | Effort |
 | --- | --- | --- |
-| **MS-14 Parity + polish** | Tier-2 parity closure driven by the generated checklist, parity acceptance corpus ≥ 90%, spectator, full datapack semantics (where we adopt them), accessibility (narrator, remap, colour-blind, subtitles, controller), localization completeness, UX polish, tutorial/onboarding, world creation screen, performance presets | 14 |
-| **MS-15 Scale + anti-cheat** | Interest-management tuning for 50 players, parallel region ticking, anti-cheat validation suite and replay evidence, moderation tools, admin RPC, load/stress harness (bots), server capacity model and benchmark, DDoS/rate-limit hardening, crash containment | 8 |
+| **MS-14 Tier-1 parity + corpus** | Hand-authored behavioural parity checklist and executable corpus (DEC-051), Tier-1 parity closure, Tier-2 coverage reporting and gap list for `MS-17`, spectator, full datapack semantics (where we adopt them), accessibility (narrator, remap, colour-blind, subtitles, controller), localization completeness, UX polish, tutorial/onboarding, world creation screen, performance presets | 18–21 |
+| **MS-15 Scale + anti-cheat** | Interest-management tuning for 50 **co-located** players and a separately measured **distributed** row (DEC-052), parallel region ticking, anti-cheat validation suite and replay evidence, moderation tools, admin RPC, load/stress harness (bots), server capacity model and benchmark, DDoS/rate-limit hardening, crash containment | 10–12 |
 
 **Phase F exit criteria**
 
-- The parity corpus reports ≥ 90% Tier-2 coverage with failures triaged and
-  documented in the inventory.
-- 50 bot players on the 4 vCPU VPS reference hold 20 TPS for one hour with p99
-  tick ≤ 35 ms; a 100-player stress test is documented with the config that
-  achieves it on 8 vCPU.
+- The parity report states the two numbers separately (DEC-051) and **meets them
+  for 1.0**: 100% of the in-scope Tier-0/1 checks pass, and vanilla coverage of
+  the pinned baseline is ≥ 85% on the hand-authored behavioural checklist. The
+  Tier-2 content gap list is published and labelled as the 2.0 commitment.
+- 50 co-located bot players on the 4 vCPU VPS reference hold 20 TPS for one hour
+  with p99 tick ≤ 35 ms at 256-block render/simulation distance; the distributed
+  player row is measured and published separately and is lower, and a 100-player
+  co-located stress test is documented with the config that achieves it on 8 vCPU.
 - Accessibility checklist passes: full keyboard/gamepad navigation, remappable
   bindings, UI scale, subtitles, narrator on menus, colour-blind palettes.
 - No known crash, duplication, or remote-exploit issue from the fuzz corpus.
 
-## 10. Phase G — 1.0 launch (`1.0.0`)
+## 10. Phase G — 1.0 Early Access launch (`1.0.0`)
 
 **Milestone MS-16** delivers the boring-but-critical launch work: signed builds
 for all 1.0 platforms, auto-updater with delta patches and rollback, Flatpak/
@@ -230,57 +250,117 @@ AppImage/AUR packaging, container images, website and download page, migration
 from 0.x saves, mod API 1.0 freeze and compatibility promise, launch trailer,
 trademark clearance sign-off (DEC-037), and the support/security playbook.
 
-**1.0.0 ship criteria** are the union of all phase criteria plus: 30 consecutive
-days of release-candidate play without a P0 bug; a save from `0.1-alpha` migrates
-to `1.0` losslessly; the dedicated server runs 7 days unattended on the reference
-VPS without leaking memory or corrupting a save.
+1.0 is an **Early Access** release (DEC-051): Tier-1 parity + Tier-2
+infrastructure + the modding platform. Full Tier-2 parity is `MS-17` (2.0) and
+the launch notes say so explicitly.
+
+**1.0.0 ship criteria** are the union of the Tier-1 phase criteria plus: both
+parity numbers are met — 100% of in-scope Tier-0/1 checks pass and vanilla
+behavioural coverage is ≥ 85% on the hand-authored checklist — and both are
+published with the Tier-2 gap list; 30 consecutive days of release-candidate play
+without a P0 bug; a save from `0.1-alpha` migrates to `1.0` losslessly; the
+dedicated server runs 7 days unattended on the reference VPS without leaking
+memory or corrupting a save; and the release notes state the Tier-1 scope, both
+parity numbers, and the 2.0 commitment.
 
 ## 11. Effort model and calendar scenarios
 
-Nominal totals (engineering only; see §12 for content production):
+The review board found the previous **159 dev-week** total to be 5–8× below the
+project's own research inventory: [research/05](../research/05-minecraft-feature-inventory.md)
+§2 estimates Tier 0 at ~80–125 person-months and Tier 2 at ~190–300
+person-months (≈ 823–1,300 dev-weeks at 4.33 dev-weeks per person-month), before
+art and audio. The plan is therefore **two tracks**, and the numbers below are
+the honest ones. Content, art, audio and QA are separate (§12).
+
+### 11.1 Track 1 — 1.0 Early Access (Tier 1 + Tier-2 infrastructure + modding)
 
 | Phase | Dev-weeks |
 | --- | --- |
-| A Foundation + first playable | 19 |
-| B Rendering + content/UI | 18 |
-| C Multiplayer + servers | 17 |
-| D World + survival | 31 |
-| E Modding + depth + audio/visuals | 44 |
-| F Parity + scale | 22 |
-| G Launch | 8 |
-| **Total** | **≈ 159** |
+| A Foundation + first playable | 26–30 |
+| B Rendering + content/UI | 26–32 |
+| C Multiplayer + servers | 23–29 |
+| D World + survival | 43–53 |
+| E Modding + Tier-1 depth + audio/visuals | 44–53 |
+| F Parity + scale | 28–33 |
+| G Early Access launch | 10 |
+| **Total to 1.0** | **≈ 200–240** |
 
-Calendar scenarios (full-time equivalents, with 20% coordination overhead for
-teams):
+That is **≈ 4–5 person-years of engineering** (200–240 ÷ 52) before content/QA
+and before the risk-register delay. It is a deliberately narrowed *scope* — Tier
+1 parity, not full parity — but it is a bottom-up estimate, still ±30%; the
+MS-03 exit review replaces it with measured throughput. Track 1 and Track 2 are
+not comparable one-by-one with the inventory's tiers (the inventory's Tier 1
+already includes much of what this plan defers to `MS-17`): the **combined**
+two-track total is ~700–1,040 dev-weeks, which brackets the lower half of the
+inventory's 823–1,300 dev-week Tier-2 range. The remainder to the inventory's
+upper bound is content authoring, art and audio, budgeted in §12, not a hidden
+reserve.
 
-| Scenario | Throughput assumption | First playable (`0.0.1`) | Public alpha (`0.1`) | Multiplayer (`0.2`) | `1.0` |
-| --- | --- | --- | --- | --- | --- |
-| **Solo, full-time, AI-assisted** | ~0.85 dev-week per calendar week | ~4–5 months | ~8–10 months | ~12–14 months | **~2.5–3 years** |
-| **Solo, part-time** | ~0.4 dev-week per calendar week | ~10–12 months | ~1.8 years | ~2.5 years | **5+ years** |
-| **Team of 3** | ~2.4 dev-weeks per calendar week | ~2 months | ~4 months | ~6 months | **~15–18 months** |
-| **Team of 6** | ~4.4 dev-weeks per calendar week | ~5 weeks | ~2.5 months | ~4 months | **~10–12 months** |
+Calendar scenarios (full-time equivalents; team figures already include 20%
+coordination overhead). The final column adds the risk-register allowance of
+roughly 20% (§16 and [risks](05-risks.md)):
+
+| Scenario | Throughput assumption | First playable (`0.0.1`) | Public alpha (`0.1`) | Multiplayer (`0.2`) | `1.0` Early Access (base) | `1.0` with risk allowance |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Solo, full-time, AI-assisted** | ~0.85 dev-week per calendar week | ~7–8 months | ~14–17 months | ~20–25 months | **~4.5–5.5 years** | **~5.5–6.5 years** |
+| **Solo, part-time** | ~0.4 dev-week per calendar week | ~1.3–1.5 years | ~2.5–3 years | ~3.5–4.5 years | **~9.5–11.5 years** | **~12–14 years** |
+| **Team of 3** | ~2.4 dev-weeks per calendar week | ~2.5–3 months | ~5–6 months | ~7–9 months | **~20–23 months** | **~24–28 months** |
+| **Team of 6** | ~4.4 dev-weeks per calendar week | ~6–7 weeks | ~3 months | ~4–5 months | **~11–13 months** | **~13–15 months** |
+
+The old "159 ÷ 0.85" was already ~3.6 years solo; the honest base is now ~4.5–5.5
+years, and with the risk allowance it is ~6 years. That is the cost of the scope
+the project actually promised.
+
+### 11.2 Track 2 — 2.0 full Tier-2 parity (`MS-17`)
+
+| Item | Estimate |
+| --- | --- |
+| Engineering: remaining blocks/items/mobs/biomes/structures, full redstone, bosses and progression, villagers/raids, commands, advancements/statistics, full server properties, Modern Delta re-baseline | **500–800 dev-weeks** |
+| Art and audio for the full parity set | 30–50 dev-weeks equivalent (plus commissioning lead time) |
+| Content authoring and QA | 20–30% of engineering, i.e. 100–240 dev-weeks |
+| Team | **6–10 people for 2–3 years**, funded |
+
+The 500–800 dev-week figure sits below the inventory's 823–1,300 dev-week Tier-2
+estimate because it is an engineering-only estimate for the *remaining* work
+after Track 1 has built the engine, content pipeline, networking and tooling; the
+inventory's ranges include Tier-0/1 code and content authoring that Track 1
+already pays for. Full parity remains a **2.0 promise, not a 1.0 one**, and it
+requires funding that does not exist yet ([OPEN-019](../decisions.md)).
 
 The single most common failure mode for projects like this is scope. The roadmap
 is deliberately structured so that **each phase is a shippable product**: a
-2.5-year solo timeline is survivable because `0.1-alpha` arrives in months, not
-years.
+multi-year solo timeline is survivable because `0.1-alpha` arrives in months, not
+years, and because 1.0 no longer pretends to be 2.0.
 
 ## 12. Content production (not in the numbers above)
 
-Engineering effort does not include the content a parity game needs. Budget
-separately:
+Engineering effort does not include the content a parity game needs. Content is
+budgeted per track, and none of it is in the dev-week totals above.
+
+### Track 1 — 1.0 Early Access
 
 | Work | Estimate | Notes |
 | --- | --- | --- |
-| Art: block/item textures, mob models, UI | 12–20 dev-weeks equivalent | Commission or license; must be original (DEC-009) |
-| Audio: SFX, ambience, music | 4–8 dev-weeks equivalent | CC0/CC-BY sourcing plus commissioned music |
-| Level design / structures / worldgen tuning | 6–10 weeks | Overlaps with MS-08 and MS-14 testing |
-| QA / playtesting / parity verification | 20–30% of engineering time | The parity corpus makes this tractable |
+| Art: Tier-1 block/item textures, common-mob models, UI | 8–14 dev-weeks equivalent | Commission or license; must be original (DEC-009) |
+| Audio: SFX, ambience, music | 4–6 dev-weeks equivalent | CC0/CC-BY sourcing plus commissioned music |
+| Level design / structures / worldgen tuning | 4–8 weeks | Overlaps with MS-08 and MS-14 testing |
+| QA / playtesting / parity verification | 20–30% of engineering time, i.e. 40–72 dev-weeks | The parity corpus makes this tractable |
 | Localization (community) | Ongoing | Tooling from MS-05 makes it cheap |
+| **Track 1 content/QA subtotal** | **≈ 56–100 dev-weeks** | Additive to the 200–240 |
+
+### Track 2 — 2.0 full parity
+
+| Work | Estimate | Notes |
+| --- | --- | --- |
+| Art and audio for the full Tier-2 set | 30–50 dev-weeks equivalent | Commissioned; separate from engineering |
+| Level design, structure and dungeon content | 10–16 weeks | |
+| QA / parity verification at full parity | 20–30% of 500–800, i.e. 100–240 dev-weeks | |
+| **Track 2 content/QA subtotal** | **≈ 140–306 dev-weeks** | Additive to the 500–800 |
 
 Recommendation: build a **placeholder pack** early (MS-03) with programmer art
-so engineering never blocks on art, and commission the real pack in Phase D so
-it is ready for the alpha releases.
+so engineering never blocks on art, and commission the Tier-1 pack in Phase D so
+it is ready for the alpha releases. Full-parity art is a 2.0 decision funded with
+the 2.0 team (OPEN-019).
 
 ## 13. AI-assisted development (how this plan actually uses agents)
 
@@ -303,10 +383,36 @@ reviewed by a human, CI gates it (DEC-035), and provenance rules apply
 (DEC-036). Teams that skip review will spend the saved time on debugging
 regressions.
 
+**AI does not close a 5–8× gap.** The 200–240 dev-week 1.0 estimate already
+assumes the high-leverage mix above (specs, schemas, boilerplate, content data,
+tests) at the 0.85 dev-week-per-calendar-week solo throughput. AI leverage is
+concentrated in work that is cheap relative to GPU driver debugging, netcode
+feel, level design and playtesting, which stay low-leverage. The plan no longer
+quotes an "AI-collapsed" number: the previous 159 dev-weeks implicitly did, and
+that is how the estimate drifted from the inventory. Re-measure the real
+throughput at MS-03 and re-baseline §11 with data.
+
 ## 14. Parallel tracks and the critical path
 
-The critical path runs through `MS-03 → MS-04 → MS-06 → MS-11 → MS-14 → MS-16`.
-Safe parallelisation for a 3-person team:
+The real longest path is **`MS-05 → {MS-08, MS-10} → MS-11 → MS-14 → MS-16`**,
+not the old `MS-03 → MS-04 → MS-06 → MS-11 → …` chain. The renderer and
+networking are large, but they gate the content chain rather than lie on it:
+
+- `MS-05 → MS-08` and `MS-05 → MS-10`: worldgen and survival both need the
+  content model.
+- `MS-06 → MS-11`: entity replication and the protocol carry the mob set, so
+  depth cannot finish before networking.
+- `MS-11 ↔ MS-09` (base migration): the "base game on the public API" epic in
+  MS-09 cannot close before MS-11's content exists, so MS-11 gates MS-09's last
+  epic; MS-09 then feeds MS-14. The arrow runs MS-11 → MS-09, not the reverse.
+- `MS-05 → MS-13` (content mapping): `ids.json` and unknown-content
+  quarantine are MS-13 work but need the MS-05 registry; MS-13 cannot close
+  early.
+- `MS-04 → MS-06` (streaming under join) and `MS-04 → MS-12` (post stack).
+- `MS-14, MS-15 → MS-16`; `MS-16 → MS-17` is the 2.0 track, off the 1.0 path.
+
+MS-11 is the long pole: 18–21 dev-weeks behind the 20–24 dev-week worldgen and
+the 16–20 dev-week survival milestones. Safe parallelisation for a 3-person team:
 
 | Track | Owner | Milestones |
 | --- | --- | --- |
@@ -319,18 +425,28 @@ content packs are ideal for AI-assisted parallel work.
 
 ## 15. Post-1.0 roadmap
 
-| Release | Theme | Highlights | Effort |
-| --- | --- | --- | --- |
-| `1.1` | Flagship content I | First-party differentiators built on the mod API: programmable logic blocks (an in-world computer), first-class energy/fluid networks, one showcase tech pack | 10–14 |
-| `1.2` | Worlds and dungeons | Procedural dungeon/structure API, showcase adventure pack, map sharing | 8–12 |
-| `1.3` | Mobile | Android port, touch UI, mobile perf tiers, Play Store release | 8–12 |
-| `1.4` | Far terrain | Visual-only LOD/far-terrain renderer out to 128+ chunks | 4–6 |
-| `1.5` | Native plugins + server mesh | Signed native plugin tier in a supervised process, multi-server network (proxy/lobby) | 6–10 |
-| `1.6` | Web and reach | WebTransport/web client feasibility, better Steam Deck and accessibility passes | 8–12 |
-| TBD | Compatibility gateway | Optional Minecraft-client gateway as an isolated, best-effort bridge (not core) | 10–16 |
+**2.0 full Tier-2 parity is the first and largest post-1.0 commitment** and the
+only one that needs a staffed, funded team (OPEN-019). It runs as its own track
+in parallel with the smaller 1.x feature releases below; those releases do not
+wait for it and do not require full parity.
 
-Community mods and content packs are expected to fill most of the post-1.0
-content surface; the engineering roadmap should shrink, not grow, after 1.0.
+| Release | Milestone | Theme | Highlights | Effort |
+| --- | --- | --- | --- | --- |
+| `2.0` | `MS-17` | **Full Tier-2 parity** | Remaining blocks/items/mobs/biomes/structures, full redstone, bosses and terminus progression, raids, potions, advancements/statistics, commands and game rules, full server properties; Modern Delta re-baseline (OPEN-020); full-parity art/audio | **500–800 dev-weeks**, 6–10 people for 2–3 years |
+| `1.1` | `MS-24` | Flagship content I | First-party differentiators built on the mod API: programmable logic blocks (an in-world computer), first-class energy/fluid networks, one showcase tech pack | 10–14 |
+| `1.2` | `MS-18` | Worlds and dungeons | Procedural dungeon/structure API, showcase adventure pack, map sharing | 8–12 |
+| `1.3` | `MS-19` | Mobile | Android port, touch UI, mobile perf tiers, Play Store release | 8–12 |
+| `1.4` | `MS-20` | Far terrain | Visual-only LOD/far-terrain renderer out to 128+ chunks and 1024-block render distance | 4–6 |
+| `1.5` | `MS-21` | Native plugins + server mesh | Signed native plugin tier in a supervised process, multi-server network (proxy/lobby) | 6–10 |
+| `1.6` | `MS-22` | Web and reach | WebTransport/web client feasibility, better Steam Deck and accessibility passes | 8–12 |
+| TBD | `MS-23` | Compatibility gateway | Optional Minecraft-client gateway as an isolated, best-effort bridge (not core) | 10–16 |
+
+Milestone IDs are stable identifiers, not release order (`MS-09` already follows
+`MS-13` in the 1.0 plan). `MS-17` was assigned to the 2.0 track when it became the
+first post-1.0 commitment; flagship content moved to the next free id, `MS-24`.
+Community mods and content packs still fill most of the long-tail content
+surface, but the engineering roadmap **grows** after 1.0: 1.0 is Early Access, and
+2.0 is the remaining half of the parity promise.
 
 ## 16. Risks to this schedule (summary)
 
@@ -338,12 +454,13 @@ Full register: [Risks](05-risks.md). The schedule-sensitive ones:
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
-| Custom renderer takes longer than estimated | +30–50% on Phase B | Vertical slice first, buy UI/audio/text libraries, cut shadows/post if needed |
+| Custom renderer takes longer than estimated | +30–50% on Phase B | Vertical slice first, buy UI/audio/text libraries, cut shadows/post if needed; the 200–240 dev-week 1.0 track carries the overrun |
 | Netcode "feel" iterations | +50% on MS-06 | In-process simulator from day one; reference netcode patterns; accept correction |
-| Parity content velocity (Minecraft ships 70–145 blocks/year) | Unbounded | Pinned baseline 1.21.11; generated checklist; delta process per release |
-| Solo founder burnout | Project death | Public milestones, playable builds, community early, scope tiers |
+| Parity content velocity (Minecraft ships 70–145 blocks/year) | Unbounded | Pinned baseline 1.21.11; hand-authored behavioural checklist; full Tier 2 is the 2.0 track with its own funding, not a 1.0 commitment |
+| Effort model was 5–8× low (review finding) | Credibility and burnout | Two-track re-baseline (§11); measured throughput at MS-03 replaces the estimate |
+| Solo founder burnout | Project death | Public milestones, playable builds, community early, scope tiers, a 1.0 that is honestly Early Access |
 | Performance target missed at 144 FPS | Reputation | 120 FPS release gate, 144 FPS performance mode, honest benchmarking |
-| Art/audio production | Blocks releases | Placeholder pack early; commission in Phase D; CC0 fallback |
+| Art/audio production | Blocks releases | Placeholder pack early; commission in Phase D; CC0 fallback; full-parity art is a 2.0 decision |
 
 ## 17. What to do in the first two weeks
 
@@ -365,7 +482,8 @@ If the team is one person and today is day zero:
 1. **Funding and staffing shape (owner: project lead, before Phase B).** The
    calendar scenarios assume full-time effort; the roadmap does not assume a
    funding source. Decide whether to pursue grants/sponsorship before or after
-   the `0.1` alpha. → [Team and process](04-team-and-process.md) §7.
+   the `0.1` alpha. The 2.0 track has its own, larger question (OPEN-019). →
+   [Team and process](04-team-and-process.md) §7.
 2. **Whether `0.0.1` is distributed publicly (owner: MS-03).** A public tech
    preview recruits contributors earlier but commits to save compatibility
    messaging and support load.
@@ -377,6 +495,12 @@ If the team is one person and today is day zero:
 5. **Whether to ship 1.0 on Steam (owner: MS-16).** Steam adds Deck verification,
    store review and revenue-share considerations but reaches far more players
    than GitHub Releases alone. → [Platforms](01-milestones.md).
+6. **2.0 staffing and funding (OPEN-019, owner: lead).** The 500–800 dev-week
+   Tier-2 track needs 6–10 funded people for 2–3 years; the plan states the
+   requirement rather than assuming it is met.
+7. **Modern Delta (OPEN-020, owner: MS-17).** 1.21.11 is the 1.0 baseline; before
+   the 2.0 parity claim, re-baseline to the then-current Minecraft release with a
+   separate delta manifest that cannot destabilise the pinned corpus.
 
 ## 19. References
 

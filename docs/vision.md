@@ -13,9 +13,10 @@ in Rust with a purpose-built engine, designed around four promises: **frames
 that stay fast as the world grows**, **graphics that scale from a laptop to a
 ray-traced showcase**, **modding that is a first-class part of the engine
 instead of a pile of hooks**, and **multiplayer that is server-first, cheap to
-host and pleasant to administrate**. It aims at the full Minecraft Java Edition
-feature set as a *floor*, not a ceiling, and then adds content and systems
-Minecraft cannot express. It contains no Minecraft or Weft code or assets.
+host and pleasant to administrate**. It targets the full Minecraft Java Edition
+feature set in two stages: **Tier-1 parity at 1.0 (Early Access)**, then **full
+Tier-2 parity at 2.0**, and then adds content and systems Minecraft cannot
+express. It contains no Minecraft or Weft code or assets.
 
 The short version for the README:
 
@@ -105,8 +106,9 @@ first-class distribution path, not a tolerated loophole.
 
 **Survive.** Wake up in a generated world, punch trees, build a shelter before
 night, descend for ores, smelt, craft, enchant, farm, fight, and reach the
-End — with the same verbs and pacing as the game you already know, but at 144
-FPS and with fewer "wait, why did that happen?" moments.
+underworld and, at 2.0, the terminus — with the same verbs and pacing as the
+game you already know, but at 144 FPS and with fewer "wait, why did that
+happen?" moments.
 
 **Build.** Creative mode with an infinite palette, a fast block picker,
 blueprint and structure tools, undo, and a selection/clipboard system that a
@@ -114,9 +116,10 @@ modern editor would be embarrassed not to have. Build large things without
 worrying about the engine falling over.
 
 **Play together.** Invite a friend into your single-player world with one
-click. Or rent a $5/month VPS, run `docker compose up`, and host 50 players at
-20 TPS. Or join a public server whose mods are verified automatically before
-you connect.
+click. Or rent a $5/month VPS, run `docker compose up`, and host 50
+**co-located** players at 20 TPS — the published distributed-player row is
+lower and states its own configuration (DEC-052). Or join a public server
+whose mods are verified automatically before you connect.
 
 **Make it yours.** Change textures, sounds, lighting and UI with a content
 pack. Write a WASM mod in Rust, Lua or TypeScript that adds a machine, a mob,
@@ -139,7 +142,7 @@ content packs when it trusts the server.
 
 Full parity with modern Minecraft is a multi-year effort even for a funded
 team. We refuse to lie about that, so parity is defined in tiers, each with an
-explicit exit criterion.
+explicit exit criterion and an honest release.
 
 The reference is **Minecraft Java Edition 1.21.11** (the last version with a
 high-confidence registry baseline; newer drops are handled as a documented delta
@@ -149,16 +152,24 @@ Bedrock-only mechanics are out of scope unless they are strictly better.
 
 | Tier | Meaning | Release |
 | --- | --- | --- |
-| **Tier 0 — Core** | World, blocks, player movement, mining/placing, inventory basics, survival loop stub, creative mode, save/load, single-player and LAN | MVP |
-| **Tier 1 — Parity essentials** | Crafting/furnaces, tools and tiers, health/hunger/XP, common mobs, biomes, caves, structures, day/night, boats/minecarts, basic redstone, dimensions and portals, enchanting basics | 0.1 Early Access |
-| **Tier 2 — Full parity** | All vanilla blocks/items/mobs/biomes/structures, all redstone components, villagers and trading, bosses, raids, potions, advancements/statistics, commands and game rules, full server properties | 1.0 |
-| **Tier 3 — Deep parity and polish** | Spectator, full datapack semantics, edge-case mechanics parity, accessibility, controller support, full localization | post-1.0 |
+| **Tier 0 — Core** | World, blocks, player movement, mining/placing, inventory basics, creative mode, save/load, single-player and LAN | `0.0.1`–`0.1` (MS-03, MS-04, MS-05) |
+| **Tier 1 — Parity essentials** | Crafting/furnaces, tools and tiers, health/hunger/XP, common mobs, biomes, caves, structures, day/night, boats/minecarts, basic redstone, dimensions and portals, enchanting basics | `0.3`–`0.6`, then **1.0 Early Access** (MS-08, MS-10, MS-11, MS-13, MS-14) |
+| **Tier 2 — Full parity** | All vanilla blocks/items/mobs/biomes/structures, full redstone components, villagers and trading, bosses, raids, potions, advancements/statistics, commands and game rules, full server properties | **2.0** (MS-17) |
+| **Tier 3 — Deep parity and polish** | Spectator, full datapack semantics, edge-case mechanics parity, accessibility, controller support, full localization | post-2.0 by default; the items already scheduled earlier ship earlier — controller at `0.5` (MS-12), spectator, full localization and adopted datapack semantics at `0.6`/1.0 (MS-14) |
 | **Tier 4 — Deliberately different** | Quirks that exist for historical reasons or hurt players. Documented individually with our replacement. | ongoing |
 
-"All the features of Minecraft" therefore means **Tier 2 at 1.0**, verified by
-a parity checklist corpus with in-repo acceptance tests, not by vibes. Anything
-we choose not to copy is listed in [the feature inventory](research/05-minecraft-feature-inventory.md)
-with a replacement or a reason.
+"All the features of Minecraft" therefore means **Tier 1 at 1.0 Early Access**
+and **Tier 2 at 2.0**, verified by the parity gate from
+[DEC-051](decisions.md): (a) **100% of in-scope checks pass** and (b) **≥ 85%
+vanilla coverage** measured by a hand-authored behavioural checklist. At 1.0,
+(a) is measured over the Tier-0/1 checklist while (b) is measured over the full
+pinned baseline; at 2.0 both are measured over the full Tier-2 baseline.
+Coverage and pass rate are separate numbers, never averaged; the checklist counts
+behaviour families, not registry IDs, so 85% coverage at 1.0 is not a claim that
+every Tier-2 block, mob and command exists. Registry dumps are a cross-check,
+never the corpus. Anything we choose not to copy is listed in
+[the feature inventory](research/05-minecraft-feature-inventory.md) with a
+replacement or a reason.
 
 ## 7. Non-goals
 
@@ -186,28 +197,36 @@ Explicitly **not** in scope; adding any of these requires a new decision:
 ## 8. Success metrics
 
 We will judge ourselves on measurable outcomes, not feature count. Numbers are
-targets for the 1.0 milestone and are re-validated at each release
-(see [Performance budgets](spec/25-performance-budgets.md) for the authoritative
-budget table).
+targets for the **1.0 Early Access** milestone unless labelled post-1.0, and are
+re-validated at each release (see
+[Performance budgets](spec/25-performance-budgets.md) for the authoritative
+budget table). Full Tier-2 parity is a 2.0 target, not a 1.0 one
+([DEC-051](decisions.md)).
 
 | Area | Metric | Target at 1.0 |
 | --- | --- | --- |
-| **Performance** | Sustained FPS, 1080p, 512-block render distance (32 chunks), default quality, reference machine | ≥ 120 FPS average, 1% low ≥ 90 FPS; 144 FPS as a verified performance mode |
-| | Sustained FPS at 1024-block render distance (64 chunks) | ≥ 60 FPS average |
+| **Performance** | Sustained FPS, 1080p, 512-block render radius (32 chunks), default quality, reference machine | ≥ 120 FPS average, 1% low ≥ 90 FPS; 144 FPS as a verified performance mode |
 | | CPU main-thread frame time (excludes GPU) | ≤ 2.0 ms |
 | | Client memory at 512 blocks | ≤ 4 GiB RSS |
 | | Join time, pregenerated world, warm cache | ≤ 5 s to playable |
 | | Chunk generation (terrain + features), 8 worker threads | ≥ 250 columns/s |
-| **Server** | Players at 20 TPS, 256-block simulation distance, 4 vCPU / 8 GiB VPS | 50 players |
-| | Cost per player-hour on commodity VPS | ≤ $0.02 |
-| | Tick time p99 with 2000 loaded chunks and 50 players | ≤ 35 ms |
+| **Server** | Players at 20 TPS, 256-block render and simulation distance, 4 vCPU / 8 GiB VPS — **co-located** (shared column cache, same region) | 50 players |
+| | Players at 20 TPS, **distributed** (no shared columns; the published configuration in [spec/25 §3.6](spec/25-performance-budgets.md#36-server-capacity-model) is 50 players at 64-block render/simulation on 8 vCPU) | Separate, lower published row measured at MS-15 |
+| | Cost per player-hour on commodity VPS, co-located reference configuration | ≤ $0.02 |
+| | Tick time p99 with 2,000 loaded chunks and 50 co-located players | ≤ 35 ms |
 | | Server memory | ≤ 2 GiB + 20 MiB/player |
 | **Modding** | Time from `git clone` of the mod template to seeing a new block in-game | ≤ 10 min |
 | | Mods that crash the host process (WASM tier) | 0 |
-| **Quality** | Crash-free sessions | ≥ 99.5% |
-| | Automated parity-check corpus coverage of Tier 2 | ≥ 90% |
-| **Community** | Independent public servers running for 30+ days | ≥ 100 |
-| | Published content packs / mods | ≥ 200 |
+| **Quality** | Crash-free sessions, measured only from **opt-in** crash signatures (no default telemetry) | ≥ 99.5% of reporting sessions; tracked, not a 1.0 gate |
+| | In-scope parity checks passing (Tier 0/1 checklist at 1.0, Tier 2 at 2.0) | 100% |
+| | Vanilla coverage, hand-authored behavioural checklist | ≥ 85% of pinned-baseline vanilla behaviours at 1.0; the same floor applies at 2.0 |
+| **Community** | Independent public servers running for 30+ days | ≥ 100 — **aspiration**, counted from the opt-in public server directory; baseline published after 1.0 |
+| | Published content packs / mods | ≥ 200 — **aspiration**, counted from the opt-in content index; baseline after 1.0 |
+
+Sustained 1,024-block rendering is an `MS-20` post-1.0 target, not a 1.0 metric
+([DEC-018](decisions.md), [DEC-052](decisions.md)). Community numbers are
+aspirations until a census mechanism exists; the project ships no telemetry by
+default (P7), so they cannot be claimed as measured at launch.
 
 ## 9. Platforms and hardware
 
@@ -269,11 +288,13 @@ product, not a side mode).
 - **Name:** OpenBlock. Chosen because it is descriptive, unencumbered in the
   game space as far as our trademark screening shows, and reads the same in
   most languages.
-- **Brand boundary:** "OpenBlock" is not "Minecraft". The project will not use
-  Mojang names for its content in the base pack (`Creeper`-style names are
-  replaced; for example our iconic exploding mob is a *Blaster*). Players can
-  rename content in content packs, and familiarity is preserved through
-  mechanics, not trademarks.
+- **Brand boundary:** "OpenBlock" is not "Minecraft". The project does not use
+  Mojang names for its content in the base pack: the dimensions are
+  `openblock:underworld` (the nether-like dimension) and `openblock:terminus`
+  (the end-like dimension), and entities are named originally — our iconic
+  exploding mob is the *Blaster* ([DEC-053](decisions.md)). Players can rename
+  content in content packs, and familiarity is preserved through mechanics, not
+  trademarks.
 - **Legal:** see [`research/07-legal-licensing-and-ip.md`](research/07-legal-licensing-and-ip.md)
   and [`adr/0008-license-and-provenance.md`](adr/0008-license-and-provenance.md).
   The README carries the disclaimer; there is no affiliation with Mojang or
@@ -302,8 +323,9 @@ Honest pre-mortem. If any of these fail, the project stalls:
 
 > **OpenBlock** is an open-source voxel sandbox built in Rust. Mine, build,
 > explore and survive alone or with friends on servers you host yourself.
-> It targets the full Minecraft Java feature set as a starting point, then goes
-> further with a scriptable content platform, modern GPU-driven rendering, and
-> a multiplayer stack designed for people who run servers for fun.
+> It brings Minecraft Java's Tier-1 feature set at 1.0 Early Access, targets
+> full Tier-2 parity at 2.0, and goes further with a scriptable content
+> platform, modern GPU-driven rendering, and a multiplayer stack designed for
+> people who run servers for fun.
 >
 > Fast by architecture, open by license, moddable by design.

@@ -14,12 +14,25 @@ cannot ship over an unmet promise.
 
 | Checkpoint | Version | Milestones | Effort | The question it answers |
 | --- | --- | --- | --- | --- |
-| **A** | `0.0.1` | MS-03 (after MS-01, MS-02) | 19 dev-weeks | Does the architecture work end to end — world, mesh, physics, edit, save — with no faked layer? |
-| **B** | `0.1.0-alpha` | MS-04, MS-05 | 18 dev-weeks | Is it a game a stranger can use, at 512 blocks of view and 120 FPS, with content that is data? |
-| **C** | `0.2.0-alpha` | MS-06, MS-07 | 17 dev-weeks | Can two people play together on a server an ordinary person can run? |
+| **A** | `0.0.1` | MS-00–MS-03 | 26–30 dev-weeks | Does the architecture work end to end — world, mesh, physics, edit, save — with no faked layer? |
+| **B** | `0.1.0-alpha` | MS-04, MS-05 | 26–32 dev-weeks | Is it a game a stranger can use, at 512 blocks of view and 120 FPS, with content that is data? |
+| **C** | `0.2.0-alpha` | MS-06, MS-07 | 23–29 dev-weeks | Can two people play together on a server an ordinary person can run? |
 
-The 1.0 feature set is in [vision §6](../vision.md), the schedule in
-[roadmap §11](00-roadmap.md), the tasks in [03](03-work-breakdown.md).
+The 1.0 feature set is in [vision §6](../vision.md), the two-track schedule in
+[roadmap §11](00-roadmap.md), the tasks in [03](03-work-breakdown.md). The MVP
+checkpoints are all **pre-1.0**; 1.0 itself is Early Access at Tier-1 parity
+(DEC-051), not the full Tier-2 set.
+
+**Parity statement.** 1.0 Early Access ships **Tier-1 parity plus the Tier-2
+infrastructure and the modding platform**. Full Tier-2 parity is the **2.0**
+track (`MS-17`), with its own ~500–800 dev-week budget. The parity gate is two
+numbers, never one (DEC-051): (a) **100% of in-scope checks pass** and (b) **≥ 85%
+vanilla coverage** of the pinned 1.21.11 baseline, measured by a hand-authored
+behavioural checklist (never a copied registry dump). 1.0 must pass **100% of its
+Tier-0/1 in-scope checks** and meet the **85% vanilla behavioural coverage
+floor**; 2.0 must meet both for the full Tier-2 baseline, which is also where
+every remaining block, item, mob, structure and command ships. No MVP checkpoint
+may advertise "all Minecraft features".
 
 ## 2. Requirements
 
@@ -65,7 +78,7 @@ The spec chapter is authoritative; these are the checkpoint gates, copied there.
 | --- | --- | --- |
 | PERF-MVP-001 | 256-block view, 1080p, default preset: ≥60 FPS average, p95 frame ≤20 ms, reference machine. | A |
 | PERF-MVP-002 | Break/place at camera: geometry and light remeshed within 2 frames; at 128 blocks within 100 ms. | A, B, C |
-| PERF-MVP-003 | 512-block view: ≥120 FPS average, p99 frame ≤12 ms, no frame >33 ms in a 30 blocks/s fly-through. | B, C |
+| PERF-MVP-003 | 512-block view: ≥120 FPS average, p99 frame ≤11.1 ms, no frame >33 ms in a 30 blocks/s fly-through. | B, C |
 | PERF-MVP-004 | CPU main-thread frame time ≤2.0 ms; client RSS ≤4 GiB at 512 blocks; GPU memory ≤768 MB. | B, C |
 | PERF-MVP-005 | Join a 512-block-radius world at 10 Mbit/s: playable ≤60 s, p99 tick ≤35 ms during join. | C |
 | PERF-MVP-006 | 16 players (bots) for 1 h on 4 vCPU / 8 GiB: 20 TPS, p99 tick ≤35 ms, RSS ≤2 GiB + 20 MiB/player. | C |
@@ -125,7 +138,7 @@ mobs, no internet multiplayer."
 
 | Area | In at `0.1` | Out → owner, and why |
 | --- | --- | --- |
-| Rendering | Render graph v1, 32³ cluster meshing, region/cluster culling, MDI, KTX2 texture arrays, 3-cascade CSM, tone mapping, TAA, sky, translucent water, presets | GTAO, SSR, volumetrics, particles, shader packs → MS-12: ship the 120 FPS pipeline, spend the look later. |
+| Rendering | Render graph v1, 32³ cluster meshing **on by default** (DEC-048), region/cluster culling, MDI, KTX2 texture arrays, 3-cascade CSM, tone mapping, TAA, sky, translucent water, presets | GTAO, SSR, volumetrics, particles, shader packs → MS-12: ship the 120 FPS pipeline, spend the look later. |
 | Lighting | CPU flood-fill sky and coloured block light with incremental updates (DEC-015); colour mode per OPEN-004 | Dynamic and emissive lights → MS-12: lighting is gameplay state and belongs to the world. |
 | World data and persistence | Save format documented and versioned; `0.0.1` saves refused with a message; forward migrations start here | Region v1, repair tooling, world UI → MS-13: freeze the format after the data model settles. |
 | World generation | The deterministic test generator, now selectable as a world type | Biomes, caves, structures, dimensions → MS-08: `0.3` is the world release. |
@@ -263,7 +276,7 @@ constrain later features, a biome is additive.
 | 5 | The base game runs on the public API | B | The base pack needs one private hook | Stop and fix the content model; a private hook invalidates pillar P4. |
 | 6 | Netcode feels local on a poor link | C | Visible corrections at 60 ms during normal movement | Cut fast features (boats, item entities) before cutting prediction. |
 | 7 | A stranger can operate a server | C | First join from a clean VPS takes >10 min | Stop and fix packaging, docs and defaults. |
-| 8 | Fifty players and anti-cheat | MS-15 | p99 tick >35 ms with 50 bots | Publish a lower supported count; never fake the benchmark. |
+| 8 | Fifty **co-located** players and anti-cheat, plus a published distributed row | MS-15 | p99 tick >35 ms with 50 co-located bots, or no measured distributed row | Publish a lower supported count for both distributions; never fake the benchmark (DEC-052). |
 
 ## 9. Explicit stubs
 
@@ -302,13 +315,14 @@ milestones**. Scope changes need a DEC (REQ-MVP-006).
 | Feature | First release | Milestone | Why deferred |
 | --- | --- | --- | --- |
 | Survival: health, hunger, XP, combat, crafting, furnaces, weather | `0.3.0-beta` | MS-10 | Needs items, block behaviour and a world worth surviving in. |
-| Worldgen: biomes, caves, ores, structures, nether, end | `0.3.0-beta` | MS-08 | Largest milestone; needs the content model. |
+| Worldgen: biomes, caves, ores, structures, underworld, terminus | `0.3.0-beta` | MS-08 | Large milestone; needs the content model. |
 | Persistence maturity: region v1, migrations, repair, world UI | `0.3.0-beta` | MS-13 | Format freeze after the data model stops moving. |
 | WASM mods, pack SDK, server mod verification | `0.4.0-beta` | MS-09 | Needs stable content and protocol contracts. |
-| Mobs, redstone, enchanting, trading, bosses, commands | `0.4`–`0.5` | MS-11 | Depth after the platform. |
+| Common mobs, basic redstone, enchanting and trading basics, portals | `0.4`–`0.5` | MS-11 | Tier-1 depth after the platform; full Tier-2 depth is the 2.0 track. |
 | Full visuals, shader packs, music, particles | `0.5.0-beta` | MS-12 | Presentation after performance headroom exists. |
-| Parity closure, accessibility, localization breadth, onboarding | `0.6.0-beta` | MS-14 | Needs a complete enough feature set to audit. |
-| 50-player scale, anti-cheat, moderation | `1.0.0-rc` | MS-15 | Only meaningful once the protocol is stable. |
+| Tier-1 parity gate, parity-corpus infrastructure, Tier-2 coverage reporting, accessibility, localization breadth, onboarding | `0.6.0-beta` | MS-14 | Needs a complete enough Tier-1 feature set to audit; Tier-2 closure is `MS-17`. |
+| 50 **co-located** player scale, anti-cheat, moderation; separate distributed-player row | `1.0.0-rc` | MS-15 | Only meaningful once the protocol is stable and the player distribution is stated (DEC-052). |
+| **Full Tier-2 parity**: remaining mobs/blocks/structures, full redstone, bosses, commands, advancements | `2.0` | MS-17 | A funded 6–10 person, 2–3 year track (OPEN-019), not a 1.0 commitment. |
 | Native plugins, Android, far-terrain LOD, web client, proxy | post-1.0 | MS-19–MS-22 | Platform expansion after 1.0 (DEC-018, DEC-034, OPEN-007/008). |
 | Minecraft world or resource-pack import, protocol compatibility | never in v1 | — | Non-goal (vision §7); legal and product risk. |
 | Marketplace, paid-mod cut, telemetry sale, crypto, voice chat | never / post-1.0 | — | Non-goals (vision §7); voice needs moderation tooling (DEC-031). |
@@ -345,7 +359,8 @@ milestones**. Scope changes need a DEC (REQ-MVP-006).
 ## 14. References
 
 - [Decision register](../decisions.md): DEC-002, DEC-008, DEC-009, DEC-010, DEC-015,
-  DEC-018, DEC-022, DEC-023, DEC-024, DEC-026, DEC-032, DEC-033, DEC-035.
+  DEC-018, DEC-022, DEC-023, DEC-024, DEC-026, DEC-032, DEC-033, DEC-035,
+  DEC-048, DEC-049, DEC-050, DEC-051, DEC-052, DEC-053.
 - [Vision](../vision.md): pillars, parity tiers, non-goals, reference machine.
   [Roadmap](00-roadmap.md) and [milestones](01-milestones.md) for phases and criteria.
 - [Work breakdown](03-work-breakdown.md), [team and process](04-team-and-process.md),

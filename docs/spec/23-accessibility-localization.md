@@ -1,7 +1,7 @@
 # 23 — Accessibility and Localization
 
 > Status: normative - Last updated: 2026-11-24
-> Depends on: [DEC-009](../decisions.md), [DEC-030](../decisions.md), [DEC-032](../decisions.md), [DEC-034](../decisions.md), [DEC-044](../decisions.md), [conventions](00-conventions.md), [technical architecture](01-technical-architecture.md), [rendering](03-rendering.md), [shaders and visuals](04-shaders-and-visuals.md), [audio](14-audio.md), [UI, audio and localization research](../research/08-ui-audio-localization.md)
+> Depends on: [DEC-009](../decisions.md), [DEC-030](../decisions.md), [DEC-032](../decisions.md), [DEC-034](../decisions.md), [DEC-044](../decisions.md), [DEC-050](../decisions.md), [conventions](00-conventions.md), [technical architecture](01-technical-architecture.md), [rendering](03-rendering.md), [shaders and visuals](04-shaders-and-visuals.md), [audio](14-audio.md), [UI, audio and localization research](../research/08-ui-audio-localization.md)
 > Implements: MS-05 (catalogues, lint, one locale, input abstraction, UI scale, AT scaffolding), MS-14 (RTL, CJK, narration, captions, audit)
 
 ## 1. Purpose and scope
@@ -42,7 +42,7 @@ MS-14 delivers breadth and the audit (§3.17).
 | REQ-I18N-010 | Every widget wraps, grows to its minimum width or ellipsises with a tooltip; no control clips its label in a shipped locale or in `en-XA`. | Pseudo-locale screenshots | MS-14 |
 | REQ-I18N-011 | `en-XA` and `ar-XB` are generated from `en-US` at build time, selectable in developer settings and exercised in CI. | Build artefact, CI job | MS-05 |
 | REQ-I18N-012 | Fonts ship as language-pack assets under OFL 1.1 with attribution and reserved-font-name rules; layout NEVER depends on system fonts; the fallback chain covers every script and emoji in §3.6 within PERF-I18N-003; a missing glyph draws a tofu box and logs once. | Licence and coverage tests | MS-14 |
-| REQ-I18N-013 | Packs may translate their own keys and `REPLACE` base keys ([DEC-019](../decisions.md)); conflicts are load errors; translations enter the view hash, never the simulation content hash. | Pack validator, hash test | MS-14 |
+| REQ-I18N-013 | Packs may translate their own keys and `REPLACE` base keys ([DEC-019](../decisions.md)); conflicts are load errors; translations enter `view_hash` only, never `content_hash`, and a view-only difference is advisory at join, refusing a client only when the server opts into strict view matching ([DEC-050](../decisions.md)). | Pack validator, hash test, two-locale join | MS-14 |
 | REQ-I18N-014 | The base install ships `en-US` plus one complete non-English locale; partial locales fall back per message and are labelled incomplete in settings. | Release manifest | MS-05 |
 | REQ-I18N-015 | Chat, names, signs, books and server-supplied strings are user content: inserted as placeables, stripped of control and bidi-override characters, length-capped and never parsed as FTL; a server sends message keys plus typed arguments, never raw markup. | Fuzz corpus, protocol test | MS-06 |
 | REQ-A11Y-001 | Every action is an `ActionId` with per-device bindings; no gameplay code reads a key or button directly, 100% of actions are remappable, an in-context conflict is rejected naming both actions, a cross-context duplicate warns, and profiles import/export as RON. | Remap coverage and binding tests | MS-05 |
@@ -308,8 +308,8 @@ Assists change what the client sends, never what the host accepts. `auto_jump`, 
 sprint/sneak/attack toggles and auto-walk are input shaping. Aim assist is the only one that touches
 aim, and only for gamepad and touch: 0–100% strength slows the look rate inside a 6° cone, never
 selects a target outside the current view, and pulls at most 2°/s. It is disclosed in the join
-settings the client honours when the server advertises `allow_aim_assist = false` (default on, except
-when `pvp = true`). Nothing about it crosses the wire, so compliance is a moderation matter, not an
+settings the client honours when the server advertises `world.allow_aim_assist = false` (default on, except
+when `world.pvp = true`). Nothing about it crosses the wire, so compliance is a moderation matter, not an
 anti-cheat rule ([DEC-029](../decisions.md), [20](20-security-and-anti-cheat.md)).
 Auto-walk is a toggle cancelled by movement, damage, a screen or a vehicle. One-handed presets put
 movement on one hand's keys or stick, mirror the HUD, swap mouse buttons and enlarge the crosshair;
@@ -391,7 +391,7 @@ All keys below are `Live` and apply within one frame.
 | `left_handed`, `pause_on_focus_loss`, `hold_to_use` | bool | `false`, `true`, `true` |
 
 Keys are snake_case ASCII ([DEC-044](../decisions.md)), owned by [`ob_client`](13-ui-and-ux.md) and
-per user, not per world. A server may advertise policy (`allow_aim_assist`, `allow_voice_chat`) but
+per user, not per world. A server may advertise policy (`world.allow_aim_assist`, `voice_chat.enabled`) but
 never writes a client's accessibility settings.
 
 ### 4.3 Bindings and accessibility nodes
@@ -471,8 +471,10 @@ automated test can tell whether a screen-reader user understands a trade window.
    but some translators prefer CC0 or copyleft; confirm before the Weblate instance opens. Owner: MS-14.
 2. **Locale pack distribution.** Signed in-app downloads versus bundling the ten most common locales
    (60–100 MB, but helps offline players). Owner: MS-16, using the MS-13 size budget.
-3. **Register item needed:** "Translation catalogues belong to the view hash, are excluded from the join
-   content hash, and never block a connection." Owner: MS-06, before the protocol freeze.
+3. **Translation join policy (settled by DEC-050).** Translation catalogues are view leaves, are
+   excluded from `content_hash`, and never block a connection by default; a server may opt into strict
+   view matching. Remaining open: whether an incomplete locale pack is mentioned in the join screen or
+   only in settings. Owner: MS-14, with MS-06.
 4. **Register item needed:** "Input assists are client-side settings a host may disallow through policy;
    they are never disclosed on the wire and never an anti-cheat matter." Owner: MS-15, with
    [20](20-security-and-anti-cheat.md).
@@ -485,7 +487,8 @@ automated test can tell whether a screen-reader user understands a trade window.
 ## 9. References
 
 - Decisions: [DEC-009](../decisions.md), [DEC-030](../decisions.md), [DEC-032](../decisions.md),
-  [DEC-034](../decisions.md), [DEC-044](../decisions.md); [conventions](00-conventions.md) §5, §7.
+  [DEC-034](../decisions.md), [DEC-044](../decisions.md), [DEC-050](../decisions.md);
+  [conventions](00-conventions.md) §5, §7.
 - Chapters: [architecture](01-technical-architecture.md), [engine core](02-engine-core.md),
   [rendering](03-rendering.md), [shaders and visuals](04-shaders-and-visuals.md) §3.12,
   [survival gameplay](08-gameplay-survival.md), [UI and UX](13-ui-and-ux.md), [audio](14-audio.md),

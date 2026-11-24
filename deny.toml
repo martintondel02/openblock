@@ -28,6 +28,17 @@ allow = [
   "BSL-1.0",
 ]
 confidence-threshold = 0.9
+# Fail review when a stale allow-list entry no longer applies.
+unused-allowed-license = "warn"
+
+# CDLA-Permissive-2.0 is permissive but deliberately NOT a global allow. The
+# policy in ADR-0008 §6 is a package-scoped exception only when a required
+# dependency needs it; today that would be `webpki-roots` via an iroh-relay
+# tree (research/07 §8.3). Uncomment, keep the scope to that package, and ship
+# the CDLA text in the release notices before enabling it.
+# [[licenses.exceptions]]
+# allow = ["CDLA-Permissive-2.0"]
+# name = "webpki-roots"
 
 [bans]
 multiple-versions = "warn"

@@ -1,7 +1,7 @@
 # 15 — Content System
 
 > Status: normative - Last updated: 2026-11-24
-> Depends on: [DEC-006](../decisions.md), [DEC-010](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-022](../decisions.md), [DEC-027](../decisions.md), [DEC-030](../decisions.md), [DEC-032](../decisions.md), [DEC-033](../decisions.md), [DEC-039](../decisions.md), [DEC-040](../decisions.md), [DEC-041](../decisions.md), [DEC-044](../decisions.md), [DEC-045](../decisions.md), [DEC-046](../decisions.md), [DEC-047](../decisions.md), [conventions](00-conventions.md), [architecture](01-technical-architecture.md)
+> Depends on: [DEC-006](../decisions.md), [DEC-010](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-022](../decisions.md), [DEC-027](../decisions.md), [DEC-030](../decisions.md), [DEC-032](../decisions.md), [DEC-033](../decisions.md), [DEC-039](../decisions.md), [DEC-040](../decisions.md), [DEC-041](../decisions.md), [DEC-044](../decisions.md), [DEC-045](../decisions.md), [DEC-046](../decisions.md), [DEC-047](../decisions.md), [DEC-050](../decisions.md), [conventions](00-conventions.md), [architecture](01-technical-architecture.md)
 > Implements: MS-05, MS-09
 
 ## 1. Purpose and scope
@@ -62,7 +62,7 @@ Three invariants drive every requirement below:
 | REQ-CONTENT-030 | Unknown fields MUST be errors; namespaced extensions live under `extensions` (`x-<namespace>`) and are schema-checked; an unknown kind is an error naming the closest known kind. | Negative fixtures |
 | REQ-CONTENT-031 | Diagnostics MUST carry a `PACK-NNNN` code, severity, message naming expected and found, pack, path, line and column where textual, JSON Pointer, hint and a docs anchor; `--format=json` MUST be stable and data errors MUST exit 65 (REQ-CORE-031). | Golden diagnostic JSON |
 | REQ-CONTENT-032 | Archives MUST be validated before extraction: no absolute paths, `..`, symlinks, case collisions or duplicate names; limits are ≤ 64 MiB compressed, ≤ 256 MiB expanded, ≤ 20,000 entries, expansion ratio ≤ 200:1 and JSON nesting depth ≤ 64. | Hostile-archive corpus |
-| REQ-CONTENT-033 | Hashing MUST be a Merkle tree with one leaf per entry sorted by `(kind, ID)`; `content_hash`, `view_hash` and `behaviour_hash` are separate roots, and the handshake `pack_hash` binds protocol version to the content and view roots (DEC-027). | Hash golden vectors, three OSes |
+| REQ-CONTENT-033 | Hashing MUST be a Merkle tree with one leaf per entry sorted by `(kind, ID)`; `content_hash`, `view_hash` and `behaviour_hash` are separate roots, and the handshake `pack_hash` binds protocol version to the content and view roots. `content_hash` is join-critical and strict; `view_hash` is advisory unless the server opts into strict view matching (DEC-027, DEC-050). | Hash golden vectors, three OSes |
 | REQ-CONTENT-034 | A manifest signature MUST be Ed25519 over the root with a declared signer; it identifies origin only, and the loader MUST record signer and verification result in the session manifest. | Signature fixtures |
 | REQ-CONTENT-035 | A content-hash mismatch at join MUST be refused with a machine-readable Merkle diff naming differing leaves; the client MAY fetch missing leaves from the server and retry exactly once. | Two-client mismatch test |
 | REQ-CONTENT-036 | Hot reload MUST build a generation off-thread, swap at a tick or frame boundary, retain the old generation until the new one validates, remap indices by resource ID, and never expose a half-applied registry. | Reload-under-load test |
@@ -238,8 +238,10 @@ IDs, content_format)`, stored per dimension in world metadata; a mismatch warns 
 regenerates saved chunks (DEC-047).
 
 **View kinds and the hash split.** Models, textures, sounds, screens, translations, particles,
-environments and shader packs validate at load and enter `view_hash` only. A dedicated server parses
-and validates them, then never evaluates them (DEC-045). A screen binds through its declared
+environments and shader packs validate at load and enter `view_hash` only. Translation and caption
+catalogues are view leaves, so a locale difference never reaches `content_hash` and never blocks a join
+unless the server opts into strict view matching (DEC-050). A dedicated server parses and validates
+them, then never evaluates them (DEC-045). A screen binds through its declared
 `bind` paths and typed `actions` ([13](13-ui-and-ux.md) §3.2), which the host validates; it may not
 declare code, a path or a network call.
 
@@ -299,25 +301,38 @@ or a leading dash, or colliding with another path under NFC plus case folding. `
 
 | Node | Definition |
 | --- | --- |
-| content leaf | `BLAKE3(0x00 ‖ kind_tag ‖ id_len ‖ id ‖ canonical_entry)` |
-| view leaf | `BLAKE3(0x01 ‖ kind_tag ‖ id_len ‖ id ‖ canonical_view_entry)` |
+| content leaf | `BLAKE3(0x00 ‖ kind_tag ‖ id_len ‖ id ‖ canonical_entry)`, where `canonical_entry` is the byte string defined once in §4.4 |
+| view leaf | `BLAKE3(0x01 ‖ kind_tag ‖ id_len ‖ id ‖ canonical_view_entry)`, same encoding, view components only |
 | internal | `BLAKE3(0x02 ‖ left ‖ right)`, odd node promoted unchanged |
 | root | `BLAKE3(0x03 ‖ content_format ‖ api_major ‖ leaf_count ‖ root)` |
 | pack (handshake) | `BLAKE3(0x04 ‖ protocol_version ‖ content_hash ‖ view_hash)` |
+
+One encoding, not three: `canonical_entry` is the canonical **binary TLV** of §4.4 with the varint and
+type-tag table defined there. In the leaf preimage, `kind_tag` is a `u16` little-endian registry-kind
+tag and `id_len` is the ID byte length as that same varint. RON and JSON5 are source syntaxes (§4.2);
+canonical RON is the authoring and diff form. Neither source text nor canonical RON is ever hashed, so
+a formatting difference cannot move a root.
 
 **Handshake fields.** The content handshake of [18](18-networking-multiplayer.md) carries exactly this
 set: `protocol_version`, which is also bound into `pack_hash`; `pack_hash`; `content_hash` and
 `view_hash`, carried so a mismatch can produce the Merkle leaf diff; `balance_profile_hash`; the
 `mod_manifest`; and the `dictionary_digest` derived from `content_hash`. The pass/fail decision is
-equality of `protocol_version`, `pack_hash`, `balance_profile_hash` and `mod_manifest`;
-`content_hash` and `view_hash` are already bound by `pack_hash`, and `dictionary_digest` is derived
-from `content_hash`, so none can disagree once those four match. `balance_profile_hash` is the root
+equality of `protocol_version`, `content_hash`, `balance_profile_hash` and `mod_manifest`. A view-only
+difference is **advisory by default**: `view_hash` is reported in the join screen and produces a leaf
+diff on request, but it does not refuse the join, because translations and textures cannot change the
+simulation. A server MAY opt into strict view matching, in which case `view_hash` (and therefore
+`pack_hash`) must also be equal ([19 §3.2](19-server-administration.md#32-configuration-surface));
+`pack_hash` remains carried as the single identifier that binds both roots for audits, tickets and
+logs. Translations are view leaves exclusively ([23](23-accessibility-localization.md) REQ-I18N-013),
+so two clients with different locale packs always agree on `content_hash`.
+`balance_profile_hash` is the root
 of the one `balance_profile` entry the world selected ([08](08-gameplay-survival.md) §3.13): the
 profile is a content entry and therefore already inside `content_hash`, but its hash is carried
 explicitly because clients display its enforced numbers. `mod_manifest` is compared as a hash over
 the sorted `(id, version, module_hash)` list of loaded WASM mods ([16](16-modding.md) §4.1, §4.5); it never
 enters `content_hash` or `view_hash`, and the code it names is never sent to a client. The connection
-dictionary is derived from `content_hash` on both peers and dies with the connection (DEC-040).
+dictionary is derived from `content_hash` on both peers, so a locale pack cannot perturb it, and it
+dies with the connection (DEC-040).
 [18](18-networking-multiplayer.md) owns message encoding and field order; this chapter owns the root
 definitions and this comparison list.
 
@@ -447,9 +462,10 @@ entry carries `project`, `version`, `content_format`, `api`, `game`, `requires`,
 | `content.allow_unsigned` | `true` for `--pack-dir`, `false` for the catalog | development convenience |
 | `content.allow_server_pack_delivery` | `true` ([19](19-server-administration.md) §5); the client still prompts and verifies every leaf | server may offer packs after consent, never code |
 
-Enforcement is server-side: the handshake compares the field set of §3.6, and a mismatch produces a
-Merkle diff for a content or view difference and, if unresolved, a kick naming the differing packs.
-The client may fetch missing content and
+Enforcement is server-side: the handshake compares the field set of §3.6. A content difference
+produces a Merkle diff and, if unresolved, a kick naming the differing packs; a view-only difference
+produces the diff and an advisory notice, and kicks only when the server enables strict view
+matching. The client may fetch missing content and
 view leaves from the server's content-addressed endpoint (hash in the path, body verified against
 the leaf), install them into the runtime pack cache owned by [17](17-persistence.md) §3.9 keyed by
 the pack hash, reload and retry once. Code is never part of that exchange: `scripts/` is excluded from the client-facing tree, a
@@ -459,9 +475,10 @@ client refuses a pack containing it, and `behaviour_hash` travels only as an opa
 ### 3.11 Determinism of content
 
 1. Map keys sorted by UTF-8 bytes; arrays keep semantic order; tag member lists sorted.
-2. No whitespace, comments or trailing commas in canonical bytes; source syntax cannot change a hash.
-3. Integers or fixed-point at a declared scale; view-only floats encoded as shortest round-trip `f32`
-   decimals with `-0.0` normalised and NaN/∞ rejected (DEC-039).
+2. Canonical bytes are the TLV of §4.4, not source text; whitespace, comments and trailing commas never
+   reach a hash, so source syntax cannot change one.
+3. Integers or fixed-point at a declared scale; view-only floats normalised to the shortest round-trip
+   `f32` with `-0.0` normalised and NaN/∞ rejected, then encoded as type tag `9` (DEC-039).
 4. UTF-8, NFC, explicit lengths; no locale-dependent casing or collation.
 5. IDs are strings in canonical form, never indices; ordering by ID, never by first appearance.
 6. Timestamps, paths, usernames, hostnames and download metadata excluded.
@@ -529,9 +546,9 @@ hash; `openblock-tools pack fmt` rewrites either into canonical RON.
 | --- | --- | --- |
 | `hardness: 7.5` | `hardness_milli: 7500` | field declares a scale; round half away from zero; out of range is an error |
 | `0.18` in worldgen | `180` per-mille | fixed-point, integer-only generation (DEC-046) |
-| `0.8` in a view field | `"0.8"` | shortest round-trip `f32`, excluded from `content_hash` |
+| `0.8` in a view field | type tag `9`, four `f32` bytes | shortest round-trip `f32` after normalising `-0.0`; NaN and ∞ rejected; view leaves only |
 | `"#c:ingots"`, `"?mymod:x"` | tag, optional member | `#` and `?` are syntax, not part of an ID |
-| comments, trailing commas | absent | no whitespace in canonical bytes |
+| comments, trailing commas | absent | canonical RON is authoring form only; the hashed TLV carries no whitespace |
 
 Facet fields that [11](11-inventory-crafting-items.md) names without a suffix carry their scale in
 their name here (`speed_milli`, `attack_damage_milli`, `cooldown_ct`, `hardness_milli`); a decimal in
@@ -621,12 +638,41 @@ TagDef(
 
 ### 4.4 Leaf encoding and build outputs
 
-A leaf payload is `u16 component_count`, then each component as `u16 key_len ‖ key ‖ u8 type_tag ‖
-value`, sorted by key. Type tags: `0 bool, 1 i32, 2 u32, 3 i64, 4 text, 5 id, 6 list, 7 map,
-8 bytes`; list and map lengths are `varint`. The build report is a versioned text document —
-`format`, `leaf_count`, `content_root`, `view_root`, `archive_hash`, `signer`, `signature` — never
-machine-endian binary, so it reviews in a diff and a third-party tool can verify it with a BLAKE3
-implementation alone.
+**One normative encoding.** A leaf payload is the canonical binary TLV below, and this paragraph is its
+only definition: RON, JSON5 and canonical RON are source or review forms and are never hashed (§3.6).
+
+```text
+entry       := component_count varint ‖ component*        # this is `canonical_entry` of §3.6
+component   := key_len varint ‖ key ‖ typed_value
+typed_value := type_tag u8 ‖ value
+value       := bool u8 | i32 i32le | u32 u32le | i64 i64le | text (len varint ‖ bytes)
+             | id (len varint ‖ bytes) | list (count varint ‖ typed_value*)
+             | map (count varint ‖ (key_len varint ‖ key ‖ typed_value)*)
+             | bytes (len varint ‖ bytes) | f32 f32le
+```
+
+- **Varint** is unsigned LEB128 over `u64`: seven payload bits per byte, low group first, high bit set
+  on every byte but the last; at most 10 bytes; the minimal encoding is required, so an overlong form
+  (`0x80 0x00` for zero) is an error, as is a length above `u32::MAX`. Lengths and counts are
+  `u32`-bounded. This is the only varint in the leaf encoding.
+- **Type tags** are `0 bool, 1 i32, 2 u32, 3 i64, 4 text, 5 id, 6 list, 7 map, 8 bytes, 9 f32`.
+  Every value carries its tag, including a list element and a map value, so the encoding is
+  self-describing. Integers are little-endian two's complement at their stated width. `text`, `id` and
+  `bytes` are length-prefixed; `list` and `map` are count-prefixed, and a map's keys are sorted by
+  UTF-8 bytes.
+  `f32` is the only float tag: it is normalised to the shortest round-trip `f32`, `-0.0` becomes
+  `+0.0`, NaN and infinity are rejected, and it is legal **only in a view leaf** — a float in a
+  content leaf is a validation error (DEC-039). There is no `f64` and no implicit numeric coercion.
+- Components are sorted by key, keys are unique, and an absent optional component is omitted rather
+  than encoded as null; the default is not stored (§3.4, DEC-041).
+- The encoding carries explicit lengths and no pointers, so a decoder can validate every length
+  against its remaining input before allocating, which is what makes the hash path fuzzable.
+
+The build report is a versioned text document — `format`, `leaf_count`, `content_root`, `view_root`,
+`archive_hash`, `signer`, `signature` — never machine-endian binary, so it reviews in a diff and a
+third-party tool can verify it with a BLAKE3 implementation alone. `openblock-tools pack hash
+--explain` prints the TLV of a leaf as annotated hex, so a mismatch can be diagnosed without the
+engine.
 
 ## 5. Performance budgets
 
@@ -676,9 +722,14 @@ state enumeration or index build. Neither number replaces the other.
 2. **Golden pack fixtures.** `tests/content/packs/` with `mini/` (one entry per kind), `conflict/`,
    `cycle/`, `hostile/`, each carrying expected canonical bytes, roots and diagnostics. The golden
    file prints the root, so an unintended schema change is a visible diff.
-3. **Hash stability.** The fixtures are hashed on Linux x86_64, Windows x86_64 and macOS aarch64, in
-   debug and release, at 1 and 8 workers, at three directory paths, with filesystem names shuffled;
-   all roots must match (REQ-CONTENT-002, REQ-CONTENT-033).
+3. **Hash stability and golden vectors.** The fixtures are hashed on Linux x86_64, Windows x86_64 and
+   macOS aarch64, in debug and release, at 1 and 8 workers, at three directory paths, with filesystem
+   names shuffled; all roots must match (REQ-CONTENT-002, REQ-CONTENT-033). In addition,
+   `tests/content/golden/hashes.txt` pins the byte-for-byte TLV preimage and the leaf, content and pack
+   hashes for one hand-authored entry per kind, including the edge cases: empty component set,
+   multi-byte varint, non-ASCII key order, an `f32` view value and a rejected content float. Changing
+   the varint, the tag table or the encoding changes these vectors and requires a deliberate
+   `content_format` bump, which is the point.
 4. **Malformed-pack fuzzing.** RON and JSON5 parsers, canonicaliser, archive reader and Merkle
    builder are `cargo-fuzz` targets with depth, size, entry-count, duplicate-name and traversal
    corpora: 1 h per PR, 24 h in the [MS-15](../plan/01-milestones.md) soak, no panic, OOM or hang.
@@ -703,9 +754,10 @@ state enumeration or index build. Neither number replaces the other.
    and documentation, but JSON5 is what datapack authors and JavaScript tooling already write, and
    [06](06-worldgen.md) and [11](11-inventory-crafting-items.md) already contain JSON5 examples.
    Confirm the dual surface, or make JSON5 import-only in `openblock-tools`. Owner: **MS-05**.
-2. **Register item needed: canonical stored form.** This chapter hashes canonical JSON (as
-   [06](06-worldgen.md) §4 assumes): inspectable and tool-friendly, but larger and slower than a
-   compact binary encoding. Decide before the save format freezes. Owner: **MS-05** with MS-13.
+2. **Canonical stored form (settled).** §4.4 defines the one normative encoding: canonical binary TLV
+   with an explicit varint and a single `f32` tag. Canonical RON stays the authoring and diff form;
+   canonical JSON is not hashed. Remaining open: whether `pack fmt` should also emit the TLV as an
+   opt-in debug sidecar for authors. Owner: **MS-05** with MS-13.
 3. **Register item needed: server-pushed content defaults.** May a server push content packs to a
    joining client after a size and licence prompt (recommended), and what is the default cap — 32,
    128 or operator-configured MiB? Owner: **MS-09** with MS-07.
@@ -717,10 +769,10 @@ state enumeration or index build. Neither number replaces the other.
    them. Owner: **MS-05**.
 6. **Replacing `base` entries.** Should `REPLACE` of a `base` entry require an operator lockfile
    entry by default, or is a manifest declaration enough? Owner: **MS-07**.
-7. **`view_hash` mismatch policy.** `pack_hash` binds `view_hash`, so a view-only difference currently
-   blocks the join; should a server be allowed to downgrade that to advisory, given that a mismatched
-   texture pack cannot affect gameplay? A downgrade would need a decision because it changes the
-   handshake comparison. Owner: **MS-06**.
+7. **`view_hash` mismatch policy (settled by DEC-050).** Content hash is strict; a view-only difference
+   is advisory by default and blocks a join only when the server sets `server.strict_view`. What
+   remains open is the client-facing wording of the advisory: a join-screen line, a toast, or both.
+   Owner: **MS-06**.
 8. **Schema ownership at the seam.** [13](13-ui-and-ux.md) §3.2 owns the screen document and
    [09](09-entities-ai.md) §3.8 owns `AiGraphDef`; this chapter owns only the registry wrapper
    (kind, ID, hash class) and the validation order. Confirm that split so the three chapters cannot
@@ -738,7 +790,7 @@ state enumeration or index build. Neither number replaces the other.
   [DEC-032](../decisions.md), [DEC-033](../decisions.md), [DEC-035](../decisions.md),
   [DEC-039](../decisions.md), [DEC-040](../decisions.md), [DEC-041](../decisions.md),
   [DEC-044](../decisions.md), [DEC-045](../decisions.md), [DEC-046](../decisions.md),
-  [DEC-047](../decisions.md).
+  [DEC-047](../decisions.md), [DEC-050](../decisions.md).
 - Chapters: [00](00-conventions.md), [01](01-technical-architecture.md), [02](02-engine-core.md),
   [03](03-rendering.md), [04](04-shaders-and-visuals.md), [05](05-world-model.md),
   [06](06-worldgen.md), [08](08-gameplay-survival.md), [09](09-entities-ai.md),

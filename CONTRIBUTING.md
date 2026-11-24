@@ -16,12 +16,20 @@ makes **design contributions as valuable as code** right now.
 ## Legal and provenance
 
 - By contributing you agree your work is licensed under **MIT OR Apache-2.0**
-  (see [ADR-0008](docs/adr/0008-license-and-provenance.md)).
+  (see [ADR-0008](docs/adr/0008-license-and-provenance.md)). Every commit must
+  carry a `Signed-off-by` trailer certifying the [Developer Certificate of
+  Origin 1.1](DCO); use `git commit -s`. There is no CLA.
 - **Do not copy code from Minecraft, Weft, Luanti, or any other project.**
   Reading code to understand a technique is fine; reproducing it is not.
   Describe the idea in your own words in the PR, then write your own
   implementation.
-- Do not commit Minecraft assets, names, sounds, or textures. Every asset in
+- **Clean-room naming (DEC-053).** Shipped base-pack identifiers use original
+  names: `openblock:underworld` for the nether-like dimension,
+  `openblock:terminus` for the end-like dimension, and original mob names (for
+  example the Blaster). Minecraft-specific proper nouns may appear only in
+  cited research prose; they must not appear in content identifiers, item or
+  mob names, save fields, protocol strings, or base-pack data.
+- Do not commit Minecraft assets, sounds, textures, or names. Every asset in
   the repository must have a recorded license and source.
 - AI-assisted contributions are welcome under the same rules: you are
   responsible for the provenance of what you submit.
@@ -61,7 +69,8 @@ npx markdownlint-cli2 "**/*.md"
 - [ ] Normative documents changed? A `DEC-*` is added or cited.
 - [ ] `cargo fmt`, `cargo clippy -D warnings`, `cargo test` pass.
 - [ ] New links resolve; markdown lint passes.
-- [ ] No copied code, no Minecraft assets, provenance recorded for assets.
+- [ ] Every commit carries a DCO `Signed-off-by` trailer (`git commit -s`).
+- [ ] No copied code, no Minecraft assets or proper nouns, provenance recorded.
 - [ ] Performance-sensitive paths include a benchmark or a budget note.
 
 ## Commit messages
@@ -74,6 +83,32 @@ fix(net): correct interest-set shrink on dimension change
 docs(spec): define redstone update ordering
 chore(ci): cache target dir between jobs
 ```
+
+## Commit sign-off (DCO)
+
+Every commit in a pull request must end with a `Signed-off-by: Name <email>`
+trailer. The trailer is your attestation of the [Developer Certificate of
+Origin 1.1](DCO), whose canonical text is at the repository root. Use your real
+name and an email you can receive at.
+
+```sh
+git commit -s -m "feat(render): add section mesh arena"
+git commit --amend -s              # sign the current commit
+git rebase --signoff origin/main   # sign commits already on your branch
+```
+
+Keep the sign-off on every commit, including fixup commits: the DCO requirement
+covers the whole commit range of the pull request, not just the merge commit. A
+missing trailer is a blocking review defect.
+
+## Continuous integration
+
+CI runs formatting, clippy, tests, docs, the architecture guard
+(`.github/scripts/check-arch.sh`), `cargo deny`, and markdown/link checks. The
+DCO requirement covers the whole commit range of the pull request: **every
+commit must carry a `Signed-off-by` trailer**; a PR with an unsigned commit is
+not merged until the history is amended. Only a human contributor can sign off;
+an AI agent cannot sign on your behalf.
 
 ## Code of conduct
 

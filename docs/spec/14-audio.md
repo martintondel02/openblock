@@ -1,7 +1,7 @@
 # 14 — Audio: Events, Mixing, Music, Ambience and Voice
 
 > Status: normative - Last updated: 2026-11-24
-> Depends on: [DEC-003](../decisions.md), [DEC-019](../decisions.md), [DEC-031](../decisions.md), [DEC-032](../decisions.md), [DEC-040](../decisions.md), [DEC-044](../decisions.md), [conventions](00-conventions.md), [technical architecture](01-technical-architecture.md), [UI, audio and localization research](../research/08-ui-audio-localization.md)
+> Depends on: [DEC-003](../decisions.md), [DEC-019](../decisions.md), [DEC-031](../decisions.md), [DEC-032](../decisions.md), [DEC-040](../decisions.md), [DEC-044](../decisions.md), [DEC-049](../decisions.md), [DEC-050](../decisions.md), [DEC-053](../decisions.md), [conventions](00-conventions.md), [technical architecture](01-technical-architecture.md), [UI, audio and localization research](../research/08-ui-audio-localization.md)
 > Implements: MS-05 (event bus, placeholder bank, volume settings), MS-12 (full mix, music, ambience, occlusion, captions)
 
 ## 1. Purpose and scope
@@ -103,6 +103,11 @@ transform, acoustic probes and local fluid state arrive in a `FrameAudioInput` p
 `Prepare` from the client's own world copy, a presentation read that cannot mutate simulation state
 ([01 §3.7](01-technical-architecture.md#37-determinism-boundaries)). And a client that predicts a sound
 locally suppresses the matching host event for 100 ms by `(sound_id, position cell, tick)`.
+
+There is no client-code path in audio. A mod cannot run on a client ([DEC-049](../decisions.md)), so
+mod-authored sound reaches a player only as a server-side `EffectEvent` that the client's mixer
+resolves against its content bank, exactly like a gameplay event. Nothing in this chapter loads a
+module, and `ob_audio` stays outside the client's mod surface.
 
 ### 3.2 The event model
 
@@ -297,7 +302,7 @@ state.
 | `death`, `credits` | 70 | the local player is `Dead`, or the credits screen is open |
 | `underwater` | 50 | listener eye in a fluid |
 | `cave` | 40 | enclosure ≥ 0.6 and depth below the dimension's surface band |
-| `nether`, `end` | 40 | dimension match |
+| `underworld`, `terminus` | 40 | dimension match (`openblock:underworld`, `openblock:terminus`; [DEC-053](../decisions.md)) |
 | `night`, `day`, `calm` | 20 / 10 | overworld and `day_time` band; `calm` is the fallback when nothing else applies |
 
 Selection runs at 1 Hz on the main thread: score every eligible context, keep the current one unless a
@@ -333,7 +338,9 @@ is a `CaptionRecord`:
 
 Rendering, merge limits, font and scale are owned by [23](23-accessibility-localization.md), and
 captions use the same FTL catalog as visible text, so they are never derived from a filename or an
-English string.
+English string. Caption keys are view content: translating or rewording one moves `view_hash` only,
+never `content_hash`, so a locale difference is advisory at join and does not block a connection
+([DEC-050](../decisions.md)).
 
 ### 3.12 Voice chat (post-1.0, gated)
 
@@ -483,7 +490,8 @@ p95 unless stated, reference machine ([vision §9](../vision.md#9-platforms-and-
 
 - Decisions: [DEC-003](../decisions.md), [DEC-019](../decisions.md), [DEC-031](../decisions.md),
   [DEC-032](../decisions.md), [DEC-035](../decisions.md), [DEC-039](../decisions.md),
-  [DEC-040](../decisions.md), [DEC-044](../decisions.md).
+  [DEC-040](../decisions.md), [DEC-044](../decisions.md), [DEC-049](../decisions.md),
+  [DEC-050](../decisions.md), [DEC-053](../decisions.md).
 - Chapters: [conventions](00-conventions.md), [architecture](01-technical-architecture.md),
   [engine core](02-engine-core.md), [world model](05-world-model.md), [light and weather](07-light-and-weather.md),
   [UI and UX](13-ui-and-ux.md), [content](15-content-system.md), [networking](18-networking-multiplayer.md),

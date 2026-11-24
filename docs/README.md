@@ -9,11 +9,11 @@ disagree, that is a bug in one of them, and the PR must fix it.
 | Document | What it answers |
 | --- | --- |
 | [Vision](vision.md) | What game are we making, for whom, and what is deliberately out of scope? |
-| [Decision register](decisions.md) | The binding technical decisions (`DEC-xxx`), with rationale and reversal cost. |
+| [Decision register](decisions.md) | The binding technical decisions (`DEC-001 … DEC-053`), with rationale and reversal cost. |
 | [Spec conventions](spec/00-conventions.md) | Terminology, coordinate systems, identifiers and how to write a spec chapter. |
 | [Architecture](spec/01-technical-architecture.md) | How the crates, processes and data flows fit together. |
-| [Roadmap](plan/00-roadmap.md) | The path from an empty repo to 1.0, and what each milestone proves. |
-| [Milestones](plan/01-milestones.md) | Concrete, testable exit criteria per milestone. |
+| [Roadmap](plan/00-roadmap.md) | The two-track path from an empty repo to 1.0 Early Access and 2.0, and what each milestone proves. |
+| [Milestones](plan/01-milestones.md) | Concrete, testable exit criteria per milestone (`MS-00 … MS-16`, then `MS-17` for 2.0). |
 
 ## Map of the specification
 
@@ -53,13 +53,14 @@ self-contained once you know the terminology from chapter 00.
 
 | Document | What it answers |
 | --- | --- |
-| [Roadmap](plan/00-roadmap.md) | Narrative arc and release phases |
-| [Milestones](plan/01-milestones.md) | Exit criteria and demos for `MS-00 … MS-14` |
+| [Roadmap](plan/00-roadmap.md) | Narrative arc, release phases and the two-track effort model |
+| [Milestones](plan/01-milestones.md) | Exit criteria and demos for `MS-00 … MS-16` (1.0), `MS-17` (2.0) and the post-1.0 releases |
 | [MVP definition](plan/02-mvp.md) | What "playable" means and what is cut |
 | [Work breakdown](plan/03-work-breakdown.md) | Epics, tasks, dependencies, estimates |
 | [Team and process](plan/04-team-and-process.md) | How work is organised, including AI-assisted development |
 | [Risks](plan/05-risks.md) | Risk register with mitigations and triggers |
 | [Release and operations](plan/06-release-and-operations.md) | Versioning, release cadence, server distribution, support |
+| [Review findings](plan/07-review-findings.md) | The 2026-11-24 review board's findings and the re-baseline they triggered |
 
 ## Research
 
@@ -77,11 +78,12 @@ decisions can be re-evaluated against the evidence that produced them.
 | [Legal and licensing](research/07-legal-licensing-and-ip.md) | Minecraft IP, MPL-2.0 obligations, our license and policy choices |
 | [UI, audio, localization](research/08-ui-audio-localization.md) | Text, widgets, audio engines, i18n and accessibility stacks |
 | [Persistence and packaging](research/09-persistence-assets-packaging.md) | Save formats, asset pipeline, builds and updates |
+| [Custom content and differentiation](research/10-custom-content-and-differentiation.md) | What OpenBlock adds beyond parity, and the flagship-content risks |
 
 ## Architecture decision records
 
-Short, immutable records of decisions with consequences. The [decision
-register](decisions.md) holds the current state; ADRs hold the story.
+Eight immutable records of decisions with consequences (ADR-0001 … ADR-0008). The
+[decision register](decisions.md) holds the current state; ADRs hold the story.
 
 - [ADR-0001 — Record architecture decisions](adr/0001-record-architecture-decisions.md)
 - [ADR-0002 — Rust and a purpose-built engine](adr/0002-rust-and-purpose-built-engine.md)

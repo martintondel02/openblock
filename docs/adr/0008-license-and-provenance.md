@@ -1,6 +1,6 @@
 # ADR-0008 — MIT OR Apache-2.0, no Minecraft or Weft code
 
-> Status: accepted · Date: 2026-11-24 · Decision: DEC-009
+> Status: accepted · Date: 2026-11-24 · Decision: DEC-009, DEC-053
 
 ## Context
 
@@ -26,20 +26,30 @@ clearly that it is not legal advice).
 2. **Assets: CC BY 4.0** for original art/audio, **CC0 1.0** for placeholders,
    **OFL 1.1** for fonts. Every asset must have a recorded license and source,
    enforced by a check in CI.
-3. **DCO 1.1, inbound = outbound.** No CLA initially.
+3. **DCO 1.1, inbound = outbound.** No CLA initially. The canonical text is
+   [DCO](../../DCO); every commit must carry a `Signed-off-by` trailer.
 4. **Clean-room provenance policy:**
    - No Minecraft code, assets, sounds, fonts, names or data tables are copied,
-     decompiled or transcribed.
+     decompiled or transcribed, and none is used as a shipped identifier.
    - Weft is read for concepts and measured numbers only. No Weft file, comment
      or data table is copied; any copied file would remain MPL-2.0 and could not
      be relicensed.
    - Implementations are written from behavioural descriptions and independent
      design, and PRs describe techniques in our own words.
+   - Shipped base-pack identifiers use original names: `openblock:underworld`
+     for the nether-like dimension, `openblock:terminus` for the end-like
+     dimension, and original mob names (for example the Blaster). Minecraft
+     proper nouns (dimension and mob names) appear only in cited research prose;
+     they are not content IDs, save fields, protocol strings or base-pack data
+     (DEC-053).
 5. **Trademark policy:** "OpenBlock" is a working name; a clearance search is a
    launch gate (DEC-037). The logo is copyright-reserved. No Mojang marks are
    used; the README carries a clear non-affiliation disclaimer.
 6. **Dependency policy:** `cargo-deny` allows permissive licenses plus MPL-2.0
    dependencies with notices; GPL/AGPL/SSPL/BUSL/Commons-Clause are denied.
+   CDLA-Permissive-2.0 is not a global allow: add a package-scoped
+   `[[licenses.exceptions]]` only when a required dependency needs it, and ship
+   the CDLA text (currently only `webpki-roots` via an iroh stack would).
    Binary-only SDKs (FSR/XeSS/DLSS) are never vendored (DEC-016).
 
 ## Consequences
@@ -50,8 +60,16 @@ clearly that it is not legal advice).
   Minecraft's; this also makes the game legally defensible and artistically ours.
 - We must maintain provenance hygiene continuously (PR checklist, asset
   manifests, dependency audits, ADR/decision citations), not as a one-off.
+- Every commit carries the DCO `Signed-off-by` trailer; the canonical text is
+  [DCO](../../DCO), and a missing trailer is a review defect. The DCO certifies
+  provenance, not ownership or a relicensing right.
+- Base-pack naming is a provenance gate, not a style preference. Shipped
+  identifiers use `openblock:underworld`, `openblock:terminus` and original mob
+  names; Minecraft proper nouns stay in cited research prose, and a pack that
+  ships one is rejected in asset review (DEC-053).
 - MPL-2.0 dependencies must have notices and source offers; `cargo-about` output
-  ships with the binary.
+  ships with the binary. `REUSE.toml` covers the repository files and
+  `cargo-deny` is the dependency gate; the two must agree with this ADR.
 - The name may change before 1.0 if clearance fails; the mod namespace and repo
   URL would migrate with documented redirects.
 
@@ -70,4 +88,4 @@ clearly that it is not legal advice).
 
 - [Legal and licensing research](../research/07-legal-licensing-and-ip.md)
 - [LICENSE-MIT](../../LICENSE-MIT), [LICENSE-APACHE](../../LICENSE-APACHE)
-- [CONTRIBUTING](../../CONTRIBUTING.md), [SECURITY](../../SECURITY.md)
+- [DCO](../../DCO), [CONTRIBUTING](../../CONTRIBUTING.md), [SECURITY](../../SECURITY.md)

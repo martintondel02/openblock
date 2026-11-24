@@ -342,7 +342,7 @@ The counterargument is real: a new player in 2026 sees 26.3, not 1.21.11, and 26
 Do not report one "percent complete". Report two:
 
 - **In-scope coverage:** fraction of manifest entries in Tiers 0-2 passing behavior tests. Target 100% for a v1.0 claim.
-- **Vanilla coverage:** weighted fraction of the full 1.21.11 manifest, including deliberately cut Tier 3/4 items. Target 85-90% at v1.0; never claim 100%.
+- **Vanilla coverage:** weighted fraction of the full 1.21.11 manifest, including deliberately cut Tier 3/4 items. Superseded by DEC-051: 1.0 gates Tier-1 parity; the ≥85% hand-authored coverage floor applies to the 2.0 Tier-2 claim. Never claim 100% and never generate the checklist from Minecraft registry dumps.
 
 Suggested weights: world/blocks 20%, survival 15%, crafting/items 15%, mobs/combat 15%, worldgen/biomes/structures 15%, dimensions/progression 10%, redstone 5%, meta 5%. The weights are a product decision, not a measurement; publish them so the number cannot be gamed.
 

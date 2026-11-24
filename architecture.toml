@@ -1,28 +1,151 @@
-# Layer and dependency rules for the OpenBlock workspace (DEC-003).
-# Enforced by `xtask arch` and the "Architecture guard" CI job.
-# Every workspace crate must appear in exactly one layer. A crate may only
-# depend on crates in the same layer or a layer listed in `may_depend_on`.
+# Single source of truth for the OpenBlock crate graph (DEC-003).
+# Read by .github/scripts/check-arch.sh; normative prose in docs/spec/01 §3.2/§4.1.
+#
+# Every workspace crate appears exactly once in [[crates]]. `allowed_deps` is
+# the complete list of internal crates that crate may depend on (directly,
+# normal or build dependencies). Layers are descriptive: they do not grant
+# edges.
+#
+# `gpu_free = true` puts a crate's transitive normal/build closure under
+# `[forbidden_patterns].gpu_free`; any match is a build-breaking defect. The
+# dedicated server is in this set, so it cannot link presentation or a GPU,
+# window or audio stack.
 
-version = 1
+version = 2
 
-[layers]
+[forbidden_patterns]
+gpu_free = [
+  "^wgpu($|-)",
+  "^naga($|-)",
+  "^ash($|-)",
+  "^raw-window-handle$",
+  "^winit($|-)",
+  "^cpal($|-)",
+  "^kira$",
+  "^gilrs$",
+  "^rodio$",
+  "^symphonia($|-)",
+  "^ob_render$",
+  "^ob_ui$",
+  "^ob_audio$",
+  "^ob_client$",
+]
+
 # Foundation: no GPU, window, audio or network dependencies.
-foundation = ["ob_core", "ob_math"]
-# Simulation/data: must run headless (no wgpu/winit/cpal/ash).
-data = ["ob_world", "ob_worldgen", "ob_content", "ob_sim", "ob_protocol", "ob_net", "ob_modding"]
+[[crates]]
+name = "ob_math"
+layer = "foundation"
+gpu_free = true
+allowed_deps = []
+
+[[crates]]
+name = "ob_core"
+layer = "foundation"
+gpu_free = true
+allowed_deps = ["ob_math"]
+
+# Data and simulation: must run headless.
+[[crates]]
+name = "ob_content"
+layer = "data"
+gpu_free = true
+allowed_deps = ["ob_math", "ob_core"]
+
+[[crates]]
+name = "ob_world"
+layer = "data"
+gpu_free = true
+allowed_deps = ["ob_math", "ob_core", "ob_content"]
+
+[[crates]]
+name = "ob_worldgen"
+layer = "data"
+gpu_free = true
+allowed_deps = ["ob_math", "ob_core", "ob_content", "ob_world"]
+
+[[crates]]
+name = "ob_sim"
+layer = "data"
+gpu_free = true
+allowed_deps = ["ob_math", "ob_core", "ob_content", "ob_world"]
+
+[[crates]]
+name = "ob_protocol"
+layer = "data"
+gpu_free = true
+allowed_deps = ["ob_math", "ob_core", "ob_content", "ob_world"]
+
+[[crates]]
+name = "ob_net"
+layer = "data"
+gpu_free = true
+allowed_deps = [
+  "ob_math", "ob_core", "ob_content", "ob_world", "ob_protocol", "ob_sim",
+]
+
+[[crates]]
+name = "ob_modding"
+layer = "data"
+gpu_free = true
+allowed_deps = ["ob_math", "ob_core", "ob_content", "ob_sim"]
+
 # Presentation: client-side only.
-presentation = ["ob_render", "ob_ui", "ob_audio"]
-# Binaries and tooling.
-binaries = ["ob_client", "ob_server", "ob_tools", "xtask"]
+[[crates]]
+name = "ob_render"
+layer = "presentation"
+gpu_free = false
+allowed_deps = ["ob_math", "ob_core", "ob_content", "ob_world"]
 
-[allowed_edges]
-foundation = []
-data = ["foundation"]
-presentation = ["foundation", "data"]
-binaries = ["foundation", "data", "presentation"]
+[[crates]]
+name = "ob_ui"
+layer = "presentation"
+gpu_free = false
+allowed_deps = ["ob_math", "ob_core", "ob_content", "ob_render"]
 
-[forbidden_dependencies]
-# Crates whose presence in a headless crate is a build-breaking bug.
-headless_forbidden = ["wgpu", "winit", "ash", "ash-window", "cpal", "kira", "gilrs", "raw-window-handle"]
-# Headless crates are everything in `foundation` and `data`.
-headless_crates = ["ob_core", "ob_math", "ob_world", "ob_worldgen", "ob_content", "ob_sim", "ob_protocol", "ob_net", "ob_modding"]
+[[crates]]
+name = "ob_audio"
+layer = "presentation"
+gpu_free = false
+allowed_deps = ["ob_math", "ob_core", "ob_content"]
+
+# Hosts and binaries.
+[[crates]]
+name = "ob_server"
+layer = "hosts"
+gpu_free = true
+allowed_deps = [
+  "ob_math", "ob_core", "ob_world", "ob_worldgen", "ob_content", "ob_sim",
+  "ob_net", "ob_protocol", "ob_modding",
+]
+
+[[crates]]
+name = "ob_client"
+layer = "hosts"
+gpu_free = false
+allowed_deps = [
+  "ob_math", "ob_core", "ob_world", "ob_worldgen", "ob_content", "ob_sim",
+  "ob_net", "ob_protocol", "ob_modding", "ob_server", "ob_render", "ob_ui",
+  "ob_audio",
+]
+
+# Tooling. The CLI is headless by default; the optional thumbnail preview is
+# the only presentation edge allowed here, and it is outside the 1.0 gate.
+[[crates]]
+name = "ob_tools"
+layer = "tooling"
+gpu_free = false
+allowed_deps = [
+  "ob_math", "ob_core", "ob_content", "ob_world", "ob_worldgen",
+  "ob_protocol", "ob_render", "ob_ui",
+]
+
+# Developer-only; never shipped. May depend on any workspace crate.
+[[crates]]
+name = "xtask"
+layer = "tooling"
+gpu_free = false
+allowed_deps = [
+  "ob_math", "ob_core", "ob_content", "ob_world", "ob_worldgen", "ob_sim",
+  "ob_protocol", "ob_net", "ob_modding", "ob_render", "ob_ui", "ob_audio",
+  "ob_server", "ob_client", "ob_tools",
+]

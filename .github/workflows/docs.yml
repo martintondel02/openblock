@@ -3,18 +3,16 @@ name: Docs
 on:
   push:
     branches: [main]
-    paths: ["docs/**", "README.md", "CONTRIBUTING.md", ".github/workflows/docs.yml"]
+    paths: ["docs/**", "README.md", "CONTRIBUTING.md", ".github/workflows/docs.yml", ".github/scripts/**"]
   pull_request:
-    paths: ["docs/**", "README.md", "CONTRIBUTING.md"]
+    paths: ["docs/**", "README.md", "CONTRIBUTING.md", ".github/scripts/**"]
   workflow_dispatch:
 
 jobs:
-  links:
-    name: Link check
+  consistency:
+    name: Documentation consistency
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: lycheeverse/lychee-action@v2
-        with:
-          args: --no-progress --include-fragments "docs/**/*.md" "README.md" "CONTRIBUTING.md"
-          fail: true
+      - name: Links, chapter structure, requirement ids, decision citations
+        run: python3 .github/scripts/check-docs.py

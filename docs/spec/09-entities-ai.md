@@ -44,7 +44,7 @@ Four rules frame the design. **The host decides.** Entity state is written only 
 | REQ-ENTITY-026 | Entity definitions are validated at freeze; hot reload applies between ticks, existing entities keep a compatible definition, and entities whose definition disappeared are removed with a logged reason and no drops. | Reload test + negative fixtures |
 | REQ-ENTITY-027 | Mod spawn requests, queries and component writes pass the same validation, capability checks and per-mod quotas as engine calls; a mod cannot write components directly. | Malicious-mod corpus |
 | REQ-ENTITY-028 | Clients never send entity position, health, target, AI state or loot claims; server-side validation rejects them as protocol errors. | Protocol fuzz + inspection |
-| REQ-ENTITY-029 | Every base entity type has a parity-manifest row; the Tier-2 set (157 entity types, 89 mobs at the pinned baseline) is classified and tested or documented as a divergence. | Generated manifest diff (MS-14) |
+| REQ-ENTITY-029 | Every base entity type has a parity-manifest row; the Tier-2 set (157 entity types, 89 mobs at the pinned baseline) is classified and tested or documented as a divergence. | Hand-authored parity checklist (MS-14) |
 | REQ-ENTITY-030 | `/debug entities` and metrics expose counts by category and state, sleeping count, AI tier histogram, path queue depth, spawn failures by reason and per-entity AI cost; resource limits are typed errors, never panics. | Overlay, metrics and limit-injection tests |
 | REQ-ENTITY-031 | The state hash covers entities sorted by `spawn_seq`, with quantised transform, health, AI node, target key, effect map, seats and UUID when assigned; two runs and a reload continue identically. | Determinism harness ([02](02-engine-core.md)) |
 
@@ -202,7 +202,7 @@ pub trait EntityMotion {
 }
 ```
 
-The AI converts a goal direction into local forward/strafe using the entity yaw and sets jump, climb or glide per goal. Physics owns acceleration, friction, buoyancy, step-up and fall distance; a mob's speed is its `MovementDef.speed` applied by physics, not a distance added by AI, and a jump is a request physics may refuse. Teleports exist for commands, portals, taming and ender-like content; they check a loaded, collision-free destination and otherwise return `NoSpace` without touching the entity. No goal teleports by default; `teleport_when_stuck` is opt-in content and still validated by the host.
+The AI converts a goal direction into local forward/strafe using the entity yaw and sets jump, climb or glide per goal. Physics owns acceleration, friction, buoyancy, step-up and fall distance; a mob's speed is its `MovementDef.speed` applied by physics, not a distance added by AI, and a jump is a request physics may refuse. Teleports exist for commands, portals, taming and content-defined teleport effects; they check a loaded, collision-free destination and otherwise return `NoSpace` without touching the entity. No goal teleports by default; `teleport_when_stuck` is opt-in content and still validated by the host.
 
 ### 3.7 Pathfinding and navigation
 
@@ -358,7 +358,7 @@ A name is a typed `custom_name` component: a Fluent key plus arguments for local
 | spawn and despawn | reliable ordered stream | 18 |
 | UUID | never on the tick path; save and admin tooling only | [17](17-persistence.md) |
 
-An entity is replicated when its chunk is in the client's interest set and it is within `tracking_range` (16–512 m) plus one chunk of hysteresis; deltas are ordered by descending priority and ascending NetId ([18 §3.4](18-networking-multiplayer.md)). Priority bands are 0 boss, 1 entity targeting the client, 2 moving mob within 32 m, 3 other mobs, 4 projectiles and items, 5 ambient and display. The entity budget is **1,024 bytes per tick per client** (20 KB/s at 20 Hz); bands 4–5 defer when it is exhausted, and the spawn/despawn stream is never deferred behind deltas. An entity with zero velocity, no state change and no player within 32 m sends a keepalive every 20 ticks; at most 30% of 200 visible entities move on a typical tick, giving 60 × 15 B + 7 × 3 B ≈ 921 B/tick in the MS-11 benchmark. Interpolation and correction are [18](18-networking-multiplayer.md); hidden effects and other players' exact health are never sent.
+An entity is replicated when its chunk is in the client's interest set and it is within `tracking_range` (16–512 m) plus one chunk of hysteresis; deltas are ordered by descending priority and ascending NetId ([18 §3.4](18-networking-multiplayer.md)). Priority bands are 0 boss, 1 entity targeting the client, 2 moving mob within 32 m, 3 other mobs, 4 projectiles and items, 5 ambient and display. The entity budget is **1,000 bytes per tick per client** (20.0 KB/s at 20 Hz); bands 4–5 defer when it is exhausted, and the spawn/despawn stream is never deferred behind deltas. An entity with zero velocity, no state change and no player within 32 m sends a keepalive every 20 ticks; at most 30% of 200 visible entities move on a typical tick, giving 60 × 15 B + 7 × 3 B ≈ 921 B/tick in the MS-11 benchmark. Interpolation and correction are [18](18-networking-multiplayer.md); hidden effects and other players' exact health are never sent.
 
 ## 4. Data structures and formats
 
@@ -476,7 +476,7 @@ Measured on the reference machine at 20 Hz (50 ms tick), p99 unless stated; thes
 | Replication | 200 visible, 30% moving, ≤ 20 KB/s; loss/reorder convergence; reliable spawn/despawn | `ob_net` simulator ([MS-06](../plan/01-milestones.md)) |
 | Persistence | 2,000 entities round-trip; 1,000 ticks after reload match a no-reload run | fixture save + hash |
 | Stress and fuzz | 500 mobs ≤ 10 ms; 4,000 entities activation; random spawn/despawn/transfer/damage/effect sequences: no panic, no duplicate UUID, no entity in two chunks | benches, `cargo-fuzz`, 24 h nightly |
-| Parity and abuse | every base entity has a manifest row; fake hits, entity-state messages and spawn floods rejected | generated diff (MS-14), cheater corpus (MS-15) |
+| Parity and abuse | every base entity has a manifest row; fake hits, entity-state messages and spawn floods rejected | parity checklist (MS-14), cheater corpus (MS-15) |
 
 The AI fixture is the central artefact: fixed seed, 10 mobs, a scripted player path and 2,000 ticks. It fails on any change in position, health, target or AI node, which makes an "innocent" goal-order change visible in review. The path corpus is generated once and checked in, so optimality and tie-break changes are caught without running a search at test time.
 

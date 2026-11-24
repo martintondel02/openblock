@@ -100,6 +100,9 @@ def check_ids(files: list[Path]) -> None:
                 definition_sites[m.group(1)].add(rel(f))
 
     for rid, sites in sorted(definition_sites.items()):
+        # Chapter 21 deliberately reproduces the ch25 PERF-TOOL rows as an index.
+        if rid.startswith("PERF-TOOL-") and "docs/spec/21-tooling-and-pipelines.md" in sites:
+            continue
         if len(sites) > 1:
             warnings.append(f"{rid} is defined in multiple documents: {', '.join(sorted(sites))}")
 

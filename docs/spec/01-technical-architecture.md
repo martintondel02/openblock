@@ -1,7 +1,7 @@
 # 01 — Technical Architecture
 
 > Status: normative - Last updated: 2026-11-24
-> Depends on: [DEC-002](../decisions.md), [DEC-003](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-020](../decisions.md), [DEC-024](../decisions.md), [DEC-028](../decisions.md), [DEC-042](../decisions.md), [conventions](00-conventions.md)
+> Depends on: [DEC-002](../decisions.md), [DEC-003](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-020](../decisions.md), [DEC-024](../decisions.md), [DEC-028](../decisions.md), [DEC-042](../decisions.md), [DEC-049](../decisions.md), [DEC-052](../decisions.md), [conventions](00-conventions.md)
 > Implements: MS-00, MS-02, MS-03
 
 ## 1. Purpose and scope
@@ -19,7 +19,7 @@ request, and needs a `DEC-*` if it touches [DEC-003](../decisions.md).
 
 | ID | Requirement | Verified by |
 | --- | --- | --- |
-| REQ-ARCH-001 | The workspace MUST contain exactly the crates in §3.2 and internal dependencies MUST be a subset of the declared edge list. | `cargo xtask check-arch` |
+| REQ-ARCH-001 | The workspace MUST contain exactly the crates declared in `architecture.toml`, and every shipped (normal or build) internal dependency MUST appear in that crate's `allowed_deps`. | `.github/scripts/check-arch.sh` |
 | REQ-ARCH-002 | The transitive closure of `ob_server` MUST NOT contain `wgpu`, `wgpu-*`, `winit`, `ash`, `cpal`, `naga`, `ob_render`, `ob_ui`, `ob_audio` or `ob_client`, on every supported target and with `--all-features`. | CI `arch-guard` |
 | REQ-ARCH-003 | The client, integrated host and dedicated server MUST run the same `ob_sim` tick; a scripted 600-tick session MUST produce an identical state hash in all three. | `tests/session_parity.rs` |
 | REQ-ARCH-004 | The integrated host MUST be `ob_server::Host`, differing only in transport construction, authentication and process supervision; a single-player branch in the host is forbidden. | review, `HostConfig` test |
@@ -50,8 +50,8 @@ There are four processes, and "single-player" is not one of them.
 
 | Process | Binary | Direct internal links | GPU/audio | Role |
 | --- | --- | --- | --- | --- |
-| Client | `openblock` | `ob_client`, `ob_render`, `ob_ui`, `ob_audio`, `ob_net`, `ob_sim`, `ob_server`, `ob_content`, `ob_world`, `ob_protocol`, `ob_core`, `ob_math` | yes | window, input, presentation, prediction, local hosting |
-| Dedicated server | `openblock-server` | `ob_server`, `ob_net`, `ob_sim`, `ob_worldgen`, `ob_content`, `ob_modding`, `ob_world`, `ob_protocol`, `ob_core`, `ob_math` | none | authority, replication, persistence, administration |
+| Client | `openblock` | `ob_client`, `ob_render`, `ob_ui`, `ob_audio`, `ob_net`, `ob_sim`, `ob_server`, `ob_content`, `ob_world`, `ob_worldgen`, `ob_protocol`, `ob_modding`, `ob_core`, `ob_math` | yes | window, input, presentation, prediction, local hosting |
+| Dedicated server | `openblock-server` | `ob_server`, `ob_net`, `ob_sim`, `ob_worldgen`, `ob_content`, `ob_modding`, `ob_world`, `ob_protocol`, `ob_core`, `ob_math` | none | authority, terrain generation, replication, persistence, administration |
 | Tools | `openblock-tools` | `ob_tools`, `ob_content`, `ob_world`, `ob_worldgen`, `ob_protocol`, `ob_core`, `ob_math` | none by default | pack and asset compilation, validation, world inspection, schema generation |
 | Developer tasks | `xtask` | whole workspace, dev-dependencies allowed | none | CI, benchmarks, architecture checks, replay harnesses |
 
@@ -65,10 +65,15 @@ host, but MUST NOT link presentation crates except behind a non-default thumbnai
 directory is owned by at most one host: `world.lock` is exclusive for hosts and shared for
 read-only tools, and a second host fails with the holder's PID.
 
+The dedicated server links `ob_worldgen` through `ob_server::Host`: a server that cannot generate
+terrain cannot create or extend a world. The client lists the same generator because the integrated
+host is linked into the client binary; client gameplay code MUST NOT call the generator directly
+([DEC-008](../decisions.md)).
+
 ### 3.2 Crate topology
 
-Arrows point from dependent to dependency; base edges to `ob_math` and `ob_core` are omitted
-(every crate may use `ob_math`; every crate except `ob_math` may use `ob_core`).
+Arrows point from dependent to dependency; the diagram omits the `ob_math` and `ob_core` base edges
+for readability, while the table below lists them explicitly.
 
 ```mermaid
 graph LR
@@ -86,35 +91,51 @@ graph LR
   server["ob_server lib"] --> sim
   server --> net
   server --> modding
+  server --> worldgen
   client["ob_client"] --> server
   client --> render
   client --> ui
   client --> audio
+  client --> modding
+  client --> worldgen
   tools["ob_tools"] --> worldgen
   tools --> proto
 ```
 
-Layers are L0 `ob_math`; L1 `ob_core` (lifecycle, scheduling, config, diagnostics, platform) and
-`ob_content` (registries, data definitions); L2 `ob_world`; L3 `ob_sim`, `ob_worldgen`,
-`ob_protocol`; L4 `ob_net`, `ob_modding`, `ob_render`; L5 `ob_ui`, `ob_audio`; L6 hosts. `xtask`
-is developer-only and depends on anything.
+`architecture.toml` groups crates into five descriptive layers: `foundation`
+(`ob_math`, `ob_core`), `data` (`ob_content`, `ob_world`, `ob_worldgen`, `ob_sim`, `ob_protocol`,
+`ob_net`, `ob_modding`), `presentation` (`ob_render`, `ob_ui`, `ob_audio`), `hosts` (`ob_server`,
+`ob_client`) and `tooling` (`ob_tools`, `xtask`). `gpu_free = true` is the enforced headless set:
+every foundation and data crate plus `ob_server`. `ob_tools` is headless by default but may gain an
+optional thumbnail preview, so it is outside the enforced set; `xtask` is developer-only. Layers do
+not grant edges: the per-crate `allowed_deps` list is the complete list, and a dependency not in it
+is forbidden by omission.
 
-| From | Allowed internal edges, excluding the two base edges |
-| --- | --- |
-| `ob_content` | `ob_math` |
-| `ob_world`; `ob_worldgen`, `ob_sim`, `ob_protocol` | `ob_content`, `ob_math`; `ob_world`, `ob_content` |
-| `ob_net` | `ob_protocol`, `ob_sim` |
-| `ob_modding` | `ob_content`, `ob_sim` |
-| `ob_render` | `ob_world`, `ob_content` |
-| `ob_ui`; `ob_audio` | `ob_render`, `ob_content`; `ob_content` |
-| `ob_server` | `ob_sim`, `ob_net`, `ob_modding` |
-| `ob_client` | `ob_server`, `ob_render`, `ob_ui`, `ob_audio`, `ob_net`, `ob_sim` |
-| `ob_tools`; `xtask` | `ob_worldgen`, `ob_protocol`, `ob_content`; any, dev only, never shipped |
+| Crate | Layer | `gpu_free` | Allowed internal dependencies |
+| --- | --- | --- | --- |
+| `ob_math` | foundation | yes | none |
+| `ob_core` | foundation | yes | `ob_math` |
+| `ob_content` | data | yes | `ob_math`, `ob_core` |
+| `ob_world` | data | yes | `ob_math`, `ob_core`, `ob_content` |
+| `ob_worldgen` | data | yes | `ob_math`, `ob_core`, `ob_content`, `ob_world` |
+| `ob_sim` | data | yes | `ob_math`, `ob_core`, `ob_content`, `ob_world` |
+| `ob_protocol` | data | yes | `ob_math`, `ob_core`, `ob_content`, `ob_world` |
+| `ob_net` | data | yes | `ob_math`, `ob_core`, `ob_content`, `ob_world`, `ob_protocol`, `ob_sim` |
+| `ob_modding` | data | yes | `ob_math`, `ob_core`, `ob_content`, `ob_sim` |
+| `ob_render` | presentation | no | `ob_math`, `ob_core`, `ob_content`, `ob_world` |
+| `ob_ui` | presentation | no | `ob_math`, `ob_core`, `ob_content`, `ob_render` |
+| `ob_audio` | presentation | no | `ob_math`, `ob_core`, `ob_content` |
+| `ob_server` | hosts | yes | `ob_math`, `ob_core`, `ob_world`, `ob_worldgen`, `ob_content`, `ob_sim`, `ob_net`, `ob_protocol`, `ob_modding` |
+| `ob_client` | hosts | no | `ob_math`, `ob_core`, `ob_world`, `ob_worldgen`, `ob_content`, `ob_sim`, `ob_net`, `ob_protocol`, `ob_modding`, `ob_server`, `ob_render`, `ob_ui`, `ob_audio` |
+| `ob_tools` | tooling | no | `ob_math`, `ob_core`, `ob_content`, `ob_world`, `ob_worldgen`, `ob_protocol`, `ob_render`, `ob_ui` |
+| `xtask` | tooling | no | all other workspace crates; developer-only, never shipped |
+
+Edges not listed in `allowed_deps` are forbidden by omission. The table below records the rules
+that are tempting or security-sensitive; it is not a second allow-list.
 
 | Forbidden | Reason |
 | --- | --- |
 | `ob_server` to `ob_render`, `ob_ui`, `ob_audio`, `ob_client` | the headless server must not link presentation ([DEC-003](../decisions.md), [DEC-028](../decisions.md)) |
-| `ob_client` to `ob_worldgen` | gameplay generation is rejected ([DEC-008](../decisions.md)); a future visual-only LOD generator lives in `ob_render` or needs a new decision ([DEC-018](../decisions.md)) |
 | `ob_render` to `ob_sim`, `ob_net` | the renderer consumes plain extract data, never game or wire types |
 | `ob_ui` to `ob_sim`, `ob_net`, `ob_client`; `ob_audio` to `ob_render`, `ob_sim` | UI emits intents; audio must not need a GPU or game state |
 | `ob_world` to `ob_protocol`, `ob_net`, `ob_render` | storage stays transport- and GPU-agnostic |
@@ -122,12 +143,21 @@ is developer-only and depends on anything.
 | `ob_sim` to `ob_net`, `ob_modding`, presentation | dependency inversion: the simulation declares traits, implementations depend on it |
 | `ob_worldgen` to `ob_sim`; `ob_modding` to `ob_net`, `ob_render`, `ob_client` | generation is a pure function; mods reach the network only through host capabilities |
 
-`arch-guard` resolves `cargo metadata` for Linux, Windows and macOS targets, with default features
-and `--all-features`, counting target-specific dependencies in the union so a Windows-only `winit`
-edge cannot hide behind a Linux runner. `check-arch` compares resolved edges with
-`architecture.toml` (§4.1): an undeclared edge fails, an unused declaration warns and fails after
-one release cycle. The `ob_server` closure is walked against the deny list, and a container image
-inspection checks for X11, Wayland, ALSA and PulseAudio.
+`ob_client` lists `ob_worldgen` because the integrated host is linked into the client binary; client
+gameplay code MUST NOT call the generator directly, and a visual-only LOD generator stays in
+`ob_render` or needs a new decision ([DEC-008](../decisions.md), [DEC-018](../decisions.md)).
+`ob_client` also lists `ob_modding` so the integrated host can run server-installed mods; the 1.0
+client presentation tier executes no mod code ([DEC-049](../decisions.md)).
+
+`check-arch.sh` parses `architecture.toml` with Python's `tomllib` and resolves `cargo metadata`
+with `--all-features` for Linux, Windows and macOS, taking the union so a platform-only GPU edge
+cannot hide behind a Linux runner. It verifies: (a) every workspace crate appears exactly once;
+(b) each crate's resolved normal/build dependencies are in its `allowed_deps` (dev-dependencies are
+outside the shipped graph); (c) no `gpu_free` crate reaches a package matching
+`[forbidden_patterns].gpu_free`; and (d) `ob_server` reaches no presentation crate. An undeclared
+edge fails; an allowed edge that is not used yet is permitted because crates gain dependencies
+incrementally. Container image inspection remains a separate deployment check for X11, Wayland,
+ALSA and PulseAudio.
 
 ### 3.3 Threading model
 
@@ -283,8 +313,15 @@ order, which would make replays and replication unsound ([DEC-020](../decisions.
 | `WindowPlugin`, `InputPlugin`, `RenderPlugin`, `UiPlugin`, `AudioPlugin` | yes | no | window, input, device thread, retained UI, mixer |
 | `ContentPlugin`, `WorldPlugin`, `SimPlugin` | yes | yes | packs, world store, tick pipeline |
 | `WorldgenPlugin`, `HostPlugin` | hosting only | yes | generation, `ob_server::Host` |
-| `NetPlugin`, `ModdingPlugin` | yes, mods behind a feature | yes | transport role, WASM host |
+| `NetPlugin`, `ModdingPlugin` | yes, host side only | yes | transport role; host-side WASM host; 1.0 clients execute no mod code ([DEC-049](../decisions.md)) |
 | `ToolsPlugin` | no | no | `openblock-tools` entry points |
+
+Client-side mod code is not part of 1.0 ([DEC-049](../decisions.md)). The client presentation tier
+links no WASM runtime or native plugin loader; a mod may describe a screen and receive
+server-computed data through the host UI binding, but the client executes only engine UI code and
+validated pack data. In single-player the integrated host still runs server-installed mods in its
+host role. A client code tier is post-1.0 and needs a new decision with a determinism and anti-cheat
+review; `OPEN-006` is closed.
 
 A plugin's lifecycle is `register`, `ready`, `start`, `stop`, `shutdown`. `register` is declarative
 and may not touch services or the filesystem; `ready` resolves handles once every service exists;
@@ -354,6 +391,11 @@ enforced rather than documented.
 | Meshing; replication | deterministic per input; payload deterministic, timing not | mesh digests; convergence test |
 | UI, audio, particles, camera | free to vary | none, by design |
 
+`gpu_free` in §4.1 is a link-time and deployment boundary, not a determinism claim. A crate can be
+GPU-free and still contain non-deterministic code (I/O, diagnostics), and a deterministic algorithm
+can have a GPU implementation used only for presentation. The table above is the only authority for
+what enters the state hash.
+
 Simulation code MUST NOT read wall-clock time, thread identity, addresses, uninitialised memory or
 hash-map iteration order; the tick count is the only clock. Parallelism inside a tick is allowed
 only with an order-independent reduction or a defined gather order, owned by
@@ -383,8 +425,8 @@ is mandatory and is copied into the PR description:
 
 1. Decide authority: simulation-visible state belongs in `ob_sim`, must be deterministic and must
    appear in the state hash.
-2. Add or update crate edges in `architecture.toml`; `arch-guard` must stay green with
-   `--all-features`.
+2. Add or update crate edges in `architecture.toml`; run `.github/scripts/check-arch.sh` locally and
+   keep `arch-guard` green with `--all-features`.
 3. Define cross-thread data (owner, type, cadence, capacity, overflow) in the §4.2 table, and the
    service, if any: owner thread, lifecycle, restart policy, degraded behaviour.
 4. Define systems (stage, access set, ordering edges, parallelism) through a plugin, and workers
@@ -399,23 +441,67 @@ is mandatory and is copied into the PR description:
 
 ### 4.1 Crate edge manifest
 
-`architecture.toml` is the machine-readable form of §3.2: one `[[edge]]` entry per allowed internal
-dependency with a `why`, one `[[forbidden]]` entry per rule, and a `[deny.packages]` list walked
-over the closure of each `gpu_free` crate. The checker reads `cargo metadata`, so manifest and real
-graph cannot drift.
+`architecture.toml` is the single machine-readable source for the crate graph and the headless
+boundary. It has two parts:
+
+- `[[crates]]` entries, one per workspace crate, with `name`, `layer`
+  (`foundation`, `data`, `presentation`, `hosts` or `tooling`), `gpu_free` and
+  `allowed_deps`. `allowed_deps` is the complete list of internal crates that
+  crate may depend on directly, including the `ob_math`/`ob_core` base edges.
+- `[forbidden_patterns].gpu_free`, a list of regular expressions matched against every package in
+  the transitive normal/build closure of a `gpu_free` crate.
+
+Layer names are descriptive and grant no permission. `gpu_free = true` marks a crate that must build
+and run without a GPU, window or audio stack, and puts its closure under the forbidden patterns.
+Every workspace crate appears exactly once; a missing or duplicate `[[crates]]` entry, a name that is
+not a workspace member, or a dependency outside its `allowed_deps` fails the guard.
 
 ```toml
-[workspace]
-gpu_free = ["ob_server"]
+version = 2
 
-[[edge]]
-from = "ob_client"
-to = "ob_server"
-why = "integrated host is the same implementation, REQ-ARCH-004"
+[forbidden_patterns]
+gpu_free = [
+  "^wgpu($|-)", "^naga($|-)", "^ash($|-)", "^raw-window-handle$",
+  "^winit($|-)", "^cpal($|-)", "^kira$", "^gilrs$",
+  "^rodio$", "^symphonia($|-)",
+  "^ob_render$", "^ob_ui$", "^ob_audio$", "^ob_client$",
+]
 
-[deny.packages]
-crates = ["wgpu", "winit", "ash", "cpal", "naga", "ob_render", "ob_ui", "ob_audio", "ob_client"]
+[[crates]]
+name = "ob_server"
+layer = "hosts"
+gpu_free = true
+allowed_deps = [
+  "ob_math", "ob_core", "ob_world", "ob_worldgen", "ob_content",
+  "ob_sim", "ob_net", "ob_protocol", "ob_modding",
+]
+
+[[crates]]
+name = "ob_client"
+layer = "hosts"
+gpu_free = false
+allowed_deps = [
+  "ob_math", "ob_core", "ob_world", "ob_worldgen", "ob_content",
+  "ob_sim", "ob_net", "ob_protocol", "ob_modding", "ob_server",
+  "ob_render", "ob_ui", "ob_audio",
+]
 ```
+
+`.github/scripts/check-arch.sh` parses this file with Python's `tomllib` and resolves
+`cargo metadata` with `--all-features` for the Linux, Windows and macOS targets, taking the union so
+a target-specific edge cannot hide. It fails if any of the following is true:
+
+1. a workspace crate is missing from `[[crates]]`, appears more than once, or a `[[crates]]` name
+   is not a workspace member;
+2. a resolved normal or build dependency of a workspace crate is not in that crate's
+   `allowed_deps` (dev-dependencies are outside the shipped graph);
+3. the closure of a `gpu_free = true` crate contains a package matching a
+   `[forbidden_patterns].gpu_free` pattern;
+4. the closure of `ob_server` contains a crate in the `presentation` layer or `ob_client`.
+
+Unused `allowed_deps` entries are permitted: a crate may declare an edge before the first use
+lands. The table in §3.2 is a view of this file, and a disagreement is a documentation bug. The
+checker reads the resolved graph, so the manifest and the real graph cannot drift silently.
 
 ### 4.2 Thread inventory and channels
 
@@ -493,16 +579,19 @@ metrics `openblock_<area>_<name>_<unit>`; renaming one breaks dashboards and sup
 | ID | Budget | Measurement |
 | --- | --- | --- |
 | PERF-ARCH-001 | Client main-thread CPU ≤ 2.0 ms p95 at 512-block render distance, 1080p, reference machine | `flythrough` benchmark |
-| PERF-ARCH-002 | Host tick ≤ 35 ms p99 with 2,000 chunks and 50 players on the 4 vCPU reference | headless load harness |
+| PERF-ARCH-002 | Host tick ≤ 35 ms p99 with 2,000 chunks and 50 co-located players (shared chunk cache) on the 4 vCPU reference; the distributed-player row is separate | headless load harness |
 | PERF-ARCH-003 | Snapshot publication ≤ 50 µs p99 at 2,000 entities and 32 players; ≤ 8 KiB allocated per tick in steady state | microbenchmark |
 | PERF-ARCH-004 | Main-to-device handoff ≤ 100 µs p99 with zero allocations after warm-up | microbenchmark, stalled device |
 | PERF-ARCH-005 | Job submit plus join overhead ≤ 20 µs p99 excluding the job body | `ob_core` bench |
 | PERF-ARCH-006 | 95% of remesh jobs within 64 blocks are visible within two frames | scripted edit benchmark |
-| PERF-ARCH-007 | Server resident memory ≤ 2 GiB plus 20 MiB per player at 50 players | 24 h soak, RSS sampling |
+| PERF-ARCH-007 | Server resident memory ≤ 2 GiB plus 20 MiB per co-located player at 50 players | 24 h soak, RSS sampling |
 | PERF-ARCH-008 | Graceful shutdown with a world flush ≤ 5 s p99 | 2,000 dirty chunk shutdown |
 
 These are enforced by the gates in [chapter 25](25-performance-budgets.md); a regression beyond the
-stated tolerance fails the PR ([DEC-035](../decisions.md)).
+stated tolerance fails the PR ([DEC-035](../decisions.md)). Server capacity rows are co-located
+(players share a loaded column cache) and use the 256-block default; the lower distributed-player
+row and the published cost of the opt-in 512-block setting live in [chapter 19](19-server-administration.md)
+and [chapter 25](25-performance-budgets.md) ([DEC-052](../decisions.md)).
 
 ## 6. Failure modes and edge cases
 
@@ -533,7 +622,7 @@ stated tolerance fails the PR ([DEC-035](../decisions.md)).
 
 | Test | What it proves | Where |
 | --- | --- | --- |
-| `check-arch` | internal edges match the manifest, deny list clean | CI, every target and feature set |
+| `check-arch.sh` | every crate appears once; internal edges match `allowed_deps`; `gpu_free` and `ob_server` closures clean | CI, Linux/Windows/macOS, all features |
 | Unsafe scan | no `unsafe` outside audited modules; `forbid` present | CI source scan |
 | Thread inventory | every thread is named, classified and counted | start-up test in all three hosts |
 | Session parity | client, integrated host and dedicated server produce one hash | `tests/session_parity.rs` |
@@ -568,7 +657,9 @@ it in review is cheaper than discovering a GPU dependency in a server image afte
 - Decisions: [DEC-002](../decisions.md), [DEC-003](../decisions.md), [DEC-007](../decisions.md),
   [DEC-008](../decisions.md), [DEC-020](../decisions.md), [DEC-024](../decisions.md),
   [DEC-028](../decisions.md), [DEC-033](../decisions.md), [DEC-035](../decisions.md),
-  [DEC-042](../decisions.md); [conventions](00-conventions.md).
+  [DEC-042](../decisions.md), [DEC-049](../decisions.md), [DEC-052](../decisions.md); [conventions](00-conventions.md).
+- Manifest: [architecture.toml](../../architecture.toml), checked by
+  [check-arch.sh](../../.github/scripts/check-arch.sh).
 - Chapters: [engine core](02-engine-core.md), [rendering](03-rendering.md),
   [world model](05-world-model.md), [modding](16-modding.md), [persistence](17-persistence.md),
   [networking](18-networking-multiplayer.md), [testing](24-testing-benchmarks.md),

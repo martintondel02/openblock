@@ -415,7 +415,7 @@ gantt
 | RISK-106 | **Social safety**: voice, UGC and minigames invite abuse and server liability | Medium | High | Default-off voice; capability grants; report/block; relay policy; operator controls | Any voice or UGC incident without moderation tooling |
 | RISK-107 | **Physics, performance and determinism**: moving grids and networks are float-heavy | High | High | Fixed-point where possible; server authority; prediction descriptors; sleep/wake; budgets | Tick p99 >35 ms or visible rubber-banding in Workshop |
 | RISK-108 | **Identity and legal**: names, art or mechanics drift toward Minecraft/Create | Medium | Medium | Original style guide; doc 07 review; no imported assets; legal check before reveal | Any asset or name that reads as a Minecraft reference |
-| RISK-109 | **Parity distraction**: flagships pull engineers off the Tier 2 floor | Medium | High | Parity gates first; flagship work starts only after G2; parity coverage is a release gate | Tier 2 coverage below 90% at G3 |
+| RISK-109 | **Parity distraction**: flagships pull engineers off the Tier 2 floor | Medium | High | Parity gates first; flagship work starts only after G2; parity coverage is a release gate | Tier-2 coverage below the DEC-051 85% floor at the 2.0 gate |
 
 The two risks that actually kill the project are RISK-101 and RISK-102, and they compound: a team that clones Create needs more scope to compete, which pulls engineers off parity, which makes the parity claim false. The mitigation is not "work harder"; it is a smaller flagship set and a platform contract that lets the community supply the long tail.
 

@@ -1,7 +1,7 @@
 # 19 — Server Administration
 
 > Status: normative - Last updated: 2026-11-24
-> Depends on: [DEC-003](../decisions.md), [DEC-024](../decisions.md), [DEC-026](../decisions.md), [DEC-028](../decisions.md), [DEC-033](../decisions.md), [DEC-035](../decisions.md), [DEC-038](../decisions.md), [DEC-042](../decisions.md), [DEC-044](../decisions.md), [DEC-046](../decisions.md), [DEC-047](../decisions.md); [architecture](01-technical-architecture.md), [engine core](02-engine-core.md), [gameplay](08-gameplay-survival.md), [persistence](17-persistence.md), [networking](18-networking-multiplayer.md), [security](20-security-and-anti-cheat.md); [research 04](../research/04-networking-sota.md) §5, [research 09](../research/09-persistence-assets-packaging.md) §6.7
+> Depends on: [DEC-003](../decisions.md), [DEC-024](../decisions.md), [DEC-026](../decisions.md), [DEC-028](../decisions.md), [DEC-031](../decisions.md), [DEC-033](../decisions.md), [DEC-035](../decisions.md), [DEC-038](../decisions.md), [DEC-042](../decisions.md), [DEC-044](../decisions.md), [DEC-046](../decisions.md), [DEC-047](../decisions.md), [DEC-050](../decisions.md), [DEC-052](../decisions.md); [architecture](01-technical-architecture.md), [engine core](02-engine-core.md), [gameplay](08-gameplay-survival.md), [persistence](17-persistence.md), [networking](18-networking-multiplayer.md), [security](20-security-and-anti-cheat.md); [research 04](../research/04-networking-sota.md) §5, [research 09](../research/09-persistence-assets-packaging.md) §6.7
 > Implements: MS-07
 
 ## 1. Purpose and scope
@@ -33,7 +33,7 @@ abuse policy in [20](20-security-and-anti-cheat.md).
 | REQ-SRV-009 | Pregeneration MUST be resumable, report progress, honour a thread budget and never starve the tick; generated columns MUST be identical to live generation ([DEC-046](../decisions.md)). | Pregen resume test, hash comparison | MS-08 |
 | REQ-SRV-010 | Chunk regeneration MUST be an explicit command with a dry-run report and a backup; a changed generator fingerprint MUST never regenerate silently ([DEC-047](../decisions.md)). | Fingerprint-change test | MS-13 |
 | REQ-SRV-011 | Backups MUST run on a schedule, before migration and on demand; retention MUST be bounded by count and age; every backup MUST be verified and recorded. | Backup/restore suite | MS-07 |
-| REQ-SRV-012 | A backup MUST be consistent: flush and fsync first, then link or copy immutable region files ([17](17-persistence.md) §3.8); a partial backup MUST be marked failed, never used. | Kill-during-backup test | MS-07 |
+| REQ-SRV-012 | A backup MUST be consistent: flush and fsync first, then take a full copy, a reflink or an OS directory snapshot of every file, and verification MUST cover that snapshot rather than a live, moving world ([17](17-persistence.md) §3.8); a partial backup MUST be marked failed, never used. | Kill-during-backup test | MS-07 |
 | REQ-SRV-013 | Restore MUST target a new directory, verify every region header, index and hash before swapping under the world lock, and keep the replaced world for rollback. | Restore drill | MS-07 |
 | REQ-SRV-014 | Ops, whitelist, bans, mute and kick MUST be available from console and RPC; bans and whitelists MUST be keyed on the player's public key ([DEC-026](../decisions.md)); every action MUST be audited. | Admin test matrix | MS-07 |
 | REQ-SRV-015 | The audit log MUST be append-only JSON lines, mode 0600, hash-chained, rotated, and free of IP addresses unless explicitly enabled. | Inspection, tamper-evidence test | MS-15 |
@@ -105,29 +105,32 @@ The systemd unit uses `Restart=on-failure`, `RestartSec=5`, `LimitNOFILE=65536`,
 `AmbientCapabilities=CAP_NET_BIND_SERVICE` only when binding below 1024. `SIGTERM` starts the drain in
 §3.8; systemd's `TimeoutStopSec=40` covers the 30 s drain plus flush.
 
-Reference sizing for the three published configurations; the capacity evidence is in §3.9.
+Reference sizing for the three co-located player-count tiers; the capacity evidence, including the
+separate distributed-player row, is in §3.9. Render and simulation distance are equal by default (256 blocks,
+[DEC-052](../decisions.md)); the 512-block setting is opt-in and is not a published tier.
 
 | Setting | 10 players | 50 players | 100 players |
 | --- | --- | --- | --- |
-| vCPU / RAM | 2 / 2.5 GiB | 4 / 3.5 GiB | 8 / 5 GiB |
-| `server.simulation_distance_blocks` | 256 | 256 | 192 |
-| `server.view_distance_blocks` | 512 | 512 | 384 |
+| vCPU / RAM | 2 / 2.5 GiB | 4 / 3 GiB | 8 / 5 GiB |
+| `server.simulation_distance_blocks` | 256 | 256 | 128 |
+| `server.view_distance_blocks` | 256 | 256 | 128 |
 | `server.max_players` | 10 | 50 | 100 |
 | `performance.max_entities` | 1,500 | 5,000 | 8,000 |
+| `performance.max_loaded_chunks` | 2,000 | 2,000 | 2,000 |
 | `replication.entities_per_snapshot` | 128 | 256 | 256 |
 | `replication.bytes_per_second_per_player` | 65,536 | 65,536 | 49,152 |
 | `backups.interval_minutes` | 120 | 60 | 60 |
-| Tick headroom target | 70% | 30% | 20% |
+| Headroom below the 50 ms period | 84% | 30% | 34% |
 
 ```toml
 # the 50-player reference, layered over the defaults of §3.2
 [server]
 max_players = 50
-view_distance_blocks = 512
+view_distance_blocks = 256         # equal to simulation_distance_blocks; 512 is opt-in
 simulation_distance_blocks = 256
 [performance]
 worker_threads = 2                 # max(1, 4 vCPU - 2); the host tick takes the fourth
-max_loaded_chunks = 20_000
+max_loaded_chunks = 2_000          # derived, §3.2
 [replication]
 entities_per_snapshot = 256
 [backups]
@@ -150,10 +153,10 @@ nesting; CLI flags are generated from the schema, so the two cannot drift.
 | `server.port` | u16 | `25565` | restart | UDP; clients append it to the ticket |
 | `server.max_players` | u16 | `20` | next_session | 1–500 |
 | `server.snapshot_rate_hz` | u8 | `20` | next_session | `20` or `30` only; simulation stays 20 Hz |
-| `server.view_distance_blocks` | u16 | `512` | next_session | 64–1024, multiple of 16 |
+| `server.view_distance_blocks` | u16 | `256` (`= simulation_distance_blocks`) | next_session | 64–1024, multiple of 16; when unset it follows `simulation_distance_blocks`; 512 is opt-in with the published cost in §3.9 ([DEC-052](../decisions.md)) |
 | `server.simulation_distance_blocks` | u16 | `256` | next_session | 64–`view_distance_blocks` |
 | `server.online_mode` | enum | `"key"` | restart | `key`, `oidc`, `open` (LAN/dev only) |
-| `server.require_content_match` | enum | `"strict"` | restart | `strict` (`pack_hash` equality) or `content_only` (view differences advisory) |
+| `server.strict_view` | bool | `false` | restart | `false` = `content_hash` strict and `view_hash` advisory; `true` = a view-only difference also refuses the join ([DEC-050](../decisions.md)) |
 | `server.min_client_protocol_minor` | u16 | `0` | restart | ≤ the build's protocol minor |
 | `server.allow_client_view_beyond_server` | bool | `true` | live | pop-in warning when true |
 | `identity.mode` | enum | `"self_signed"` | restart | `self_signed`, `acme`, `provided` |
@@ -183,6 +186,7 @@ nesting; CLI flags are generated from the schema, so the two cannot drift.
 | `world.difficulty` | enum | `"normal"` | session | `peaceful`, `easy`, `normal`, `hard`, `hardcore` (locks death behaviour) |
 | `world.pvp` | bool | `true` | session | host-enforced |
 | `world.allow_flight` | bool | `false` | session | anti-cheat exception, logged |
+| `world.allow_aim_assist` | bool | `true` | live | advertised to clients; a client assist that changes input only, never a simulation rule; effective default is `false` while `world.pvp = true` ([23 §3.14](23-accessibility-localization.md#314-gameplay-assists)) |
 | `world.force_gamemode` | bool | `false` | session | re-apply on every join |
 | `world.spawn_protection_blocks` | u16 | `16` | session | 0–256 |
 | `world.world_border_blocks` | u32 | `29999984` | session | radius in blocks, matched to `level.json.world_border` |
@@ -190,7 +194,7 @@ nesting; CLI flags are generated from the schema, so the two cannot drift.
 | `world.game_rules.*` | typed map | per [08](08-gameplay-survival.md) | session | unknown rule is an error |
 | `performance.worker_threads` | u8 | `0` | restart | 0 = `max(1, cpus − 2)` |
 | `performance.region_tick_workers` | u8 | `0` | restart | 0 = auto |
-| `performance.max_loaded_chunks` | u32 | `20000` | live | generation and load backpressure |
+| `performance.max_loaded_chunks` | u32 | `2000` | live | derived, not hand-set: the 256-block interest union plus the 2-chunk unload ring is 37² = 1,369 columns for any number of co-located players, and 2,000 adds headroom for spawn chunks and a second nearby cluster; it is also the PERF-TICK-001 figure (12 ms at 2,000 columns). Memory is ≈80 MiB per 1,000 columns (PERF-MEM-001: 90 MB at 1,089 columns), so 2,000 columns ≈ 160 MiB. The opt-in 512-block setting needs ≥ 4,761 (69²) columns including the unload ring, ≈390 MB |
 | `performance.entity_activation_range_blocks` | u16 | `128` | next_session | AI and tick range |
 | `performance.max_entities` | u32 | `5000` | next_session | hard cap; spawning stops with a metric |
 | `performance.tick_soft_budget_ms` | u16 | `40` | live | logs an overrun above this |
@@ -218,6 +222,16 @@ nesting; CLI flags are generated from the schema, so the two cannot drift.
 | `permissions.op_permission_level` | u8 | `3` | live | 0–4, see [08](08-gameplay-survival.md) §3.12 |
 | `permissions.function_permission_level` | u8 | `2` | live | command blocks and functions |
 | `permissions.enable_command_block` | bool | `true` | session | per world |
+| `anti_cheat.mode` | enum | `"correct"` | live | `off`, `log`, `correct`, `kick`; annotation and bans are separate keys below, validators always run, and only the response changes ([20 §3.7](20-security-and-anti-cheat.md#37-enforcement-ladder)) |
+| `anti_cheat.annotate_score` | u16 | `10` | live | family score that opens a case; provisional until the [20 §8](20-security-and-anti-cheat.md#8-open-questions) register item closes |
+| `anti_cheat.kick_score` | u16 | `60` | live | one family at the score, or two families at ≥ 24 each; provisional, same register item |
+| `anti_cheat.auto_ban` | bool | `false` | restart | opt-in only; never triggered by statistical rules alone (REQ-SEC-008) |
+| `anti_cheat.ore_obfuscation` | enum | `"off"` | restart | `off`, `adjacency`, `proximity`; provisional, gated on the register item in [20 §8](20-security-and-anti-cheat.md#8-open-questions) |
+| `anti_cheat.max_corrections_per_minute` | u16 | `30` | live | correction rate cap per player |
+| `anti_cheat.evidence_seconds` | u16 | `120` | live | 30–300; evidence-ring length; provisional until [OPEN-017](../decisions.md) closes |
+| `anti_cheat.evidence_retention_days` | u8 | `7` | live | 1–30; bundle retention; provisional until [OPEN-017](../decisions.md) closes |
+| `voice_chat.enabled` | bool | `false` | restart | post-1.0 module behind a non-default Cargo feature, off unless the operator enables it ([14 §3.12](14-audio.md#312-voice-chat-post-10-gated), [DEC-031](../decisions.md)) |
+| `voice_chat.max_speakers` | u8 | `8` | live | reserved voice slots; provisional until the voice relay is specified |
 | `logging.level` | enum | `"info"` | live | `error`…`trace` |
 | `logging.format` | enum | `"json"` | live | `json`, `pretty` |
 | `logging.rotation_size_mib` | u16 | `50` | live | 1–1024 |
@@ -238,13 +252,14 @@ nesting; CLI flags are generated from the schema, so the two cannot drift.
 | `console.remote.rcon_compatible` | bool | `false` | restart | plaintext, loopback only, never remotely bound |
 | `console.remote.rcon_port` | u16 | `25575` | restart | used only with the line above |
 | `backups.enabled` | bool | `true` | live | scheduled backups |
+| `backups.mode` | enum | `"auto"` | restart | `auto` (reflink when the filesystem reports it, else full copy), `copy`, `reflink`; hard links are unsupported ([17 §3.8](17-persistence.md#38-backups-restore-import-and-export)) |
 | `backups.interval_minutes` | u16 | `60` | live | 15–1440 |
 | `backups.destination` | path | `""` | live | empty = `<world>/backups/` ([17](17-persistence.md) §3.8) |
 | `backups.keep_hourly` | u16 | `24` | live | count |
 | `backups.keep_daily` | u16 | `7` | live | count |
 | `backups.keep_weekly` | u16 | `4` | live | count |
 | `backups.pre_migration` | bool | `true` | restart | cannot be disabled without `--i-know` |
-| `backups.verify_after` | bool | `true` | live | re-read and hash every region |
+| `backups.verify_after` | bool | `true` | live | re-read and hash the backup snapshot, never the live world |
 | `backups.external_copy` | path | `""` | live | `rsync`-style target for disaster recovery |
 | `limits.max_chunk_bytes` | u32 | `262144` | restart | decode cap before allocation |
 | `limits.max_packet_bytes` | u32 | `65536` | restart | control message cap |
@@ -268,6 +283,15 @@ dotted form in logs and audit ([16 §3.10](16-modding.md#310-operator-controls))
 is empty by default because [DEC-020](../decisions.md) requires an operator decision per capability,
 never an assumed grant.
 
+`[anti_cheat]` is the canonical schema for the keys [20](20-security-and-anti-cheat.md) consumes: this
+chapter owns the type, default and reload class, [20](20-security-and-anti-cheat.md) owns the ladder
+and what each threshold means. The score defaults and `ore_obfuscation` are marked provisional because
+[20 §8](20-security-and-anti-cheat.md#8-open-questions) still carries register items for them; a
+default change is a schema change, not a silent tuning. `[voice_chat]` is present so the schema is
+complete, but it is inert until the post-1.0 module of [14 §3.12](14-audio.md#312-voice-chat-post-10-gated)
+ships, and `voice_chat.enabled = true` on a build without the feature is a start-up error rather than
+a silent no-op.
+
 Gameplay keys in `[world]` are defaults. Once a world exists, `level.json` is authoritative for its
 gamemode, difficulty, rules and border ([17](17-persistence.md) §3.4); `world.force_gamemode` and the
 `gamerule` command change the world, and `--force-world-settings` re-applies the config at load.
@@ -283,7 +307,7 @@ gamemode, difficulty, rules and border ([17](17-persistence.md) §3.4); `world.f
 | `world border` (`set`, `get`) | `--radius`, `--center` | updates `level.json` and all clients | clamped to ±29,999,984 |
 | `pregen` | `--world`, `--radius`, `--threads`, `--resume`, `--verify`, `--dry-run` | generates columns ahead of play | progress every 5 s, resumable; the spelling in [06](06-worldgen.md) §3.11 |
 | `world regen_chunks` | `--chunks`, `--dry-run`, `--force` | regenerates generated-only chunks | the `--regen-chunks` action of [DEC-047](../decisions.md); prints affected columns and builds first |
-| `world backup` | `--label` | flush, link/copy, verify, record | never blocks the tick |
+| `world backup` | `--label` | flush, reflink/copy or snapshot, verify, record | never blocks the tick |
 | `world restore` | `--backup`, `--verify-only` | restores into a new directory and swaps | requires a stopped world |
 | `world verify` | `--repair` | checks headers, indexes, CRCs, content table | reports quarantine candidates |
 | `world export` | `--output`, `--include-players` | writes an `.obworld` archive | excludes backups and cache |
@@ -368,6 +392,7 @@ reached through an SSH tunnel. Every other console or RPC surface requires TLS 1
 | `say`, `tell` | 1–3 | chat and direct message |
 | `diagnose` | 4 | write a redacted support bundle |
 | `audit` (`tail`, `verify`) | 4 | read or verify the audit chain |
+| `cases` (`list`, `purge`) | 4 | evidence bundles under `<world>/cases/` ([20 §3.8](20-security-and-anti-cheat.md#38-evidence-bundles-and-privacy)) |
 | `stop [--drain N]` | 4 | graceful shutdown |
 
 ### 3.6 Observability
@@ -452,18 +477,28 @@ Recommended dashboards (JSON in `ops/grafana/`) and alerts:
 | Data | RPO | RTO | Mechanism |
 | --- | --- | --- | --- |
 | Player state | ≤ 60 s | restart | autosave every 60 s plus logout, death and transfer |
-| World blocks | crash: last commit; disaster: `backups.interval_minutes` | 5 min in place, 30 min on a new host | region commits, then link/copy ([17](17-persistence.md) §3.5, §3.8) |
+| World blocks | crash: last commit; disaster: `backups.interval_minutes` | 5 min in place, 30 min on a new host | region commits, then reflink/copy or an OS directory snapshot ([17](17-persistence.md) §3.5, §3.8) |
 | Config, identity, keys | last change | 10 min | operator copy; never in a world archive |
 | Audit log | ≤ 5 s | 1 min | append + rotation |
 
 Retention defaults are 24 hourly, 7 daily and 4 weekly, pruned oldest first; the pre-migration backup
 is never pruned while its version is running. A backup is: flush the world store and fsync, pause
-compaction, hard-link or copy `level.json`, `ids.json`, `players/`, every region file and every structure sidecar,
-verify a BLAKE3 manifest, then atomically rename the backup directory ([17](17-persistence.md) §3.8).
-Hard links are only valid because region files are immutable once committed; the server detects a
-filesystem without hard links and falls back to a copy, showing the space cost. `external_copy`
-additionally writes to an off-host target; encryption and access control at that target are the
-operator's responsibility and are documented as such.
+compaction, take a consistent **source** — a full copy of every file (the portable default), a reflink
+(copy-on-write clone) where the filesystem supports one, or an OS directory snapshot where the OS
+offers one — of `level.json`, `ids.json`, `players/`, every region file and every structure sidecar,
+compute and verify a BLAKE3 manifest over that snapshot, then atomically rename the backup directory
+([17](17-persistence.md) §3.8). A reflink never changes after the clone, a directory snapshot pins the
+filesystem view, and a full copy is independent by construction. A hard link is **not** a mode: a
+committed region file is still appended to and rewrites its inactive index and header in place, so a
+hard-linked backup would silently change with the live world. The space cost of each mode is shown,
+and `external_copy` additionally writes to an off-host target; encryption and access control at that
+target are the operator's responsibility and are documented as such.
+
+Verification reads **only** the backup path and never the live world, because `backups.verify_after`
+must not certify a moving target: a backup whose manifest cannot be computed over the completed
+snapshot — a short copy, a source that was not cloned or snapshotted, a failed rename — is marked
+failed and retried, not promoted. That is also why a backup that would need to re-read a live region
+to complete is rejected rather than repaired in place.
 
 Disaster recovery: provision a host, install the same or a newer build, restore the latest verified
 backup into a new directory, run `world verify`, start with joins disabled, confirm the spawn area
@@ -494,22 +529,41 @@ to MS-21. Container upgrades follow the same order with `docker compose pull` an
 The table is the published sizing matrix. Values marked *target* are the MS-15 measurements the
 design must meet, taken on the reference 4 vCPU / 8 GiB host; rows above 4 vCPU are the same workload
 extrapolated and are labelled as such in `benchmarks/ms-15-capacity.md`, which replaces this table at
-release and reopens the budget on regression.
+release and reopens the budget on regression. **Every published row is inside
+`PERF-TICK-009` (35 ms p99).** A configuration that cannot meet it is not a tier; the 512-block
+setting is therefore documented separately below rather than as a row.
 
-| Players | Sim distance | vCPU | RAM | Tick p99 | Down per player | Join time | Verdict |
+| Players | Render = sim distance | vCPU | RAM | Tick p99 | Down per player | Join time | Verdict |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 10 | 256 | 2 | 2.5 GiB | 8 ms (target) | 15 KB/s | 5 s | small VPS, comfortable |
-| 25 | 256 | 4 | 3 GiB | 16 ms (target) | 20 KB/s | 8 s | recommended entry tier |
-| 50 | 256 | 4 | 3.5 GiB | 30–35 ms (target) | 22 KB/s | 10 s | reference tier ([vision](../vision.md) §8) |
-| 50 | 512 | 8 | 4 GiB | 45 ms (target) | 40 KB/s | 40 s | tight; only with entity caps |
-| 100 | 192 | 8 | 4.5 GiB | 40 ms (target) | 18 KB/s | 12 s | entity-light worlds only |
-| 100 | 256 | 8 | 5 GiB | 45 ms (target) | 25 KB/s | 15 s | not recommended at 1.0 |
+| 10, co-located | 256 | 2 | 2.5 GiB | 8 ms (target) | 15 KB/s | 5 s | small VPS, comfortable |
+| 25, co-located | 256 | 4 | 3 GiB | 16 ms (target) | 20 KB/s | 8 s | recommended entry tier |
+| 50, co-located | 256 | 4 | 3 GiB | 35 ms p99 gate | 22 KB/s | 10 s | reference tier ([vision](../vision.md) §8) |
+| 10, distributed | 64 | 4 | 3 GiB | 18 ms (target) | 14 KB/s | 5 s | separate interest sets: 1,690 loaded columns, no shared cache |
+| 100, co-located | 128 | 8 | 5 GiB | 33 ms (target) | 18 KB/s | 10 s | entity-light worlds only |
+
+The two distribution cases are different claims and are never interchangeable
+([DEC-052](../decisions.md)). **Co-located** players share one chunk cache and one interest union, so
+the 50-player tier loads 37² = 1,369 columns for everyone at 256 blocks. **Distributed** players each
+own their columns — 10 players at 64 blocks is 10 × 13² = 1,690 columns including the 2-chunk unload
+ring, most of the `performance.max_loaded_chunks` budget, and one fifth the players per core of the
+co-located row. The distributed row is deliberately a shorter distance; a distributed 50-player
+256-block claim would need 50 × 37² = 68,450 columns and is not a product.
+
+The 512-block setting is **opt-in**, not a tier ([DEC-052](../decisions.md)): one player's render set
+is 65² = 4,225 columns (4,761 with the 2-chunk unload ring), the join payload is 80–110 MB
+([18 §3.12](18-networking-multiplayer.md#312-metrics-diagnostics-and-bandwidth-model)), world data is
+≈350 MB for 4,225 columns before a second player (PERF-MEM-001), entity traffic is 25–40 KB/s, and the
+world-tick cost alone roughly doubles against the 2,000-column tier (PERF-TICK-001 is 12 ms at 2,000
+columns), before replication. An operator who enables it raises `performance.max_loaded_chunks` to at
+least 4,761, accepts the join cost, publishes their own measurement, and does not attribute it to
+this matrix. `PERF-NET-001`'s 512-block
+bandwidth row (≤ 64 KB/s p95, ≤ 128 KB/s peak) is the traffic gate, not a tick gate.
 
 The RAM column is the container limit; server RSS stays within `2 GiB + 20 MiB × players`
-(3 GiB at 50, 4 GiB at 100), and the remainder covers the OS, page cache and allocator
-fragmentation.
+(3 GiB at 50, 4 GiB at 100), and 2,000 loaded columns add ≈160 MiB of world data. The remainder covers
+the OS, page cache and allocator fragmentation.
 
-The tick budget at 20 Hz is 50 ms. For 50 players at 256 blocks the allocation is 15 ms simulation,
+The tick budget at 20 Hz is 50 ms. For 50 co-located players at 256 blocks the allocation is 15 ms simulation,
 8 ms replication and interest, 6 ms chunk cache and send, 4 ms saves and 17 ms headroom; the p99
 target is 35 ms ([vision](../vision.md) §8). Cost drivers in order: loaded ticking chunks, entities
 with AI, per-player interest queries, chunk encoding during join and flight, then saves. Transport
@@ -594,6 +648,8 @@ pub struct ServerConfig {
     pub content: ContentSection,
     pub mods: ModsSection,
     pub permissions: PermissionsSection,
+    pub anti_cheat: AntiCheatSection,
+    pub voice_chat: VoiceChatSection,
     pub logging: LoggingSection,
     pub metrics: MetricsSection,
     pub health: HealthSection,
@@ -651,10 +707,10 @@ that table does not state.
 | PERF-SRV-011 | `/metrics` scrape ≤ 20 ms and ≤ 1 MiB | endpoint benchmark |
 | PERF-SRV-012 | `/health` and `/ready` ≤ 10 ms p99 | endpoint benchmark |
 | PERF-SRV-013 | Console or RPC command latency ≤ 50 ms p99 on local surfaces | console benchmark |
-| PERF-SRV-014 | Backup of a 2 GiB world ≤ 60 s with hard links; verification ≤ 2 min | backup drill |
+| PERF-SRV-014 | Backup of a 2 GiB world ≤ 60 s with reflinks or an OS directory snapshot; verification ≤ 2 min; a full copy is bounded by device write bandwidth | backup drill |
 | PERF-SRV-015 | Restore ≤ 5 min in place for 2 GiB; ≤ 30 min on a new host | quarterly drill |
 | PERF-SRV-016 | Audit append ≤ 0.5 ms p99 and never on the tick thread | audit benchmark |
-| PERF-SRV-017 | 50 players at 256 blocks: tick p99 ≤ 35 ms and RSS ≤ 3 GiB on 4 vCPU (PERF-SRV-002/003) | load harness |
+| PERF-SRV-017 | 50 co-located players at 256 blocks: tick p99 ≤ 35 ms and RSS ≤ 3 GiB on 4 vCPU (PERF-SRV-002/003) | load harness |
 
 ## 6. Failure modes and edge cases
 
@@ -706,13 +762,15 @@ one measurement path.
 | 4 | Default backup destination inside the world directory or external? | Inside by default (single volume, simple permissions), with `external_copy` for disaster recovery; the world-size budget excludes backups. | MS-13 |
 | 5 | May `online_mode = "open"` be used on a public server? | Permit it but warn at start-up and in `status`; it exists for LAN and development, and the server is unauthenticated. | MS-07 / MS-20 |
 | 6 | Do we ship a web administration UI? | Not at 1.0: console, RPC and Grafana cover it; revisit after MS-21. | MS-16 |
+| 7 | `[anti_cheat]` scores and `[voice_chat]` are in the schema with conservative defaults, but the score thresholds and ore obfuscation are still register items in [20 §8](20-security-and-anti-cheat.md#8-open-questions), and the voice relay is post-1.0 ([DEC-031](../decisions.md)). | Keep the §3.2 defaults, mark the affected keys provisional, and treat a default change as a visible schema change rather than silent tuning. | MS-15 / MS-14 |
 
 ## 9. References
 
 - Decisions: [DEC-003](../decisions.md), [DEC-024](../decisions.md), [DEC-026](../decisions.md),
-  [DEC-028](../decisions.md), [DEC-033](../decisions.md), [DEC-035](../decisions.md),
+  [DEC-028](../decisions.md), [DEC-031](../decisions.md), [DEC-033](../decisions.md), [DEC-035](../decisions.md),
   [DEC-038](../decisions.md), [DEC-042](../decisions.md), [DEC-044](../decisions.md),
-  [DEC-046](../decisions.md), [DEC-047](../decisions.md).
+  [DEC-046](../decisions.md), [DEC-047](../decisions.md), [DEC-050](../decisions.md),
+  [DEC-052](../decisions.md).
 - Chapters: [00](00-conventions.md) §3.4; [01](01-technical-architecture.md) §3.1, §3.8, §5;
   [02](02-engine-core.md) §3.5, §3.8, §3.11; [08](08-gameplay-survival.md) §3.12;
   [17](17-persistence.md) §3.1, §3.5, §3.7, §3.8; [18](18-networking-multiplayer.md) §3.4, §3.6,

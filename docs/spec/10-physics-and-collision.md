@@ -45,7 +45,7 @@ Five rules frame the design. **Same solver everywhere.** Client prediction, inte
 | REQ-PHYS-025 | The reach and line-of-sight queries used by combat and interaction are the same shape-aware raycasts, with the same caps and tie-breaks. | Cross-chapter query test |
 | REQ-PHYS-026 | Client prediction runs this solver on the prediction overlay and never writes authoritative positions; a correction converges within two ticks. | Prediction/reconciliation tests |
 | REQ-PHYS-027 | Content collision shapes are validated at freeze (coordinates, box count, merge result); a hot reload rebuilds the shape table between ticks and unsticks any body left inside a new solid shape. | Shape validator + reload test |
-| REQ-PHYS-028 | Fluid and block updates are scheduled in `(due, seq)` order; physics never runs inside a fluid or redstone update, and entity movement never interleaves with scheduled ticks. | Cross-system ordering test |
+| REQ-PHYS-028 | Fluid and block updates are scheduled in `(due_tick, packed block key, kind)` order with no persisted sequence; physics never runs inside a fluid or redstone update, and entity movement never interleaves with scheduled ticks. | Cross-system ordering test |
 | REQ-PHYS-029 | No tunnelling is observable: after every tick a body's AABB penetrates no solid shape by more than 1e-6 m, at every supported speed and shape thickness. | Fuzz invariant + reference solver |
 | REQ-PHYS-030 | `/debug physics` and metrics expose body count, sweep and cell counts, ray count, fluid queue depth, recovery and `Budget` counters, and per-system timing. | Overlay + metrics test |
 
@@ -208,7 +208,7 @@ pub fn plan_displace_entities(world: &World, moved: Aabb, delta: Vec3,
 pub fn settle_entities(world: &mut World, moved: Aabb, policy: DisplacePolicy);
 ```
 
-`plan_displace_entities` is a pure plan: entities intersecting `moved` are translated by `delta` if their destination is free; if blocked, the plan tries the nearest free face in the fixed order Y, X, Z. If no face is free, `Push` and `Ignore` return `PistonBlocked`, while `Crush` (opt-in; the base pack aborts) plans damage through [08](08-gameplay-survival.md). The piston transaction applies the block batch and the entity plan in one commit, so an abort changes neither blocks nor entities, preserving the all-or-nothing rule of [12 §3.5.2](12-redstone-and-logic.md). After the commit, `settle_entities` re-checks the moved volume for bodies that entered it during the same tick (for example a player stepping into the head) and pushes them out or applies crush damage; that is a post-commit correction, not a rollback. A piston can move an entity at most 12 blocks, matching the push limit. Passengers move with their vehicle as one unit; a piston cannot separate a rider from its seat.
+`plan_displace_entities` is a pure plan: entities intersecting `moved` are translated by `delta` if their destination is free; if blocked, the plan tries the free faces in the canonical order owned by [12 §3.5.2](12-redstone-and-logic.md#352-pistons) — **−Y, −X, +X, −Z, +Z, +Y** — and takes the first one that is free. That is the same list redstone uses for crush displacement, not a nearest-facing search; "nearest" is not a tie-break, which is why the two chapters quote one list rather than two similar ones. A fixture with two free faces asserts which destination is chosen, so a reordering cannot hide behind the word "nearest". If no face is free, `Push` and `Ignore` return `PistonBlocked`, while `Crush` (opt-in; the base pack aborts) plans damage through [08](08-gameplay-survival.md). The piston transaction applies the block batch and the entity plan in one commit, so an abort changes neither blocks nor entities, preserving the all-or-nothing rule of [12 §3.5.2](12-redstone-and-logic.md). After the commit, `settle_entities` re-checks the moved volume for bodies that entered it during the same tick (for example a player stepping into the head) and pushes them out or applies crush damage; that is a post-commit correction, not a rollback. A piston can move an entity at most 12 blocks, matching the push limit. Passengers move with their vehicle as one unit; a piston cannot separate a rider from its seat.
 
 ### 3.9 Fluid flow
 
@@ -223,7 +223,7 @@ Fluid state is the block-state encoding of [05 §3.4](05-world-model.md#34-block
 
 **Reactions.** When water and lava meet, the block result is content data: a water source adjacent to a lava source produces obsidian; flowing water against a lava source produces cobblestone; flowing lava into water produces stone. The reaction is a single block edit with cause `Fluid`, scheduled before the next flow tick and applied in `(distance, block key)` order.
 
-**Scheduling and budgets.** Fluid updates enter the chunk's `TickQueue` keyed `(due, seq)` with a delay of 5 ct for water, 30 ct for lava in the overworld and 10 ct in the nether, from content. The host drains at most 512 fluid updates per tick and keeps at most 4,096 pending; when the cap is reached, entries for the same position coalesce to the latest state, so a flood degrades to slower spreading rather than an unbounded queue. An update schedules at most six successors; no fluid update applies immediately, which is what prevents recursive floods and tick spikes. Fluid updates never interleave with entity movement ([REQ-PHYS-028](#2-requirements)); the cross-system order is owned by [12](12-redstone-and-logic.md).
+**Scheduling and budgets.** Fluid updates enter the chunk's `TickQueue` ordered by `(due_tick, packed block key)` with a delay of 5 ct for water, 30 ct for lava in the overworld and 10 ct in the underworld, from content; the fluid `kind` is part of the entry, and because a cell holds only one fluid kind this order is equivalent to the canonical `(due_tick, key, kind)` of [05 §3.7](05-world-model.md#37-scheduled-ticks). There is no sequence number, so equal-due updates order by position and load in the same order they were saved. The host drains at most 512 fluid updates per tick and keeps at most 4,096 pending; when the cap is reached, entries for the same position coalesce to the latest state, so a flood degrades to slower spreading rather than an unbounded queue. An update schedules at most six successors; no fluid update applies immediately, which is what prevents recursive floods and tick spikes. Fluid updates never interleave with entity movement ([REQ-PHYS-028](#2-requirements)); the cross-system order is owned by [12](12-redstone-and-logic.md).
 
 **Source and duplication safety.** A source is created only by the two-neighbour rule; a flowing block and a falling column never create a source by themselves. A fluid break that would create a new source is checked against the block state and the chunk status before the edit. The conformance corpus includes an infinite-water fixture, a lava/water cobblestone generator, a waterlogged-slab break and a 1,000-block flood; each asserts a bounded block count and a stable hash after quiescence.
 
@@ -238,7 +238,7 @@ pub trait PhysicsQuery {
 }
 ```
 
-The API is read-only and host-side: a WASM mod needs the `world.read` capability ([16](16-modding.md)), a native plugin is operator-trusted, and a client presentation mod receives no world occupancy at all, consistent with the visual-only rule for shader packs ([DEC-045](../decisions.md)). `overlap` writes into a caller buffer and returns the number written or a `QueryLimit` when the buffer is too small; `sweep` and `raycast` return fixed-size values. Each mod gets 1,000 queries per tick, 256 results per `overlap`, and 512 m maximum ray length; exceeding a quota disables the query, logs the mod and does not affect the simulation. No query returns a mutable world handle, a block entity, or another entity's state.
+The API is read-only and host-side: a WASM mod needs the `world.read` capability ([16](16-modding.md)) and a native plugin is operator-trusted. 1.0 clients run no mod or WASM code at all ([DEC-049](../decisions.md)), so there is no client-side query path to leak occupancy; a post-1.0 client code tier would remain presentation-only, consistent with the visual-only rule for shader packs ([DEC-045](../decisions.md)). `overlap` writes into a caller buffer and returns the number written or a `QueryLimit` when the buffer is too small; `sweep` and `raycast` return fixed-size values. Each mod gets 1,000 queries per tick, 256 results per `overlap`, and 512 m maximum ray length; exceeding a quota disables the query, logs the mod and does not affect the simulation. No query returns a mutable world handle, a block entity, or another entity's state.
 
 ### 3.11 Determinism and numeric policy
 
@@ -312,11 +312,12 @@ The bounds are `f32` for broadphase only; every exact test uses the integer boxe
 | `kind` | u8 | water or lava |
 | `level` | u8 | 1–7 flowing, 8 source |
 | `falling` | bool | falling column |
-| `due_tick` | i64 | absolute tick, saved |
-| `seq` | u64 | tie-break within a tick |
 | `cause` | u8 | flow, reaction, neighbour, worldgen |
+| `due_tick` | i64 | absolute tick; saved as a remaining delay against the payload's `saved_tick` |
+| `block_key` | u64 | packed position; canonical tie-break within a tick |
 
-A fluid entry is 24 B including padding, plus the queue node. Pending entries are `BTreeMap<(i64, u64), FluidTick>` per chunk, persisted with the chunk ([17](17-persistence.md)); the same-position coalescing map is a transient `FxHashMap<BlockPos, seq>` that is rebuilt from the queue on load, so it is not persisted.
+A fluid entry is 24 B including padding (the four small fields precede the two 8-byte
+fields, so there is one 4-byte pad), plus the queue node. Pending entries are `BTreeMap<(i64, u64), FluidTick>` per chunk, persisted with the chunk as delays ([17](17-persistence.md)); the same-position coalescing map is a transient `FxHashMap<BlockPos, u64>` holding the canonical key per position, rebuilt from the queue on load, so it is not persisted.
 
 ## 5. Performance budgets
 
@@ -372,6 +373,7 @@ Measured on the reference machine at 20 Hz (50 ms tick), p99 unless stated; thes
 | --- | --- | --- |
 | Unit | shape merge, connection masks, axis order, cost and clamp constants, medium sampling | nextest with golden tables |
 | Conformance scenarios | walk, sprint, jump 1–3 blocks, slab/stair step, sneak edge, ladder, water exit, lava sink, elytra dive, boat, minecart, piston crush, sand fall, TNT, arrow, 512 m ray | golden trace per scenario: position, velocity, contacts, flags each tick |
+| Piston face order | an entity blocked on two faces is displaced to the first free face of the [12 §3.5.2](12-redstone-and-logic.md#352-pistons) list (−Y, −X, +X, −Z, +Z, +Y), not to the geometrically nearest one | two-free-face fixture asserting the destination |
 | Differential solver | no penetration and final position within 1e-4 of a 1e-4 m brute-force reference on 1,000 random scenes | `proptest` + reference implementation |
 | Fuzz | random inputs, shapes, velocities, explosions, fluid edits: finite, inside border, no penetration > 1e-6, no duplicate block/item, no panic | `cargo-fuzz`, 24 h nightly, 10M-tick soak |
 | Determinism | same trace and state hash on Linux/Windows/macOS and 1/2/8 workers; 180° rotation symmetry for a scene and its rotated copy | cross-platform replay harness ([02 §3.10](02-engine-core.md#310-determinism-harness)) |
@@ -397,7 +399,7 @@ The symmetry test deliberately uses a 180° yaw rotation plus an integer block t
 
 ## 9. References
 
-- Decisions: [DEC-004](../decisions.md) (sections), [DEC-007](../decisions.md) (fixed tick), [DEC-008](../decisions.md) (authority), [DEC-021](../decisions.md) (f64 and pinned math), [DEC-029](../decisions.md) (validation), [DEC-035](../decisions.md) (budgets), [DEC-038](../decisions.md) (20 Hz), [DEC-039](../decisions.md) (numeric policy), [DEC-045](../decisions.md) (visual-only packs).
+- Decisions: [DEC-004](../decisions.md) (sections), [DEC-007](../decisions.md) (fixed tick), [DEC-008](../decisions.md) (authority), [DEC-021](../decisions.md) (f64 and pinned math), [DEC-029](../decisions.md) (validation), [DEC-035](../decisions.md) (budgets), [DEC-038](../decisions.md) (20 Hz), [DEC-039](../decisions.md) (numeric policy), [DEC-045](../decisions.md) (visual-only packs), [DEC-049](../decisions.md) (no client mod code in 1.0).
 - Chapters: [00](00-conventions.md), [01](01-technical-architecture.md), [02](02-engine-core.md), [05](05-world-model.md), [07](07-light-and-weather.md), [08](08-gameplay-survival.md), [09](09-entities-ai.md), [11](11-inventory-crafting-items.md), [12](12-redstone-and-logic.md), [15](15-content-system.md), [16](16-modding.md), [17](17-persistence.md), [18](18-networking-multiplayer.md), [20](20-security-and-anti-cheat.md), [25](25-performance-budgets.md).
 - Research: [Weft teardown](../research/01-weft-teardown.md) §4.5 (region ticking) and §10 lesson 20 (validated movement); [Minecraft feature inventory](../research/05-minecraft-feature-inventory.md) §3.9 (fluids, gravity, lighting) and §3.12 (combat and movement feel).
 - External: Amanatides & Woo, "A Fast Voxel Traversal Algorithm for Ray Tracing", *Eurographics '87* — <https://doi.org/10.1111/j.1467-8659.1987.tb00527.x>; Christer Ericson, *Real-Time Collision Detection*, Morgan Kaufmann, 2005, ch. 5–6 (AABB sweeps and plane tests); IEEE 754-2019, *IEEE Standard for Floating-Point Arithmetic* — <https://doi.org/10.1109/IEEESTD.2019.8766229>; Minecraft Wiki, "Fluid", "Explosion" and "Piston" — external parity facts for flow delays, blast geometry and push limits: <https://minecraft.wiki/w/Fluid>, <https://minecraft.wiki/w/Explosion>, <https://minecraft.wiki/w/Piston>.

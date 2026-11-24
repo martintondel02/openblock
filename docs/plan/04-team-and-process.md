@@ -51,7 +51,7 @@ before it becomes an incident.
 | Configuration | Throughput | Can | Cannot | First to break | First to buy |
 | --- | --- | --- | --- | --- | --- |
 | **1**, solo, full-time | ~0.85 dev-wk/wk | Ship the slice and `0.1`; keep one coherent architecture; talk to players directly | Parallelise performance and content; second review for saves, protocol, security; 24/7 ops | Bus factor, then burnout around month 9 | Art/audio commission; one external security review per phase |
-| **3**, the roadmap's tracks | ~2.4 dev-wk/wk | Run A/B/C in parallel; `0.1` in ~4 months, `1.0` in 15–18 months | Two critical paths at once; in-house art or QA | Review bottleneck when two tracks need one crate | Art/audio, QA contractor, external security review |
+| **3**, the roadmap's tracks | ~2.4 dev-wk/wk | Run A/B/C in parallel; `0.1` in ~4 months, `1.0` Early Access in 20–23 months | Two critical paths at once; in-house art or QA | Review bottleneck when two tracks need one crate | Art/audio, QA contractor, external security review |
 | **6**, pairs per area | ~4.4 dev-wk/wk | Feature and performance work in parallel; `1.0` in 10–12 months; on-call rotation | Avoid coordination overhead; staff legal or 24/7 ops | Duplicated work without area ownership | Bench hardware, community manager, legal counsel |
 
 Hiring order beyond the lead: rendering/GPU, tools/content, network/server, art,
@@ -360,7 +360,7 @@ owns the domain. The DCO and the code licence survive any entity change.
 | CI duration | PR pipeline p50 | ≤15 min | Weekly |
 | Flaky test rate | Tests failing on rerun without a change | ≤2% | Weekly |
 | Requirement coverage | Normative REQs with a named test | 100% (manual ones marked) | Per release |
-| Parity corpus coverage | Tier-2 checks passing | ≥90% at 1.0 | Monthly from MS-14 |
+| Parity corpus coverage | In-scope pass rate + hand-authored vanilla coverage | 100% of in-scope Tier-0/1 checks at 1.0; ≥85% coverage of the Tier-2 checklist at the 2.0 gate | Monthly from MS-14 |
 | Open P0 / P1 | Count at any time | 0 P0, ≤5 P1 | Weekly |
 | Contributor retention | First-time contributors landing a second PR within 90 days | ≥40% | Quarterly |
 | New contributors | Distinct first-time contributors merged per month | ≥3 after `0.1` | Monthly |

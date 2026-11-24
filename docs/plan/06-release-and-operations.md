@@ -278,7 +278,7 @@ event, a launch with a save-corruption bug is a trust event the project does not
 | --- | --- | --- | --- |
 | T−7 d | Final gates, freeze confirmed, store assets uploaded but unpublished; RC to beta at T−2 with the migration drill | Release manager, MS-13 | Nothing published; beta only |
 | T−1 d | Sign and stage; verify the manifest on a clean machine; confirm the support rota | MS-16 | Staged, not offered |
-| T−2 h | Manifest at 5%; watch crash-free sessions, join failures and server reports; raise to 25% at T+2 h if green | Release manager | Revert manifest |
+| T−2 h | Manifest at 5%; watch opt-in crash-signature rate (crash-free sessions are unmeasurable without telemetry), join failures and server reports; raise to 25% at T+2 h if green | Release manager | Revert manifest |
 | T−0 | Announcement; store pages public; `/1.0/` live; support staffed | Lead | Correction, manifest revert |
 | T+2 h | Publish first-day metrics | Release manager | Revert to 5% |
 | T+24 h | Raise to 100%; take a hotfix decision on any S2 | Release manager | Roll back to N−1 |
