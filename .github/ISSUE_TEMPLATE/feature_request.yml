@@ -1,0 +1,31 @@
+name: Feature request
+description: A player-facing feature or gameplay content idea.
+labels: ["type: feature", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed feature
+    validations:
+      required: true
+  - type: dropdown
+    id: tier
+    attributes:
+      label: Scope tier
+      options:
+        - Tier 0 — core MVP
+        - Tier 1 — parity essentials
+        - Tier 2 — full parity
+        - Tier 3 — deep parity / polish
+        - Beyond Minecraft (custom content)
+        - Unsure
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and Minecraft's approach

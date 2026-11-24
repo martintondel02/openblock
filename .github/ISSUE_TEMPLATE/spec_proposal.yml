@@ -1,0 +1,39 @@
+name: Specification change
+description: Propose a new or changed requirement, design or decision.
+labels: ["type: spec", "needs-triage"]
+body:
+  - type: input
+    id: doc
+    attributes:
+      label: Affected document(s)
+      placeholder: docs/spec/18-networking-multiplayer.md
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is wrong, missing, or undecided today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: The concrete change, with numbers and alternatives considered.
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Which milestones, code areas, save/network formats or players are affected?
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: This proposal does not contradict an existing DEC without proposing a supersession.
+          required: true
+        - label: I have read docs/spec/00-conventions.md.
+          required: true
