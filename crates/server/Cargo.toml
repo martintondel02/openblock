@@ -1,6 +1,6 @@
 [package]
 name = "ob_server"
-description = "The OpenBlock dedicated server."
+description = "The headless authoritative host shared by single-player and dedicated servers."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,3 +17,10 @@ name = "openblock-server"
 path = "src/bin/openblock_server.rs"
 
 [dependencies]
+ob_core.workspace = true
+ob_math.workspace = true
+ob_content.workspace = true
+ob_world.workspace = true
+ob_worldgen.workspace = true
+ob_sim.workspace = true
+log.workspace = true

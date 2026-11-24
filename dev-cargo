@@ -1,0 +1,12 @@
+#!/bin/sh
+# Rootless development wrapper: workspace-local CARGO_HOME and a Zig-based C
+# linker (this environment has no system cc/gcc). Use exactly like cargo:
+#   ./dev-cargo check --workspace --all-targets
+#   ./dev-cargo test --workspace --all-targets
+# Real Fedora toolchains do not need this wrapper (see CONTRIBUTING.md).
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+export CARGO_HOME="$ROOT/.cargo-home"
+export CC="$ROOT/.toolchain/zigcc"
+export AR="$ROOT/.toolchain/zigar"
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$ROOT/.toolchain/zigcc"
+exec "${HOME}/.cargo/bin/cargo" "$@"

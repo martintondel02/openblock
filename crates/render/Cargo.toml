@@ -1,6 +1,6 @@
 [package]
 name = "ob_render"
-description = "GPU renderer: render graph, passes, shaders and GPU resource management."
+description = "The GPU renderer built on wgpu: voxel meshing, mesh upload and shading."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,4 +8,16 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[lib]
+name = "ob_render"
+path = "src/lib.rs"
+
 [dependencies]
+ob_math.workspace = true
+ob_world.workspace = true
+ob_content.workspace = true
+wgpu.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+log.workspace = true
+winit.workspace = true

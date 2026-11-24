@@ -6,7 +6,7 @@
 <p align="center">
   <a href=".github/workflows/ci.yml"><img alt="CI" src="https://github.com/martintondel02/openblock/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE-MIT"><img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a>
-  <img alt="Status" src="https://img.shields.io/badge/status-specification%20stage-orange.svg">
+  <img alt="Status" src="https://img.shields.io/badge/status-v0.0.1%20tech%20preview-orange.svg">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.100%2B-B7410E.svg?logo=rust">
   <img alt="Primary platform" src="https://img.shields.io/badge/platform-Fedora%2044%2F45%20%7C%20Linux-51A2DA.svg?logo=fedora">
 </p>
@@ -41,10 +41,18 @@ OpenBlock is designed to express content and systems Minecraft cannot:
 programmable logic blocks, first-class energy/fluid networks, scriptable mob
 AI, procedural dungeons, server-side minigames and more.
 
-> **Status: pre-alpha, specification stage.** There is no playable build yet.
-> The repository currently contains the full specification, research and plan
-> that the implementation will follow — see [`docs/`](docs/README.md). If you
-> want to help build it, start with [`CONTRIBUTING.md`](CONTRIBUTING.md) and
+![OpenBlock v0.0.1 tech preview — procedurally generated terrain, trees and sky, rendered by the wgpu client](docs/img/v0.0.1-screenshot.png)
+
+<p align="center"><em>v0.0.1, seed 42: procedural terrain and trees rendered by the wgpu client (offscreen capture on Fedora 45, RADV).</em></p>
+
+> **Status: v0.0.1 tech preview.** A runnable single-player vertical slice now
+> exists: procedural terrain, chunk streaming, walk/fly physics, block
+> break/place, hotbar selection, save/load and a headless host with a
+> determinism smoke test. It is the first slice of MS-03, not a finished game:
+> multiplayer, UI text, audio and the GPU-driven render path are later
+> milestones. The full specification, research and plan live in
+> [`docs/`](docs/README.md); if you want to help, start with
+> [`CONTRIBUTING.md`](CONTRIBUTING.md) and
 > [`docs/plan/01-milestones.md`](docs/plan/01-milestones.md).
 
 ---
@@ -200,6 +208,32 @@ Budgets and their enforcement: [`spec/25-performance-budgets.md`](docs/spec/25-p
 The reference machine, CI gates and packaging order all follow Fedora ([DEC-054](docs/decisions.md)).
 Packaging sources (RPM spec, systemd unit, firewalld service, Flatpak manifest,
 AppStream metadata) live in [`packaging/`](packaging/README.md).
+
+## Running the v0.0.1 tech preview
+
+```sh
+# Client (single player; Fedora 44/45, Wayland, Vulkan)
+cargo run --release -p ob_client --bin openblock -- --seed 42
+
+# Headless host: generate, tick, save, reload and verify determinism
+cargo run --release -p ob_server --bin openblock-server -- --smoke --seed 42
+
+# Dedicated host (no networking yet; MS-06)
+cargo run --release -p ob_server --bin openblock-server -- --world demo --seed 42
+
+# Headless render check / screenshot (works without a display; needs a Vulkan driver)
+cargo run --release -p ob_client --bin openblock -- --screenshot openblock.png --seed 42 --fly
+```
+
+Controls: mouse look (click to capture), `WASD` move, `Space` jump, `Shift`
+sprint, `F` toggle fly, left/right click break/place, `1`–`8` select block,
+`Esc` release the pointer. Saves live under
+`${XDG_DATA_HOME:-~/.local/share}/openblock/worlds/`.
+
+The client needs a Vulkan-capable GPU and driver (Fedora:
+`mesa-vulkan-drivers` for AMD/Intel, or the NVIDIA driver from RPM Fusion).
+On a machine without a display/GPU only the headless host runs — that is the
+target for dedicated servers.
 
 ### Building on Fedora (for contributors)
 

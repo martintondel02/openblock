@@ -29,8 +29,12 @@
     <content_attribute id="social-chat">intense</content_attribute>
   </content_rating>
   <releases>
-    <release version="0.0.0" date="2026-11-24" type="development">
-      <description><p>Specification-stage scaffold: no playable build yet.</p></description>
+    <release version="0.0.1" date="2026-11-24" type="development">
+      <description>
+        <p>Tech preview: a runnable single-player vertical slice (procedural
+        terrain, walk/fly physics, block break/place, save/load) plus a headless
+        host. Multiplayer, UI text and audio arrive at later milestones.</p>
+      </description>
     </release>
   </releases>
 </component>

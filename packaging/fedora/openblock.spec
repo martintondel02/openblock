@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           openblock
-Version:        0.0.0
+Version:        0.0.1
 Release:        1%{?dist}
 Summary:        Fast, deeply moddable, server-first voxel sandbox
 

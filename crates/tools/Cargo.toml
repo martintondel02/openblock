@@ -1,6 +1,6 @@
 [package]
 name = "ob_tools"
-description = "Offline asset, content-pack and world tooling for OpenBlock."
+description = "Offline tooling: asset compiler, world tools and inspectors."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,3 +17,6 @@ name = "openblock-tools"
 path = "src/bin/openblock_tools.rs"
 
 [dependencies]
+ob_core.workspace = true
+ob_content.workspace = true
+ob_world.workspace = true

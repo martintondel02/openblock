@@ -1,11 +1,15 @@
 [package]
 name = "ob_protocol"
-description = "Versioned wire protocol shared by client and server."
+description = "The OpenBlock wire protocol: versioned messages shared by client and server."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
+[lib]
+name = "ob_protocol"
+path = "src/lib.rs"
 
 [dependencies]

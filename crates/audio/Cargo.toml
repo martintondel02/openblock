@@ -1,11 +1,15 @@
 [package]
 name = "ob_audio"
-description = "Sound engine, spatial audio and music system."
+description = "Audio: sound event bus, spatial mixing and music."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
+[lib]
+name = "ob_audio"
+path = "src/lib.rs"
 
 [dependencies]

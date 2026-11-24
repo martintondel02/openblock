@@ -1,6 +1,6 @@
 [package]
 name = "ob_sim"
-description = "Authoritative simulation: entities, AI, physics and gameplay systems."
+description = "Authoritative gameplay simulation: player physics, block interaction and game rules."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,4 +8,11 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[lib]
+name = "ob_sim"
+path = "src/lib.rs"
+
 [dependencies]
+ob_math.workspace = true
+ob_content.workspace = true
+ob_world.workspace = true

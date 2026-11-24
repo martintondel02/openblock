@@ -1,6 +1,6 @@
 [package]
 name = "ob_worldgen"
-description = "Deterministic terrain, biome and structure generation."
+description = "Deterministic terrain generation shared by client and dedicated server."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,4 +8,11 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[lib]
+name = "ob_worldgen"
+path = "src/lib.rs"
+
 [dependencies]
+ob_math.workspace = true
+ob_content.workspace = true
+ob_world.workspace = true

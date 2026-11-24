@@ -1,6 +1,6 @@
 [package]
 name = "ob_core"
-description = "Application loop, scheduler, configuration, diagnostics and platform services."
+description = "Engine core: app lifecycle, scheduler, config, logging and diagnostics."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,4 +8,9 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[lib]
+name = "ob_core"
+path = "src/lib.rs"
+
 [dependencies]
+log.workspace = true

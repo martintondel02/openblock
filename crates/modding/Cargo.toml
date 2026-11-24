@@ -1,11 +1,15 @@
 [package]
 name = "ob_modding"
-description = "Content pack runtime, WASM mod host and native plugin ABI."
+description = "Modding: content pack loading and the sandboxed mod host."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
+[lib]
+name = "ob_modding"
+path = "src/lib.rs"
 
 [dependencies]

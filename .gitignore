@@ -7,3 +7,8 @@
 .vscode/
 /packages/
 /profiling/
+
+# Local rootless dev toolchain (Fedora has gcc; this sandbox does not).
+/.toolchain/
+/.cargo-home/
+/.tmp-sdroot/

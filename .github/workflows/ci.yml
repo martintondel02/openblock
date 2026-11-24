@@ -32,6 +32,18 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace --all-targets
+      - name: Headless host smoke test
+        run: cargo run --release --locked -p ob_server --bin openblock-server -- --smoke --data-dir target/smoke --seed 42
+      - name: Offscreen render smoke test (lavapipe)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mesa-vulkan-drivers libvulkan1
+          cargo run --release --locked -p ob_client --bin openblock -- --screenshot target/screenshot.png --seed 42 --fly --render-distance 4
+          test -s target/screenshot.png
+          bytes=$(wc -c < target/screenshot.png)
+          echo "screenshot bytes: $bytes"
+          test "$bytes" -gt 5000
       - name: Docs
         if: matrix.os == 'ubuntu-latest'
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
@@ -59,6 +71,8 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Build and test
         run: cargo test --workspace --all-targets
+      - name: Headless host smoke test
+        run: cargo run --release --locked -p ob_server --bin openblock-server -- --smoke --data-dir target/smoke --seed 42
       - name: Architecture guard
         run: .github/scripts/check-arch.sh
       - name: Documentation consistency

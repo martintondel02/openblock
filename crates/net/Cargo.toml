@@ -1,11 +1,15 @@
 [package]
 name = "ob_net"
-description = "Transport, replication, interest management and server operations."
+description = "Networking: transport, replication and interest management."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
+[lib]
+name = "ob_net"
+path = "src/lib.rs"
 
 [dependencies]

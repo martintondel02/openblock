@@ -1,6 +1,6 @@
 [package]
 name = "ob_content"
-description = "Registries, content packs, tags, recipes and data-driven definitions."
+description = "The content model: block and item types with namespaced ids and tags."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,4 +8,9 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[lib]
+name = "ob_content"
+path = "src/lib.rs"
+
 [dependencies]
+rustc-hash.workspace = true

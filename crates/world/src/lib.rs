@@ -1,9 +1,18 @@
-//! The voxel world model: block storage, sections, chunks, lighting and spatial queries.
+//! The voxel world model: paletted sections, chunk columns, lighting and queries.
 //!
-//! **Status: scaffolding.** This crate is a placeholder created alongside the
-//! OpenBlock specification. Its public API is defined in the specification
-//! under `docs/spec/` and is implemented starting at the milestone named in
-//! that document. Do not depend on this crate from outside the workspace yet.
+//! Coordinate types come from [`ob_math`]. The world stores 16³ sections
+//! ([`section::Section`]) organised into 16×16 chunk columns ([`chunk::ChunkColumn`]).
+//! Mutations mark affected sections dirty; the client turns dirty sections into
+//! meshes. The dedicated server uses the same code with no renderer attached.
 
-#![forbid(unsafe_code)]
-#![warn(missing_docs)]
+pub mod chunk;
+pub mod light;
+pub mod save;
+pub mod section;
+pub mod world;
+
+pub use chunk::ChunkColumn;
+pub use light::Light;
+pub use save::{SaveError, from_bytes, to_bytes};
+pub use section::{Section, SectionStorage};
+pub use world::{RayHit, World};

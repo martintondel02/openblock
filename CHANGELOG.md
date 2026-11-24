@@ -6,6 +6,35 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [0.0.1] — 2026-11-24 (tech preview, specification stage)
+
+The first runnable build: a windowed voxel client on wgpu 30 and a headless
+host, wired to the first implementation of the engine core.
+
+### Added
+- `openblock` client: winit 0.30 window, wgpu 30 renderer, procedural terrain
+  streaming, walk/fly AABB physics, block break/place, hotbar selection, world
+  autosave, FPS/position in the window title.
+- `openblock-server`: headless 20 Hz host with the same simulation code as the
+  client, autosave, world reload, `--smoke` determinism check and `--ticks N`.
+- Engine foundation: coordinate/AABB/RNG crate, in-code block registry,
+  paletted 16³ sections with 4/8/16-bit palettes, packed sky/RGB light storage,
+  chunk columns, raycasting and dirty-section tracking; deterministic terrain
+  generator; player physics and block interaction; v0 snapshot save format
+  with CRC32C; wgpu mesher with face shading and ambient occlusion.
+- Offscreen render-to-PNG path (`--screenshot`) that works without a window or
+  display, plus a GPU test that verifies non-black geometry output and skips
+  cleanly when no Vulkan adapter exists.
+- Linux/Fedora-first CI: Fedora 44/45 container jobs, a headless host smoke test
+  in every Rust job, and a lavapipe offscreen render check on Ubuntu.
+
+### Changed
+- Crate versions move to 0.0.1; packaging metadata and Flatpak manifest are
+  pinned to the same version.
+- Networking, modding, UI text, audio and the GPU-driven render path remain
+  later milestones (MS-06 and onward); this build is a single-player tech
+  preview.
+
 ## [Unreleased]
 
 ### Added

@@ -4,16 +4,32 @@ members = ["crates/*", "xtask"]
 default-members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/martintondel02/openblock"
 
-# External dependencies are pinned here as each milestone lands; see
-# docs/spec/02-engine-core.md and docs/plan/01-milestones.md. Internal path
-# dependencies are added per crate when it gains its first code.
+# External dependencies are pinned here; see docs/decisions.md and
+# docs/spec/02-engine-core.md. Internal path dependencies are listed below.
 [workspace.dependencies]
+glam = { version = "0.34", features = ["bytemuck"] }
+wgpu = "30"
+winit = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+log = "0.4"
+png = "0.18"
+rustc-hash = "2"
+
+ob_core = { path = "crates/core", version = "0.0.1" }
+ob_math = { path = "crates/math", version = "0.0.1" }
+ob_content = { path = "crates/content", version = "0.0.1" }
+ob_world = { path = "crates/world", version = "0.0.1" }
+ob_worldgen = { path = "crates/worldgen", version = "0.0.1" }
+ob_sim = { path = "crates/sim", version = "0.0.1" }
+ob_render = { path = "crates/render", version = "0.0.1" }
+ob_server = { path = "crates/server", version = "0.0.1" }
 
 [profile.dev]
 opt-level = 1
@@ -26,7 +42,7 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 debug = "line-tables-only"
-strip = "split"
+strip = "symbols"
 
 # The dedicated server unwinds so job/WASM traps can be contained (DEC-042).
 [profile.server]

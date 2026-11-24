@@ -1,6 +1,6 @@
 [package]
 name = "ob_math"
-description = "Math primitives, coordinate spaces and fixed-point helpers."
+description = "Voxel-aware math: coordinate spaces, AABBs and deterministic RNG."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,4 +8,9 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[lib]
+name = "ob_math"
+path = "src/lib.rs"
+
 [dependencies]
+glam.workspace = true

@@ -1,11 +1,15 @@
 [package]
 name = "ob_ui"
-description = "Retained, data-driven UI: screens, widgets, text and localization."
+description = "User interface: retained widget tree, screens and localization."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
+[lib]
+name = "ob_ui"
+path = "src/lib.rs"
 
 [dependencies]
