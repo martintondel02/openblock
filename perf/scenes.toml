@@ -1,0 +1,179 @@
+# OpenBlock benchmark scene manifest.
+#
+# Normative definition: docs/spec/25-performance-budgets.md (section 4) and
+# docs/spec/24-testing-benchmarks.md. A scene is a reproducible workload: a
+# golden world + input log + preset + warm-up + measurement window. Scenes are
+# content-addressed by hash; a changed scene hash invalidates its baseline (the
+# harness records instead of gating until a new baseline exists).
+
+schema = "openblock.scenes/1"
+
+# --- Windowed scenes (GPU + frame-time gates) ---
+
+[[scene]]
+id = "empty"
+description = "Empty world, sky and UI only; isolates start-up and pipeline costs."
+world = "golden/empty.obworld"
+input = "inputs/idle_5s.input"
+preset = "high"
+render_distance_blocks = 128
+warmup_s = 5
+runs = 3
+duration_s = 10
+
+[[scene]]
+id = "flythrough"
+description = "120 s fixed-seed flight at 30 blocks/s over mixed terrain with water, forest and a village; the primary 120/144 FPS gate."
+world = "golden/mixed_512.obworld"
+input = "inputs/flythrough_120s.input"
+preset = "high"
+render_distance_blocks = 512
+warmup_s = 10
+runs = 3
+duration_s = 120
+
+[[scene]]
+id = "tnt"
+description = "Chained TNT: 64 explosions, mesh churn, particles, lighting updates and sound storms."
+world = "golden/flat_256.obworld"
+input = "inputs/tnt_64.64"
+preset = "high"
+render_distance_blocks = 256
+warmup_s = 10
+runs = 3
+duration_s = 30
+
+[[scene]]
+id = "water"
+description = "Underwater and surface water rendering with SSR, refraction and translucency."
+world = "golden/ocean_512.obworld"
+input = "inputs/swim_30s.input"
+preset = "high"
+render_distance_blocks = 512
+warmup_s = 10
+runs = 3
+duration_s = 30
+
+[[scene]]
+id = "cave"
+description = "Cave traversal with dynamic lights and lava; stresses lighting, occlusion and translucency."
+world = "golden/cave_256.obworld"
+input = "inputs/cave_30s.input"
+preset = "high"
+render_distance_blocks = 256
+warmup_s = 10
+runs = 3
+duration_s = 30
+
+[[scene]]
+id = "megabuild"
+description = "Large player-built city at 512 blocks; stresses draw counts, cluster meshing and occlusion."
+world = "golden/megabuild_512.obworld"
+input = "inputs/city_walk_60s.input"
+preset = "high"
+render_distance_blocks = 512
+warmup_s = 10
+runs = 3
+duration_s = 60
+
+# --- Headless scenes (server, IO, generation, content) ---
+
+[[scene]]
+id = "tick50"
+description = "Server tick: 50 bots, 2,000 loaded chunks, 256-block simulation distance, mobs and redstone active."
+world = "golden/server_50.obworld"
+input = "inputs/tick50_120s.input"
+preset = "n/a"
+simulation_distance_blocks = 256
+warmup_s = 10
+runs = 3
+duration_s = 120
+tier = "server"
+
+[[scene]]
+id = "tick16"
+description = "Server reference config: 16 bots, 4 vCPU / 8 GiB, 256-block simulation distance, 20 TPS."
+world = "golden/server_16.obworld"
+input = "inputs/tick16_3600s.input"
+preset = "n/a"
+simulation_distance_blocks = 256
+warmup_s = 30
+runs = 1
+duration_s = 3600
+tier = "server"
+
+[[scene]]
+id = "join"
+description = "Network join from login to playable and to full 512-block interest set on a shaped 10 Mbit/s, 40 ms RTT link."
+world = "golden/mixed_512.obworld"
+input = "inputs/idle_10s.input"
+preset = "high"
+render_distance_blocks = 512
+network = "10mbit_40ms"
+warmup_s = 0
+runs = 3
+duration_s = 150
+
+[[scene]]
+id = "save"
+description = "Region save/load throughput, save pause time and fsync budget on a pregenerated 512-block world."
+world = "golden/mixed_512.obworld"
+input = "inputs/edit_1000.ops"
+preset = "n/a"
+warmup_s = 0
+runs = 5
+duration_s = 60
+
+[[scene]]
+id = "gen"
+description = "Worldgen throughput on 8 threads over the 10,000-seed corpus subset; deterministic hash check included."
+world = "seeds/gen_corpus_1000.txt"
+input = "n/a"
+preset = "n/a"
+warmup_s = 0
+runs = 3
+duration_s = 300
+
+[[scene]]
+id = "relight"
+description = "Incremental lighting after scripted block edits, including sky-light column and cross-section propagation."
+world = "golden/mixed_512.obworld"
+input = "inputs/relight_200_edits.ops"
+preset = "n/a"
+warmup_s = 0
+runs = 5
+duration_s = 60
+
+[[scene]]
+id = "pack"
+description = "Content pack validation, load, registry freeze and content hashing for the base pack and a 100-pack corpus."
+world = "golden/base_pack"
+input = "packs/validate_corpus.txt"
+preset = "n/a"
+warmup_s = 0
+runs = 5
+duration_s = 60
+
+# --- Harness self-tests ---
+
+[[scene]]
+id = "mods"
+description = "Reference WASM mod set on the client: world read/write, entity spawn, UI data binding and scheduled callbacks."
+world = "golden/mixed_512.obworld"
+input = "inputs/flythrough_120s.input"
+preset = "high"
+render_distance_blocks = 512
+mods = ["reference/tech", "reference/farming", "reference/minigame"]
+warmup_s = 10
+runs = 3
+duration_s = 120
+
+[[scene]]
+id = "ci"
+description = "The PR CI lane: fmt, clippy, tests, docs, arch guard, gated scene subset and benchmark comparison."
+world = "n/a"
+input = "n/a"
+preset = "n/a"
+warmup_s = 0
+runs = 1
+duration_s = 1500

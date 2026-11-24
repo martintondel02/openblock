@@ -242,7 +242,7 @@ flowchart LR
 
 **Random ticks.** For every section in simulation distance with `random_ticks` enabled, the engine picks `random_tick_speed` local indices per tick (base-pack default 3) and dispatches a random tick to each. The RNG is `splitmix64(world_seed ^ dim_seed ^ section_key ^ tick ^ i)`: stateless, so no PRNG state is stored and a replayed tick makes identical choices. Only blocks opting into random ticking are affected, so an empty section costs one branch.
 
-**Region awareness.** Ticks are owned by their chunk; chunks are grouped into 32×32-chunk regions (the same grouping as region files, [17](17-persistence.md)). With parallel region ticking — proposed, see Open questions — each region executes its ticks in key order on one worker, and a neighbour or shape update that would cross a region boundary is deferred to the next tick and ordered by destination region key. Cross-region redstone is therefore not simultaneous, and [12](12-redstone-and-logic.md) must state that contract rather than imply vanilla ordering.
+**Region awareness.** Ticks are owned by their chunk; chunks are grouped into 32×32-chunk regions (the same grouping as region files, [17](17-persistence.md)). With parallel region ticking — an unresolved register item, see §8 — each region executes its ticks in key order on one worker, and a neighbour or shape update that would cross a region boundary is deferred to the next tick and ordered by destination region key. Cross-region redstone is therefore not simultaneous, and [12](12-redstone-and-logic.md) must state that contract rather than imply vanilla ordering.
 
 **Unloaded chunks and catch-up.** A chunk outside simulation distance executes nothing; its queue is persisted with due times (the remaining delay against the saved world tick, [17](17-persistence.md)) and its `last_simulated` tick is stored. On promotion back to `Ready`:
 
@@ -302,7 +302,7 @@ A 512-block client may render chunks the server only simulates out to 256, which
 | Entities | Frozen: position, velocity, health and AI state persist; no movement, damage or despawn | No away-from-keyboard mob farms; smaller saves |
 | Redstone, fluids | Paused; pending neighbour updates into the chunk are discarded, scheduled ticks retained | Unbounded cross-chunk queues are a memory leak |
 | Crops, saplings | Block ticks retained; catch-up bounded per §3.7 | Predictable, no free growth |
-| Timed block entities | Paused unless the type opts into wall-clock progress (Open question) | Parity expects paused; opt-in serves modded machines |
+| Timed block entities | Paused unless the type opts into wall-clock progress (§8) | Parity expects paused; opt-in serves modded machines |
 | Scheduled ticks | Retained with due times; catch-up on load | Timers survive restarts |
 | Portals | Crossing grants a destination ticket so the far side loads | Otherwise the player falls through unloaded space |
 | Weather | Continues for the whole dimension, not per chunk | A storm is not a local phenomenon |
@@ -435,11 +435,11 @@ A test-only `SlowWorld` (`BTreeMap<BlockPos, BlockStateId>` plus recompute-from-
 
 ## 8. Open questions
 
-1. **Simulation-distance default and its coupling to render distance.** This chapter assumes 256 blocks, but the choice interacts with server capacity ([MS-15](../plan/01-milestones.md)) and prediction. Proposed **DEC-038**: "Simulation distance defaults to 256 blocks, is capped at render distance, and is a per-world setting; clients predict only within simulation distance." Owner: **MS-04** with MS-07.
-2. **Block-state encoding freeze.** The 16-property-bit budget and canonical ordering become save-format-adjacent once content ships. Proposed **DEC-039**: "Block states are a dense registry-frozen ID over a canonical ≤ 16-bit property word, persisted as resource ID plus property map." Owner: **MS-13**, before the world format freezes.
-3. **Parallel region ticking and cross-region ordering.** §3.7 defers cross-region updates by one tick, a gameplay-visible semantic that needs a decision, not an optimisation note. Proposed **DEC-040**: "Parallel region ticking ships at 1.0; cross-region block and redstone updates are deferred to the next tick and ordered by destination region key." Owner: **MS-15** with MS-11 and [12](12-redstone-and-logic.md).
-4. **Timed block entities while unloaded.** Wall-clock progress rewards infrastructure players; paused matches the parity expectation and simplifies the save. Proposed **DEC-041**: "Block entities are paused while unloaded unless their content type opts into wall-clock progress, recorded in the payload." Owner: **MS-10**.
-5. **Chunk ticket taxonomy.** The four ticket kinds in §3.9 are a proposal; spawn-chunk retention and command-forceload semantics need an owner and a cap. Owner: **MS-07**.
+1. **Simulation-distance default and its coupling to render distance.** This chapter assumes 256 blocks, but the choice interacts with server capacity ([MS-15](../plan/01-milestones.md)) and prediction. Register item needed: simulation-distance default (256 blocks, capped at render distance, and a per-world setting; clients predict only within simulation distance) (owner **MS-04** with MS-07).
+2. **Block-state encoding freeze.** The 16-property-bit budget and canonical ordering become save-format-adjacent once content ships. Register item needed: block-state encoding freeze (a dense registry-frozen ID over a canonical ≤ 16-bit property word, persisted as resource ID plus property map) (owner **MS-13**, before the world format freezes).
+3. **Parallel region ticking and cross-region ordering.** §3.7 defers cross-region updates by one tick, a gameplay-visible semantic that needs a decision, not an optimisation note. Register item needed: parallel region ticking and cross-region ordering (parallel region ticking ships at 1.0; cross-region block and redstone updates are deferred to the next tick and ordered by destination region key) (owner **MS-15** with MS-11 and [12](12-redstone-and-logic.md)).
+4. **Timed block entities while unloaded.** Wall-clock progress rewards infrastructure players; paused matches the parity expectation and simplifies the save. Register item needed: timed block entities while unloaded (paused unless their content type opts into wall-clock progress, recorded in the payload) (owner **MS-10**).
+5. **Chunk ticket taxonomy.** The four ticket kinds in §3.9 are a proposal; spawn-chunk retention and command-forceload semantics need a documented cap and lifecycle policy. Owner: **MS-07**.
 
 ## 9. References
 

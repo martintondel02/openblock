@@ -1,7 +1,7 @@
 # 11 — Items, Inventory and Crafting
 
 > Status: normative - Last updated: 2026-11-24
-> Depends on: [DEC-006](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-017](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-022](../decisions.md), [DEC-023](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md); [content system](15-content-system.md), [persistence](17-persistence.md), [networking](18-networking-multiplayer.md), [redstone](12-redstone-and-logic.md)
+> Depends on: [DEC-006](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-017](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-022](../decisions.md), [DEC-023](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md), [DEC-038](../decisions.md), [DEC-040](../decisions.md), [DEC-041](../decisions.md); [content system](15-content-system.md), [persistence](17-persistence.md), [networking](18-networking-multiplayer.md), [redstone](12-redstone-and-logic.md)
 > Implements: MS-10 (stacks, containers, crafting, stations), MS-11 (enchanting, brewing, trading, loot), MS-14 (parity corpus)
 
 ## 1. Purpose and scope
@@ -10,7 +10,7 @@ This chapter defines what an item *is*, how a stack carries data, how inventorie
 
 Out of scope: the block/item registry pipeline and pack layering ([15](15-content-system.md)); the save file container and migrations ([17](17-persistence.md)); message encoding and the reliable stream ([18](18-networking-multiplayer.md)); hopper *power* semantics ([12](12-redstone-and-logic.md)); inventory screens and drag rendering ([13](13-ui-and-ux.md)); WASM capability enforcement ([16](16-modding.md), [20](20-security-and-anti-cheat.md)); item model shaders ([03](03-rendering.md)).
 
-Two invariants frame everything. First, item state is a **typed component map**, not a free-form tree: there is no untyped NBT escape hatch in the public API (DEC-019). Second, the host owns every stack (DEC-008): clients send intents, never slot contents, and the host answers with authoritative deltas (DEC-023). Durations are canonical ticks (ct) at 20 ct/s (DEC-007); the 30 Hz mapping is an open decision (proposed DEC-038, [08 §8](08-gameplay-survival.md#8-open-questions)).
+Two invariants frame everything. First, item state is a **typed component map**, not a free-form tree: there is no untyped NBT escape hatch in the public API (DEC-019, DEC-041). Second, the host owns every stack (DEC-008): clients send intents, never slot contents, and the host answers with authoritative deltas (DEC-023). Durations are canonical ticks (ct) at 20 ct/s (DEC-007, DEC-038); the simulation runs at 20 Hz and a 30 Hz setting raises only the snapshot/replication rate, never a duration or a gameplay value.
 
 ## 2. Requirements
 
@@ -112,7 +112,7 @@ Floats are forbidden in components: simulation values are integers or per-mille 
 | `potion`, `effects` | potion ID, effect map | brew results and custom effects |
 | `charged_projectiles`, `banner_patterns`, `trim`, `map_id`, `written_book`, `firework`, `lock` | typed | per-kind validation |
 
-**Why components, not NBT.** A free-form tree is unvalidated (ambiguous numeric widths, unbounded depth, duplicate keys), so it is an anti-cheat and memory-safety liability; it cannot be canonicalised cheaply, so identical stacks hash differently; its string keys are repeated on every network update; and it is an executable-payload habit that invites hidden behaviour. Typed components give schema validation with actionable errors, hard size bounds, default elision, cheap structural equality, a stable hash for audit and duplication evidence, and a versioned migration path. Unknown components from a newer pack are kept as opaque bytes for round-trip only and are never interpreted; a server with a different content hash refuses the join before such a stack can matter (DEC-006, DEC-027).
+**Why components, not NBT.** A free-form tree is unvalidated (ambiguous numeric widths, unbounded depth, duplicate keys), so it is an anti-cheat and memory-safety liability; it cannot be canonicalised cheaply, so identical stacks hash differently; its string keys are repeated on every network update; and it is an executable-payload habit that invites hidden behaviour. Typed components give schema validation with actionable errors, hard size bounds, default elision, cheap structural equality, a stable hash for audit and duplication evidence, and a versioned migration path (DEC-041). Unknown components from a newer pack are kept as opaque bytes for round-trip only and are never interpreted; a server with a different content hash refuses the join before such a stack can matter (DEC-006, DEC-027).
 
 **Canonical encoding.** Two encodings share one canonical form. The *canonical* form (disk, hash, audit) resolves every ID to its resource-ID string and sorts components by ID:
 
@@ -318,7 +318,7 @@ Item presentation is view-only. `ItemModelDef` declares a parent, textures, elem
 
 ### 3.16 Content behaviour and mod hooks
 
-Item behaviour is data first: facets cover food, fuel, tools, armor, placement, projectiles and most use actions. The remainder is a `UseHandler` selected by a registered ID, executed **on the host only**. A WASM mod registers a handler through the host ABI ([16](16-modding.md)) with the `actions.world` capability; the host validates the action queue at the tick commit point, applies the same budgets as any mod callback (1 ms hard cap, 4,096 actions/tick) and attributes cost per mod. Clients receive a declarative prediction descriptor (use time, cooldown, shape, whether the action changes the world) inside the content hash, so they can animate and predict the common case; complex behaviour is server-authoritative and may correct. No item hook can run on a client, read files, open sockets or bypass the inventory transaction rules.
+Item behaviour is data first: facets cover food, fuel, tools, armor, placement, projectiles and most use actions. The remainder is a `UseHandler` selected by a registered ID, executed **on the host only**. A WASM mod registers a handler through the host ABI ([16](16-modding.md)) with the `world.write` capability; the host validates the action queue at the tick commit point, applies the same budgets as any mod callback (1 ms hard cap, 4,096 actions/tick) and attributes cost per mod. Clients receive a declarative prediction descriptor (use time, cooldown, shape, whether the action changes the world) inside the content hash, so they can animate and predict the common case; complex behaviour is server-authoritative and may correct. No item hook can run on a client, read files, open sockets or bypass the inventory transaction rules.
 
 ### 3.17 Risks
 
@@ -416,20 +416,20 @@ The duplication fuzz is the release gate from the MS-10 exit criteria: 100k rand
 
 ## 8. Open questions
 
-Proposed DEC numbers are placeholders: sibling chapters in this writing batch propose the same range, and the register owner assigns final IDs on acceptance.
+The register settles the decisions this chapter depends on. Items that are still open are listed below; where a former placeholder now has a canonical decision, the item records the mapping rather than asking again.
 
-1. **Typed component schema as a decision (proposed DEC-042).** The register has no decision fixing "components, not NBT"; this chapter enforces it. Confirm before MS-10. Owner: MS-05/MS-10.
-2. **Transaction wire details beyond DEC-023 (proposed DEC-043).** DEC-023 fixes the transport and authority; revision-plus-fingerprint validation, sequence idempotency and the resync message should be register-level. Owner: MS-06.
+1. **Typed component schema — settled by DEC-041.** Item data is a typed component map with canonical sorted encoding and a BLAKE3 transaction hash; this chapter implements that decision and no further register entry is needed. Owner: MS-05/MS-10.
+2. **Transaction wire details beyond DEC-023.** DEC-023 fixes the transport and authority; the revision-plus-fingerprint check, sequence idempotency and the resync message are still chapter-level. **Register item needed: inventory transactions carry a window revision plus a touched-slot fingerprint, are idempotent by sequence, and a mismatch triggers a full window resync (owner MS-06).**
 3. **Cursor persistence.** Should a cursor stack survive disconnect, or be returned to the inventory on close? This chapter persists it; confirm. Owner: MS-10.
 4. **Unknown components.** Preserve opaque bytes (recommended for forward compatibility) or reject the stack when the content hash matches but the component is unknown? Owner: MS-13/MS-09.
 5. **Automated furnace XP.** Drop stored XP as orbs when automation empties the output, or void it? Dropping rewards farms but avoids silent loss. Owner: MS-10.
 6. **Container caps for mods.** Is 256 slots per inventory and depth 1 permanent, or may a trusted pack raise them with a server opt-in? Owner: MS-09.
 7. **Enchant offer preview.** Tier 4 says show possible enchantments; confirm the "top three candidates, random result" presentation and whether it is a register decision. Owner: MS-11/MS-14.
-8. **Per-connection ID dictionaries (proposed DEC-044).** DEC-006 forbids numeric indices crossing a process boundary; the wire plan uses a handshake-built dictionary of resource IDs. Confirm that a connection-local dictionary is permitted (recommended), or require full IDs in every stack. Owner: MS-06.
+8. **Per-connection ID dictionaries — settled by DEC-040.** DEC-006 keeps numeric indices out of saves and persistent references; DEC-040 permits a connection-local, hash-verified dictionary derived from `content_hash` and ends it with the connection. This chapter's wire plan implements that decision; no further entry is needed. Owner: MS-06.
 
 ## 9. References
 
-- Decisions: [DEC-006](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-017](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-022](../decisions.md), [DEC-023](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md).
+- Decisions: [DEC-006](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-017](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-022](../decisions.md), [DEC-023](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md), [DEC-038](../decisions.md), [DEC-040](../decisions.md), [DEC-041](../decisions.md).
 - Research: [feature inventory](../research/05-minecraft-feature-inventory.md) (item, recipe and station scope), [modding and content](../research/06-modding-and-content-system.md) (typed components, canonicalisation, host ABI), [networking SOTA](../research/04-networking-sota.md).
 - Chapters: [03](03-rendering.md), [09](09-entities-ai.md), [12](12-redstone-and-logic.md), [13](13-ui-and-ux.md), [15](15-content-system.md), [16](16-modding.md), [17](17-persistence.md), [18](18-networking-multiplayer.md), [20](20-security-and-anti-cheat.md), [25](25-performance-budgets.md).
 - External facts checked against the parity baseline: [Item components](https://minecraft.wiki/w/Data_component_format), [Crafting](https://minecraft.wiki/w/Crafting), [Recipe](https://minecraft.wiki/w/Recipe), [Smelting](https://minecraft.wiki/w/Smelting), [Enchanting](https://minecraft.wiki/w/Enchanting), [Anvil](https://minecraft.wiki/w/Anvil), [Brewing](https://minecraft.wiki/w/Brewing), [Trading](https://minecraft.wiki/w/Trading), [Loot table](https://minecraft.wiki/w/Loot_table), [Hopper](https://minecraft.wiki/w/Hopper).

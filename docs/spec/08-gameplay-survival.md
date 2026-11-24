@@ -1,7 +1,7 @@
 # 08 — Survival Gameplay
 
 > Status: normative - Last updated: 2026-11-24
-> Depends on: [DEC-004](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-021](../decisions.md), [DEC-022](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md), [DEC-037](../decisions.md); [world model](05-world-model.md), [light and weather](07-light-and-weather.md), [physics](10-physics-and-collision.md), [networking](18-networking-multiplayer.md), [anti-cheat](20-security-and-anti-cheat.md)
+> Depends on: [DEC-004](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-021](../decisions.md), [DEC-022](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md), [DEC-037](../decisions.md), [DEC-038](../decisions.md), [DEC-039](../decisions.md), [DEC-044](../decisions.md); [world model](05-world-model.md), [light and weather](07-light-and-weather.md), [physics](10-physics-and-collision.md), [networking](18-networking-multiplayer.md), [anti-cheat](20-security-and-anti-cheat.md)
 > Implements: MS-10 (core loop), MS-11 (depth), MS-14 (parity corpus)
 
 ## 1. Purpose and scope
@@ -10,7 +10,7 @@ This chapter defines the survival loop: game modes, the player state machine, he
 
 Out of scope: entity bodies, AI and spawning tables ([09](09-entities-ai.md)); the collision/velocity solver and raycasts ([10](10-physics-and-collision.md)); item stacks, containers and recipes ([11](11-inventory-crafting-items.md)); redstone ([12](12-redstone-and-logic.md)); HUD and screens ([13](13-ui-and-ux.md)); persistence ([17](17-persistence.md)); packet encoding ([18](18-networking-multiplayer.md)); enforcement policy and replay evidence ([20](20-security-and-anti-cheat.md)).
 
-Two rules apply everywhere. The host is the only writer of player state (DEC-008); clients send inputs and intents. Durations are expressed in **canonical ticks** (ct) at 20 ct/s (DEC-007); how a 30 Hz server maps them is an open decision (proposed DEC-038, §8), so every number in this chapter is defined at 20 ct/s.
+Two rules apply everywhere. The host is the only writer of player state (DEC-008); clients send inputs and intents. Durations are expressed in **canonical ticks** (ct) at 20 ct/s (DEC-007, DEC-038); a 30 Hz server setting raises only the snapshot/replication rate, so every number in this chapter is defined at 20 ct/s.
 
 ## 2. Requirements
 
@@ -19,7 +19,7 @@ Two rules apply everywhere. The host is the only writer of player state (DEC-008
 | REQ-GAME-001 | Modes are registry entries with capability flags; the host rejects every action whose flag is false, including predicted actions. | Unit: mode matrix | MS-10 |
 | REQ-GAME-002 | Player transitions follow §3.2; illegal transitions are rejected and logged. | Property: transition table | MS-10 |
 | REQ-GAME-003 | Replicated fields are host-written; a client converges within 2 ticks of a correction. | Two-client replay | MS-06 |
-| REQ-GAME-004 | Vitals and damage use fixed-point integers (1 HP = 1,024 units); no float enters health, hunger, XP or combat. | Inspection + hash test | MS-10 |
+| REQ-GAME-004 | Vitals and damage use fixed-point integers (1 HP = 1,024 units); no float enters health, hunger, XP or combat ([DEC-039](../decisions.md)). | Inspection + hash test | MS-10 |
 | REQ-GAME-005 | Damage applies §3.3 phases in order with round-half-up and matches the golden vectors. | Unit: `damage::golden` | MS-10 |
 | REQ-GAME-006 | Every damage type declares armor, protection, i-frame, knockback and message fields; a missing field fails content validation. | Content validation | MS-10 |
 | REQ-GAME-007 | Absorption is spent before health, never self-regenerates, and caps at 20 HP. | Unit + scenario | MS-10 |
@@ -181,7 +181,7 @@ A hit may start at `c >= 900`; the host tolerates 1 ct of earliness for latency 
 
 A raised shield blocks melee and arrows from within ±90° of the authoritative look (15° tolerance), dealing 0; explosions deal 50%. Blocking costs 1 durability plus `damage/4`; an axe disables the shield for 100 ct. Bows, crossbows and tridents are host-simulated: the client sends a use intent, the host spawns and integrates the projectile and resolves the first AABB or block hit ([10](10-physics-and-collision.md)); client tracers and sparks are presentation.
 
-**Hit registration.** The client sends `AttackIntent { target, client_tick, look, charge }` on the reliable ordered stream, never damage. The host checks target liveness and damageability, same dimension, distance ≤ 3.0 m (5.0 m creative), line of sight against current solid blocks, cooldown and mode flags. It retains 500 ms of position history and tests the target box rewound to `server_tick - clamp(RTT/2, 0, 4 ct)`, accepting only if the rewound box is within reach and the *current* geometry still sees the target. Rewind is therefore capped at 200 ms: a 300 ms link gains no advantage, a normal link feels local. Rejections feed the replay bundle ([20](20-security-and-anti-cheat.md)).
+**Hit registration.** The client sends `AttackIntent { target, client_tick, look, charge }` as a command inside the `InputFrame` datagram ([18 §3.4](18-networking-multiplayer.md)); it never sends damage. The host checks target liveness and damageability, same dimension, distance ≤ 3.0 m (5.0 m creative), line of sight against current solid blocks, cooldown and mode flags. It retains 500 ms of position history and tests the target box rewound to `server_tick - clamp(RTT/2, 0, 4 ct)`, accepting only if the rewound box is within reach and the *current* geometry still sees the target. Rewind is therefore capped at 200 ms: a 300 ms link gains no advantage, a normal link feels local. Rejections feed the replay bundle ([20](20-security-and-anti-cheat.md)).
 
 ### 3.7 Movement abilities
 
@@ -258,13 +258,13 @@ World spawn is selected once by the worldgen spawn search ([06 §3.3](06-worldge
 | hard | 150% | lethal | slow | increased |
 | hardcore | hard | lethal | slow | one life, locked |
 
-The damage scalar applies after `BASE` and before absorption, so armor scales consistently. Game rules are typed world settings with host-only writers, named in snake_case to match the save and config schema: `do_daylight_cycle`, `do_weather_cycle`, `keep_inventory`, `natural_regeneration`, `do_immediate_respawn`, `players_sleeping_percentage`, `spawn_radius`, `do_mob_spawning`, `mob_griefing`, `do_fire_tick`, `random_tick_speed` (3), `show_death_messages`, `fall_damage`/`fire_damage`/`drowning_damage`/`freeze_damage`, `disable_elytra_movement_check` (logged), `command_block_output`, `send_command_feedback` and `max_command_chain_length` (65,536). Commands accept rule IDs case-insensitively and display the snake_case ID as canonical.
+The damage scalar applies after `BASE` and before absorption, so armor scales consistently. Game rules are typed world settings with host-only writers, named in snake_case to match the save and config schema ([DEC-044](../decisions.md)): `do_daylight_cycle`, `do_weather_cycle`, `keep_inventory`, `natural_regeneration`, `do_immediate_respawn`, `players_sleeping_percentage`, `spawn_radius`, `do_mob_spawning`, `mob_griefing`, `do_fire_tick`, `random_tick_speed` (3), `show_death_messages`, `fall_damage`/`fire_damage`/`drowning_damage`/`freeze_damage`, `disable_elytra_movement_check` (logged), `command_block_output`, `send_command_feedback` and `max_command_chain_length` (65,536). Commands accept rule IDs case-insensitively and display the snake_case ID as canonical.
 
 On death the host writes the player snapshot (inventory, cursor, XP, stats), spawns drops with a 10 ct pickup delay and 6,000 ct despawn, drops `min(points, 100)` XP, broadcasts the message and sets `Dead`. `keep_inventory` skips item and XP drops; Vanishing Curse items are destroyed; hardcore moves the player to spectator. The death screen shows the damage message, killer, score and respawn button as UI state ([13](13-ui-and-ux.md)). Respawn runs the safe-spawn search around the personal spawn, falling back to world spawn with a message.
 
 ### 3.12 Commands, permissions, statistics and onboarding
 
-Permission levels are server policy, checked before state-changing arguments are parsed: level 0 (all players) `help`, `list`, `msg`, `trigger`; level 1 `spawnpoint`, self `clear`; level 2 `gamemode`, `tp`, `give`, `time`, `weather`, `summon`, `setblock`, `fill`, `clone`, `gamerule`, `effect`, `enchant`, `xp`, and command blocks/functions; level 3 `kick`, `ban`, `whitelist`, `op`, `save`, `difficulty`; level 4 `stop`, `save-off`, `reload`, `mods` (console, RCON, owner). World edits cap at 32,768 blocks, selectors at 1,024 entities, function recursion at 64 and chains at `max_command_chain_length`; commands are rate-limited to 20/s per player, execute in `PostTick`, and batch their edits into one tick's change set. Server configuration keys that affect this chapter (`difficulty`, `gamemode`, `force-gamemode`, `pvp`, `allow-flight`, `spawn-protection`, `op-permission-level`, `function-permission-level`, `enable-command-block`, `rcon`) and console/RCON behavior live in [19](19-server-administration.md); policy enforcement lives in [20](20-security-and-anti-cheat.md).
+Permission levels are server policy, checked before state-changing arguments are parsed: level 0 (all players) `help`, `list`, `msg`, `trigger`; level 1 `spawnpoint`, self `clear`; level 2 `gamemode`, `tp`, `give`, `time`, `weather`, `summon`, `setblock`, `fill`, `clone`, `gamerule`, `effect`, `enchant`, `xp`, and command blocks/functions; level 3 `kick`, `ban`, `whitelist`, `op`, `save`, `difficulty`; level 4 `stop`, `save_off`, `reload`, `mods` (console, RCON, owner). World edits cap at 32,768 blocks, selectors at 1,024 entities, function recursion at 64 and chains at `max_command_chain_length`; commands are rate-limited to 20/s per player, execute in `PostTick`, and batch their edits into one tick's change set. Server configuration keys that affect this chapter (`world.difficulty`, `world.gamemode`, `world.force_gamemode`, `world.pvp`, `world.allow_flight`, `world.spawn_protection_blocks`, `permissions.op_permission_level`, `permissions.function_permission_level`, `permissions.enable_command_block`, `console.remote.rcon_*`) and console/RCON behavior live in the canonical key table of [19 §3.2](19-server-administration.md#32-configuration-surface); policy enforcement lives in [20](20-security-and-anti-cheat.md).
 
 Statistics are registry IDs `openblock:stat/<kind>/<target>` (`mined`, `crafted`, `used`, `killed`, `killed_by`, `custom`) plus scalars for distance, play time, damage dealt/taken, deaths and jumps, stored as a sorted `(StatId, u64)` map, accumulated host-side and replicated only as owner deltas. Advancements are content data: typed criteria, an AND/OR requirement tree, rewards (XP, loot, recipes), display and parent. The host awards each once, unlocks recipes from the same trigger, and sends a toast. Onboarding is a data-driven chain of advancement-like hints ("you are hungry", "night is coming"), a first-night checklist and an optional tutorial world; hints are suppressible and default off on servers. Completion is measured locally by the harness, with no telemetry.
 
@@ -295,7 +295,7 @@ Enforcement (log → rubber-band → kick), evidence bundles and false-positive 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
 | RISK-041 Combat numbers feel wrong despite matching formulas | Identity damage | Parity corpus plus a tuning harness; values in a profile |
-| RISK-042 30 Hz distorts real-time pacing | Regen and night length vary | Canonical-tick scaling with golden tests (proposed DEC-038) |
+| RISK-042 Tick-rate drift distorts real-time pacing | Regen and night length vary | Fixed 20 Hz simulation and canonical-tick golden tests (DEC-038) |
 | RISK-043 Death or portal transfer duplicates/loses items | Economy and trust | One host transaction, save-before-drop, duplication fuzz |
 | RISK-044 Portal linking is exploited | Fair play | Persisted link, deterministic search, locked transfer, no roof gap |
 | RISK-045 Balance data sprawls into incompatible profiles | Mod breakage | Schema validation, one profile, hash in the handshake |
@@ -376,7 +376,7 @@ The self-state delta carries health and absorption (15 + 15 bits) on change, foo
 - **Bed obstructed or destroyed** while sleeping: the player wakes, no spawn change, no time skip. Sleepers who are dead or transferring are excluded from the denominator; spectators always are.
 - **Portal frame destroyed mid-transfer:** abort and refund the cooldown. **Unsafe destination:** build the platform; if that fails, fall back to the target dimension's world spawn and log it.
 - **Time changed by a command:** timers are durations, not absolute deadlines, so they are unaffected.
-- **30 Hz rounding:** rational scaling, and a positive 20 Hz delay never becomes zero. Health, absorption and exhaustion clamp before use; XP saturates at `u64::MAX`; level caps at 30,000.
+- **30 Hz replication versus 20 Hz ticks:** snapshot cadence is independent of tick durations, so a positive 20 Hz delay never becomes zero at a 30 Hz replication rate. Health, absorption and exhaustion clamp before use; XP saturates at `u64::MAX`; level caps at 30,000.
 - **Missing damage type or balance field:** content validation fails; a runtime lookup miss falls back to `generic_kill` and logs an error.
 
 ## 7. Testing strategy
@@ -396,19 +396,15 @@ Every requirement in §2 names its layer. The playthrough harness fails if the f
 
 ## 8. Open questions
 
-Proposed DEC numbers are placeholders: sibling chapters in this writing batch propose the same range, and the register owner assigns final IDs on acceptance.
-
-1. **Canonical-tick scaling at 30 Hz (proposed DEC-038).** Scale delays by `tick_rate/20` for real-time fidelity, or reinterpret them as ticks for simulation parity? Owner: MS-10, before 0.3 beta.
-2. **Fixed-point vitals (proposed DEC-039).** This chapter fixes health, hunger, XP and combat to integers. Confirm scope: all player-adjacent gameplay values, or networked state only? Owner: MS-02/MS-10.
-3. **Combat rewind window (proposed DEC-040).** Is 200 ms permanent, or may competitive servers configure 0–250 ms? Owner: MS-06/MS-15.
-4. **Sleep denominator (proposed DEC-041).** Keep 100% of non-spectator players by default, or scale with server population? Owner: MS-10.
-5. **Portal creation policy.** May the host carve blocks to place a return portal, and is the nether roof permanently excluded? Owner: MS-08/MS-10.
-6. **Embersteel naming and tier count.** Final netherite-equivalent name, and whether copper is a tier or an iron side-grade (DEC-037, DEC-022). Owner: MS-16 content lock.
-7. **Hardcore on servers.** One life per player or per world, and does the spectator state survive reconnect? Owner: MS-11.
+1. **Combat rewind window.** Is 200 ms permanent, or may competitive servers configure 0–250 ms? Register item needed: combat-rewind window configurability (owner **MS-06/MS-15**).
+2. **Sleep denominator.** Keep 100% of non-spectator players by default, or scale with server population? Register item needed: sleep-denominator scaling (owner **MS-10**).
+3. **Portal creation policy.** May the host carve blocks to place a return portal, and is the nether roof permanently excluded? Owner: **MS-08/MS-10**.
+4. **Embersteel naming and tier count.** Final netherite-equivalent name, and whether copper is a tier or an iron side-grade (DEC-037, DEC-022). Owner: **MS-16 content lock**.
+5. **Hardcore on servers.** One life per player or per world, and does the spectator state survive reconnect? Owner: **MS-11**.
 
 ## 9. References
 
-- Decisions: [DEC-004](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-021](../decisions.md), [DEC-022](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md), [DEC-037](../decisions.md).
+- Decisions: [DEC-004](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-021](../decisions.md), [DEC-022](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md), [DEC-037](../decisions.md), [DEC-038](../decisions.md), [DEC-039](../decisions.md), [DEC-044](../decisions.md).
 - Research: [feature inventory](../research/05-minecraft-feature-inventory.md), [networking SOTA](../research/04-networking-sota.md), [modding and content](../research/06-modding-and-content-system.md).
 - Chapters: [05](05-world-model.md), [07](07-light-and-weather.md), [09](09-entities-ai.md), [10](10-physics-and-collision.md), [11](11-inventory-crafting-items.md), [12](12-redstone-and-logic.md), [13](13-ui-and-ux.md), [17](17-persistence.md), [18](18-networking-multiplayer.md), [20](20-security-and-anti-cheat.md), [25](25-performance-budgets.md).
 - External facts checked against the parity baseline: [Health](https://minecraft.wiki/w/Health), [Hunger](https://minecraft.wiki/w/Hunger), [Damage](https://minecraft.wiki/w/Damage), [Experience](https://minecraft.wiki/w/Experience), [Combat](https://minecraft.wiki/w/Combat), [Portal](https://minecraft.wiki/w/Portal), [Bed](https://minecraft.wiki/w/Bed), [Spawn](https://minecraft.wiki/w/Spawn), [Game rule](https://minecraft.wiki/w/Game_rule).

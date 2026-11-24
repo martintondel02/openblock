@@ -1,0 +1,28 @@
+# Layer and dependency rules for the OpenBlock workspace (DEC-003).
+# Enforced by `xtask arch` and the "Architecture guard" CI job.
+# Every workspace crate must appear in exactly one layer. A crate may only
+# depend on crates in the same layer or a layer listed in `may_depend_on`.
+
+version = 1
+
+[layers]
+# Foundation: no GPU, window, audio or network dependencies.
+foundation = ["ob_core", "ob_math"]
+# Simulation/data: must run headless (no wgpu/winit/cpal/ash).
+data = ["ob_world", "ob_worldgen", "ob_content", "ob_sim", "ob_protocol", "ob_net", "ob_modding"]
+# Presentation: client-side only.
+presentation = ["ob_render", "ob_ui", "ob_audio"]
+# Binaries and tooling.
+binaries = ["ob_client", "ob_server", "ob_tools", "xtask"]
+
+[allowed_edges]
+foundation = []
+data = ["foundation"]
+presentation = ["foundation", "data"]
+binaries = ["foundation", "data", "presentation"]
+
+[forbidden_dependencies]
+# Crates whose presence in a headless crate is a build-breaking bug.
+headless_forbidden = ["wgpu", "winit", "ash", "ash-window", "cpal", "kira", "gilrs", "raw-window-handle"]
+# Headless crates are everything in `foundation` and `data`.
+headless_crates = ["ob_core", "ob_math", "ob_world", "ob_worldgen", "ob_content", "ob_sim", "ob_protocol", "ob_net", "ob_modding"]

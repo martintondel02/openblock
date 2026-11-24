@@ -1,7 +1,7 @@
 # 04 — Shaders and Visuals: Lighting, Shadows, Sky, Post and Shader Packs
 
 > Status: normative - Last updated: 2026-11-24
-> Depends on: DEC-005, DEC-014, DEC-015, DEC-016, DEC-017, DEC-029, DEC-032; [conventions](00-conventions.md), [rendering](03-rendering.md), [light and weather](07-light-and-weather.md), [performance budgets](25-performance-budgets.md)
+> Depends on: DEC-005, DEC-011, DEC-014, DEC-015, DEC-016, DEC-017, DEC-022, DEC-029, DEC-032, DEC-045; [conventions](00-conventions.md), [rendering](03-rendering.md), [light and weather](07-light-and-weather.md), [performance budgets](25-performance-budgets.md)
 > Implements: MS-04, MS-12
 
 ## 1. Purpose and scope
@@ -39,8 +39,8 @@ are stated at 1080p on the reference machine of [vision §9](../vision.md#9-plat
 | REQ-VIS-006 | One sun and one moon directional light, driven by world time; a dimension may disable either through content. | Config test |
 | REQ-VIS-007 | Sky and atmosphere use precomputed LUTs; no per-pixel atmosphere raymarch is permitted in the default path. | Shader inspection plus perf gate |
 | REQ-VIS-008 | Fog is height- and distance-based, colour-matched to the sky in the view direction, and reaches ≥ 0.9 opacity at the render distance so no hard boundary is visible. | Golden image at 512 blocks |
-| REQ-VIS-009 | Shadows are engine-owned cascaded shadow maps: 1 cascade at a 48-block shadow distance, 2 at 64, 3 beyond, 2048² (1024² on `low`), 16-bit depth, 3×3 PCF, texel-stabilised. | Shadow unit tests plus image test |
-| REQ-VIS-010 | The shadow distance is a setting (off, 64, 96, 128 blocks); the default is 96 blocks. | Settings schema test |
+| REQ-VIS-009 | Shadows are engine-owned cascaded shadow maps: 1 cascade at a 48-block shadow distance, 2 at 64, 3 beyond, 2048² (1024² on `low`, 4096² on `ultra`), 16-bit depth, 3×3 PCF, texel-stabilised. | Shadow unit tests plus image test |
+| REQ-VIS-010 | The shadow distance is a setting (off, 48, 64, 96, 128 blocks; the `low` preset uses 48); the default is 96 blocks. | Settings schema test |
 | REQ-VIS-011 | Shader packs receive a stable shadow contract (matrices, atlas, cascade selection, comparison sampler) and never a world-occupancy query. | API inspection plus negative test |
 | REQ-VIS-012 | Water renders with animated normals, Fresnel, SSR with a sky fallback, refraction, intersection foam and an underwater volume with caustics. | Golden images above and below water |
 | REQ-VIS-013 | World translucency is sorted per cluster; particles and translucent entities use weighted OIT; no global per-quad sort exists. | Sort-order test plus cost gate |
@@ -187,10 +187,10 @@ driven by gameplay effect state, never by the shader.
 
 | Shadow distance | Cascades | Far splits (blocks, ratios 0.2 / 0.5 / 1.0) | Texel size |
 | ---: | :---: | --- | --- |
-| 48 (low) | 1 | 48 | 23 mm |
+| 48 (low) | 1 | 48 | 47 mm |
 | 64 (medium) | 2 | 12.8, 64 | 6.3 mm / 31 mm |
 | **96 (default)** | **3** | **19.2, 48, 96** | **9.4 mm / 23 mm / 47 mm** |
-| 96 at 4096² (ultra) | 3 | 19.2, 48, 96 | 4.7 mm / 12 mm / 23 mm |
+| 128 at 4096² (ultra) | 3 | 25.6, 64, 128 | 6.3 mm / 16 mm / 31 mm |
 
 Split ratios are fixed (0.2 / 0.5 / 1.0 of the shadow distance) rather than derived from a
 practical-split formula: with a first-person near plane of 0.1 m, the formula collapses
@@ -450,7 +450,7 @@ only against the public API and built in CI, which is the proof that the API is 
 | --- | --- |
 | Use the provided bind groups and binding numbers; never declare your own group | The layout is fixed at four groups ([chapter 03 §3.7](03-rendering.md#37-textures-samplers-and-material-binding)) and validation rejects a mismatch |
 | Immediates ≤ 64 B, 16 B aligned; provide the uniform-block fallback | `IMMEDIATES` is absent on some targets; the fallback path must compile from the same source |
-| `vec3<f32>` is 16 B, array stride 16 B, `mat4x4` 16 B; never pack across a 16 B boundary | WGSL layout rules; the assembler emits `static_assert`-style checks at build time |
+| `vec3<f32>` is 16 B, array stride 16 B, `mat4x4<f32>` is 64 B with 16 B columns; never pack across a 16 B boundary | WGSL layout rules; the assembler emits `static_assert`-style checks at build time |
 | Pack scalars into `u32` bitfields when a struct grows past a cache line | The quad format is the model: 16 B carries 4 corners and a face |
 | `f32` everywhere; no reliance on reduced precision | WGSL has no precision qualifiers; mobile `f16` is a post-1.0 option |
 | Depth is reverse-Z: near = 1.0, far = 0.0; use `ob_linearize_depth` | One convention, asserted in debug builds |
@@ -586,7 +586,7 @@ p95 at 1080p, `high` unless stated, matching the pass budgets in
 | PERF-VIS-007 | TAA + upscale | ≤ 0.35 ms |
 | PERF-VIS-008 | Bloom + tonemap + grade | ≤ 0.25 ms |
 | PERF-VIS-009 | Particles | ≤ 0.25 ms at 16,384 live |
-| PERF-VIS-010 | Shading + post GPU, `high` preset | ≤ 5.35 ms (5.65 ms with cull and upload; 6.0 ms envelope) |
+| PERF-VIS-010 | Shading + post GPU, `high` preset | ≤ 5.35 ms (5.65 ms with upload, Hi-Z build and cull; 6.0 ms envelope) |
 | PERF-VIS-011 | Shader compile, per variant | p95 ≤ 250 ms |
 | PERF-VIS-012 | Base-pack warm-up on 8 threads | ≤ 2.0 s |
 | PERF-VIS-013 | Shader compiles after the first frame | 0 |
@@ -629,8 +629,8 @@ where applicable: ~40 images compared with SSIM ≥ 0.99 and mean absolute error
 The per-preset images double as the visual contract for the preset table.
 
 **Per-effect cost.** Every row of §3.10 is toggled independently in the `flythrough` and
-`water` scenes; the delta is recorded in `benchmarks/visuals.md` and a regression above 20%
-of the stated value fails the build.
+`water` scenes; the delta is recorded in `benchmarks/visuals.md` and a regression above 10%
+of the stated value fails the build ([25 §3.8](25-performance-budgets.md#38-enforcement-gates-and-the-change-process)).
 
 **Shader budgets.** Compile time p95 ≤ 250 ms per variant, base-pack warm-up ≤ 2 s on 8
 threads, zero compiles after the first frame, pipeline cache hit rate ≥ 90% on a warm start.
@@ -649,18 +649,17 @@ review of block and ore legibility at 720p with the lowest texture tier.
 
 ## 8. Open questions
 
-1. **Shader pack authority boundary.** The API forbids world queries, but packs may want
-   per-fragment sky visibility or a custom shadow march. Proposed **DEC-063**: "Packs receive
-   a read-only presentation snapshot (light volume sample, depth, scene colour) and may not
+1. **Shader pack authority boundary — settled by [DEC-045](../decisions.md).** Packs receive a
+   read-only presentation snapshot (light volume sample, depth, scene colour) and may not
    receive block states or an occupancy buffer; any shadow technique must run on engine-provided
-   inputs." Owner: MS-12, before the API freeze at 1.0.
+   inputs. The remaining work is enforcing the boundary in the API freeze at 1.0. Owner: MS-12.
 2. **HDR output.** PQ/HLG swapchain output, OS-level HDR toggling and SDR UI over an HDR world
-   are deferred by REQ-VIS-019. Proposed **DEC-064**: "HDR output ships post-1.0 with a
-   calibrated SDR fallback; no 1.0 platform requirement." Owner: MS-12/MS-13.
+   are deferred by REQ-VIS-019. Register item needed: HDR output ships post-1.0 with a calibrated
+   SDR fallback and no 1.0 platform requirement (owner MS-12/MS-13).
 3. **Dynamic light policy.** The 256-light cap, the 8-per-tile limit and the "drop, never
-   approximate" rule are a first guess at what players notice. Proposed **DEC-065**: "Dynamic
-   lights are presentation-only with a 256-light cap; held and player-attached lights have
-   absolute priority." Owner: MS-12, closed with visual review.
+   approximate" rule are a first guess at what players notice. Register item needed: dynamic
+   lights are presentation-only with a 256-light cap and absolute priority for held and
+   player-attached lights (owner MS-12). Closed with visual review.
 4. **Coloured versus monochrome block light (OPEN-004).** The shader supports both under
    `light mode`, but the default preset depends on the memory decision (~100 MB at 512 blocks).
    Owner: MS-05 before 0.1; the shader decode table is final either way.
@@ -672,15 +671,12 @@ review of block and ore legibility at 720p with the lowest texture tier.
    changes and with the pinned Minecraft baseline. Proposal: generate the checklist from the
    same corpus as the mechanical parity tests and review divergences each release. Owner: MS-14.
 
-The DEC numbers above are provisional: several chapters currently propose overlapping ids, and
-the register owner must assign final numbers when the proposals are merged into
-[the decision register](../decisions.md).
-
 ## 9. References
 
-Decisions: [DEC-005](../decisions.md), [DEC-014](../decisions.md), [DEC-015](../decisions.md),
-[DEC-016](../decisions.md), [DEC-017](../decisions.md), [DEC-022](../decisions.md),
-[DEC-029](../decisions.md), [DEC-032](../decisions.md).
+Decisions: [DEC-005](../decisions.md), [DEC-011](../decisions.md), [DEC-014](../decisions.md),
+[DEC-015](../decisions.md), [DEC-016](../decisions.md), [DEC-017](../decisions.md),
+[DEC-022](../decisions.md), [DEC-029](../decisions.md), [DEC-032](../decisions.md),
+[DEC-045](../decisions.md).
 
 Research: [voxel rendering state of the art](../research/03-voxel-rendering-sota.md) (lighting
 costs, CSM, water and post technique comparison), [Weft teardown](../research/01-weft-teardown.md)
