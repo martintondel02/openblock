@@ -1,0 +1,11 @@
+{
+  // Line length is enforced by review, not tooling: prose tables and mermaid
+  // diagrams are legitimately wide.
+  "MD013": false,
+  // Documents in docs/ are long-form and may repeat headings across chapters.
+  "MD024": { "siblings_only": true },
+  // Allow inline HTML for centred logos/badges in the README.
+  "MD033": false,
+  // First line of a file may be a title; fine either way.
+  "MD041": false
+}

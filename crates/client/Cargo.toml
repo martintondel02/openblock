@@ -1,0 +1,19 @@
+[package]
+name = "ob_client"
+description = "The OpenBlock game client."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "ob_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "openblock"
+path = "src/bin/openblock.rs"
+
+[dependencies]

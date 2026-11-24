@@ -1,0 +1,11 @@
+[package]
+name = "ob_render"
+description = "GPU renderer: render graph, passes, shaders and GPU resource management."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]

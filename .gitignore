@@ -1,0 +1,9 @@
+/target
+/run
+*.pdb
+*.dSYM
+.DS_Store
+.idea/
+.vscode/
+/packages/
+/profiling/

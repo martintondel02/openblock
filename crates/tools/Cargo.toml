@@ -1,0 +1,19 @@
+[package]
+name = "ob_tools"
+description = "Offline asset, content-pack and world tooling for OpenBlock."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "ob_tools"
+path = "src/lib.rs"
+
+[[bin]]
+name = "openblock-tools"
+path = "src/bin/openblock_tools.rs"
+
+[dependencies]
