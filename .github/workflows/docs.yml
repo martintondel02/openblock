@@ -13,6 +13,6 @@ jobs:
     name: Documentation consistency
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Links, chapter structure, requirement ids, decision citations
         run: python3 .github/scripts/check-docs.py
