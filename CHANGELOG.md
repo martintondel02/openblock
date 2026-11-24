@@ -6,6 +6,38 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [0.0.4] — 2026-11-24 (tech preview, visual-quality slice)
+
+### Added
+- Four selectable procedural texture styles with distinct art direction and
+  palettes: `classic` (16², Minecraft-inspired), `painterly` (32²,
+  Hytale-inspired), `lush` (32², detailed nature) and `minimal` (16², clean
+  modern). Each style is deterministic, generated at startup and exposed via
+  `--texture-style NAME` and a new Settings row (applied live and persisted).
+- Full mip chains for block textures with nearest magnification and linear
+  minification/mip filtering, so distant blocks stop shimmering.
+- Alpha cut-out leaves: leaf layers punch clustered transparent holes and the
+  world shader discards those texels (clustered coverage ~4.5–15% by style).
+- Sky gradient (horizon to zenith) and distance fog for both renderers; distant
+  geometry fades into the horizon instead of ending at a hard chunk edge.
+- Subtle deterministic per-quad brightness variation so large merged surfaces
+  (grass fields, stone floors, canopies) no longer read as one flat colour.
+
+### Changed
+- `BlockTextureArray` stores its style and resolution, supports
+  `new_with_style`, and both renderers can switch styles at runtime
+  (`Renderer::set_texture_style`, `OffscreenRenderer::set_texture_style`).
+- Settings gain `texture_style` (validated enum, default `classic`) and the
+  pause/settings menu gains texture-style rows.
+- Offscreen screenshots use the persisted style, so `--screenshot` renders the
+  same look as the window.
+
+### Notes
+- Perf impact of mips/alpha cut-out/per-quad tint is negligible on the
+  reference machine; the offscreen benchmark gate is unchanged.
+- Styles are procedural, not hand-painted packs. Hand-authored PNG texture
+  packs remain an MS-05 content-system task; see docs/spec/15-content-system.md.
+
 ## [0.0.3] — 2026-11-24 (tech preview, MS-05 UI slice)
 
 ### Added

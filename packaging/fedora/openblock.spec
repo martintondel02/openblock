@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           openblock
-Version:        0.0.3
+Version:        0.0.4
 Release:        1%{?dist}
 Summary:        Fast, deeply moddable, server-first voxel sandbox
 
@@ -127,6 +127,13 @@ update-desktop-database &>/dev/null || :
 %config(noreplace) %{_sysconfdir}/openblock-server/server.toml
 
 %changelog
+* Tue Nov 24 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.0.4-1
+- Four selectable texture styles: classic (Minecraft-inspired), painterly
+  (Hytale-inspired), lush (detailed nature) and minimal (clean modern).
+- Full mip chains for block textures, alpha cut-out leaves, subtle per-quad
+  brightness variation, distance fog and a sky gradient.
+- Texture style selectable in the settings menu and via --texture-style.
+
 * Tue Nov 24 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.0.3-1
 - HUD (crosshair, hotbar with block icons), F3 debug overlay and F1 toggle.
 - Pause/settings menu (Esc): render distance, FOV, mouse sensitivity,

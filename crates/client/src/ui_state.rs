@@ -62,6 +62,10 @@ pub enum MenuItem {
     ToggleDebugOverlay,
     /// Toggle HUD visibility.
     ToggleHud,
+    /// Select the previous texture style.
+    TextureStylePrevious,
+    /// Select the next texture style.
+    TextureStyleNext,
 }
 
 /// A rectangle in UI pixels, origin top-left.
@@ -320,6 +324,8 @@ impl UiState {
                 MenuItem::FovUp,
                 MenuItem::SensitivityDown,
                 MenuItem::SensitivityUp,
+                MenuItem::TextureStylePrevious,
+                MenuItem::TextureStyleNext,
                 MenuItem::ToggleFullscreen,
                 MenuItem::ToggleDebugOverlay,
                 MenuItem::ToggleHud,
@@ -342,6 +348,10 @@ impl UiState {
             MenuItem::FovUp => "(+)".into(),
             MenuItem::SensitivityDown => format!("Mouse sensitivity  {:.2}x  (-)", self.settings.mouse_sensitivity),
             MenuItem::SensitivityUp => "(+)".into(),
+            MenuItem::TextureStylePrevious => {
+                format!("Texture style  {}  (<)", self.settings.texture_style.name())
+            }
+            MenuItem::TextureStyleNext => "(>)".into(),
             MenuItem::ToggleFullscreen => {
                 format!("Fullscreen  {}", if self.settings.fullscreen { "on" } else { "off" })
             }
@@ -389,6 +399,14 @@ impl UiState {
             MenuItem::SensitivityUp => self.adjust(|s| {
                 s.mouse_sensitivity = (s.mouse_sensitivity + 0.1).min(MAX_MOUSE_SENSITIVITY);
             }),
+            MenuItem::TextureStylePrevious => {
+                self.settings.texture_style = self.settings.texture_style.previous();
+                true
+            }
+            MenuItem::TextureStyleNext => {
+                self.settings.texture_style = self.settings.texture_style.next();
+                true
+            }
             MenuItem::ToggleFullscreen => {
                 self.settings.fullscreen = !self.settings.fullscreen;
                 true
@@ -507,6 +525,7 @@ pub fn facing_label(yaw: f32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ob_core::config::TextureStyle;
 
     #[test]
     fn screen_starts_in_playing_with_hud_visible() {
@@ -551,6 +570,30 @@ mod tests {
         assert!(state.debug_overlay);
         assert!(state.apply(MenuItem::ToggleHud));
         assert!(!state.hud_visible);
+    }
+
+    #[test]
+    fn texture_style_rows_cycle_and_persist_signal() {
+        let mut state = UiState::default();
+        assert_eq!(state.settings.texture_style, TextureStyle::Classic);
+        assert!(state.apply(MenuItem::TextureStyleNext));
+        assert_eq!(state.settings.texture_style, TextureStyle::Painterly);
+        assert!(state.apply(MenuItem::TextureStylePrevious));
+        assert_eq!(state.settings.texture_style, TextureStyle::Classic);
+        state.settings.texture_style = TextureStyle::Minimal;
+        assert!(state.apply(MenuItem::TextureStyleNext));
+        assert_eq!(state.settings.texture_style, TextureStyle::Classic);
+    }
+
+    #[test]
+    fn settings_menu_contains_the_texture_style_rows() {
+        let mut state = UiState::default();
+        state.open_pause();
+        state.apply(MenuItem::OpenSettings);
+        let items = state.menu_items();
+        assert!(items.contains(&MenuItem::TextureStylePrevious));
+        assert!(items.contains(&MenuItem::TextureStyleNext));
+        assert_eq!(items.last(), Some(&MenuItem::Back));
     }
 
     #[test]

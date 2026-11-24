@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ob_content::{BlockId, Registry};
-use ob_core::config::{load_settings, save_settings};
+use ob_core::config::{Settings, TextureStyle, load_settings, save_settings};
 use ob_math::{ChunkPos, SEA_LEVEL, SectionPos, WorldVec};
 use ob_render::{Camera, OffscreenRenderer, Renderer, UiFrame};
 use ob_server::{Host, HostConfig};
@@ -76,6 +76,8 @@ pub struct ClientOptions {
     pub seconds: Option<f32>,
     /// Number of dedicated section-meshing worker threads (1..=16).
     pub mesh_workers: usize,
+    /// Texture style override for this run (persisted settings otherwise).
+    pub texture_style: Option<TextureStyle>,
 }
 
 impl Default for ClientOptions {
@@ -90,6 +92,7 @@ impl Default for ClientOptions {
             screenshot: None,
             seconds: None,
             mesh_workers: default_mesh_workers(),
+            texture_style: None,
         }
     }
 }
@@ -129,12 +132,13 @@ pub fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
 /// This requires no window or display; it is used both for screenshots and to
 /// verify the GPU pipeline on headless hosts.
 pub fn screenshot(options: &ClientOptions, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let (settings, _data_dir) = effective_settings(options);
     let registry = Arc::new(Registry::base());
     let config = HostConfig {
         seed: options.seed,
         world_name: options.world.clone(),
         data_dir: options.data_dir.clone(),
-        render_distance_chunks: options.render_distance_chunks,
+        render_distance_chunks: settings.render_distance_chunks,
         generate_budget: GENERATE_BUDGET,
     };
     let mut host = Host::open(Arc::clone(&registry), config)?;
@@ -160,7 +164,11 @@ pub fn screenshot(options: &ClientOptions, path: &std::path::Path) -> Result<(),
     let mut camera = Camera::new(eye, yaw, pitch);
     camera.far = (host.render_distance_chunks() as f32 * 16.0 + 48.0).max(128.0);
 
-    let mut renderer = OffscreenRenderer::new(SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT)?;
+    let mut renderer = OffscreenRenderer::new_with_style(
+        SCREENSHOT_WIDTH,
+        SCREENSHOT_HEIGHT,
+        render_texture_style(settings.texture_style),
+    )?;
 
     // Compose a showcase frame: HUD (crosshair, hotbar, block name) drawn over
     // the world. Screenshot mode is also the headless verification path for the
@@ -402,6 +410,10 @@ impl GameState {
                     }
                     MenuItem::ToggleFullscreen => {
                         self.apply_fullscreen(self.ui.settings.fullscreen);
+                    }
+                    MenuItem::TextureStylePrevious | MenuItem::TextureStyleNext => {
+                        self.renderer
+                            .set_texture_style(render_texture_style(self.ui.settings.texture_style));
                     }
                     _ => {}
                 }
@@ -979,7 +991,9 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        let renderer = match Renderer::new(Arc::clone(&window)) {
+        let (settings, data_dir) = effective_settings(&self.options);
+        let renderer = match Renderer::new_with_style(Arc::clone(&window), render_texture_style(settings.texture_style))
+        {
             Ok(renderer) => renderer,
             Err(err) => {
                 log::error!("{err}");
@@ -991,19 +1005,13 @@ impl ApplicationHandler for App {
             }
         };
         log::info!("GPU: {}", renderer.adapter_summary());
-        let data_dir = self.options.data_dir.clone().unwrap_or_else(ob_core::data_dir);
-        let mut settings = load_settings(&data_dir);
-        // An explicit --render-distance overrides the persisted setting.
-        if self.options.render_distance_chunks != ClientOptions::default().render_distance_chunks {
-            settings.render_distance_chunks = self.options.render_distance_chunks;
-        }
-        settings.clamp();
         log::info!(
-            "settings: {} (render distance {} chunks, fov {:.0}, sensitivity {:.2}x)",
+            "settings: {} (render distance {} chunks, fov {:.0}, sensitivity {:.2}x, textures {})",
             ob_core::config::settings_path(&data_dir).display(),
             settings.render_distance_chunks,
             settings.fov_degrees,
-            settings.mouse_sensitivity
+            settings.mouse_sensitivity,
+            settings.texture_style.name()
         );
         let registry = Arc::new(Registry::base());
         let mesh_scheduler = MeshScheduler::new(self.options.mesh_workers, Arc::clone(&registry));
@@ -1275,6 +1283,30 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Resolves persisted settings, with explicit CLI flags taking precedence.
+fn effective_settings(options: &ClientOptions) -> (Settings, PathBuf) {
+    let data_dir = options.data_dir.clone().unwrap_or_else(ob_core::data_dir);
+    let mut settings = load_settings(&data_dir);
+    if options.render_distance_chunks != ClientOptions::default().render_distance_chunks {
+        settings.render_distance_chunks = options.render_distance_chunks;
+    }
+    if let Some(style) = options.texture_style {
+        settings.texture_style = style;
+    }
+    settings.clamp();
+    (settings, data_dir)
+}
+
+/// Maps a persisted texture style to the renderer's texture-pack style.
+fn render_texture_style(style: TextureStyle) -> ob_render::TexturePackStyle {
+    match style {
+        TextureStyle::Classic => ob_render::TexturePackStyle::Classic,
+        TextureStyle::Painterly => ob_render::TexturePackStyle::Painterly,
+        TextureStyle::Lush => ob_render::TexturePackStyle::Lush,
+        TextureStyle::Minimal => ob_render::TexturePackStyle::Minimal,
+    }
+}
+
 /// Writes an RGBA8 image to a PNG file.
 fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent()
@@ -1310,6 +1342,10 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
             }
             "fly" => options.fly = true,
             "x11" => options.force_x11 = true,
+            "texture-style" => {
+                options.texture_style =
+                    Some(TextureStyle::from_name(value).ok_or_else(|| format!("unknown texture style '{value}'"))?);
+            }
             "mesh-workers" => {
                 options.mesh_workers = value
                     .parse()

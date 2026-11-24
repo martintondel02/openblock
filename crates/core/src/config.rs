@@ -13,6 +13,58 @@ use serde::{Deserialize, Serialize};
 /// File name of the user settings document.
 pub const CONFIG_FILE_NAME: &str = "config.json";
 
+/// Selectable procedural texture-pack style.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextureStyle {
+    /// Clean Minecraft-inspired pixel art (default).
+    #[default]
+    Classic,
+    /// Soft hand-painted Hytale-inspired look.
+    Painterly,
+    /// Detailed, saturated natural textures.
+    Lush,
+    /// Modern flat, minimal palette.
+    Minimal,
+}
+
+impl TextureStyle {
+    /// All selectable styles, in menu order.
+    pub const ALL: [TextureStyle; 4] = [
+        TextureStyle::Classic,
+        TextureStyle::Painterly,
+        TextureStyle::Lush,
+        TextureStyle::Minimal,
+    ];
+
+    /// Stable settings/CLI name.
+    pub fn name(self) -> &'static str {
+        match self {
+            TextureStyle::Classic => "classic",
+            TextureStyle::Painterly => "painterly",
+            TextureStyle::Lush => "lush",
+            TextureStyle::Minimal => "minimal",
+        }
+    }
+
+    /// Parses a settings/CLI name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|style| style.name() == name)
+    }
+
+    /// Next style in the cycle (menu buttons).
+    pub fn next(self) -> Self {
+        let index = Self::ALL.into_iter().position(|style| style == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    /// Previous style in the cycle.
+    pub fn previous(self) -> Self {
+        let index = Self::ALL.into_iter().position(|style| style == self).unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
 /// Smallest supported render distance in chunks.
 pub const MIN_RENDER_DISTANCE: i32 = 2;
 /// Largest render distance offered by the settings screen in v0.0.x.
@@ -42,6 +94,8 @@ pub struct Settings {
     pub show_debug_overlay: bool,
     /// Worker threads for chunk meshing; `None` selects the automatic default.
     pub mesh_workers: Option<usize>,
+    /// Procedural texture-pack style.
+    pub texture_style: TextureStyle,
 }
 
 impl Default for Settings {
@@ -53,6 +107,7 @@ impl Default for Settings {
             fullscreen: false,
             show_debug_overlay: false,
             mesh_workers: None,
+            texture_style: TextureStyle::Classic,
         }
     }
 }
@@ -175,6 +230,7 @@ mod tests {
             fullscreen: true,
             show_debug_overlay: true,
             mesh_workers: Some(6),
+            ..Settings::default()
         };
         save_settings(&dir, &settings).expect("save");
         assert_eq!(load_settings(&dir), settings);
@@ -231,6 +287,26 @@ mod tests {
         let loaded = load_settings(&dir);
         assert_eq!(loaded.fov_degrees, Settings::default().fov_degrees);
         assert_eq!(loaded.mouse_sensitivity, Settings::default().mouse_sensitivity);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn texture_style_round_trips_and_cycles() {
+        for style in TextureStyle::ALL {
+            assert_eq!(TextureStyle::from_name(style.name()), Some(style));
+            assert_eq!(style.next().previous(), style);
+        }
+        assert_eq!(TextureStyle::Classic.next(), TextureStyle::Painterly);
+        assert_eq!(TextureStyle::Minimal.next(), TextureStyle::Classic);
+        assert_eq!(TextureStyle::from_name("nope"), None);
+        let dir = temp_dir("style");
+        let settings = Settings {
+            texture_style: TextureStyle::Lush,
+            ..Settings::default()
+        };
+        save_settings(&dir, &settings).expect("save");
+        let loaded = load_settings(&dir);
+        assert_eq!(loaded.texture_style, TextureStyle::Lush);
         let _ = fs::remove_dir_all(dir);
     }
 

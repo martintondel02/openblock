@@ -29,6 +29,13 @@
     <content_attribute id="social-chat">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.0.4" date="2026-11-24" type="development">
+      <description>
+        <p>Four selectable procedural texture styles (classic, painterly, lush,
+        minimal) with mipmapped textures, cut-out leaves, distance fog, a sky
+        gradient and subtle per-quad lighting variation.</p>
+      </description>
+    </release>
     <release version="0.0.3" date="2026-11-24" type="development">
       <description>
         <p>HUD, F3 debug overlay, pause/settings menu with persisted options,

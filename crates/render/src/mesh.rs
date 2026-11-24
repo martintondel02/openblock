@@ -326,6 +326,25 @@ fn emit_greedy(
     }
 }
 
+/// Subtle per-quad brightness variation in `0.94..=1.04`.
+///
+/// Large merged surfaces (grass fields, stone floors, tree canopies) would
+/// otherwise read as one flat colour. Hashing the quad's world anchor and
+/// texture layer keeps the variation deterministic and, because it is applied
+/// after greedy merging, it does not reduce merging or affect the merge key.
+fn quad_tint(anchor: [f32; 3], layer: u32) -> f32 {
+    let x = anchor[0].round() as i64 as u64;
+    let y = anchor[1].round() as i64 as u64;
+    let z = anchor[2].round() as i64 as u64;
+    let mut seed = x
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(y.rotate_left(21))
+        .wrapping_add(z.rotate_left(42))
+        .wrapping_add(u64::from(layer) << 17);
+    seed = ob_math::mix64(seed);
+    0.94 + 0.10 * ((seed >> 40) as f32 / (1u32 << 24) as f32)
+}
+
 /// Emits the two CCW triangles of one merged rectangle.
 fn emit_quad(out: &mut Vec<Vertex>, origin: BlockPos, axes: &FaceAxes, slice: usize, rect: Rect, key: MergeKey) {
     // The rectangle covers the half-open block interval `rect.u..rect.u + width`
@@ -372,12 +391,13 @@ fn emit_quad(out: &mut Vec<Vertex>, origin: BlockPos, axes: &FaceAxes, slice: us
     // band on `grass_side`, bark stripes on `log_side`) is not upside down.
     let uvs = [[0.0, height], [width, height], [width, 0.0], [0.0, 0.0]];
 
+    let tint = quad_tint(positions[0], key.layer);
     for index in TRIANGLE_INDICES {
         out.push(Vertex {
             position: positions[index],
             uv: uvs[index],
             layer: key.layer,
-            light: key.brightness * key.ao[index],
+            light: key.brightness * key.ao[index] * tint,
         });
     }
 }
@@ -503,14 +523,17 @@ mod tests {
         assert_eq!(mesh_section(&world, section()).vertices.len(), mesh.vertices.len());
 
         // FACES order is +X, -X, +Y, -Y, +Z, -Z; all AO factors are 1.0 for an
-        // isolated block, so each quad's light equals the face brightness.
+        // isolated block, so each quad's light is the face brightness times the
+        // deterministic per-quad tint.
         let expected_lights = [0.72, 0.72, 1.0, 0.45, 0.85, 0.85];
         for (quad, expected) in mesh.vertices.as_chunks::<6>().0.iter().zip(expected_lights) {
+            let tint = quad_tint(quad[0].position, u32::from(textures::STONE.0));
+            assert!((0.94..=1.04).contains(&tint), "tint {tint} out of range");
             for vertex in quad {
                 assert_eq!(vertex.layer, u32::from(textures::STONE.0));
                 assert!(
-                    (vertex.light - expected).abs() < 1e-5,
-                    "face brightness {} should be {expected}",
+                    (vertex.light - expected * tint).abs() < 1e-5,
+                    "face brightness {} should be {expected} x {tint}",
                     vertex.light,
                 );
             }
@@ -616,10 +639,13 @@ mod tests {
         let min_v = uvs.iter().map(|uv| uv[1]).fold(f32::MAX, f32::min);
         let max_v = uvs.iter().map(|uv| uv[1]).fold(f32::MIN, f32::max);
         assert_eq!((max_u - min_u, max_v - min_v), (4.0, 4.0));
-        // All top vertices sample the stone layer with full +Y brightness.
+        // A single merged quad shares one tint, so every top vertex has the
+        // same +Y light value within the tint range.
+        let first_light = top[0][0].light;
         for vertex in top[0] {
             assert_eq!(vertex.layer, u32::from(textures::STONE.0));
-            assert!((vertex.light - 1.0).abs() < 1e-5);
+            assert!((vertex.light - first_light).abs() < 1e-6);
+            assert!((0.94..=1.04).contains(&vertex.light));
         }
     }
 
@@ -683,8 +709,8 @@ mod tests {
             .map(|vertex| vertex.light)
             .collect();
         assert!(
-            lights.iter().any(|light| (light - 0.42).abs() < 1e-5),
-            "expected a fully occluded 0.42 corner, got {lights:?}",
+            lights.iter().any(|light| (0.94..=1.04).contains(&(light / 0.42))),
+            "expected a fully occluded 0.42 corner (times tint), got {lights:?}",
         );
     }
 
@@ -705,9 +731,11 @@ mod tests {
         assert_eq!(stats.vertices, 36);
         let top = quads_at_y(&mesh, 1.0);
         assert_eq!(top.len(), 1, "the water surface should be a single merged quad");
+        let first_light = top[0][0].light;
         for vertex in top[0] {
             assert_eq!(vertex.layer, u32::from(textures::WATER.0));
-            assert!((vertex.light - 1.0).abs() < 1e-5);
+            assert!((vertex.light - first_light).abs() < 1e-6);
+            assert!((0.94..=1.04).contains(&vertex.light));
         }
     }
 
@@ -790,7 +818,7 @@ mod tests {
         let side = side.expect("the block should have a +X side quad");
         for vertex in side {
             assert_eq!(vertex.layer, u32::from(textures::GRASS_SIDE.0));
-            assert!((vertex.light - 0.72).abs() < 1e-5);
+            assert!((0.94..=1.04).contains(&(vertex.light / 0.72)));
         }
         // Texture row 0 is the top of the image, so the top edge of a side face
         // must sample V = 0 and the bottom edge V = 1.
@@ -971,5 +999,23 @@ mod tests {
         let mesh = snapshot.mesh(&registry());
         assert!(mesh.is_empty());
         assert_eq!(mesh.triangle_count(), 0);
+    }
+
+    #[test]
+    fn quad_tint_is_deterministic_and_bounded() {
+        for layer in 0..ob_content::textures::COUNT as u32 {
+            for x in -8..8 {
+                for z in -8..8 {
+                    let anchor = [x as f32, 64.0, z as f32];
+                    let tint = quad_tint(anchor, layer);
+                    assert!((0.94..=1.04).contains(&tint), "tint {tint} out of range");
+                    assert_eq!(tint.to_bits(), quad_tint(anchor, layer).to_bits());
+                }
+            }
+        }
+        // Different anchors should not all collapse to the same value.
+        let values: std::collections::HashSet<u32> =
+            (-8..8).map(|x| quad_tint([x as f32, 64.0, 0.0], 4).to_bits()).collect();
+        assert!(values.len() > 8, "quad tint has too little variation");
     }
 }

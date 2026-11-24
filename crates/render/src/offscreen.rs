@@ -1,9 +1,9 @@
 //! Offscreen rendering: draw the world into a fixed-size colour texture and read
 //! the pixels back as RGBA8.
 //!
-//! This path needs no window or display. It reuses the same shader, vertex
-//! layout, texture array, camera uniform, frustum culling and sky clear colour
-//! as the windowed renderer, so it verifies the GPU pipeline as well as
+//! This path needs no window or display. It reuses the same sky pass, shader,
+//! vertex layout, texture array, camera uniform, fog, frustum culling and sky
+//! palette as the windowed renderer, so it verifies the GPU pipeline as well as
 //! producing screenshots.
 
 use std::collections::HashMap;
@@ -19,17 +19,6 @@ use crate::{Camera, RenderError, RenderStats, Vertex, mesh, pipeline, section_vi
 /// Offscreen colour target format (sRGB, readable through `copy_texture_to_buffer`).
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-/// Upper bound on the number of sections meshed and drawn in one offscreen frame.
-const MAX_SECTIONS: usize = 4096;
-
-/// Sky clear colour, matching the windowed renderer's clear.
-const SKY_COLOR: wgpu::Color = wgpu::Color {
-    r: 0.55,
-    g: 0.72,
-    b: 0.95,
-    a: 1.0,
-};
-
 /// A windowless renderer that draws the world into an RGBA8 texture.
 pub struct OffscreenRenderer {
     /// GPU device.
@@ -38,6 +27,8 @@ pub struct OffscreenRenderer {
     queue: wgpu::Queue,
     /// Chunk render pipeline.
     pipeline: wgpu::RenderPipeline,
+    /// Full-screen sky gradient pipeline.
+    sky_pipeline: wgpu::RenderPipeline,
     /// Camera uniform buffer.
     uniform_buffer: wgpu::Buffer,
     /// Procedural block texture array and sampler.
@@ -77,6 +68,11 @@ struct CachedMesh {
 impl OffscreenRenderer {
     /// Creates an offscreen renderer with a fixed `width` x `height` target.
     pub fn new(width: u32, height: u32) -> Result<Self, RenderError> {
+        Self::new_with_style(width, height, crate::TexturePackStyle::default())
+    }
+
+    /// Creates an offscreen renderer with a specific texture-pack style.
+    pub fn new_with_style(width: u32, height: u32, style: crate::TexturePackStyle) -> Result<Self, RenderError> {
         let width = width.max(1);
         let height = height.max(1);
 
@@ -116,16 +112,18 @@ impl OffscreenRenderer {
         let depth_view = pipeline::create_depth_view(&device, width, height);
 
         let uniform_buffer = pipeline::create_camera_buffer(&device);
-        let textures = BlockTextureArray::new(&device, &queue);
+        let textures = BlockTextureArray::new_with_style(&device, &queue, style);
         let ui = UiRenderer::new(&device, &queue, &textures, COLOR_FORMAT);
         let bind_group_layout = pipeline::create_bind_group_layout(&device);
         let bind_group = pipeline::create_bind_group(&device, &bind_group_layout, &uniform_buffer, &textures);
         let pipeline = pipeline::create_pipeline(&device, COLOR_FORMAT, &bind_group_layout);
+        let sky_pipeline = pipeline::create_sky_pipeline(&device, COLOR_FORMAT);
 
         Ok(Self {
             device,
             queue,
             pipeline,
+            sky_pipeline,
             uniform_buffer,
             _textures: textures,
             bind_group,
@@ -150,6 +148,23 @@ impl OffscreenRenderer {
     /// Statistics from the last rendered frame.
     pub fn stats(&self) -> RenderStats {
         self.stats
+    }
+
+    /// Rebuilds the block texture array and its bind groups for a new style.
+    pub fn set_texture_style(&mut self, style: crate::TexturePackStyle) {
+        if self._textures.style() == style {
+            return;
+        }
+        let textures = BlockTextureArray::new_with_style(&self.device, &self.queue, style);
+        let layout = pipeline::create_bind_group_layout(&self.device);
+        self.bind_group = pipeline::create_bind_group(&self.device, &layout, &self.uniform_buffer, &textures);
+        self.ui = UiRenderer::new(&self.device, &self.queue, &textures, COLOR_FORMAT);
+        self._textures = textures;
+    }
+
+    /// Currently active procedural texture-pack style.
+    pub fn texture_style(&self) -> crate::TexturePackStyle {
+        self._textures.style()
     }
 
     /// Rebuilds the cached GPU meshes for every non-empty loaded section.
@@ -208,10 +223,7 @@ impl OffscreenRenderer {
     /// Renders the cached meshes and an optional UI frame, then reads the frame back.
     pub fn render_cached_with_ui(&mut self, camera: &Camera, ui: Option<&UiFrame>) -> Result<RenderStats, RenderError> {
         let aspect = self.width as f32 / self.height as f32;
-        let view_projection = camera.view_projection(aspect);
-        let uniform = pipeline::CameraUniform {
-            view_proj: view_projection.to_cols_array_2d(),
-        };
+        let uniform = pipeline::CameraUniform::new(camera, aspect);
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         let frustum = camera.frustum_planes(aspect);
@@ -221,6 +233,29 @@ impl OffscreenRenderer {
             label: Some("offscreen-cached-frame"),
         });
         {
+            // Sky first, with no depth attachment: one full-screen triangle.
+            let mut sky = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("offscreen-sky"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(pipeline::SKY_CLEAR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            sky.set_pipeline(&self.sky_pipeline);
+            sky.draw(0..3, 0..1);
+        }
+        {
+            // The world loads the sky already written above and clears depth
+            // independently.
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("offscreen-main"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -228,7 +263,7 @@ impl OffscreenRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(SKY_COLOR),
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -289,111 +324,6 @@ impl OffscreenRenderer {
     ) -> Result<(), RenderError> {
         self.rebuild_mesh_cache(world);
         let _ = self.render_cached_with_ui(camera, ui)?;
-        log::info!(
-            "offscreen frame: {} visible sections drawn, {} vertices, {} draws",
-            self.stats.sections,
-            self.stats.vertices,
-            self.stats.draw_calls
-        );
-        Ok(())
-    }
-
-    /// Old uncached body kept for reference; unreachable.
-    #[allow(dead_code)]
-    fn render_world_uncached(&mut self, world: &World, camera: &Camera) -> Result<(), RenderError> {
-        let aspect = self.width as f32 / self.height as f32;
-        let view_projection = camera.view_projection(aspect);
-        let uniform = pipeline::CameraUniform {
-            view_proj: view_projection.to_cols_array_2d(),
-        };
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
-        let frustum = camera.frustum_planes(aspect);
-
-        // Collect the loaded section positions in a deterministic order, then
-        // cull before meshing so offscreen screenshots skip invisible work.
-        let base_y = WORLD_MIN_Y / SECTION_SIZE as i32;
-        let mut positions: Vec<SectionPos> = world
-            .chunks()
-            .flat_map(|(chunk_pos, _column)| {
-                (0..N_SECTIONS).map(move |index| SectionPos::new(chunk_pos.x, base_y + index as i32, chunk_pos.z))
-            })
-            .collect();
-        positions.sort_unstable();
-
-        let mut draws: Vec<(wgpu::Buffer, u32)> = Vec::new();
-        let mut stats = RenderStats::default();
-        'sections: for pos in positions {
-            if draws.len() >= MAX_SECTIONS {
-                break 'sections;
-            }
-            if !section_visible(&frustum, pos) {
-                continue;
-            }
-            let Some(section) = world.section(pos) else {
-                continue;
-            };
-            if section.is_empty() {
-                continue;
-            }
-            let section_mesh = mesh::mesh_section(world, pos);
-            if section_mesh.is_empty() {
-                continue;
-            }
-            let vertex_count = section_mesh.vertices.len() as u32;
-            let size = (section_mesh.vertices.len() * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
-            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("offscreen-section-mesh"),
-                size,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.queue
-                .write_buffer(&buffer, 0, bytemuck::cast_slice(&section_mesh.vertices));
-            draws.push((buffer, vertex_count));
-            stats.draw_calls += 1;
-            stats.vertices += u64::from(vertex_count);
-            stats.sections += 1;
-        }
-        self.stats = stats;
-
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("offscreen-frame"),
-        });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("offscreen-main"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.color_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(SKY_COLOR),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            for (buffer, vertex_count) in &draws {
-                pass.set_vertex_buffer(0, buffer.slice(..));
-                pass.draw(0..*vertex_count, 0..1);
-            }
-        }
-        self.queue.submit([encoder.finish()]);
-
-        self.read_back()?;
         log::info!(
             "offscreen frame: {} visible sections drawn, {} vertices, {} draws",
             self.stats.sections,
@@ -553,6 +483,71 @@ mod tests {
         world
     }
 
+    /// Mean RGB of one row, in sRGB bytes.
+    fn row_rgb(pixels: &[u8], width: u32, y: u32) -> [f32; 3] {
+        let start = (y * width * 4) as usize;
+        let row = pixels[start..start + (width * 4) as usize].as_chunks::<4>().0;
+        let mut sum = [0f64; 3];
+        for pixel in row {
+            sum[0] += f64::from(pixel[0]);
+            sum[1] += f64::from(pixel[1]);
+            sum[2] += f64::from(pixel[2]);
+        }
+        let count = row.len() as f64;
+        [
+            (sum[0] / count) as f32,
+            (sum[1] / count) as f32,
+            (sum[2] / count) as f32,
+        ]
+    }
+
+    /// Euclidean distance between two sRGB colours.
+    fn colour_distance(a: [f32; 3], b: [f32; 3]) -> f32 {
+        ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+    }
+
+    /// Asserts that the sky gradient only varies with Y: every row is uniform
+    /// horizontally up to `tolerance` sRGB steps.
+    fn assert_rows_uniform(pixels: &[u8], width: u32, height: u32, tolerance: u8) {
+        for y in 0..height {
+            let start = (y * width * 4) as usize;
+            let row = pixels[start..start + (width * 4) as usize].as_chunks::<4>().0;
+            let first = row[0];
+            for pixel in row {
+                assert!(
+                    pixel[0].abs_diff(first[0]) <= tolerance
+                        && pixel[1].abs_diff(first[1]) <= tolerance
+                        && pixel[2].abs_diff(first[2]) <= tolerance,
+                    "row {y} is not horizontally uniform: {first:?} vs {pixel:?}"
+                );
+            }
+        }
+    }
+
+    /// Mean distance from a set of pixels to a target sRGB colour.
+    fn mean_distance_to(pixels: &[u8], mask: &[bool], target: [f32; 3]) -> f32 {
+        let mut sum = 0f64;
+        let mut count = 0usize;
+        for (index, selected) in mask.iter().copied().enumerate() {
+            if !selected {
+                continue;
+            }
+            let offset = index * 4;
+            let colour = [
+                f32::from(pixels[offset]),
+                f32::from(pixels[offset + 1]),
+                f32::from(pixels[offset + 2]),
+            ];
+            sum += f64::from(colour_distance(colour, target));
+            count += 1;
+        }
+        if count == 0 {
+            f32::INFINITY
+        } else {
+            (sum / count as f64) as f32
+        }
+    }
+
     #[test]
     fn offscreen_render_is_not_black() {
         // The renderer itself must not depend on worldgen or content beyond the
@@ -577,21 +572,18 @@ mod tests {
         let mut camera = Camera::new(WorldVec::new(8.0, 76.0, 8.0), 0.6, -1.0);
         camera.far = 128.0;
 
-        // Render the same clear pass with an empty world first, so the expected
-        // sky colour is measured instead of assumed.
+        // Render the same sky pass with an empty world first, so every
+        // background pixel is measured instead of assuming a clear colour.
         let empty = World::new(Arc::clone(&registry), 1);
         renderer.render_world(&empty, &camera).expect("render empty world");
         let background = renderer.read_rgba();
         assert_eq!(background.len(), 320 * 180 * 4);
         assert_eq!(renderer.stats().sections, 0);
-        let clear = [background[0], background[1], background[2]];
+        let top = row_rgb(&background, 320, 2);
+        let bottom = row_rgb(&background, 320, 177);
         assert!(
-            background
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .all(|p| p[0] == clear[0] && p[1] == clear[1] && p[2] == clear[2]),
-            "an empty offscreen frame must be a uniform clear colour"
+            colour_distance(top, bottom) > 30.0,
+            "the empty frame does not show a vertical sky gradient: {top:?} vs {bottom:?}"
         );
 
         renderer.render_world(&world, &camera).expect("render test platform");
@@ -601,32 +593,37 @@ mod tests {
         assert_eq!(renderer.stats().sections, renderer.stats().draw_calls);
         assert!(renderer.stats().vertices > 0);
 
+        // Count only pixels the geometry changed: the sky gradient itself is
+        // not a uniform colour any more.
         let mut histogram: HashMap<[u8; 3], usize> = HashMap::new();
         let mut different = 0usize;
-        for pixel in pixels.as_chunks::<4>().0 {
-            let rgb = [pixel[0], pixel[1], pixel[2]];
-            if rgb != clear {
+        for (index, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
+            let background_offset = index * 4;
+            let differs = pixel[0].abs_diff(background[background_offset]) > 0
+                || pixel[1].abs_diff(background[background_offset + 1]) > 0
+                || pixel[2].abs_diff(background[background_offset + 2]) > 0;
+            if differs {
                 different += 1;
+                *histogram.entry([pixel[0], pixel[1], pixel[2]]).or_insert(0) += 1;
             }
-            *histogram.entry(rgb).or_insert(0) += 1;
         }
         let total = (320 * 180) as usize;
         let fraction = different as f32 / total as f32;
 
-        let mut top: Vec<([u8; 3], usize)> = histogram.iter().map(|(k, v)| (*k, *v)).collect();
-        top.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
+        let mut top_colours: Vec<([u8; 3], usize)> = histogram.iter().map(|(k, v)| (*k, *v)).collect();
+        top_colours.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
         eprintln!(
-            "offscreen: clear={clear:?}, differing={different}/{total} ({:.2}%), distinct={}",
+            "offscreen: differing={different}/{total} ({:.2}%), distinct geometry colours={}",
             fraction * 100.0,
             histogram.len()
         );
-        for (rgb, count) in top.iter().take(8) {
+        for (rgb, count) in top_colours.iter().take(8) {
             eprintln!("  {rgb:?}: {count}");
         }
 
         assert!(
             fraction >= 0.01,
-            "only {:.2}% of pixels differ from the clear colour",
+            "only {:.2}% of pixels differ from the sky background",
             fraction * 100.0
         );
         // Procedural 16×16 textures produce many more shades than the old
@@ -634,12 +631,14 @@ mod tests {
         // well over sixteen distinct RGB values.
         assert!(
             histogram.len() >= 16,
-            "only {} distinct RGB values were drawn",
+            "only {} distinct geometry RGB values were drawn",
             histogram.len()
         );
 
         // A camera far above the world with a short far plane must cull every
-        // section: the image returns to the uniform sky and no section is drawn.
+        // section: the frame returns to the sky gradient and no section is drawn.
+        // The sky is screen-space only, so the image is the same as the empty
+        // world rendered above.
         let mut high_camera = Camera::new(WorldVec::new(8.0, 220.0, 8.0), 0.0, 0.0);
         high_camera.far = 64.0;
         renderer
@@ -648,13 +647,154 @@ mod tests {
         assert_eq!(renderer.stats().sections, 0);
         assert_eq!(renderer.stats().draw_calls, 0);
         let culled = renderer.read_rgba();
+        assert_eq!(culled.len(), background.len());
         assert!(
             culled
-                .as_chunks::<4>()
-                .0
                 .iter()
-                .all(|p| p[0] == clear[0] && p[1] == clear[1] && p[2] == clear[2]),
-            "a fully culled frame must be the clear colour",
+                .zip(background.iter())
+                .all(|(actual, expected)| actual.abs_diff(*expected) <= 1),
+            "a fully culled frame must show the same sky gradient as an empty world",
+        );
+    }
+
+    #[test]
+    fn sky_gradient_is_vertical() {
+        if std::env::var_os("OPENBLOCK_NO_GPU_TESTS").is_some() {
+            eprintln!("skipping offscreen GPU tests: OPENBLOCK_NO_GPU_TESTS is set");
+            return;
+        }
+        let registry = Arc::new(Registry::base());
+        let empty = World::new(registry, 1);
+        let mut renderer = match OffscreenRenderer::new(320, 180) {
+            Ok(renderer) => renderer,
+            Err(RenderError::NoAdapter(reason)) => {
+                eprintln!("skipping sky_gradient_is_vertical: no GPU adapter ({reason})");
+                return;
+            }
+            Err(err) => panic!("failed to create the offscreen renderer: {err}"),
+        };
+
+        let camera = Camera::new(WorldVec::new(0.0, 128.0, 0.0), 0.0, 0.0);
+        renderer.render_world(&empty, &camera).expect("render sky only");
+        assert_eq!(renderer.stats().sections, 0);
+        let pixels = renderer.read_rgba();
+        assert_eq!(pixels.len(), 320 * 180 * 4);
+
+        // The gradient is a function of screen Y only.
+        assert_rows_uniform(&pixels, 320, 180, 1);
+
+        let top = row_rgb(&pixels, 320, 1);
+        let middle = row_rgb(&pixels, 320, 90);
+        let bottom = row_rgb(&pixels, 320, 178);
+        let luma = |colour: [f32; 3]| 0.2126 * colour[0] + 0.7152 * colour[1] + 0.0722 * colour[2];
+
+        eprintln!("sky gradient: top={top:?}, middle={middle:?}, bottom={bottom:?}");
+        assert!(
+            colour_distance(top, bottom) > 40.0,
+            "top and bottom of the sky are too similar: {top:?} vs {bottom:?}"
+        );
+        // The zenith is darker and more saturated blue than the warm horizon.
+        assert!(
+            luma(top) + 20.0 < luma(bottom),
+            "the zenith is not darker than the horizon: {} vs {}",
+            luma(top),
+            luma(bottom)
+        );
+        assert!(
+            top[2] - top[0] > bottom[2] - bottom[0] + 40.0,
+            "the zenith is not bluer than the horizon: {top:?} vs {bottom:?}"
+        );
+        // The screen centre is the horizon; the lower edge gets a subtle warm
+        // haze, so the middle sits between the two ends in brightness.
+        assert!(
+            luma(top) < luma(middle),
+            "the gradient is not monotonic towards the horizon"
+        );
+        assert!(
+            luma(middle) < luma(bottom),
+            "the horizon haze should not be darker than the horizon"
+        );
+    }
+
+    #[test]
+    fn fog_fades_geometry_into_the_sky() {
+        if std::env::var_os("OPENBLOCK_NO_GPU_TESTS").is_some() {
+            eprintln!("skipping offscreen GPU tests: OPENBLOCK_NO_GPU_TESTS is set");
+            return;
+        }
+        let registry = Arc::new(Registry::base());
+        let world = test_world(&registry);
+        let empty = World::new(Arc::clone(&registry), 1);
+        let mut renderer = match OffscreenRenderer::new(320, 180) {
+            Ok(renderer) => renderer,
+            Err(RenderError::NoAdapter(reason)) => {
+                eprintln!("skipping fog_fades_geometry_into_the_sky: no GPU adapter ({reason})");
+                return;
+            }
+            Err(err) => panic!("failed to create the offscreen renderer: {err}"),
+        };
+
+        // Look across the platform from 40 blocks away. Its near edge is ~24
+        // blocks away; with `far = 44` fog starts at 24.2 and is saturated at
+        // 41.8, while the whole section still sits inside the far plane. The
+        // clear configuration uses a far plane beyond any visible geometry, so
+        // no fog is applied.
+        let mut clear_camera = Camera::new(WorldVec::new(8.0, 76.0, 40.0), 0.0, -0.30);
+        clear_camera.far = 512.0;
+        let mut dense_camera = clear_camera;
+        dense_camera.far = 44.0;
+
+        // Sky-only reference for the horizon colour (screen centre).
+        renderer.render_world(&empty, &clear_camera).expect("render sky only");
+        let background = renderer.read_rgba();
+        let horizon = row_rgb(&background, 320, 90);
+
+        renderer
+            .render_world(&world, &clear_camera)
+            .expect("render clear platform");
+        assert!(renderer.stats().sections > 0, "the platform must be visible");
+        let clear = renderer.read_rgba();
+
+        // The geometry mask comes from the unfogged frame. Perspective X/Y
+        // coverage does not depend on the far plane, so the same screen pixels
+        // show the platform in both configurations.
+        let mut mask = vec![false; (320 * 180) as usize];
+        for (index, pixel) in clear.as_chunks::<4>().0.iter().enumerate() {
+            let offset = index * 4;
+            let background_pixel = &background[offset..offset + 3];
+            if pixel[0].abs_diff(background_pixel[0]) > 2
+                || pixel[1].abs_diff(background_pixel[1]) > 2
+                || pixel[2].abs_diff(background_pixel[2]) > 2
+            {
+                mask[index] = true;
+            }
+        }
+        let geometry_pixels = mask.iter().filter(|selected| **selected).count();
+        assert!(
+            geometry_pixels > 100,
+            "only {geometry_pixels} platform pixels were found"
+        );
+
+        renderer
+            .render_world(&world, &dense_camera)
+            .expect("render fogged platform");
+        let dense = renderer.read_rgba();
+
+        let clear_distance = mean_distance_to(&clear, &mask, horizon);
+        let dense_distance = mean_distance_to(&dense, &mask, horizon);
+        eprintln!(
+            "fog test: {geometry_pixels} platform pixels, horizon={horizon:?}, \
+             mean distance clear={clear_distance:.2}, dense={dense_distance:.2}"
+        );
+
+        assert!(
+            clear_distance > 20.0,
+            "the unfogged platform is too close to the sky horizon colour ({clear_distance:.2})"
+        );
+        assert!(
+            dense_distance < clear_distance * 0.75,
+            "dense fog did not pull the platform towards the horizon: \
+             clear={clear_distance:.2}, dense={dense_distance:.2}"
         );
     }
 

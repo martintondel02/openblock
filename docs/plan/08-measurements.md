@@ -153,3 +153,20 @@ Snapshot capture costs ~25.9 µs per solid section, so 32 submissions/frame cost
   GPU overlay test and by the offscreen `--screenshot` path.
 - Window FPS numbers above still include compositor/present limits and hidden
   window caveats; the offscreen benchmark remains the CI gate.
+
+## 2026-11-24 — v0.0.4 (texture styles, fog, sky)
+
+- Four procedural texture styles were added (classic 16², painterly 32²,
+  lush 32², minimal 16²), each with a full mip chain (nearest magnification,
+  linear minification/mip filtering).
+- Alpha cut-out leaves and a deterministic per-quad brightness variation
+  (±5%) add visual depth without changing the geometry or batching model.
+- Sky gradient + distance fog replace the flat clear colour. Fog resolves to the
+  horizon colour, so chunk edges dissolve into the sky.
+- Rendering cost unchanged within noise: the cached offscreen benchmark still
+  reports ~0.6–0.7 ms p50 at 1280×720 on RADV integrated graphics (fog/sky are
+  one fullscreen triangle plus a few ALU ops per fragment; mips reduce texture
+  cache pressure at distance).
+- Workspace tests: 166 (v0.0.3: 149), including CPU tests for every texture
+  style, mip determinism and leaf alpha; GPU texture-grid previews remain an
+  explicitly-run ignored test to keep CI GPU-free.

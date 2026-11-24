@@ -41,11 +41,11 @@ OpenBlock is designed to express content and systems Minecraft cannot:
 programmable logic blocks, first-class energy/fluid networks, scriptable mob
 AI, procedural dungeons, server-side minigames and more.
 
-![OpenBlock v0.0.3 tech preview — textured terrain with a crosshair, hotbar and block icons](docs/img/v0.0.3-screenshot.png)
+![OpenBlock v0.0.4 tech preview — textured terrain with fog, sky gradient, HUD and hotbar](docs/img/v0.0.4-screenshot.png)
 
-<p align="center"><em>v0.0.3, seed 42: textured greedy-meshed terrain with the new HUD — crosshair and hotbar with isometric block icons (offscreen capture on Fedora 45, RADV).</em></p>
+<p align="center"><em>v0.0.4, seed 42, classic texture style: mipmapped block textures, cut-out leaves, distance fog, sky gradient and the HUD (offscreen capture on Fedora 45, RADV).</em></p>
 
-> **Status: v0.0.3 tech preview.** A runnable single-player vertical slice now
+> **Status: v0.0.4 tech preview.** A runnable single-player vertical slice now
 > exists: procedural terrain, chunk streaming, walk/fly physics, block
 > break/place, hotbar selection, save/load and a headless host with a
 > determinism smoke test. It is the first slice of MS-03, not a finished game:
@@ -231,6 +231,21 @@ cargo run --release -p ob_tools --bin openblock-tools -- bench --frames 60 --see
 cargo run --release -p ob_client --bin openblock -- --seed 42 --fly --seconds 10
 ```
 
+## Texture styles
+
+![Four OpenBlock texture styles: classic, painterly, lush and minimal](docs/img/v0.0.4-texture-styles.png)
+
+| Style | Resolution | Character |
+| --- | --- | --- |
+| `classic` | 16×16 | Minecraft-inspired: clean greens, warm dirt, calm stone, one muted flower, clustered leaf holes |
+| `painterly` | 32×32 | Hytale-inspired: muted warm palette, soft gradients and dithering, rounded pebbles, deep teal water |
+| `lush` | 32×32 | Detailed natural: layered foliage, mossy stone, bark knots, turquoise water with foam |
+| `minimal` | 16×16 | Clean modern: flat pastel tones, crisp 1 px accents, almost no noise |
+
+Select it in **Esc → Settings → Texture style** (changes immediately and is
+saved), or launch with `--texture-style painterly`. The styles are generated
+procedurally and deterministically, so no texture files are downloaded.
+
 Measured on the reference dev machine (Fedora 45, RADV integrated GPU,
 1280×720): **115 FPS at a 128-block radius, 135 FPS at a 192-block radius**
 (steady state, p95 ≤ 17 ms), and **0.62 ms p50** for a cached offscreen frame at
@@ -239,7 +254,7 @@ gate. Full log: [`docs/plan/08-measurements.md`](docs/plan/08-measurements.md).
 
 Controls: mouse look (click to capture), `WASD` move, `Space` jump, `Shift`
 sprint, `F` toggle fly, left/right click break/place, `1`–`8` or the mouse wheel
-select a block. `F3` toggles the debug overlay, `F1` toggles the HUD, `F2` saves
+select a block. Texture style is in the settings menu. `F3` toggles the debug overlay, `F1` toggles the HUD, `F2` saves
 a screenshot, `Esc` opens the pause/settings menu (render distance, FOV, mouse
 sensitivity, fullscreen, HUD/debug toggles, save and quit). Settings are saved to
 `<data-dir>/config.json`; worlds live under

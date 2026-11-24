@@ -1,10 +1,11 @@
 //! The GPU renderer built on wgpu: voxel meshing, mesh upload and shading.
 //!
-//! v0.0.1 scope: one forward pass, textured greedy-meshed chunk geometry with
-//! baked face shading and ambient occlusion, a 16×16 block texture array, a
-//! depth buffer, section frustum culling and a sky clear. The render graph,
-//! GPU-driven submission and post chain in `docs/spec/03-rendering.md` arrive
-//! with the rest of MS-04.
+//! v0.0.1 scope: a screen-space sky gradient pass followed by one forward pass,
+//! textured greedy-meshed chunk geometry with baked face shading and ambient
+//! occlusion, a 16×16 block texture array, distance fog that fades chunk edges
+//! into the sky horizon, a depth buffer and section frustum culling. The render
+//! graph, GPU-driven submission and post chain in `docs/spec/03-rendering.md`
+//! arrive with the rest of MS-04.
 
 #![allow(missing_docs)] // TODO(MS-04): re-enable once the v0.0.1 API surface settles
 #![forbid(unsafe_code)]
@@ -26,6 +27,7 @@ use winit::window::Window;
 pub use frustum::{FRUSTUM_PLANE_COUNT, aabb_visible, section_bounds, section_visible};
 pub use mesh::{MesherStats, SNAPSHOT_SIZE, SectionSnapshot, mesh_section, mesh_section_with_stats};
 pub use offscreen::OffscreenRenderer;
+pub use textures::{TexturePack, TexturePackStyle};
 pub use ui::{GLYPH_SIZE, LINE_HEIGHT, UiFrame, UiRenderer, UiStats, UiTexture, UiVertex, glyph_advance, line_height};
 
 use pipeline::CameraUniform;
@@ -83,6 +85,19 @@ impl Camera {
     /// convention is `a·x + b·y + c·z + d >= 0`.
     pub fn frustum_planes(&self, aspect: f32) -> [[f32; 4]; FRUSTUM_PLANE_COUNT] {
         frustum::planes_from_view_projection(&self.view_projection(aspect))
+    }
+
+    /// Distance-fog `(start, end)` bounds derived from the far plane.
+    ///
+    /// Fog begins at 55% and reaches full strength at 95% of the far plane, so
+    /// terrain fades into the sky before the far plane culls it. The end is
+    /// clamped to at least `start + 1` so a tiny far plane cannot invert the
+    /// range. Both the windowed and offscreen renderers use this method, which
+    /// keeps their fog identical for the same camera.
+    pub fn fog_range(&self) -> (f32, f32) {
+        let start = self.far * 0.55;
+        let end = (self.far * 0.95).max(start + 1.0);
+        (start, end)
     }
 }
 
@@ -190,8 +205,10 @@ pub struct Renderer {
     pub(crate) queue: wgpu::Queue,
     /// Surface configuration.
     pub(crate) config: wgpu::SurfaceConfiguration,
-    /// Render pipeline.
+    /// World render pipeline.
     pub(crate) pipeline: wgpu::RenderPipeline,
+    /// Full-screen sky gradient pipeline.
+    pub(crate) sky_pipeline: wgpu::RenderPipeline,
     /// Depth texture view.
     pub(crate) depth_view: wgpu::TextureView,
     /// Camera uniform buffer.
@@ -221,6 +238,11 @@ pub struct Renderer {
 impl Renderer {
     /// Creates a renderer for a window: instance, surface, adapter, device and pipeline.
     pub fn new(window: Arc<Window>) -> Result<Self, RenderError> {
+        Self::new_with_style(window, TexturePackStyle::default())
+    }
+
+    /// Creates a renderer using the requested procedural texture-pack style.
+    pub fn new_with_style(window: Arc<Window>, style: TexturePackStyle) -> Result<Self, RenderError> {
         // wgpu 30's `InstanceDescriptor` has no `Default` impl; this constructor
         // is its `default()` equivalent and needs no display handle. On native
         // platforms `Arc<Window>` satisfies raw-window-handle's blanket
@@ -287,11 +309,12 @@ impl Renderer {
         let depth_view = pipeline::create_depth_view(&device, width, height);
 
         let uniform_buffer = pipeline::create_camera_buffer(&device);
-        let textures = BlockTextureArray::new(&device, &queue);
+        let textures = BlockTextureArray::new_with_style(&device, &queue, style);
         let ui = ui::UiRenderer::new(&device, &queue, &textures, format);
         let bind_group_layout = pipeline::create_bind_group_layout(&device);
         let bind_group = pipeline::create_bind_group(&device, &bind_group_layout, &uniform_buffer, &textures);
         let pipeline = pipeline::create_pipeline(&device, format, &bind_group_layout);
+        let sky_pipeline = pipeline::create_sky_pipeline(&device, format);
 
         Ok(Self {
             instance,
@@ -300,6 +323,7 @@ impl Renderer {
             queue,
             config,
             pipeline,
+            sky_pipeline,
             depth_view,
             uniform_buffer,
             _textures: textures,
@@ -326,6 +350,27 @@ impl Renderer {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.depth_view = pipeline::create_depth_view(&self.device, width, height);
+    }
+
+    /// Rebuilds the block texture array and every bind group that references it.
+    ///
+    /// Cheap enough for a settings change: generated textures are 16x16 or 32x32
+    /// per layer and the world pipeline itself does not change.
+    pub fn set_texture_style(&mut self, style: TexturePackStyle) {
+        if self._textures.style() == style {
+            return;
+        }
+        let textures = BlockTextureArray::new_with_style(&self.device, &self.queue, style);
+        let layout = pipeline::create_bind_group_layout(&self.device);
+        self.bind_group = pipeline::create_bind_group(&self.device, &layout, &self.uniform_buffer, &textures);
+        self.ui = ui::UiRenderer::new(&self.device, &self.queue, &textures, self.config.format);
+        self._textures = textures;
+        log::info!("texture style set to {}", style.name());
+    }
+
+    /// Currently active procedural texture-pack style.
+    pub fn texture_style(&self) -> TexturePackStyle {
+        self._textures.style()
     }
 
     /// Uploads (or replaces) the mesh for a section.
@@ -359,15 +404,13 @@ impl Renderer {
 
     /// Renders one frame of the world with an optional UI overlay.
     ///
-    /// The UI frame is drawn in a second pass after the world pass, with alpha
-    /// blending and no depth attachment.
+    /// The sky gradient is drawn first into a cleared colour target (no depth),
+    /// the world pass loads that colour and clears depth on its own, and the UI
+    /// frame is drawn last with alpha blending and no depth attachment.
     pub fn render_with_ui(&mut self, camera: &Camera, ui: Option<&ui::UiFrame>) -> Result<(), RenderError> {
         let (width, height) = self.size();
         let aspect = width as f32 / height as f32;
-        let view_projection = camera.view_projection(aspect);
-        let uniform = CameraUniform {
-            view_proj: view_projection.to_cols_array_2d(),
-        };
+        let uniform = CameraUniform::new(camera, aspect);
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         let frustum = camera.frustum_planes(aspect);
@@ -396,6 +439,29 @@ impl Renderer {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         {
+            // Sky first, with no depth attachment: one full-screen triangle.
+            let mut sky = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sky"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(pipeline::SKY_CLEAR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            sky.set_pipeline(&self.sky_pipeline);
+            sky.draw(0..3, 0..1);
+        }
+        {
+            // The world loads the sky already written above and clears depth
+            // independently.
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -403,12 +469,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.55,
-                            g: 0.72,
-                            b: 0.95,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -512,5 +573,20 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Vertex, uv), 12);
         assert_eq!(std::mem::offset_of!(Vertex, layer), 20);
         assert_eq!(std::mem::offset_of!(Vertex, light), 24);
+    }
+
+    #[test]
+    fn fog_range_tracks_the_far_plane() {
+        let mut camera = Camera::new(WorldVec::new(0.0, 70.0, 0.0), 0.0, 0.0);
+        camera.far = 200.0;
+        let (start, end) = camera.fog_range();
+        assert!((start - 110.0).abs() < 1e-4, "fog start is {start}");
+        assert!((end - 190.0).abs() < 1e-4, "fog end is {end}");
+
+        // A very short far plane keeps a usable, non-inverted range.
+        camera.far = 1.0;
+        let (start, end) = camera.fog_range();
+        assert!(start >= 0.0);
+        assert!(end >= start + 1.0, "fog range is {start}..{end}");
     }
 }
