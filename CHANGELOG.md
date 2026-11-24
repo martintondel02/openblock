@@ -6,6 +6,40 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [0.0.7] — 2026-11-24 (tech preview, survival foundations)
+
+### Added
+- Survival mode (default for new settings; `--creative` or the settings toggle
+  switches): health and hunger (20 each), fall damage above a safe impact speed,
+  starvation at zero hunger, slow regeneration above 18 hunger, a red damage
+  flash, hearts and hunger HUD icons, pickup toasts and a death/respawn screen.
+- Items: a minimal item catalogue (one item per block plus `openblock:apple`),
+  nine-slot item hotbar with stack counts, deterministic block drops (grass drops
+  dirt), a 1-in-6 deterministic apple drop from leaves, placement that consumes
+  the selected stack, and right-click eating that restores hunger.
+- Vitals and inventory persist with the world (`player.txt` extended, new
+  `inventory.txt`), and the smoke state hash covers them; old saves load with
+  defaults. Death teleports nowhere — respawn returns to the spawn point and
+  keeps the inventory.
+- Movement: crouch/sneak (`Shift`) with reduced speed, lower eye height and
+  ledge protection; sprint (`Ctrl`) with a smooth FOV boost; walk-mode gravity
+  and jumping confirmed; flying remains on `F`.
+- Settings/CLI: `--survival`/`--creative`, game-mode row, and new F3 lines for
+  game mode, vitals and movement state.
+
+### Changed
+- Hotbar scrolling direction now matches the usual convention (scroll down →
+  next slot).
+- Client inventory screen has a survival mode (hotbar stacks with counts and
+  item hints) and keeps the creative palette in creative.
+- Controls: Shift is crouch (was sprint), Ctrl is sprint.
+
+### Measured
+- Test count: 244 -> 293 (items/drops, vitals/fall/starvation/regen/eating,
+  inventory/actions/persistence, crouch/sprint/edge protection, HUD/death UI).
+- No rendering or streaming performance changes; the offscreen benchmark gate is
+  unchanged.
+
 ## [0.0.6] — 2026-11-24 (tech preview, resource packs)
 
 ### Added

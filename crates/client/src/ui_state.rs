@@ -4,11 +4,14 @@
 //! while `ob_render::ui` draws it. Keeping the model separate makes the layout
 //! and menu logic unit-testable without a window or a device.
 
+use std::collections::VecDeque;
+
 use ob_content::{BlockType, Registry};
 use ob_core::config::{
     MAX_FOV_DEGREES, MAX_MOUSE_SENSITIVITY, MAX_RENDER_DISTANCE, MIN_FOV_DEGREES, MIN_MOUSE_SENSITIVITY,
     MIN_RENDER_DISTANCE, Settings,
 };
+use ob_render::UiFrame;
 
 use crate::inventory::{InventoryLayout, InventoryState, layout as inventory_layout};
 
@@ -36,18 +39,206 @@ pub const MENU_ROW_HEIGHT: f32 = 34.0;
 pub const MENU_PANEL_WIDTH: f32 = 420.0;
 /// Seconds for which the selected block name stays visible after a change.
 pub const BLOCK_NAME_SECONDS: f32 = 2.5;
+/// Number of heart and hunger icons in the survival HUD.
+pub const VITAL_ICON_COUNT: usize = 10;
+/// Each vital icon represents this many health or hunger points.
+pub const VITAL_POINTS_PER_ICON: f32 = 2.0;
+/// Edge length of one vital icon in UI pixels.
+pub const VITAL_ICON_SIZE: f32 = 16.0;
+/// Gap between vital icons.
+pub const VITAL_ICON_GAP: f32 = 2.0;
+/// Left margin of the survival vitals rows.
+pub const VITAL_MARGIN_X: f32 = 14.0;
+/// Seconds the red damage vignette remains visible.
+pub const DAMAGE_FLASH_SECONDS: f32 = 0.35;
+/// Seconds a pickup or hint toast remains visible.
+pub const TOAST_SECONDS: f32 = 2.5;
+/// Maximum number of toasts shown at once.
+pub const MAX_TOASTS: usize = 3;
+/// Width of a death-screen button.
+pub const DEATH_BUTTON_WIDTH: f32 = 220.0;
+/// Height of a death-screen button.
+pub const DEATH_BUTTON_HEIGHT: f32 = 40.0;
+/// Vertical gap between death-screen buttons.
+pub const DEATH_BUTTON_GAP: f32 = 14.0;
+/// Death-screen note explaining that the inventory survives.
+pub const DEATH_NOTE: &str = "The world keeps your inventory";
 
 /// Which screen currently owns input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     /// Normal gameplay with a captured pointer.
     Playing,
-    /// Creative inventory with a released pointer.
+    /// Survival inventory / creative palette with a released pointer.
     Inventory,
     /// Pause menu.
     Pause,
     /// Settings screen reached from the pause menu.
     Settings,
+    /// Modal death screen; gameplay input is blocked.
+    Death,
+}
+
+/// Fill level of a single heart icon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeartState {
+    /// Both health points for this heart are present.
+    Full,
+    /// Exactly one of the two health points is present.
+    Half,
+    /// No health remains in this heart.
+    Empty,
+}
+
+/// Fill level of a single hunger icon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HungerState {
+    /// Both hunger points for this drumstick are present.
+    Full,
+    /// Exactly one of the two hunger points is present.
+    Half,
+    /// No hunger remains in this drumstick.
+    Empty,
+}
+
+/// One action offered by the death screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeathAction {
+    /// Respawn at the world spawn point and return to gameplay.
+    Respawn,
+    /// Save the world and exit the process.
+    SaveAndQuit,
+}
+
+/// Death-screen actions in display order.
+pub const DEATH_ACTIONS: [DeathAction; 2] = [DeathAction::Respawn, DeathAction::SaveAndQuit];
+
+/// How urgent a HUD toast is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastKind {
+    /// Normal pickup/hint message.
+    Info,
+    /// Warning such as a full inventory.
+    Warning,
+}
+
+/// One fading HUD toast.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Toast {
+    /// Message text.
+    pub text: String,
+    /// Remaining lifetime in seconds.
+    pub remaining: f32,
+    /// Visual urgency.
+    pub kind: ToastKind,
+}
+
+/// Bounded queue of recent pickup/hint messages.
+#[derive(Debug, Clone, Default)]
+pub struct ToastQueue {
+    entries: VecDeque<Toast>,
+}
+
+impl ToastQueue {
+    /// Pushes an info toast, dropping the oldest when the queue is full.
+    pub fn push(&mut self, text: impl Into<String>) {
+        self.push_kind(ToastKind::Info, text);
+    }
+
+    /// Pushes a warning toast, dropping the oldest when the queue is full.
+    pub fn push_warning(&mut self, text: impl Into<String>) {
+        self.push_kind(ToastKind::Warning, text);
+    }
+
+    fn push_kind(&mut self, kind: ToastKind, text: impl Into<String>) {
+        while self.entries.len() >= MAX_TOASTS {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(Toast {
+            text: text.into(),
+            remaining: TOAST_SECONDS,
+            kind,
+        });
+    }
+
+    /// Advances every toast and removes expired entries.
+    pub fn tick(&mut self, dt_seconds: f32) {
+        if !dt_seconds.is_finite() || dt_seconds <= 0.0 {
+            return;
+        }
+        for toast in &mut self.entries {
+            toast.remaining = (toast.remaining - dt_seconds).max(0.0);
+        }
+        self.entries.retain(|toast| toast.remaining > 0.0);
+    }
+
+    /// Number of visible toasts.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no toasts are visible.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Iterates oldest to newest.
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Toast> {
+        self.entries.iter()
+    }
+
+    /// Removes every toast.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// Tracks health drops and runs the red damage-vignette timer.
+#[derive(Debug, Clone, Default)]
+pub struct DamageFlash {
+    previous_health: Option<f32>,
+    remaining: f32,
+}
+
+impl DamageFlash {
+    /// Observes the current health, starting a flash when it dropped.
+    ///
+    /// Returns whether a new flash was triggered. The first observation only
+    /// records the baseline, so loading a wounded save does not flash.
+    pub fn observe(&mut self, health: f32) -> bool {
+        let dropped = self
+            .previous_health
+            .is_some_and(|previous| health.is_finite() && previous.is_finite() && health < previous);
+        self.previous_health = Some(health);
+        if dropped {
+            self.remaining = DAMAGE_FLASH_SECONDS;
+        }
+        dropped
+    }
+
+    /// Advances the flash timer.
+    pub fn tick(&mut self, dt_seconds: f32) {
+        if !dt_seconds.is_finite() || dt_seconds <= 0.0 {
+            return;
+        }
+        self.remaining = (self.remaining - dt_seconds).max(0.0);
+    }
+
+    /// Seconds left in the current flash.
+    pub fn remaining(&self) -> f32 {
+        self.remaining
+    }
+
+    /// Vignette alpha in `0.0..=1.0`.
+    pub fn alpha(&self) -> f32 {
+        (self.remaining / DAMAGE_FLASH_SECONDS).clamp(0.0, 1.0)
+    }
+
+    /// Clears the timer and forgets the previous-health baseline.
+    pub fn reset(&mut self) {
+        self.previous_health = None;
+        self.remaining = 0.0;
+    }
 }
 
 /// An interactive row on the pause or settings screen.
@@ -73,6 +264,8 @@ pub enum MenuItem {
     SensitivityDown,
     /// Increase mouse sensitivity.
     SensitivityUp,
+    /// Toggle between survival and creative gameplay.
+    ToggleGameMode,
     /// Toggle fullscreen.
     ToggleFullscreen,
     /// Toggle the F3 debug overlay.
@@ -172,6 +365,14 @@ pub struct DebugStats {
     pub time_of_day: f32,
     /// Active texture source label, e.g. `painterly 32px` or a pack folder name.
     pub texture_source: String,
+    /// `survival` or `creative`.
+    pub game_mode: &'static str,
+    /// Current health in half-hearts.
+    pub health: f32,
+    /// Current hunger points.
+    pub hunger: f32,
+    /// `walk`, `sneak`, `sprint` or `fly`.
+    pub movement: &'static str,
 }
 
 impl DebugStats {
@@ -188,12 +389,29 @@ impl DebugStats {
                 self.fps, self.frame_p50_ms, self.frame_p95_ms
             ),
             format!(
+                "Game: {}",
+                if self.game_mode.is_empty() {
+                    "survival"
+                } else {
+                    self.game_mode
+                }
+            ),
+            format!(
                 "XYZ {:.3} / {:.3} / {:.3}",
                 self.position[0], self.position[1], self.position[2]
             ),
+            format!("Vitals: {:.1} / 20 HP, {:.1} / 20 hunger", self.health, self.hunger),
             format!(
                 "Chunk {} {} {}   Facing {}",
                 self.chunk[0], self.chunk[1], self.chunk[2], self.facing
+            ),
+            format!(
+                "Move: {}",
+                if self.movement.is_empty() {
+                    "walk"
+                } else {
+                    self.movement
+                }
             ),
             format!(
                 "FOV {:.0}   Render distance {} chunks",
@@ -229,8 +447,8 @@ impl DebugStats {
                 self.ticks
             ),
         ];
-        if lines.len() < 13 {
-            lines.resize(13, String::new());
+        if lines.len() < 15 {
+            lines.resize(15, String::new());
         }
         lines
     }
@@ -294,6 +512,12 @@ pub struct UiState {
     pub active_texture_pack: Option<String>,
     /// Drag value for a future settings slider.
     pub dragging: bool,
+    /// Recent pickup/hint messages shown above the vitals.
+    pub toasts: ToastQueue,
+    /// Keyboard focus on the death screen (0 = respawn, 1 = save and quit).
+    pub death_selected: usize,
+    /// Hovered death-screen button, if any.
+    pub death_hovered: Option<usize>,
 }
 
 impl Default for UiState {
@@ -314,6 +538,9 @@ impl Default for UiState {
             cursor: (0.0, 0.0),
             active_texture_pack: None,
             dragging: false,
+            toasts: ToastQueue::default(),
+            death_selected: 0,
+            death_hovered: None,
         }
     }
 }
@@ -336,6 +563,7 @@ impl UiState {
         if self.break_flash_seconds <= 0.0 {
             self.break_flash = None;
         }
+        self.toasts.tick(dt_seconds);
     }
 
     /// Toggles the F3 overlay and mirrors it into settings.
@@ -388,8 +616,60 @@ impl UiState {
         match self.screen {
             Screen::Playing => self.open_inventory(),
             Screen::Inventory => self.close_inventory(),
-            Screen::Pause | Screen::Settings => {}
+            Screen::Pause | Screen::Settings | Screen::Death => {}
         }
+    }
+
+    /// Opens the modal death screen and focuses the respawn button.
+    pub fn open_death(&mut self) {
+        self.screen = Screen::Death;
+        self.death_selected = 0;
+        self.death_hovered = None;
+    }
+
+    /// Leaves the death screen if it is open.
+    pub fn clear_death(&mut self) {
+        if self.screen == Screen::Death {
+            self.screen = Screen::Playing;
+        }
+    }
+
+    /// Keeps keyboard focus on the death buttons without opening the pause menu.
+    pub fn focus_death_buttons(&mut self) {
+        self.death_selected = self.death_selected.min(DEATH_ACTIONS.len() - 1);
+        self.death_hovered = None;
+    }
+
+    /// Moves the death-screen selection, wrapping around both buttons.
+    pub fn move_death_selection(&mut self, steps: i32) {
+        let count = DEATH_ACTIONS.len() as i32;
+        self.death_selected = (self.death_selected as i32 + steps).rem_euclid(count) as usize;
+    }
+
+    /// Death action currently focused, if any.
+    pub fn selected_death_action(&self) -> Option<DeathAction> {
+        DEATH_ACTIONS.get(self.death_selected).copied()
+    }
+
+    /// Runs the focused death-screen button.
+    pub fn activate_death(&mut self) -> Option<DeathAction> {
+        self.selected_death_action()
+    }
+
+    /// Updates the hovered death-screen button from the cursor.
+    pub fn update_death_hover(&mut self, screen: [f32; 2]) {
+        let rects = death_button_rects(screen);
+        self.death_hovered = rects
+            .iter()
+            .position(|rect| rect.contains(self.cursor.0, self.cursor.1));
+    }
+
+    /// Handles a click on the death screen, returning the chosen action.
+    pub fn click_death(&mut self, screen: [f32; 2]) -> Option<DeathAction> {
+        self.update_death_hover(screen);
+        let index = self.death_hovered?;
+        self.death_selected = index;
+        self.activate_death()
     }
 
     /// Shows a block name briefly near the crosshair after a completed break.
@@ -433,7 +713,7 @@ impl UiState {
     /// Menu rows for the current screen.
     pub fn menu_items(&self) -> Vec<MenuItem> {
         match self.screen {
-            Screen::Playing | Screen::Inventory => Vec::new(),
+            Screen::Playing | Screen::Inventory | Screen::Death => Vec::new(),
             Screen::Pause => vec![MenuItem::Resume, MenuItem::OpenSettings, MenuItem::SaveAndQuit],
             Screen::Settings => vec![
                 MenuItem::RenderDistanceDown,
@@ -442,6 +722,7 @@ impl UiState {
                 MenuItem::FovUp,
                 MenuItem::SensitivityDown,
                 MenuItem::SensitivityUp,
+                MenuItem::ToggleGameMode,
                 MenuItem::TextureStylePrevious,
                 MenuItem::TextureStyleNext,
                 MenuItem::ToggleTexturePack,
@@ -467,6 +748,7 @@ impl UiState {
             MenuItem::FovUp => "(+)".into(),
             MenuItem::SensitivityDown => format!("Mouse sensitivity  {:.2}x  (-)", self.settings.mouse_sensitivity),
             MenuItem::SensitivityUp => "(+)".into(),
+            MenuItem::ToggleGameMode => format!("Game mode  {}  (toggle)", self.settings.game_mode.name()),
             MenuItem::TextureStylePrevious => {
                 format!("Texture style  {}  (<)", self.settings.texture_style.name())
             }
@@ -532,6 +814,10 @@ impl UiState {
             MenuItem::SensitivityUp => self.adjust(|s| {
                 s.mouse_sensitivity = (s.mouse_sensitivity + 0.1).min(MAX_MOUSE_SENSITIVITY);
             }),
+            MenuItem::ToggleGameMode => {
+                self.settings.game_mode = self.settings.game_mode.next();
+                true
+            }
             MenuItem::TextureStylePrevious => {
                 self.settings.texture_style = self.settings.texture_style.previous();
                 true
@@ -639,6 +925,260 @@ impl UiState {
             }
         }
     }
+}
+
+/// Fill state of every heart icon for a health value in `0..=20`.
+///
+/// Each icon represents two health points: an odd remaining point leaves the
+/// next heart half-full.
+pub fn heart_states(health: f32) -> [HeartState; VITAL_ICON_COUNT] {
+    let health = if health.is_finite() {
+        health.clamp(0.0, VITAL_ICON_COUNT as f32 * VITAL_POINTS_PER_ICON)
+    } else {
+        0.0
+    };
+    std::array::from_fn(
+        |index| match vital_fill(health - index as f32 * VITAL_POINTS_PER_ICON) {
+            VitalFill::Full => HeartState::Full,
+            VitalFill::Half => HeartState::Half,
+            VitalFill::Empty => HeartState::Empty,
+        },
+    )
+}
+
+/// Fill state of every hunger icon for a hunger value in `0..=20`.
+pub fn hunger_states(hunger: f32) -> [HungerState; VITAL_ICON_COUNT] {
+    let hunger = if hunger.is_finite() {
+        hunger.clamp(0.0, VITAL_ICON_COUNT as f32 * VITAL_POINTS_PER_ICON)
+    } else {
+        0.0
+    };
+    std::array::from_fn(
+        |index| match vital_fill(hunger - index as f32 * VITAL_POINTS_PER_ICON) {
+            VitalFill::Full => HungerState::Full,
+            VitalFill::Half => HungerState::Half,
+            VitalFill::Empty => HungerState::Empty,
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VitalFill {
+    Full,
+    Half,
+    Empty,
+}
+
+fn vital_fill(points: f32) -> VitalFill {
+    if points >= VITAL_POINTS_PER_ICON {
+        VitalFill::Full
+    } else if points >= 1.0 {
+        VitalFill::Half
+    } else {
+        VitalFill::Empty
+    }
+}
+
+/// Positions of the ten heart and ten hunger icons above the hotbar.
+pub fn vitals_layout(screen: [f32; 2]) -> (Vec<UiRect>, Vec<UiRect>) {
+    let hotbar_top = screen[1] - HOTBAR_SLOT_SIZE - 18.0;
+    let row = |y: f32| {
+        (0..VITAL_ICON_COUNT)
+            .map(|index| {
+                UiRect::new(
+                    VITAL_MARGIN_X + index as f32 * (VITAL_ICON_SIZE + VITAL_ICON_GAP),
+                    y,
+                    VITAL_ICON_SIZE,
+                    VITAL_ICON_SIZE,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let hunger_y = hotbar_top - VITAL_ICON_SIZE - 6.0;
+    let hearts_y = hunger_y - VITAL_ICON_SIZE - 4.0;
+    (row(hearts_y), row(hunger_y))
+}
+
+/// Draws the survival health and hunger rows from primitive rectangles.
+pub fn draw_vitals(frame: &mut UiFrame, screen: [f32; 2], health: f32, hunger: f32) {
+    let (hearts, hunger_icons) = vitals_layout(screen);
+    for (rect, state) in hearts.iter().zip(heart_states(health)) {
+        draw_heart(frame, *rect, state);
+    }
+    for (rect, state) in hunger_icons.iter().zip(hunger_states(hunger)) {
+        draw_hunger(frame, *rect, state);
+    }
+}
+
+/// Pixel-art heart shape: two top bumps, a wide body and a tapering tip.
+fn heart_shape(rect: UiRect) -> [UiRect; 5] {
+    let u = rect.w / 7.0;
+    let v = rect.h / 6.0;
+    [
+        UiRect::new(rect.x + u, rect.y, 2.0 * u, 2.0 * v),
+        UiRect::new(rect.x + 4.0 * u, rect.y, 2.0 * u, 2.0 * v),
+        UiRect::new(rect.x, rect.y + 2.0 * v, 7.0 * u, 2.0 * v),
+        UiRect::new(rect.x + u, rect.y + 4.0 * v, 5.0 * u, v),
+        UiRect::new(rect.x + 3.0 * u, rect.y + 5.0 * v, u, v),
+    ]
+}
+
+fn draw_heart(frame: &mut UiFrame, rect: UiRect, state: HeartState) {
+    let shape = heart_shape(rect);
+    let empty = [0.12, 0.04, 0.05, 0.92];
+    for part in shape {
+        frame.rect(part.x, part.y, part.w, part.h, empty);
+    }
+    let full = [0.86, 0.15, 0.20, 1.0];
+    let half_x = rect.x + rect.w / 2.0;
+    for part in shape {
+        match state {
+            HeartState::Full => frame.rect(part.x, part.y, part.w, part.h, full),
+            HeartState::Half => {
+                let right = (part.x + part.w).min(half_x);
+                if right > part.x {
+                    frame.rect(part.x, part.y, right - part.x, part.h, full);
+                }
+            }
+            HeartState::Empty => {}
+        }
+    }
+}
+
+/// Pixel-art drumstick shape: a meat blob with a small bone at the lower right.
+fn drumstick_shape(rect: UiRect) -> [UiRect; 5] {
+    let u = rect.w / 7.0;
+    let v = rect.h / 6.0;
+    [
+        UiRect::new(rect.x + 2.0 * u, rect.y + v, 4.0 * u, 2.0 * v),
+        UiRect::new(rect.x + u, rect.y + 2.0 * v, 5.0 * u, 2.0 * v),
+        UiRect::new(rect.x + 2.0 * u, rect.y + 4.0 * v, 3.0 * u, v),
+        UiRect::new(rect.x + 5.0 * u, rect.y + 4.0 * v, 2.0 * u, v),
+        UiRect::new(rect.x + 6.0 * u, rect.y + 5.0 * v, u, v),
+    ]
+}
+
+fn draw_hunger(frame: &mut UiFrame, rect: UiRect, state: HungerState) {
+    let shape = drumstick_shape(rect);
+    let dark_meat = [0.16, 0.09, 0.05, 0.92];
+    let dark_bone = [0.24, 0.21, 0.16, 0.88];
+    for (index, part) in shape.iter().enumerate() {
+        let color = if index >= 3 { dark_bone } else { dark_meat };
+        frame.rect(part.x, part.y, part.w, part.h, color);
+    }
+    let meat = [0.82, 0.51, 0.24, 1.0];
+    let bone = [0.93, 0.88, 0.73, 1.0];
+    let half_x = rect.x + rect.w / 2.0;
+    for (index, part) in shape.iter().enumerate() {
+        let color = if index >= 3 { bone } else { meat };
+        match state {
+            HungerState::Full => frame.rect(part.x, part.y, part.w, part.h, color),
+            HungerState::Half => {
+                let right = (part.x + part.w).min(half_x);
+                if right > part.x {
+                    frame.rect(part.x, part.y, right - part.x, part.h, color);
+                }
+            }
+            HungerState::Empty => {}
+        }
+    }
+}
+
+/// Draws the red damage vignette with four inward-fading bands.
+pub fn draw_damage_flash(frame: &mut UiFrame, screen: [f32; 2], alpha: f32) {
+    if !alpha.is_finite() || alpha <= 0.0 {
+        return;
+    }
+    let alpha = alpha.clamp(0.0, 1.0);
+    let band = 10.0;
+    for layer in 0..4 {
+        let inset = layer as f32 * band;
+        let layer_alpha = alpha * (0.26 - layer as f32 * 0.05).max(0.0);
+        let color = [0.86, 0.04, 0.06, layer_alpha];
+        frame.rect(0.0, inset, screen[0], band, color);
+        frame.rect(0.0, screen[1] - inset - band, screen[0], band, color);
+        frame.rect(inset, 0.0, band, screen[1], color);
+        frame.rect(screen[0] - inset - band, 0.0, band, screen[1], color);
+    }
+}
+
+/// Draws the pickup/hint toasts above the vitals, newest closest to them.
+pub fn draw_toasts(frame: &mut UiFrame, toasts: &ToastQueue, screen: [f32; 2]) {
+    let (hearts, _) = vitals_layout(screen);
+    let Some(first) = hearts.first() else {
+        return;
+    };
+    let scale = 1.2;
+    let line_step = ob_render::line_height(scale) + 4.0;
+    for (index, toast) in toasts.iter().rev().enumerate() {
+        let fade = (toast.remaining / 0.5).clamp(0.0, 1.0);
+        let alpha = fade * 0.95;
+        let y = first.y - 18.0 - index as f32 * line_step;
+        let width = frame.text_width(scale, &toast.text);
+        frame.rect(
+            VITAL_MARGIN_X,
+            y - 2.0,
+            width + 8.0,
+            ob_render::line_height(scale) + 4.0,
+            [0.02, 0.03, 0.05, alpha * 0.65],
+        );
+        let color = match toast.kind {
+            ToastKind::Info => [0.95, 0.97, 1.0, alpha],
+            ToastKind::Warning => [1.0, 0.62, 0.55, alpha],
+        };
+        frame.text(VITAL_MARGIN_X + 4.0, y, scale, color, &toast.text);
+    }
+}
+
+/// Positions of the two death-screen buttons.
+pub fn death_button_rects(screen: [f32; 2]) -> [UiRect; 2] {
+    let x = (screen[0] - DEATH_BUTTON_WIDTH) / 2.0;
+    let first_y = screen[1] / 2.0 + 32.0;
+    [
+        UiRect::new(x, first_y, DEATH_BUTTON_WIDTH, DEATH_BUTTON_HEIGHT),
+        UiRect::new(
+            x,
+            first_y + DEATH_BUTTON_HEIGHT + DEATH_BUTTON_GAP,
+            DEATH_BUTTON_WIDTH,
+            DEATH_BUTTON_HEIGHT,
+        ),
+    ]
+}
+
+/// Draws the modal death screen over the world and HUD.
+pub fn draw_death_screen(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2]) {
+    let [width, height] = screen;
+    frame.rect(0.0, 0.0, width, height, [0.16, 0.01, 0.02, 0.68]);
+    frame.rect(0.0, 0.0, width, height, [0.35, 0.02, 0.03, 0.20]);
+    let centre_x = width / 2.0;
+    let centre_y = height / 2.0;
+    frame.text_centered(centre_x, centre_y - 132.0, 4.0, [1.0, 0.88, 0.86, 1.0], "You died");
+    frame.text_centered(centre_x, centre_y - 76.0, 1.5, [0.95, 0.82, 0.80, 1.0], DEATH_NOTE);
+    let rects = death_button_rects(screen);
+    for (index, (rect, label)) in rects.iter().zip(["Respawn", "Save & quit"]).enumerate() {
+        let active = index == ui.death_selected || ui.death_hovered == Some(index);
+        let background = if active {
+            [0.30, 0.06, 0.07, 0.98]
+        } else {
+            [0.17, 0.03, 0.04, 0.96]
+        };
+        frame.rect(rect.x, rect.y, rect.w, rect.h, background);
+        let border = if active {
+            [0.98, 0.76, 0.38, 1.0]
+        } else {
+            [0.50, 0.22, 0.22, 1.0]
+        };
+        frame.outline(rect.x, rect.y, rect.w, rect.h, if active { 2.0 } else { 1.0 }, border);
+        frame.text_centered(rect.center().0, rect.y + 11.0, 2.0, [0.96, 0.92, 0.90, 1.0], label);
+    }
+    let hint_y = rects[1].y + rects[1].h + 24.0;
+    frame.text_centered(
+        centre_x,
+        hint_y,
+        1.2,
+        [0.86, 0.72, 0.72, 1.0],
+        "Enter/Click select   Up/Down choose   Esc focus buttons   F3 debug",
+    );
 }
 
 /// Facing label from a yaw in radians (0 faces -Z / north).
@@ -933,12 +1473,19 @@ mod tests {
             fov_degrees: 70.0,
             time_of_day: 0.5,
             texture_source: "painterly 32px".into(),
+            game_mode: "survival",
+            health: 14.0,
+            hunger: 12.5,
+            movement: "sprint",
         };
         let left = stats.left_lines();
-        assert_eq!(left.len(), 13);
+        assert_eq!(left.len(), 15);
         let joined = left.join("\n");
         for needle in [
             "120 FPS",
+            "Game: survival",
+            "Vitals: 14.0 / 20 HP, 12.5 / 20 hunger",
+            "Move: sprint",
             "Chunk",
             "Facing north",
             "Textures: painterly 32px",
@@ -976,5 +1523,169 @@ mod tests {
         let centre = panel.center();
         assert!((centre.0 - 640.0).abs() < 0.01);
         assert!((centre.1 - 360.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn heart_states_map_health_to_full_half_and_empty_icons() {
+        use HeartState::{Empty, Full, Half};
+        assert_eq!(heart_states(0.0), [Empty; VITAL_ICON_COUNT]);
+        assert_eq!(
+            heart_states(1.0),
+            [Half, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty]
+        );
+        assert_eq!(
+            heart_states(2.0),
+            [Full, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty]
+        );
+        assert_eq!(
+            heart_states(19.0),
+            [Full, Full, Full, Full, Full, Full, Full, Full, Full, Half]
+        );
+        assert_eq!(heart_states(20.0), [Full; VITAL_ICON_COUNT]);
+        assert_eq!(heart_states(-4.0), [Empty; VITAL_ICON_COUNT]);
+        assert_eq!(heart_states(f32::NAN), [Empty; VITAL_ICON_COUNT]);
+        assert_eq!(heart_states(20.5), [Full; VITAL_ICON_COUNT]);
+    }
+
+    #[test]
+    fn hunger_states_map_hunger_to_full_half_and_empty_icons() {
+        use HungerState::{Empty, Full, Half};
+        assert_eq!(hunger_states(0.0), [Empty; VITAL_ICON_COUNT]);
+        assert_eq!(
+            hunger_states(1.0),
+            [Half, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty]
+        );
+        assert_eq!(
+            hunger_states(2.0),
+            [Full, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty]
+        );
+        assert_eq!(
+            hunger_states(19.0),
+            [Full, Full, Full, Full, Full, Full, Full, Full, Full, Half]
+        );
+        assert_eq!(hunger_states(20.0), [Full; VITAL_ICON_COUNT]);
+        assert_eq!(hunger_states(f32::NAN), [Empty; VITAL_ICON_COUNT]);
+    }
+
+    #[test]
+    fn vitals_are_above_the_hotbar_and_inside_the_screen() {
+        let screen = [1280.0, 720.0];
+        let hotbar = UiState::default().hotbar_rects(screen);
+        let (hearts, hunger) = vitals_layout(screen);
+        assert_eq!(hearts.len(), VITAL_ICON_COUNT);
+        assert_eq!(hunger.len(), VITAL_ICON_COUNT);
+        assert!(hunger[0].y + hunger[0].h <= hotbar[0].y);
+        assert!(hearts[0].y + hearts[0].h <= hunger[0].y);
+        for rect in hearts.iter().chain(hunger.iter()) {
+            assert!(rect.x >= 0.0 && rect.x + rect.w <= screen[0]);
+            assert!(rect.y >= 0.0 && rect.y + rect.h <= screen[1]);
+        }
+    }
+
+    #[test]
+    fn damage_flash_timer_triggers_on_health_drop_and_expires() {
+        let mut flash = DamageFlash::default();
+        assert!(!flash.observe(20.0), "the first sample is only a baseline");
+        assert_eq!(flash.remaining(), 0.0);
+        assert!(flash.observe(14.0));
+        assert_eq!(flash.remaining(), DAMAGE_FLASH_SECONDS);
+        assert!((flash.alpha() - 1.0).abs() < 1e-6);
+        flash.tick(0.2);
+        assert!((flash.remaining() - 0.15).abs() < 1e-6);
+        assert!(flash.alpha() < 1.0);
+        flash.tick(5.0);
+        assert_eq!(flash.remaining(), 0.0);
+        assert_eq!(flash.alpha(), 0.0);
+        assert!(!flash.observe(14.0), "not dropping again must not flash");
+        assert!(flash.observe(13.0));
+        flash.reset();
+        assert_eq!(flash.remaining(), 0.0);
+        // Negative or non-finite frame times do not advance the timer.
+        let mut flash = DamageFlash::default();
+        flash.observe(20.0);
+        flash.observe(10.0);
+        flash.tick(f32::NAN);
+        flash.tick(-1.0);
+        assert_eq!(flash.remaining(), DAMAGE_FLASH_SECONDS);
+    }
+
+    #[test]
+    fn toast_queue_caps_at_three_and_expires() {
+        let mut toasts = ToastQueue::default();
+        assert!(toasts.is_empty());
+        toasts.push("first");
+        toasts.push("second");
+        toasts.push_warning("third");
+        toasts.push("fourth");
+        assert_eq!(toasts.len(), MAX_TOASTS);
+        let texts: Vec<&str> = toasts.iter().map(|toast| toast.text.as_str()).collect();
+        assert_eq!(texts, ["second", "third", "fourth"]);
+        assert_eq!(toasts.iter().next_back().map(|toast| toast.kind), Some(ToastKind::Info));
+        toasts.tick(1.0);
+        assert_eq!(toasts.len(), MAX_TOASTS);
+        toasts.tick(TOAST_SECONDS);
+        assert!(toasts.is_empty());
+        toasts.push("after");
+        toasts.clear();
+        assert!(toasts.is_empty());
+    }
+
+    #[test]
+    fn death_screen_blocks_the_pause_menu_and_resolves_both_actions() {
+        let mut state = UiState::default();
+        state.open_death();
+        assert_eq!(state.screen, Screen::Death);
+        assert!(state.menu_items().is_empty());
+        assert!(state.panel_rect([1280.0, 720.0]).is_none());
+        assert_eq!(state.selected_death_action(), Some(DeathAction::Respawn));
+        assert_eq!(state.activate_death(), Some(DeathAction::Respawn));
+        state.move_death_selection(1);
+        assert_eq!(state.selected_death_action(), Some(DeathAction::SaveAndQuit));
+        state.move_death_selection(1);
+        assert_eq!(state.selected_death_action(), Some(DeathAction::Respawn));
+        state.move_death_selection(-1);
+        assert_eq!(state.selected_death_action(), Some(DeathAction::SaveAndQuit));
+        state.focus_death_buttons();
+        assert_eq!(state.selected_death_action(), Some(DeathAction::SaveAndQuit));
+        state.clear_death();
+        assert_eq!(state.screen, Screen::Playing);
+    }
+
+    #[test]
+    fn death_buttons_are_centred_and_hit_testable() {
+        let screen = [1280.0, 720.0];
+        let rects = death_button_rects(screen);
+        assert!((rects[0].center().0 - 640.0).abs() < 0.01);
+        assert!((rects[1].center().0 - 640.0).abs() < 0.01);
+        assert_eq!(rects.len(), DEATH_ACTIONS.len());
+        let mut state = UiState::default();
+        state.open_death();
+        state.cursor = rects[1].center();
+        state.update_death_hover(screen);
+        assert_eq!(state.death_hovered, Some(1));
+        assert_eq!(state.click_death(screen), Some(DeathAction::SaveAndQuit));
+        state.cursor = (0.0, 0.0);
+        state.update_death_hover(screen);
+        assert_eq!(state.death_hovered, None);
+    }
+
+    #[test]
+    fn game_mode_row_toggles_and_is_labelled() {
+        let mut state = UiState::default();
+        state.open_pause();
+        state.apply(MenuItem::OpenSettings);
+        assert!(state.menu_items().contains(&MenuItem::ToggleGameMode));
+        assert_eq!(
+            state.row_label(MenuItem::ToggleGameMode),
+            "Game mode  survival  (toggle)"
+        );
+        assert!(state.apply(MenuItem::ToggleGameMode));
+        assert_eq!(state.settings.game_mode, ob_core::config::GameMode::Creative);
+        assert_eq!(
+            state.row_label(MenuItem::ToggleGameMode),
+            "Game mode  creative  (toggle)"
+        );
+        assert!(state.apply(MenuItem::ToggleGameMode));
+        assert_eq!(state.settings.game_mode, ob_core::config::GameMode::Survival);
     }
 }

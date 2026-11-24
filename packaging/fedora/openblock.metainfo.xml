@@ -29,6 +29,13 @@
     <content_attribute id="social-chat">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.0.7" date="2026-11-24" type="development">
+      <description>
+        <p>Survival foundations (health, hunger, fall damage, block drops, an
+        item inventory, apples and eating, death/respawn, persisted state) plus
+        crouch/sneak, sprint and improved movement.</p>
+      </description>
+    </release>
     <release version="0.0.6" date="2026-11-24" type="development">
       <description>
         <p>Runtime loading of Minecraft-format resource packs for block textures

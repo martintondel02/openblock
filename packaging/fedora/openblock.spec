@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           openblock
-Version:        0.0.6
+Version:        0.0.7
 Release:        1%{?dist}
 Summary:        Fast, deeply moddable, server-first voxel sandbox
 
@@ -127,6 +127,14 @@ update-desktop-database &>/dev/null || :
 %config(noreplace) %{_sysconfdir}/openblock-server/server.toml
 
 %changelog
+* Tue Nov 24 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.0.7-1
+- Survival foundations: health/hunger, fall damage, starvation/regeneration,
+  block drops into a 9-slot item inventory, apples from leaves, eating, death
+  and respawn, persisted vitals/inventory, and a survival HUD (hearts, hunger,
+  item counts, damage flash, pickup toasts, death screen).
+- Crouch/sneak (Shift: slower, lower eye height, edge protection) and sprint
+  (Ctrl with FOV boost); gravity/jump in walk mode; --survival/--creative.
+
 * Tue Nov 24 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.0.6-1
 - Load Minecraft-format resource packs at runtime (--texture-pack PATH), with
   standard block filenames, animated-texture first frames, per-layer procedural

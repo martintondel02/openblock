@@ -231,3 +231,20 @@ Snapshot capture costs ~25.9 µs per solid section, so 32 submissions/frame cost
 - Test count: 244 (216 in v0.0.5), including synthetic-pack CPU tests for layout
   resolution, scaling, animated frames, alpha and tinting, GPU array/renderer
   tests, and an ignored real-pack load test.
+
+## 2026-11-24 — v0.0.7 (survival foundations, movement)
+
+- Survival systems are simulation-rate only: fall damage/hunger/starvation/regen
+  run on the existing 20 Hz tick and per-tick cost is a handful of float ops plus
+  an inventory lookup on block actions. No measurable frame-time change; the
+  offscreen benchmark gate is unchanged.
+- Movement: crouch caps target speed at 1.31 m/s (walk 4.317, sprint 5.612),
+  lowers the eye from 1.62 m to 1.27 m, and adds a support probe (one thin AABB
+  test against the existing voxel query) per horizontal axis per tick while
+  sneaking. Sprinting eases the camera FOV to 110% over ~80 ms.
+- Persistence: player.txt grew from 7 to 10 fields (old saves load with 20/20
+  health/hunger and alive); inventory.txt is a small text file written
+  atomically with the world. The smoke state hash now covers vitals and
+  inventory: `smoke OK hash=00fc740debf500c0` for seed 42.
+- Test count: 293 (items/drops, vitals cadence, inventory/actions/persistence,
+  crouch/sprint/ledge tests, HUD/death UI).

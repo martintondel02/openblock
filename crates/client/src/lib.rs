@@ -13,13 +13,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ob_content::{BlockId, Registry};
-use ob_core::config::{Settings, TextureStyle, load_settings, save_settings};
+use ob_core::config::{GameMode as SettingsGameMode, Settings, TextureStyle, load_settings, save_settings};
 use ob_math::{BlockPos, ChunkPos, SEA_LEVEL, SectionPos, WorldVec};
 use ob_render::{
     BlockOutline, Camera, DAY_LENGTH_TICKS, Environment, OffscreenRenderer, Renderer, SceneParams, TextureSource,
     UiFrame,
 };
-use ob_server::{Host, HostConfig};
+use ob_server::{GameMode as HostGameMode, Host, HostConfig};
 use ob_sim::{BlockAction, PlayerInput, REACH};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -36,7 +36,7 @@ pub mod ui_state;
 use inventory::inventory_blocks;
 use mesh_scheduler::MeshScheduler;
 use mining::MiningState;
-use ui_state::{DebugStats, MenuAction, MenuItem, Screen, UiState, facing_label};
+use ui_state::{DamageFlash, DeathAction, DebugStats, MenuAction, MenuItem, Screen, UiState, facing_label};
 
 /// One fixed simulation tick (20 Hz, DEC-038).
 const TICK: Duration = Duration::from_millis(50);
@@ -95,6 +95,12 @@ pub struct ClientOptions {
     pub no_texture_pack: bool,
     /// Time-of-day override in 0..=1 for screenshots (0 midnight, 0.5 noon).
     pub time_of_day: Option<f32>,
+    /// Explicit gameplay-mode override for this run (persisted when given).
+    pub game_mode: Option<SettingsGameMode>,
+    /// Render the death screen in the offscreen screenshot frame.
+    pub screenshot_dead: bool,
+    /// Seed the host with sample items and vitals for the offscreen screenshot.
+    pub screenshot_items: bool,
 }
 
 impl Default for ClientOptions {
@@ -114,6 +120,9 @@ impl Default for ClientOptions {
             texture_pack: None,
             no_texture_pack: false,
             time_of_day: None,
+            game_mode: None,
+            screenshot_dead: false,
+            screenshot_items: false,
         }
     }
 }
@@ -132,7 +141,12 @@ pub fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
         return screenshot_with_mode(&options, path, ScreenshotMode::Inventory);
     }
     if let Some(path) = &options.screenshot {
-        return screenshot(&options, path);
+        let mode = if options.screenshot_dead {
+            ScreenshotMode::Dead
+        } else {
+            ScreenshotMode::Hud
+        };
+        return screenshot_with_mode(&options, path, mode);
     }
     #[cfg(target_os = "linux")]
     let event_loop = {
@@ -158,6 +172,8 @@ enum ScreenshotMode {
     Hud,
     /// Inventory panel over the world with a block hovered.
     Inventory,
+    /// Modal death screen over the world.
+    Dead,
 }
 
 /// Renders one offscreen frame of the world and writes it as a PNG (RGBA8).
@@ -175,6 +191,7 @@ fn screenshot_with_mode(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut settings, data_dir) = effective_settings(options);
     persist_texture_pack_choice(options, &mut settings, &data_dir);
+    persist_game_mode_choice(options, &mut settings, &data_dir);
     let registry = Arc::new(Registry::base());
     let config = HostConfig {
         seed: options.seed,
@@ -184,6 +201,14 @@ fn screenshot_with_mode(
         generate_budget: GENERATE_BUDGET,
     };
     let mut host = Host::open(Arc::clone(&registry), config)?;
+    host.set_game_mode(map_game_mode(settings.game_mode));
+    log::info!("game mode: {}", host.game_mode().name());
+    if options.screenshot_items {
+        seed_screenshot_items(&mut host, &registry);
+    }
+    if mode == ScreenshotMode::Dead {
+        host.damage(ob_sim::MAX_HEALTH);
+    }
 
     // Drain streaming fully before meshing: the first frame must not be a
     // partially generated world.
@@ -209,44 +234,66 @@ fn screenshot_with_mode(
     let (mut renderer, texture_source) = create_offscreen_renderer(options, &settings)?;
     log_texture_source(&texture_source);
 
-    // Compose a showcase frame: HUD or inventory drawn over the world.
+    // Compose a showcase frame: HUD, inventory or death screen over the world.
     // Screenshot mode is also the headless verification path for the UI
     // renderer, since it needs no window or surface.
     let screen = [SCREENSHOT_WIDTH as f32, SCREENSHOT_HEIGHT as f32];
-    let mut ui = UiState::default();
+    let mut ui = UiState::from_settings(settings);
+    ui.active_texture_pack = active_texture_pack_label(&texture_source);
+    ui.hotbar_selected = host.hotbar_selection();
+    if options.screenshot_items {
+        ui.toasts.push("Picked up Stone x8");
+        ui.toasts.push("Picked up Apple x3");
+        ui.toasts.push_warning("Inventory full - dropped Log x2");
+        ui.block_name_seconds = ui_state::BLOCK_NAME_SECONDS;
+    }
     let mut frame = UiFrame::new(screen[0], screen[1]);
-    let (centre_x, centre_y) = (screen[0] / 2.0, screen[1] / 2.0);
+    let centre_x = screen[0] / 2.0;
+    let centre_y = screen[1] / 2.0;
+    let survival = host.game_mode() == HostGameMode::Survival;
     match mode {
         ScreenshotMode::Hud => {
+            ui.block_name_seconds = ui_state::BLOCK_NAME_SECONDS;
             let cross = [0.95, 0.97, 1.0, 0.85];
             frame.rect(centre_x - 1.0, centre_y - 9.0, 2.0, 18.0, cross);
             frame.rect(centre_x - 9.0, centre_y - 1.0, 18.0, 2.0, cross);
-            ui.block_name_seconds = ui_state::BLOCK_NAME_SECONDS;
-            draw_hotbar(&mut frame, &ui, &registry, screen);
-            if let Some(label) = ui
-                .hotbar_block(&registry, ui.hotbar_selected)
-                .map(|block| inventory::display_name(block.id))
-            {
-                frame.text_centered(
-                    centre_x,
-                    ui.hotbar_rects(screen)[0].y - 30.0,
-                    2.0,
-                    [1.0, 1.0, 1.0, 1.0],
-                    &label,
-                );
+            draw_vitals_for_mode(&mut frame, &ui, &host, screen);
+            draw_hotbar_for_mode(&mut frame, &ui, &registry, &host, screen);
+            draw_selected_name(&mut frame, &ui, &registry, &host, screen);
+            if survival {
+                ui_state::draw_toasts(&mut frame, &ui.toasts, screen);
             }
         }
         ScreenshotMode::Inventory => {
             ui.open_inventory();
-            let items = inventory_blocks(&registry);
-            if let Some(index) = items.iter().position(|id| registry.block(*id).id == "openblock:log") {
-                ui.inventory.selected = index;
-                ui.inventory.hovered = Some(index);
-                ui.hotbar_selected = 4;
+            if survival {
+                ui.inventory.selected = host.hotbar_selection();
+                ui.inventory.hovered = Some(host.hotbar_selection());
+                inventory::draw_survival(
+                    &mut frame,
+                    &ui,
+                    &registry,
+                    host.inventory(),
+                    host.hotbar_selection(),
+                    screen,
+                );
+            } else {
+                let items = inventory_blocks(&registry);
+                if let Some(index) = items.iter().position(|id| registry.block(*id).id == "openblock:log") {
+                    ui.inventory.selected = index;
+                    ui.inventory.hovered = Some(index);
+                    ui.hotbar_selected = 4;
+                }
+                inventory::draw(&mut frame, &ui, &registry, screen);
             }
-            inventory::draw(&mut frame, &ui, &registry, screen);
             // Keep the hotbar visible above the dimmed world, as in gameplay.
-            draw_hotbar(&mut frame, &ui, &registry, screen);
+            draw_hotbar_for_mode(&mut frame, &ui, &registry, &host, screen);
+        }
+        ScreenshotMode::Dead => {
+            ui.open_death();
+            draw_vitals_for_mode(&mut frame, &ui, &host, screen);
+            draw_hotbar_for_mode(&mut frame, &ui, &registry, &host, screen);
+            ui_state::draw_death_screen(&mut frame, &ui, screen);
         }
     }
     let environment = options.time_of_day.map(Environment::new).unwrap_or_default();
@@ -269,18 +316,76 @@ fn screenshot_with_mode(
     write_png(path, SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT, &rgba)?;
 
     log::info!(
-        "screenshot written to {} ({}x{}, GPU {})",
+        "screenshot written to {} ({}x{}, GPU {}, mode {}, health {:.1}, hunger {:.1})",
         path.display(),
         SCREENSHOT_WIDTH,
         SCREENSHOT_HEIGHT,
-        renderer.adapter_summary()
+        renderer.adapter_summary(),
+        host.game_mode().name(),
+        host.player().health,
+        host.player().hunger,
     );
     Ok(())
 }
 
+/// Gives the screenshot host a small, deterministic inventory and wounded vitals.
+fn seed_screenshot_items(host: &mut Host, registry: &Registry) {
+    for (name, count) in [("openblock:stone", 8_u8), ("openblock:apple", 3), ("openblock:log", 2)] {
+        if let Some(item) = registry.item_id(name) {
+            host.give_item(item, count);
+        }
+    }
+    let player = host.player_mut();
+    player.health = 14.0;
+    player.hunger = 12.0;
+    player.dead = false;
+    host.set_hotbar_selection(0);
+}
+
+/// Draws the survival vitals; creative keeps a clean HUD.
+fn draw_vitals_for_mode(frame: &mut UiFrame, _ui: &UiState, host: &Host, screen: [f32; 2]) {
+    if host.game_mode() == HostGameMode::Survival {
+        let player = host.player();
+        ui_state::draw_vitals(frame, screen, player.health, player.hunger);
+    }
+}
+
+/// Draws the selected hotbar slot's display name, if the name timer is active.
+fn draw_selected_name(frame: &mut UiFrame, ui: &UiState, registry: &Registry, host: &Host, screen: [f32; 2]) {
+    if ui.block_name_seconds <= 0.0 {
+        return;
+    }
+    let label = if host.game_mode() == HostGameMode::Survival {
+        host.selected_stack()
+            .map(|stack| inventory::display_name(registry.item(stack.item).id))
+    } else {
+        ui.hotbar_block(registry, ui.hotbar_selected)
+            .map(|block| inventory::display_name(block.id))
+    };
+    if let Some(label) = label {
+        let y = ui
+            .hotbar_rects(screen)
+            .first()
+            .map(|slot| slot.y - 30.0)
+            .unwrap_or(screen[1] - 70.0);
+        frame.text_centered(screen[0] / 2.0, y, 2.0, [1.0, 1.0, 1.0, 1.0], &label);
+    }
+}
+
+/// Draws the hotbar using the host inventory in survival and the fixed creative
+/// palette in creative.
+fn draw_hotbar_for_mode(frame: &mut UiFrame, ui: &UiState, registry: &Registry, host: &Host, screen: [f32; 2]) {
+    match host.game_mode() {
+        HostGameMode::Survival => {
+            inventory::draw_survival_hotbar(frame, ui, registry, host.inventory(), host.hotbar_selection(), screen)
+        }
+        HostGameMode::Creative => draw_creative_hotbar(frame, ui, registry, screen),
+    }
+}
+
 /// Draws the nine-slot hotbar, skipping slots whose blocks are missing from the
 /// active registry.
-fn draw_hotbar(frame: &mut UiFrame, ui: &UiState, registry: &Registry, screen: [f32; 2]) {
+fn draw_creative_hotbar(frame: &mut UiFrame, ui: &UiState, registry: &Registry, screen: [f32; 2]) {
     for (index, slot) in ui.hotbar_rects(screen).iter().enumerate() {
         let selected = index == ui.hotbar_selected;
         let background = if selected {
@@ -341,6 +446,8 @@ struct GameState {
     fly_toggle: bool,
     captured: bool,
     mouse_left: bool,
+    current_fov: f32,
+    damage_flash: DamageFlash,
     mining: MiningState,
     last_place: Option<Instant>,
     accumulator: Duration,
@@ -390,6 +497,11 @@ impl GameState {
     }
 
     fn handle_escape(&mut self) {
+        if self.host.is_dead() {
+            self.begin_death_screen();
+            self.ui.focus_death_buttons();
+            return;
+        }
         match self.ui.screen {
             Screen::Playing => {
                 self.cancel_mining();
@@ -408,16 +520,114 @@ impl GameState {
                 self.ui.resume();
                 self.capture_pointer();
             }
+            Screen::Death => {
+                // Focus the buttons instead of opening the pause menu.
+                self.ui.focus_death_buttons();
+            }
         }
         self.persist_settings();
     }
 
-    /// Opens the creative inventory and releases the pointer.
+    /// Enters the modal death screen exactly once, releasing gameplay input.
+    fn begin_death_screen(&mut self) {
+        if self.ui.screen == Screen::Death {
+            return;
+        }
+        self.cancel_mining();
+        self.keys = [false; 8];
+        self.ui.open_death();
+        self.release_pointer();
+        self.damage_flash.observe(self.host.player().health);
+    }
+
+    /// Respawn action from the death screen.
+    fn respawn_after_death(&mut self) {
+        self.host.respawn();
+        self.ui.resume();
+        self.ui.toasts.clear();
+        self.keys = [false; 8];
+        self.cancel_mining();
+        let player = self.host.player();
+        self.input_yaw = player.yaw;
+        self.input_pitch = player.pitch;
+        self.prev_eye = player.eye();
+        self.current_eye = player.eye();
+        self.accumulator = Duration::ZERO;
+        self.damage_flash.reset();
+        self.capture_pointer();
+        self.update_title();
+    }
+
+    /// Applies a death-screen action; returns whether the process should exit.
+    fn handle_death_action(&mut self, action: DeathAction) -> bool {
+        match action {
+            DeathAction::Respawn => {
+                self.respawn_after_death();
+                false
+            }
+            DeathAction::SaveAndQuit => {
+                if let Err(err) = self.host.save() {
+                    log::warn!("save on death-screen quit failed: {err}");
+                }
+                self.persist_settings();
+                true
+            }
+        }
+    }
+
+    /// Pushes the configured gameplay mode into the authoritative host.
+    fn apply_game_mode_setting(&mut self) {
+        let mode = map_game_mode(self.ui.settings.game_mode);
+        self.host.set_game_mode(mode);
+        if mode == HostGameMode::Creative {
+            self.damage_flash.reset();
+            if self.ui.screen == Screen::Death {
+                self.ui.clear_death();
+                self.capture_pointer();
+            }
+        } else {
+            // The survival HUD is driven by the authoritative host selection.
+            self.ui.hotbar_selected = self.host.hotbar_selection();
+            self.damage_flash.observe(self.host.player().health);
+        }
+        log::info!("game mode: {}", mode.name());
+        self.update_title();
+    }
+
+    /// Selects a hotbar slot in both the host and the UI model.
+    fn select_hotbar_slot(&mut self, slot: usize) {
+        if self.host.game_mode() == HostGameMode::Survival {
+            self.host.set_hotbar_selection(slot);
+        }
+        self.ui.select_hotbar(slot);
+        if self.host.game_mode() == HostGameMode::Survival {
+            self.ui.hotbar_selected = self.host.hotbar_selection();
+        }
+        self.update_title();
+    }
+
+    /// Cycles the hotbar by `steps` slots, using the host selection in survival.
+    fn cycle_hotbar_slots(&mut self, steps: i32) {
+        let current = if self.host.game_mode() == HostGameMode::Survival {
+            self.host.hotbar_selection()
+        } else {
+            self.ui.hotbar_selected
+        };
+        let slot = (current as i32 + steps).rem_euclid(ui_state::HOTBAR_SLOTS as i32) as usize;
+        self.select_hotbar_slot(slot);
+    }
+
+    /// Opens the survival inventory or creative palette and releases the pointer.
     fn open_inventory(&mut self) {
         self.cancel_mining();
         self.ui.open_inventory();
-        let item_count = inventory_blocks(&self.registry).len();
-        self.ui.update_inventory_hover(self.window_screen(), item_count);
+        if self.host.game_mode() == HostGameMode::Survival {
+            self.ui.inventory.selected = self.host.hotbar_selection();
+            self.ui.hotbar_selected = self.host.hotbar_selection();
+        } else {
+            let item_count = inventory_blocks(&self.registry).len();
+            self.ui.update_inventory_hover(self.window_screen(), item_count);
+        }
         self.release_pointer();
     }
 
@@ -492,6 +702,9 @@ impl GameState {
                     }
                     MenuItem::ToggleFullscreen => {
                         self.apply_fullscreen(self.ui.settings.fullscreen);
+                    }
+                    MenuItem::ToggleGameMode => {
+                        self.apply_game_mode_setting();
                     }
                     MenuItem::TextureStylePrevious | MenuItem::TextureStyleNext => {
                         // Style rows switch the active source to Style(new style)
@@ -622,6 +835,18 @@ impl GameState {
             time_of_day: Environment::from_ticks(self.host.tick_count() + DAY_LENGTH_TICKS / 4, DAY_LENGTH_TICKS)
                 .time_of_day,
             texture_source: self.texture_source_description(),
+            game_mode: self.host.game_mode().name(),
+            health: player.health,
+            hunger: player.hunger,
+            movement: if player.flying {
+                "fly"
+            } else if player.sprinting {
+                "sprint"
+            } else if player.sneaking {
+                "sneak"
+            } else {
+                "walk"
+            },
         };
     }
 
@@ -638,7 +863,18 @@ impl GameState {
 
     fn update_title(&mut self) {
         let player = self.host.player();
-        let block = self.ui.hotbar_label(self.ui.hotbar_selected).unwrap_or("unknown");
+        let survival = self.host.game_mode() == HostGameMode::Survival;
+        let block = if survival {
+            self.host
+                .selected_stack()
+                .map(|stack| inventory::display_name(self.registry.item(stack.item).id))
+                .unwrap_or_else(|| "empty".to_string())
+        } else {
+            self.ui
+                .hotbar_label(self.ui.hotbar_selected)
+                .unwrap_or("unknown")
+                .to_string()
+        };
         let status = match self.ui.screen {
             Screen::Playing => {
                 if self.captured {
@@ -650,16 +886,31 @@ impl GameState {
             Screen::Inventory => " | INVENTORY (E/Esc to close)",
             Screen::Pause => " | PAUSED (Esc to resume)",
             Screen::Settings => " | SETTINGS (Esc to go back)",
+            Screen::Death => " | DEAD (Enter respawn)",
         };
-        let mode = if player.flying { "fly" } else { "walk" };
+        let movement = if player.flying {
+            "fly"
+        } else if player.sprinting {
+            "sprint"
+        } else if player.sneaking {
+            "sneak"
+        } else {
+            "walk"
+        };
+        let mode = if survival {
+            format!("survival \u{2665}{:.0} food {:.0}", player.health, player.hunger)
+        } else {
+            "creative".to_string()
+        };
         self.window.set_title(&format!(
-            "OpenBlock {} | {} FPS | {:.0}, {:.0}, {:.0} | {} | {}{}",
+            "OpenBlock {} | {} FPS | {:.0}, {:.0}, {:.0} | {} | {} | {}{}",
             ob_core::VERSION,
             self.fps,
             player.pos.x,
             player.pos.y,
             player.pos.z,
             block,
+            movement,
             mode,
             status,
         ));
@@ -827,6 +1078,7 @@ impl GameState {
             strafe: 0.0,
             jump: false,
             sprint: false,
+            sneak: false,
             fly_toggle: self.fly_toggle,
         };
         self.fly_toggle = false;
@@ -843,7 +1095,9 @@ impl GameState {
             input.strafe += 1.0;
         }
         input.jump = self.keys[4];
-        input.sprint = self.keys[5];
+        // Shift crouches/sneaks; Ctrl sprints (Minecraft-style bindings).
+        input.sneak = self.keys[5];
+        input.sprint = self.keys[6];
         self.prev_eye = self.host.player().eye();
         self.host.tick(&input);
         self.current_eye = self.host.player().eye();
@@ -870,18 +1124,31 @@ impl GameState {
                 self.frame_times.drain(..25_000);
             }
         }
+        if self.host.is_dead() && self.ui.screen != Screen::Death {
+            self.begin_death_screen();
+        } else if !self.host.is_dead() && self.ui.screen == Screen::Death {
+            // A creative-mode switch (or an external respawn) revives the player.
+            self.ui.clear_death();
+            self.capture_pointer();
+        }
         self.accumulator += dt.min(Duration::from_millis(250));
         let mut ticks = 0;
-        if self.ui.screen == Screen::Playing {
+        if self.ui.screen == Screen::Playing && !self.host.is_dead() {
             while self.accumulator >= TICK && ticks < 5 {
                 self.accumulator -= TICK;
                 self.tick();
                 ticks += 1;
             }
         } else {
-            // Menus pause simulation and movement input; rendering continues.
+            // Menus, death and the pause screen stop simulation and movement.
             self.accumulator = Duration::ZERO;
         }
+        if self.host.game_mode() == HostGameMode::Survival {
+            self.damage_flash.observe(self.host.player().health);
+        } else {
+            self.damage_flash.reset();
+        }
+        self.damage_flash.tick(dt.as_secs_f32());
         self.update_mining(dt);
         self.ui.tick(dt.as_secs_f32());
         self.rolling_frame_ms.push(dt.as_secs_f32() * 1000.0);
@@ -892,7 +1159,11 @@ impl GameState {
         let eye = self.prev_eye.lerp(self.current_eye, alpha as f64);
         let player = self.host.player();
         let mut camera = Camera::new(eye, player.yaw, player.pitch);
-        camera.fov_y = self.ui.settings.fov_degrees.to_radians();
+        // Sprinting slightly widens the FOV; crouching leaves it alone.
+        let target_fov = self.ui.settings.fov_degrees * if player.sprinting { 1.10 } else { 1.0 };
+        let blend = 1.0 - (-dt.as_secs_f32() * 12.0).exp();
+        self.current_fov += (target_fov - self.current_fov) * blend;
+        camera.fov_y = self.current_fov.to_radians();
         camera.far = (self.host.render_distance_chunks() as f32 * 16.0 + 48.0).max(128.0);
         self.stream_and_mesh();
         // Keep the window title in sync with the effective render distance.
@@ -973,11 +1244,6 @@ impl GameState {
         }
     }
 
-    /// Short display name of the block in a hotbar slot.
-    fn hotbar_label(&self, index: usize) -> Option<&'static str> {
-        self.ui.hotbar_label(index)
-    }
-
     /// Builds the UI frame for the current window size.
     fn build_ui_frame(&self) -> Option<UiFrame> {
         self.build_ui_frame_at(self.window_screen())
@@ -988,74 +1254,36 @@ impl GameState {
         let [width, height] = screen;
         let playing = self.ui.screen == Screen::Playing;
         let inventory_open = self.ui.screen == Screen::Inventory;
-        let show_hotbar = (playing || inventory_open) && self.ui.hud_visible;
-        let show_crosshair = playing && self.ui.hud_visible;
+        let death_open = self.ui.screen == Screen::Death;
+        let survival = self.host.game_mode() == HostGameMode::Survival;
+        let show_hotbar = (playing || inventory_open || death_open) && self.ui.hud_visible;
+        let show_crosshair = playing && self.ui.hud_visible && !self.host.is_dead();
         let show_debug = self.ui.debug_overlay;
         let show_menu = matches!(self.ui.screen, Screen::Pause | Screen::Settings);
-        if !show_hotbar && !show_crosshair && !show_debug && !show_menu && !inventory_open {
+        if !show_hotbar && !show_crosshair && !show_debug && !show_menu && !inventory_open && !death_open {
             return None;
         }
         let mut frame = UiFrame::new(width, height);
         let white = [1.0, 1.0, 1.0, 1.0];
         let text_color = [0.94, 0.96, 0.99, 1.0];
 
-        // --- F3 debug overlay: two columns in the top corners ---
-        if show_debug {
-            let scale = 2.0;
-            let line_height = ob_render::line_height(scale);
-            let left = self.debug_stats.left_lines();
-            let right = self.debug_stats.right_lines();
-            let left_width = left
-                .iter()
-                .map(|line| frame.text_width(scale, line))
-                .fold(0.0_f32, f32::max)
-                .max(420.0);
-            frame.rect(
-                6.0,
-                6.0,
-                left_width + 18.0,
-                left.len() as f32 * line_height + 14.0,
-                [0.03, 0.04, 0.07, 0.74],
-            );
-            for (index, text_line) in left.iter().enumerate() {
-                frame.text(14.0, 13.0 + index as f32 * line_height, scale, text_color, text_line);
-            }
-            let right_width = right
-                .iter()
-                .map(|line| frame.text_width(scale, line))
-                .fold(0.0_f32, f32::max);
-            let right_x = width - right_width - 14.0;
-            frame.rect(
-                right_x - 10.0,
-                6.0,
-                right_width + 18.0,
-                right.len() as f32 * line_height + 14.0,
-                [0.03, 0.04, 0.07, 0.74],
-            );
-            for (index, text_line) in right.iter().enumerate() {
-                frame.text(
-                    right_x,
-                    13.0 + index as f32 * line_height,
-                    scale,
-                    [0.80, 0.86, 0.94, 1.0],
-                    text_line,
-                );
-            }
-            frame.text(
-                14.0,
-                height - 30.0,
-                1.5,
-                [0.80, 0.86, 0.94, 0.9],
-                "F3 debug overlay   F1 HUD   F2 screenshot   Esc menu",
-            );
-        }
-
-        // --- Inventory: dimmed world, centred block grid and hotbar ---
+        // --- Inventory: dimmed world, hotbar row or creative block grid ---
         if inventory_open {
-            inventory::draw(&mut frame, &self.ui, &self.registry, screen);
+            if survival {
+                inventory::draw_survival(
+                    &mut frame,
+                    &self.ui,
+                    &self.registry,
+                    self.host.inventory(),
+                    self.host.hotbar_selection(),
+                    screen,
+                );
+            } else {
+                inventory::draw(&mut frame, &self.ui, &self.registry, screen);
+            }
         }
 
-        // --- HUD: crosshair, mining progress, hotbar and selected name ---
+        // --- HUD: crosshair, mining progress, vitals, hotbar and item name ---
         if show_crosshair || show_hotbar {
             let centre_x = width / 2.0;
             let centre_y = height / 2.0;
@@ -1074,21 +1302,24 @@ impl GameState {
             }
 
             if show_hotbar {
-                draw_hotbar(&mut frame, &self.ui, &self.registry, screen);
-                if playing && self.ui.block_name_seconds > 0.0 {
-                    let name = self.hotbar_label(self.ui.hotbar_selected).unwrap_or("unknown");
-                    let y = self
-                        .ui
-                        .hotbar_rects(screen)
-                        .first()
-                        .map(|slot| slot.y - 30.0)
-                        .unwrap_or(height - 70.0);
-                    frame.text_centered(centre_x, y, 2.0, white, name);
+                draw_hotbar_for_mode(&mut frame, &self.ui, &self.registry, &self.host, screen);
+                if playing {
+                    draw_selected_name(&mut frame, &self.ui, &self.registry, &self.host, screen);
+                }
+            }
+
+            if survival && show_hotbar {
+                draw_vitals_for_mode(&mut frame, &self.ui, &self.host, screen);
+                if playing {
+                    ui_state::draw_toasts(&mut frame, &self.ui.toasts, screen);
+                    ui_state::draw_damage_flash(&mut frame, screen, self.damage_flash.alpha());
                 }
             }
 
             if playing {
-                let mode = if self.host.player().flying {
+                let mode = if survival {
+                    "survival - Shift crouch, Ctrl sprint, RMB eat/place"
+                } else if self.host.player().flying {
                     "fly (F)"
                 } else {
                     "walk (F to fly)"
@@ -1106,7 +1337,7 @@ impl GameState {
                 let title = match self.ui.screen {
                     Screen::Pause => "Paused",
                     Screen::Settings => "Settings",
-                    Screen::Playing | Screen::Inventory => "",
+                    Screen::Playing | Screen::Inventory | Screen::Death => "",
                 };
                 frame.text_centered(panel.x + panel.w / 2.0, panel.y + 14.0, 2.5, white, title);
                 let rows = self.ui.menu_rects(screen);
@@ -1121,7 +1352,7 @@ impl GameState {
                 let hint = match self.ui.screen {
                     Screen::Pause => "Esc resume   Enter/Click select   F3 debug   F2 screenshot",
                     Screen::Settings => "Esc back   Enter/Click adjust   changes are saved",
-                    Screen::Playing | Screen::Inventory => "",
+                    Screen::Playing | Screen::Inventory | Screen::Death => "",
                 };
                 frame.text_centered(
                     panel.x + panel.w / 2.0,
@@ -1132,6 +1363,16 @@ impl GameState {
                 );
             }
         }
+
+        // --- Death screen: drawn over the HUD, below the F3 overlay ---
+        if death_open {
+            ui_state::draw_death_screen(&mut frame, &self.ui, screen);
+        }
+
+        // --- F3 debug overlay: always on top so it stays usable while dead ---
+        if show_debug {
+            draw_debug_overlay(&mut frame, &self.debug_stats, screen);
+        }
         Some(frame)
     }
 
@@ -1141,7 +1382,7 @@ impl GameState {
     /// mouse button is held, resets when the target changes or the button is
     /// released, and applies exactly one break action on completion.
     fn update_mining(&mut self, dt: Duration) {
-        if self.ui.screen != Screen::Playing || !self.captured || !self.mouse_left {
+        if self.ui.screen != Screen::Playing || !self.captured || !self.mouse_left || self.host.is_dead() {
             self.mining.stop();
             return;
         }
@@ -1184,14 +1425,36 @@ impl GameState {
             place_block: false,
             place: BlockId::AIR,
         };
-        if self.host.apply_action(&action) {
+        let survival = self.host.game_mode() == HostGameMode::Survival;
+        let outcome = self.host.apply_action_with_outcome(&action);
+        if outcome.changed {
+            if survival {
+                let mut overflow = outcome.pickup_overflow.clone();
+                for drop in &outcome.drops {
+                    let over = overflow
+                        .iter()
+                        .position(|stack| stack.item == drop.item)
+                        .map(|index| overflow.remove(index).count)
+                        .unwrap_or(0);
+                    let picked = drop.count.saturating_sub(over);
+                    let name = inventory::display_name(self.registry.item(drop.item).id);
+                    if picked > 0 {
+                        self.ui.toasts.push(format!("Picked up {name} x{picked}"));
+                    }
+                    if over > 0 {
+                        self.ui
+                            .toasts
+                            .push_warning(format!("Inventory full - dropped {name} x{over}"));
+                    }
+                }
+            }
             self.ui.flash_broken_block(name);
         }
     }
 
     /// Starts hold-to-mine for the block currently under the crosshair.
     fn start_mining(&mut self) {
-        if !self.captured || self.ui.screen != Screen::Playing {
+        if !self.captured || self.ui.screen != Screen::Playing || self.host.is_dead() {
             return;
         }
         self.mouse_left = true;
@@ -1208,21 +1471,70 @@ impl GameState {
         }
     }
 
-    /// Immediately places the selected block, throttled to one per cooldown.
+    /// Handles right-click: eat food or place a block, throttled per cooldown.
+    ///
+    /// Survival eats a selected edible item when hunger is missing, then falls
+    /// through to placement rules. Placement must match the selected stack's
+    /// block item; creative keeps the fixed palette pick.
     fn place_block(&mut self) {
-        if !self.captured || self.ui.screen != Screen::Playing {
+        if !self.captured || self.ui.screen != Screen::Playing || self.host.is_dead() {
             return;
         }
+        if self.host.game_mode() == HostGameMode::Survival {
+            let stack = self.host.selected_stack();
+            if inventory::should_eat(&self.registry, stack, self.host.player().hunger) {
+                let name = stack
+                    .map(|stack| inventory::display_name(self.registry.item(stack.item).id))
+                    .unwrap_or_else(|| "item".to_string());
+                if self.host.eat_selected() {
+                    self.ui.toasts.push(format!("Ate {name}"));
+                    return;
+                }
+            }
+            if self.last_place.is_some_and(|at| at.elapsed() < PLACE_COOLDOWN) {
+                return;
+            }
+            self.last_place = Some(Instant::now());
+            let Some(block) = inventory::placement_target(HostGameMode::Survival, BlockId::AIR, &self.registry, stack)
+            else {
+                let hint = if stack.is_none() {
+                    "No item in the selected slot"
+                } else {
+                    "Selected item cannot be placed"
+                };
+                self.ui.toasts.push(hint);
+                return;
+            };
+            let action = BlockAction {
+                break_block: false,
+                place_block: true,
+                place: block,
+            };
+            let outcome = self.host.apply_action_with_outcome(&action);
+            if !outcome.changed {
+                self.ui.toasts.push("Cannot place there");
+            }
+            return;
+        }
+
         if self.last_place.is_some_and(|at| at.elapsed() < PLACE_COOLDOWN) {
             return;
         }
         self.last_place = Some(Instant::now());
+        let Some(block) = inventory::placement_target(
+            HostGameMode::Creative,
+            self.selected_block(),
+            &self.registry,
+            self.host.selected_stack(),
+        ) else {
+            return;
+        };
         let action = BlockAction {
             break_block: false,
             place_block: true,
-            place: self.selected_block(),
+            place: block,
         };
-        self.host.apply_action(&action);
+        let _ = self.host.apply_action_with_outcome(&action);
     }
 
     /// Number of registry-backed inventory entries (every block except air).
@@ -1232,27 +1544,60 @@ impl GameState {
 
     /// Updates the inventory hover from the last cursor position.
     fn update_inventory_hover(&mut self) {
-        let item_count = self.inventory_item_count();
-        self.ui.update_inventory_hover(self.window_screen(), item_count);
+        let screen = self.window_screen();
+        if self.host.game_mode() == HostGameMode::Survival {
+            self.ui.inventory.hovered = inventory::survival_hit_test(screen, self.ui.cursor.0, self.ui.cursor.1);
+        } else {
+            let item_count = self.inventory_item_count();
+            self.ui.update_inventory_hover(screen, item_count);
+        }
     }
 
-    /// Moves the inventory grid selection with the arrow keys.
+    /// Moves the inventory selection with the arrow keys.
     fn move_inventory_selection(&mut self, dx: i32, dy: i32) {
-        let item_count = self.inventory_item_count();
-        self.ui
-            .move_inventory_selection(self.window_screen(), item_count, dx, dy);
+        if self.host.game_mode() == HostGameMode::Survival {
+            self.ui.inventory.selected =
+                inventory::move_survival_selection(self.ui.inventory.selected, dx, dy, ui_state::HOTBAR_SLOTS);
+        } else {
+            let item_count = self.inventory_item_count();
+            self.ui
+                .move_inventory_selection(self.window_screen(), item_count, dx, dy);
+        }
     }
 
-    /// Scrolls the inventory grid and re-evaluates the hover under the cursor.
+    /// Scrolls the inventory (or cycles the survival hotbar row selection).
     fn scroll_inventory(&mut self, rows: i32) {
+        if self.host.game_mode() == HostGameMode::Survival {
+            self.ui.inventory.selected =
+                inventory::cycle_survival_selection(self.ui.inventory.selected, rows, ui_state::HOTBAR_SLOTS);
+            return;
+        }
         let item_count = self.inventory_item_count();
         let screen = self.window_screen();
         self.ui.scroll_inventory(screen, item_count, rows);
         self.ui.update_inventory_hover(screen, item_count);
     }
 
+    /// Mouse-wheel navigation in the inventory screen.
+    fn inventory_wheel(&mut self, steps: i32) {
+        if self.host.game_mode() == HostGameMode::Survival {
+            self.scroll_inventory(steps);
+        } else {
+            self.scroll_inventory(-steps);
+        }
+    }
+
     /// Assigns the current inventory selection and returns to gameplay.
     fn assign_inventory_selection(&mut self) -> bool {
+        if self.host.game_mode() == HostGameMode::Survival {
+            let slot = self.ui.inventory.selected.min(ui_state::HOTBAR_SLOTS - 1);
+            self.ui.inventory.selected = slot;
+            self.select_hotbar_slot(slot);
+            self.ui.close_inventory();
+            self.capture_pointer();
+            self.update_title();
+            return true;
+        }
         if inventory::assign_selected_to_hotbar(&mut self.ui, &self.registry).is_some() {
             self.capture_pointer();
             self.update_title();
@@ -1263,7 +1608,7 @@ impl GameState {
     }
 
     /// Handles a left click on the inventory: hovering a slot selects and
-    /// assigns it. Clicks outside the panel keep the inventory open.
+    /// activates it. Clicks outside keep the inventory open.
     fn inventory_click(&mut self) {
         self.update_inventory_hover();
         let Some(index) = self.ui.inventory.hovered else {
@@ -1272,6 +1617,64 @@ impl GameState {
         self.ui.inventory.selected = index;
         self.assign_inventory_selection();
     }
+}
+
+/// Draws the two-column F3 debug overlay.
+fn draw_debug_overlay(frame: &mut UiFrame, stats: &DebugStats, screen: [f32; 2]) {
+    let [width, height] = screen;
+    let scale = 2.0;
+    let line_height = ob_render::line_height(scale);
+    let left = stats.left_lines();
+    let right = stats.right_lines();
+    let left_width = left
+        .iter()
+        .map(|line| frame.text_width(scale, line))
+        .fold(0.0_f32, f32::max)
+        .max(420.0);
+    frame.rect(
+        6.0,
+        6.0,
+        left_width + 18.0,
+        left.len() as f32 * line_height + 14.0,
+        [0.03, 0.04, 0.07, 0.74],
+    );
+    for (index, text_line) in left.iter().enumerate() {
+        frame.text(
+            14.0,
+            13.0 + index as f32 * line_height,
+            scale,
+            [0.94, 0.96, 0.99, 1.0],
+            text_line,
+        );
+    }
+    let right_width = right
+        .iter()
+        .map(|line| frame.text_width(scale, line))
+        .fold(0.0_f32, f32::max);
+    let right_x = width - right_width - 14.0;
+    frame.rect(
+        right_x - 10.0,
+        6.0,
+        right_width + 18.0,
+        right.len() as f32 * line_height + 14.0,
+        [0.03, 0.04, 0.07, 0.74],
+    );
+    for (index, text_line) in right.iter().enumerate() {
+        frame.text(
+            right_x,
+            13.0 + index as f32 * line_height,
+            scale,
+            [0.80, 0.86, 0.94, 1.0],
+            text_line,
+        );
+    }
+    frame.text(
+        14.0,
+        height - 30.0,
+        1.5,
+        [0.80, 0.86, 0.94, 0.9],
+        "F3 debug overlay   F1 HUD   F2 screenshot   Esc menu",
+    );
 }
 
 impl ApplicationHandler for App {
@@ -1292,6 +1695,7 @@ impl ApplicationHandler for App {
         };
         let (mut settings, data_dir) = effective_settings(&self.options);
         persist_texture_pack_choice(&self.options, &mut settings, &data_dir);
+        persist_game_mode_choice(&self.options, &mut settings, &data_dir);
         let (renderer, texture_source) = match create_window_renderer(Arc::clone(&window), &self.options, &settings) {
             Ok(pair) => pair,
             Err(err) => {
@@ -1327,6 +1731,7 @@ impl ApplicationHandler for App {
             let size = window.inner_size();
             (size.width.max(1) as f32, size.height.max(1) as f32)
         };
+        let initial_fov = settings.fov_degrees;
         let mut ui = UiState::from_settings(settings);
         ui.active_texture_pack = active_texture_pack_label(&texture_source);
         let applied_render_distance = ui.settings.render_distance_chunks;
@@ -1338,6 +1743,9 @@ impl ApplicationHandler for App {
                 return;
             }
         };
+        host.set_game_mode(map_game_mode(ui.settings.game_mode));
+        ui.hotbar_selected = host.hotbar_selection();
+        log::info!("game mode: {}", host.game_mode().name());
         host.ensure_streaming(INITIAL_RADIUS as usize * 2);
         let (eye, yaw, pitch) = {
             let player = host.player();
@@ -1357,6 +1765,8 @@ impl ApplicationHandler for App {
             fly_toggle: self.options.fly,
             captured: false,
             mouse_left: false,
+            current_fov: initial_fov,
+            damage_flash: DamageFlash::default(),
             mining: MiningState::default(),
             last_place: None,
             accumulator: Duration::ZERO,
@@ -1425,54 +1835,67 @@ impl ApplicationHandler for App {
                         KeyCode::KeyD => state.keys[3] = pressed,
                         KeyCode::Space => state.keys[4] = pressed,
                         KeyCode::ShiftLeft => state.keys[5] = pressed,
-                        KeyCode::KeyF if pressed && state.ui.screen == Screen::Playing => {
+                        KeyCode::ControlLeft => state.keys[6] = pressed,
+                        KeyCode::KeyF if pressed && state.ui.screen == Screen::Playing && !state.host.is_dead() => {
                             state.fly_toggle = true;
                         }
                         KeyCode::KeyE if pressed => match state.ui.screen {
-                            Screen::Playing => state.open_inventory(),
+                            Screen::Playing if !state.host.is_dead() => state.open_inventory(),
                             Screen::Inventory => state.close_inventory(),
-                            Screen::Pause | Screen::Settings => {}
+                            Screen::Pause | Screen::Settings | Screen::Death => {}
+                            Screen::Playing => {}
                         },
                         KeyCode::Escape if pressed => state.handle_escape(),
                         KeyCode::F1 if pressed => {
                             state.ui.apply(MenuItem::ToggleHud);
                             state.persist_settings();
                         }
-                        KeyCode::F2 if pressed && state.ui.screen == Screen::Playing => {
+                        KeyCode::F2 if pressed && state.ui.screen == Screen::Playing && !state.host.is_dead() => {
                             state.screenshot_requested = true;
                         }
                         KeyCode::F3 if pressed => {
                             state.ui.toggle_debug_overlay();
                             state.persist_settings();
                         }
-                        KeyCode::ArrowUp if pressed => {
-                            if state.ui.screen == Screen::Inventory {
-                                state.move_inventory_selection(0, -1);
-                            } else {
-                                state.menu_move(-1);
+                        KeyCode::ArrowUp if pressed => match state.ui.screen {
+                            Screen::Death => state.ui.move_death_selection(-1),
+                            Screen::Inventory => state.move_inventory_selection(0, -1),
+                            Screen::Playing | Screen::Pause | Screen::Settings => state.menu_move(-1),
+                        },
+                        KeyCode::ArrowDown if pressed => match state.ui.screen {
+                            Screen::Death => state.ui.move_death_selection(1),
+                            Screen::Inventory => state.move_inventory_selection(0, 1),
+                            Screen::Playing | Screen::Pause | Screen::Settings => state.menu_move(1),
+                        },
+                        KeyCode::ArrowLeft if pressed => match state.ui.screen {
+                            Screen::Death => state.ui.move_death_selection(-1),
+                            Screen::Inventory => state.move_inventory_selection(-1, 0),
+                            Screen::Playing | Screen::Pause | Screen::Settings => {}
+                        },
+                        KeyCode::ArrowRight if pressed => match state.ui.screen {
+                            Screen::Death => state.ui.move_death_selection(1),
+                            Screen::Inventory => state.move_inventory_selection(1, 0),
+                            Screen::Playing | Screen::Pause | Screen::Settings => {}
+                        },
+                        KeyCode::Enter if pressed => match state.ui.screen {
+                            Screen::Death => {
+                                if let Some(action) = state.ui.activate_death()
+                                    && state.handle_death_action(action)
+                                {
+                                    state.persist_settings();
+                                    event_loop.exit();
+                                }
                             }
-                        }
-                        KeyCode::ArrowDown if pressed => {
-                            if state.ui.screen == Screen::Inventory {
-                                state.move_inventory_selection(0, 1);
-                            } else {
-                                state.menu_move(1);
-                            }
-                        }
-                        KeyCode::ArrowLeft if pressed && state.ui.screen == Screen::Inventory => {
-                            state.move_inventory_selection(-1, 0);
-                        }
-                        KeyCode::ArrowRight if pressed && state.ui.screen == Screen::Inventory => {
-                            state.move_inventory_selection(1, 0);
-                        }
-                        KeyCode::Enter if pressed => {
-                            if state.ui.screen == Screen::Inventory {
+                            Screen::Inventory => {
                                 state.assign_inventory_selection();
-                            } else if state.activate_selected() {
-                                state.persist_settings();
-                                event_loop.exit();
                             }
-                        }
+                            Screen::Playing | Screen::Pause | Screen::Settings => {
+                                if state.activate_selected() {
+                                    state.persist_settings();
+                                    event_loop.exit();
+                                }
+                            }
+                        },
                         KeyCode::Digit1
                         | KeyCode::Digit2
                         | KeyCode::Digit3
@@ -1482,10 +1905,10 @@ impl ApplicationHandler for App {
                         | KeyCode::Digit7
                         | KeyCode::Digit8
                         | KeyCode::Digit9
-                            if state.ui.screen == Screen::Playing =>
+                            if state.ui.screen == Screen::Playing && !state.host.is_dead() =>
                         {
                             if let Some(slot) = digit_slot(code) {
-                                state.ui.select_hotbar(slot);
+                                state.select_hotbar_slot(slot);
                             }
                         }
                         _ => {}
@@ -1505,6 +1928,18 @@ impl ApplicationHandler for App {
                     return;
                 }
                 match state.ui.screen {
+                    Screen::Death => {
+                        if button == MouseButton::Left {
+                            let screen = state.window_screen();
+                            if let Some(action) = state.ui.click_death(screen)
+                                && state.handle_death_action(action)
+                            {
+                                state.persist_settings();
+                                event_loop.exit();
+                            }
+                        }
+                        return;
+                    }
                     Screen::Inventory => {
                         if button == MouseButton::Left {
                             state.inventory_click();
@@ -1525,6 +1960,10 @@ impl ApplicationHandler for App {
                     }
                     Screen::Playing => {}
                 }
+                if state.host.is_dead() {
+                    state.begin_death_screen();
+                    return;
+                }
                 if !state.captured {
                     state.capture_pointer();
                     return;
@@ -1543,6 +1982,10 @@ impl ApplicationHandler for App {
                         let screen = state.window_screen();
                         state.ui.update_hover(screen);
                     }
+                    Screen::Death => {
+                        let screen = state.window_screen();
+                        state.ui.update_death_hover(screen);
+                    }
                     Screen::Playing => {}
                 }
             }
@@ -1552,13 +1995,16 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::PixelDelta(pos) => (pos.y / 40.0).round() as i32,
                 };
                 match state.ui.screen {
-                    Screen::Playing if steps != 0 => {
-                        state.ui.cycle_hotbar(steps);
-                        state.update_title();
+                    Screen::Playing if steps != 0 && !state.host.is_dead() => {
+                        // Scrolling down moves to the next hotbar slot (positive
+                        // steps), matching the usual block-game convention.
+                        state.cycle_hotbar_slots(-steps);
                     }
                     Screen::Inventory if steps != 0 => {
-                        // Wheel up (positive y) reveals earlier rows.
-                        state.scroll_inventory(-steps);
+                        state.inventory_wheel(steps);
+                    }
+                    Screen::Death if steps != 0 => {
+                        state.ui.move_death_selection(-steps.signum());
                     }
                     _ => {}
                 }
@@ -1578,7 +2024,7 @@ impl ApplicationHandler for App {
         let Some(state) = self.state.as_mut() else {
             return;
         };
-        if !state.captured || state.ui.screen != Screen::Playing {
+        if !state.captured || state.ui.screen != Screen::Playing || state.host.is_dead() {
             return;
         }
         if let DeviceEvent::MouseMotion { delta } = event {
@@ -1637,8 +2083,45 @@ fn effective_settings(options: &ClientOptions) -> (Settings, PathBuf) {
     if let Some(style) = options.texture_style {
         settings.texture_style = style;
     }
+    if let Some(mode) = options.game_mode {
+        settings.game_mode = mode;
+    }
+    if options.screenshot_dead || options.screenshot_items {
+        settings.game_mode = SettingsGameMode::Survival;
+    }
     settings.clamp();
     (settings, data_dir)
+}
+
+/// Maps the persisted mode to the authoritative host mode.
+fn map_game_mode(mode: SettingsGameMode) -> HostGameMode {
+    match mode {
+        SettingsGameMode::Survival => HostGameMode::Survival,
+        SettingsGameMode::Creative => HostGameMode::Creative,
+    }
+}
+
+/// Persists an explicit `--survival`/`--creative` choice without saving
+/// unrelated CLI overrides.
+fn persist_game_mode_choice(options: &ClientOptions, settings: &mut Settings, data_dir: &Path) {
+    let Some(mode) = options.game_mode else {
+        return;
+    };
+    settings.game_mode = mode;
+    let path = ob_core::config::settings_path(data_dir);
+    let mut disk_settings = load_settings(data_dir);
+    if disk_settings.game_mode == mode && path.exists() {
+        return;
+    }
+    disk_settings.game_mode = mode;
+    match save_settings(data_dir, &disk_settings) {
+        Ok(()) => log::info!(
+            "saved game mode {} to {}",
+            mode.name(),
+            ob_core::config::settings_path(data_dir).display()
+        ),
+        Err(err) => log::warn!("could not save game mode: {err}"),
+    }
 }
 
 /// Maps a persisted texture style to the renderer's texture-pack style.
@@ -1886,9 +2369,22 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
                 }
                 options.screenshot_inventory = Some(value.into());
             }
+            "screenshot-dead" => options.screenshot_dead = true,
+            "screenshot-items" => options.screenshot_items = true,
+            "survival" => options.game_mode = Some(SettingsGameMode::Survival),
+            "creative" => options.game_mode = Some(SettingsGameMode::Creative),
             "help" | "version" => {}
             other => return Err(format!("unknown option --{other}")),
         }
+    }
+    if options.screenshot_dead && options.screenshot.is_none() {
+        return Err("--screenshot-dead requires --screenshot PATH".into());
+    }
+    if options.screenshot_items && options.screenshot.is_none() && options.screenshot_inventory.is_none() {
+        return Err("--screenshot-items requires --screenshot or --screenshot-inventory PATH".into());
+    }
+    if (options.screenshot_dead || options.screenshot_items) && options.game_mode == Some(SettingsGameMode::Creative) {
+        return Err("--screenshot-dead and --screenshot-items require survival mode".into());
     }
     Ok(options)
 }
@@ -2088,6 +2584,156 @@ mod tests {
         persist_texture_pack_choice(&options, &mut runtime, &dir);
         assert_eq!(runtime.texture_pack, None);
         assert_eq!(load_settings(&dir).texture_pack, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn game_mode_cli_flags_parse_and_the_last_one_wins() {
+        let options = options_from_args(&[("survival".to_string(), String::new())]).expect("survival");
+        assert_eq!(options.game_mode, Some(SettingsGameMode::Survival));
+        let options = options_from_args(&[("creative".to_string(), String::new())]).expect("creative");
+        assert_eq!(options.game_mode, Some(SettingsGameMode::Creative));
+        let options = options_from_args(&[
+            ("survival".to_string(), String::new()),
+            ("creative".to_string(), String::new()),
+        ])
+        .expect("both flags");
+        assert_eq!(options.game_mode, Some(SettingsGameMode::Creative));
+        assert_eq!(map_game_mode(SettingsGameMode::Survival), HostGameMode::Survival);
+        assert_eq!(map_game_mode(SettingsGameMode::Creative), HostGameMode::Creative);
+    }
+
+    #[test]
+    fn game_mode_cli_beats_persisted_settings_and_persists_itself() {
+        let dir = std::env::temp_dir().join(format!(
+            "openblock-client-mode-choice-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let disk = Settings {
+            game_mode: SettingsGameMode::Creative,
+            render_distance_chunks: 5,
+            ..Settings::default()
+        };
+        save_settings(&dir, &disk).expect("save seed settings");
+
+        // Persisted creative is respected when no CLI mode is given.
+        let options = ClientOptions {
+            data_dir: Some(dir.clone()),
+            ..ClientOptions::default()
+        };
+        let (settings, _) = effective_settings(&options);
+        assert_eq!(settings.game_mode, SettingsGameMode::Creative);
+
+        // `--survival` overrides the persisted mode for this run and is saved
+        // without leaking the unrelated render-distance default.
+        let options = ClientOptions {
+            data_dir: Some(dir.clone()),
+            game_mode: Some(SettingsGameMode::Survival),
+            ..ClientOptions::default()
+        };
+        let (mut settings, resolved_dir) = effective_settings(&options);
+        assert_eq!(settings.game_mode, SettingsGameMode::Survival);
+        assert_eq!(resolved_dir, dir);
+        persist_game_mode_choice(&options, &mut settings, &resolved_dir);
+        let loaded = load_settings(&dir);
+        assert_eq!(loaded.game_mode, SettingsGameMode::Survival);
+        assert_eq!(loaded.render_distance_chunks, 5, "unrelated CLI values must not leak");
+
+        // A missing config yields the new default: survival.
+        let missing = dir.join("missing");
+        save_settings(&missing, &Settings::default()).expect("create dir");
+        let options = ClientOptions {
+            data_dir: Some(missing.join("not-created")),
+            ..ClientOptions::default()
+        };
+        let (settings, _) = effective_settings(&options);
+        assert_eq!(settings.game_mode, SettingsGameMode::Survival);
+        let _ = std::fs::remove_dir_all(missing);
+
+        // Even when the resolved mode equals the default, an explicit CLI value
+        // is recorded so the choice is visible in config.json.
+        let fresh = dir.join("fresh");
+        let options = ClientOptions {
+            data_dir: Some(fresh.clone()),
+            game_mode: Some(SettingsGameMode::Survival),
+            ..ClientOptions::default()
+        };
+        let (mut settings, resolved_dir) = effective_settings(&options);
+        persist_game_mode_choice(&options, &mut settings, &resolved_dir);
+        assert!(ob_core::config::settings_path(&fresh).exists());
+        assert_eq!(load_settings(&fresh).game_mode, SettingsGameMode::Survival);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn screenshot_debug_flags_parse_and_require_survival_screenshots() {
+        let path = PathBuf::from("/tmp/survival.png");
+        let options = options_from_args(&[
+            ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+            ("screenshot-dead".to_string(), String::new()),
+            ("survival".to_string(), String::new()),
+        ])
+        .expect("valid dead screenshot");
+        assert_eq!(options.screenshot.as_deref(), Some(path.as_path()));
+        assert!(options.screenshot_dead);
+        assert!(!options.screenshot_items);
+        assert_eq!(options.game_mode, Some(SettingsGameMode::Survival));
+
+        let options = options_from_args(&[
+            ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+            ("screenshot-items".to_string(), String::new()),
+        ])
+        .expect("valid items screenshot");
+        assert!(options.screenshot_items);
+        assert_eq!(options.game_mode, None, "debug flags do not persist a mode");
+
+        let error = options_from_args(&[("screenshot-dead".to_string(), String::new())])
+            .expect_err("dead screenshot needs a path");
+        assert!(error.contains("--screenshot PATH"));
+
+        let error = options_from_args(&[
+            ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+            ("screenshot-dead".to_string(), String::new()),
+            ("creative".to_string(), String::new()),
+        ])
+        .expect_err("dead screenshot needs survival");
+        assert!(error.contains("survival mode"));
+
+        // Debug flags force survival at runtime, even if persisted settings are
+        // creative, without persisting that forced mode themselves.
+        let dir = std::env::temp_dir().join(format!(
+            "openblock-client-mode-force-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        save_settings(
+            &dir,
+            &Settings {
+                game_mode: SettingsGameMode::Creative,
+                ..Settings::default()
+            },
+        )
+        .expect("save seed settings");
+        let options = ClientOptions {
+            data_dir: Some(dir.clone()),
+            screenshot: Some(path),
+            screenshot_dead: true,
+            ..ClientOptions::default()
+        };
+        let (settings, _) = effective_settings(&options);
+        assert_eq!(settings.game_mode, SettingsGameMode::Survival);
+        assert_eq!(
+            load_settings(&dir).game_mode,
+            SettingsGameMode::Creative,
+            "debug screenshots must not rewrite the saved mode"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

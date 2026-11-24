@@ -231,6 +231,17 @@ cargo run --release -p ob_tools --bin openblock-tools -- bench --frames 60 --see
 cargo run --release -p ob_client --bin openblock -- --seed 42 --fly --seconds 10
 ```
 
+## Survival
+
+| Survival HUD | Inventory (survival) | Death screen |
+| --- | --- | --- |
+| ![Survival HUD](docs/img/v0.0.7-screenshot.png) | ![Survival inventory](docs/img/v0.0.7-inventory.png) | ![Death screen](docs/img/v0.0.7-death.png) |
+
+Mine blocks to fill the nine-slot item hotbar, eat apples dropped by leaves when
+hungry, and watch out for falls. Health and hunger regenerate or drain over time;
+at zero health a respawn screen appears. Creative mode (infinite blocks, no
+damage) remains available via `--creative` and the settings menu.
+
 ## Day, dusk, night and inventory
 
 | Dusk | Night |
@@ -290,10 +301,10 @@ Measured on the reference dev machine (Fedora 45, RADV integrated GPU,
 gate. Full log: [`docs/plan/08-measurements.md`](docs/plan/08-measurements.md).
 
 Controls: mouse look (click to capture), `WASD` move, `Space` jump, `Shift`
-sprint, `F` toggle fly, **hold left button to mine**, right click to place,
-`1`–`9` or the mouse wheel select a hotbar slot, `E` opens the inventory,
-`F3` debug, `F1` HUD, `F2` screenshot, `Esc` pause/settings. Texture style is in
-the settings menu. `F3` toggles the debug overlay, `F1` toggles the HUD, `F2` saves
+crouch/sneak, `Ctrl` sprint, `F` toggle fly, **hold left button to mine**, right
+click to place or eat, `1`–`9` or the mouse wheel select a hotbar slot, `E` opens
+the inventory, `F3` debug, `F1` HUD, `F2` screenshot, `Esc` pause/settings.
+Game mode and texture style are in the settings menu. `F3` toggles the debug overlay, `F1` toggles the HUD, `F2` saves
 a screenshot, `Esc` opens the pause/settings menu (render distance, FOV, mouse
 sensitivity, fullscreen, HUD/debug toggles, save and quit). Settings are saved to
 `<data-dir>/config.json`; worlds live under

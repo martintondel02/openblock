@@ -65,6 +65,43 @@ impl TextureStyle {
     }
 }
 
+/// Gameplay mode selected by the player.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GameMode {
+    /// The real game: health, hunger, fall damage, drops and item consumption.
+    #[default]
+    Survival,
+    /// Sandbox building: full vitals, instant interaction and no item costs.
+    Creative,
+}
+
+impl GameMode {
+    /// All selectable modes, in menu order.
+    pub const ALL: [GameMode; 2] = [GameMode::Survival, GameMode::Creative];
+
+    /// Stable settings/CLI name.
+    pub fn name(self) -> &'static str {
+        match self {
+            GameMode::Survival => "survival",
+            GameMode::Creative => "creative",
+        }
+    }
+
+    /// Parses a settings/CLI name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.name() == name)
+    }
+
+    /// Next mode in the cycle (settings toggle).
+    pub fn next(self) -> Self {
+        match self {
+            GameMode::Survival => GameMode::Creative,
+            GameMode::Creative => GameMode::Survival,
+        }
+    }
+}
+
 /// Smallest supported render distance in chunks.
 pub const MIN_RENDER_DISTANCE: i32 = 2;
 /// Largest render distance offered by the settings screen in v0.0.x.
@@ -102,6 +139,8 @@ pub struct Settings {
     /// Optional path to a Minecraft-style resource pack, persisted after a
     /// successful `--texture-pack` launch.
     pub texture_pack: Option<String>,
+    /// Gameplay mode: survival (default) or creative.
+    pub game_mode: GameMode,
 }
 
 impl Default for Settings {
@@ -115,6 +154,7 @@ impl Default for Settings {
             mesh_workers: None,
             texture_style: TextureStyle::Classic,
             texture_pack: None,
+            game_mode: GameMode::Survival,
         }
     }
 }
@@ -268,6 +308,7 @@ mod tests {
             show_debug_overlay: true,
             mesh_workers: Some(6),
             texture_pack: Some("packs/rotrBLOCKS V88".to_string()),
+            game_mode: GameMode::Creative,
             ..Settings::default()
         };
         save_settings(&dir, &settings).expect("save");
@@ -414,6 +455,43 @@ mod tests {
         save_settings(&dir, &settings).expect("save");
         let loaded = load_settings(&dir);
         assert_eq!(loaded.texture_style, TextureStyle::Lush);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn game_mode_defaults_to_survival_and_names_round_trip() {
+        assert_eq!(GameMode::default(), GameMode::Survival);
+        assert_eq!(Settings::default().game_mode, GameMode::Survival);
+        assert_eq!(GameMode::ALL, [GameMode::Survival, GameMode::Creative]);
+        for mode in GameMode::ALL {
+            assert_eq!(GameMode::from_name(mode.name()), Some(mode));
+        }
+        assert_eq!(GameMode::from_name("nope"), None);
+        assert_eq!(GameMode::Survival.next(), GameMode::Creative);
+        assert_eq!(GameMode::Creative.next(), GameMode::Survival);
+    }
+
+    #[test]
+    fn game_mode_round_trips_and_missing_field_defaults_to_survival() {
+        let dir = temp_dir("game-mode");
+        for mode in GameMode::ALL {
+            let settings = Settings {
+                game_mode: mode,
+                ..Settings::default()
+            };
+            save_settings(&dir, &settings).expect("save");
+            let text = fs::read_to_string(settings_path(&dir)).expect("read");
+            assert!(
+                text.contains(&format!("\"game_mode\": \"{}\"", mode.name())),
+                "settings must use the lowercase mode name:\n{text}"
+            );
+            assert_eq!(load_settings(&dir).game_mode, mode);
+        }
+
+        fs::write(settings_path(&dir), br#"{"render_distance_chunks": 8}"#).expect("write");
+        let loaded = load_settings(&dir);
+        assert_eq!(loaded.game_mode, GameMode::Survival);
+        assert_eq!(loaded.render_distance_chunks, 8);
         let _ = fs::remove_dir_all(dir);
     }
 

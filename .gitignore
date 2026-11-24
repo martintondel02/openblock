@@ -12,3 +12,6 @@
 /.toolchain/
 /.cargo-home/
 /.tmp-sdroot/
+
+# Local screenshot artifacts (never commit third-party texture captures)
+screenshots/
