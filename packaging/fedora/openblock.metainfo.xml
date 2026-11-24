@@ -29,6 +29,13 @@
     <content_attribute id="social-chat">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.0.3" date="2026-11-24" type="development">
+      <description>
+        <p>HUD, F3 debug overlay, pause/settings menu with persisted options,
+        in-game screenshots, parallel chunk meshing and generation, and
+        data-driven content packs with save-format content binding.</p>
+      </description>
+    </release>
     <release version="0.0.2" date="2026-11-24" type="development">
       <description>
         <p>Textured greedy-meshed rendering, frustum culling, compressed saves

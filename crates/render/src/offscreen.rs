@@ -13,6 +13,7 @@ use ob_math::{N_SECTIONS, SECTION_SIZE, SectionPos, WORLD_MIN_Y};
 use ob_world::World;
 
 use crate::textures::BlockTextureArray;
+use crate::ui::{UiFrame, UiRenderer};
 use crate::{Camera, RenderError, RenderStats, Vertex, mesh, pipeline, section_visible};
 
 /// Offscreen colour target format (sRGB, readable through `copy_texture_to_buffer`).
@@ -61,6 +62,8 @@ pub struct OffscreenRenderer {
     pixels: Vec<u8>,
     /// Statistics from the last rendered frame.
     stats: RenderStats,
+    /// Immediate-mode UI renderer for screenshots with HUD/menus.
+    ui: UiRenderer,
     /// Cached section meshes (rebuilt on demand; used by the benchmark path).
     meshes: HashMap<SectionPos, CachedMesh>,
 }
@@ -114,6 +117,7 @@ impl OffscreenRenderer {
 
         let uniform_buffer = pipeline::create_camera_buffer(&device);
         let textures = BlockTextureArray::new(&device, &queue);
+        let ui = UiRenderer::new(&device, &queue, &textures, COLOR_FORMAT);
         let bind_group_layout = pipeline::create_bind_group_layout(&device);
         let bind_group = pipeline::create_bind_group(&device, &bind_group_layout, &uniform_buffer, &textures);
         let pipeline = pipeline::create_pipeline(&device, COLOR_FORMAT, &bind_group_layout);
@@ -133,6 +137,7 @@ impl OffscreenRenderer {
             adapter_summary,
             pixels: Vec::new(),
             stats: RenderStats::default(),
+            ui,
             meshes: HashMap::new(),
         })
     }
@@ -197,6 +202,11 @@ impl OffscreenRenderer {
     /// Intended for benchmark loops: the returned timing includes rasterisation
     /// and the GPU-to-CPU readback, but not meshing or buffer upload.
     pub fn render_cached(&mut self, camera: &Camera) -> Result<RenderStats, RenderError> {
+        self.render_cached_with_ui(camera, None)
+    }
+
+    /// Renders the cached meshes and an optional UI frame, then reads the frame back.
+    pub fn render_cached_with_ui(&mut self, camera: &Camera, ui: Option<&UiFrame>) -> Result<RenderStats, RenderError> {
         let aspect = self.width as f32 / self.height as f32;
         let view_projection = camera.view_projection(aspect);
         let uniform = pipeline::CameraUniform {
@@ -247,6 +257,9 @@ impl OffscreenRenderer {
                 stats.sections += 1;
             }
         }
+        if let Some(ui_frame) = ui {
+            self.ui.render(&mut encoder, &self.color_view, ui_frame);
+        }
         self.queue.submit([encoder.finish()]);
         self.read_back()?;
         self.stats = stats;
@@ -264,8 +277,18 @@ impl OffscreenRenderer {
     /// Screenshots are one-shot; the cached benchmark path calls
     /// `rebuild_mesh_cache` once and then `render_cached` per frame.
     pub fn render_world(&mut self, world: &World, camera: &Camera) -> Result<(), RenderError> {
+        self.render_world_with_ui(world, camera, None)
+    }
+
+    /// Like [`OffscreenRenderer::render_world`] but draws an optional UI frame.
+    pub fn render_world_with_ui(
+        &mut self,
+        world: &World,
+        camera: &Camera,
+        ui: Option<&UiFrame>,
+    ) -> Result<(), RenderError> {
         self.rebuild_mesh_cache(world);
-        let _ = self.render_cached(camera)?;
+        let _ = self.render_cached_with_ui(camera, ui)?;
         log::info!(
             "offscreen frame: {} visible sections drawn, {} vertices, {} draws",
             self.stats.sections,
@@ -628,6 +651,78 @@ mod tests {
                 .iter()
                 .all(|p| p[0] == clear[0] && p[1] == clear[1] && p[2] == clear[2]),
             "a fully culled frame must be the clear colour",
+        );
+    }
+
+    #[test]
+    fn offscreen_ui_overlay_draws_over_the_world() {
+        // Proves the full integration: world pass, then the alpha-blended UI
+        // pass into the same colour target, then readback.
+        let registry = Arc::new(Registry::base());
+        let world = test_world(&registry);
+        let mut renderer = match OffscreenRenderer::new(320, 180) {
+            Ok(renderer) => renderer,
+            Err(RenderError::NoAdapter(reason)) => {
+                eprintln!("skipping offscreen_ui_overlay_draws_over_the_world: no GPU adapter ({reason})");
+                return;
+            }
+            Err(err) => panic!("failed to create the offscreen renderer: {err}"),
+        };
+
+        let mut camera = Camera::new(WorldVec::new(8.0, 76.0, 8.0), 0.6, -1.0);
+        camera.far = 128.0;
+        renderer.render_world(&world, &camera).expect("render world without UI");
+        let without_ui = renderer.read_rgba();
+
+        let mut frame = UiFrame::new(320.0, 180.0);
+        frame.rect(20.0, 20.0, 100.0, 50.0, [1.0, 0.0, 0.0, 1.0]);
+        frame.text(24.0, 84.0, 2.0, [1.0, 1.0, 1.0, 1.0], "UI TEST");
+        frame.block_icon(240.0, 20.0, 40.0, 0, 1);
+
+        renderer
+            .render_world_with_ui(&world, &camera, Some(&frame))
+            .expect("render world with UI");
+        let with_ui = renderer.read_rgba();
+        assert_eq!(with_ui.len(), without_ui.len());
+
+        // The filled rect must be opaque red in the final image.
+        let index = ((45 * 320) + 70) * 4;
+        let pixel = &with_ui[index..index + 4];
+        assert!(
+            pixel[0] > 200 && pixel[1] < 60 && pixel[2] < 60,
+            "UI rect pixel is {pixel:?}, expected red"
+        );
+        assert_ne!(
+            &with_ui[index..index + 3],
+            &without_ui[index..index + 3],
+            "the UI rect must replace world pixels"
+        );
+
+        // The text row must contain bright glyph pixels and differ from the
+        // world-only frame.
+        let mut text_pixels = 0usize;
+        for y in 84..100 {
+            for x in 24..120 {
+                let offset = ((y * 320) + x) * 4;
+                if with_ui[offset] > 220 && with_ui[offset + 1] > 220 && with_ui[offset + 2] > 220 {
+                    text_pixels += 1;
+                }
+            }
+        }
+        assert!(text_pixels > 10, "text rendered only {text_pixels} bright pixels");
+
+        // The block icon must add colours that the world-only frame did not have.
+        let mut icon_colours = std::collections::HashSet::new();
+        for y in 20..60 {
+            for x in 240..280 {
+                let offset = ((y * 320) + x) * 4;
+                icon_colours.insert([with_ui[offset], with_ui[offset + 1], with_ui[offset + 2]]);
+            }
+        }
+        assert!(
+            icon_colours.len() > 8,
+            "block icon produced only {} distinct colours",
+            icon_colours.len()
         );
     }
 }

@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           openblock
-Version:        0.0.2
+Version:        0.0.3
 Release:        1%{?dist}
 Summary:        Fast, deeply moddable, server-first voxel sandbox
 
@@ -127,6 +127,14 @@ update-desktop-database &>/dev/null || :
 %config(noreplace) %{_sysconfdir}/openblock-server/server.toml
 
 %changelog
+* Tue Nov 24 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.0.3-1
+- HUD (crosshair, hotbar with block icons), F3 debug overlay and F1 toggle.
+- Pause/settings menu (Esc): render distance, FOV, mouse sensitivity,
+  fullscreen, HUD/debug toggles, save and quit; persisted to config.json.
+- F2 in-game screenshot; parallel chunk meshing on worker threads; parallel
+  chunk generation (8.8x); data-driven content pack loader; save format v3
+  with a content-registry fingerprint.
+
 * Tue Nov 24 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.0.2-1
 - Textured greedy-meshed rendering, frustum culling and procedural texture array.
 - zstd-compressed save format v2 with compact light storage and v1 read support.

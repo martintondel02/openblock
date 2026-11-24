@@ -19,7 +19,11 @@ const BYTES_PER_LAYER: usize = (TEXTURE_SIZE * TEXTURE_SIZE * 4) as usize;
 const _: () = assert!(NAMES.len() == COUNT);
 
 /// The GPU texture, its array view and the shared sampler.
-pub(crate) struct BlockTextureArray {
+///
+/// The UI renderer borrows [`Self::view`] and [`Self::sampler`] so block icons
+/// share the same procedural layers, filtering and repeat behaviour as world
+/// geometry.
+pub struct BlockTextureArray {
     /// The 2D-array texture holding every block layer.
     pub(crate) _texture: wgpu::Texture,
     /// D2Array view bound by the chunk pipeline.
@@ -99,6 +103,16 @@ impl BlockTextureArray {
             view,
             sampler,
         }
+    }
+
+    /// The `D2Array` view of every block texture layer.
+    pub fn view(&self) -> &wgpu::TextureView {
+        &self.view
+    }
+
+    /// The nearest/repeat sampler shared with the world pipeline.
+    pub fn sampler(&self) -> &wgpu::Sampler {
+        &self.sampler
     }
 }
 

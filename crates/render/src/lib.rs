@@ -14,6 +14,7 @@ pub mod mesh;
 pub mod offscreen;
 mod pipeline;
 pub mod textures;
+pub mod ui;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use winit::window::Window;
 pub use frustum::{FRUSTUM_PLANE_COUNT, aabb_visible, section_bounds, section_visible};
 pub use mesh::{MesherStats, SNAPSHOT_SIZE, SectionSnapshot, mesh_section, mesh_section_with_stats};
 pub use offscreen::OffscreenRenderer;
+pub use ui::{GLYPH_SIZE, LINE_HEIGHT, UiFrame, UiRenderer, UiStats, UiTexture, UiVertex, glyph_advance, line_height};
 
 use pipeline::CameraUniform;
 use textures::BlockTextureArray;
@@ -198,6 +200,8 @@ pub struct Renderer {
     ///
     /// Kept alive here even though the bind group also retains its view.
     _textures: BlockTextureArray,
+    /// Immediate-mode UI renderer (HUD, F3 overlay, menus).
+    pub(crate) ui: ui::UiRenderer,
     /// Camera and texture bind group.
     pub(crate) bind_group: wgpu::BindGroup,
     /// Uploaded section meshes.
@@ -284,6 +288,7 @@ impl Renderer {
 
         let uniform_buffer = pipeline::create_camera_buffer(&device);
         let textures = BlockTextureArray::new(&device, &queue);
+        let ui = ui::UiRenderer::new(&device, &queue, &textures, format);
         let bind_group_layout = pipeline::create_bind_group_layout(&device);
         let bind_group = pipeline::create_bind_group(&device, &bind_group_layout, &uniform_buffer, &textures);
         let pipeline = pipeline::create_pipeline(&device, format, &bind_group_layout);
@@ -298,6 +303,7 @@ impl Renderer {
             depth_view,
             uniform_buffer,
             _textures: textures,
+            ui,
             bind_group,
             meshes: HashMap::new(),
             adapter_summary,
@@ -351,8 +357,11 @@ impl Renderer {
         self.meshes.clear();
     }
 
-    /// Renders one frame of all uploaded section meshes inside the frustum.
-    pub fn render(&mut self, camera: &Camera) -> Result<(), RenderError> {
+    /// Renders one frame of the world with an optional UI overlay.
+    ///
+    /// The UI frame is drawn in a second pass after the world pass, with alpha
+    /// blending and no depth attachment.
+    pub fn render_with_ui(&mut self, camera: &Camera, ui: Option<&ui::UiFrame>) -> Result<(), RenderError> {
         let (width, height) = self.size();
         let aspect = width as f32 / height as f32;
         let view_projection = camera.view_projection(aspect);
@@ -435,10 +444,23 @@ impl Renderer {
             }
         }
         self.stats = stats;
+        if let Some(ui_frame) = ui {
+            self.ui.render(&mut encoder, &view, ui_frame);
+        }
         self.queue.submit([encoder.finish()]);
         drop(view);
         self.queue.present(frame);
         Ok(())
+    }
+
+    /// Renders one frame of the world without a UI overlay.
+    pub fn render(&mut self, camera: &Camera) -> Result<(), RenderError> {
+        self.render_with_ui(camera, None)
+    }
+
+    /// Counters from the last UI frame, if any.
+    pub fn ui_stats(&self) -> ui::UiStats {
+        self.ui.stats()
     }
 
     /// Human-readable adapter description for logs and `--version`.

@@ -6,6 +6,47 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [0.0.3] — 2026-11-24 (tech preview, MS-05 UI slice)
+
+### Added
+- HUD: crosshair, hotbar with isometric block icons, slot numbers, selected
+  slot highlight and the selected block name.
+- F3 debug overlay: FPS and frame p50/p95, position/chunk/facing, targeted block,
+  seed, render distance, loaded chunks, sections drawn/cached, draw calls,
+  triangles, mesh worker/in-flight/backlog counters, heap, ticks, GPU and window
+  info; F1 toggles the HUD.
+- Pause/settings menu (Esc): render distance (applied live), field of view,
+  mouse sensitivity, fullscreen, debug overlay and HUD toggles, Save & quit.
+  Settings persist to `<data-dir>/config.json` with clamping and atomic writes.
+- F2 writes a PNG screenshot of the current view including the HUD.
+- `ob_render::ui`: immediate-mode UI renderer with a generated 8x8 bitmap font,
+  solid/textured quads, isometric block icons, alpha blending and batching, plus
+  a GPU integration test that verifies a UI overlay on top of a rendered world.
+
+### Changed
+- Chunk meshing runs on a rayon worker pool with `SectionSnapshot` inputs,
+  per-section epochs and stale-result dropping; the main thread only uploads
+  (32 submissions and 4 ms upload budget per frame). `--mesh-workers N`.
+- Chunk generation is parallel inside `Host::ensure_streaming` (deterministic
+  insertion order): 2,191 -> ~19,200 chunks/s (8.8x) on the reference machine.
+- Client loads settings at start-up; an explicit `--render-distance` overrides
+  the persisted value.
+- Content packs: `packs/base/blocks.json` mirrors the built-in registry, with a
+  strict loader/validator (format version, ids, textures, bounds) and a parity
+  test; `openblock-server --pack PATH` loads a pack.
+- Save format v3 adds the content-registry fingerprint (REQ-SAVE-035); v1/v2
+  saves still load and upgrade, and a mismatch is refused with an actionable
+  error.
+
+### Measured
+- Parallel meshing: RD12 steady-state ~174.7 FPS (p50 5.7 ms, p95 11.5 ms) vs a
+  serial build still draining its backlog; RD16 uncapped 174.9 FPS. Cold-start
+  first-2 s mean frame time 9.80 -> 5.68 ms (-42%).
+- Parallel generation: 256 chunks 116.8 -> 13.2 ms; identical determinism hash
+  at 1, 4 and 16 threads.
+- World save and memory numbers from v0.0.2 are unchanged (48.9 KiB save,
+  576 KiB heap for 504 sections).
+
 ## [0.0.2] — 2026-11-24 (tech preview, MS-04 slice)
 
 ### Added

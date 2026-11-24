@@ -41,11 +41,11 @@ OpenBlock is designed to express content and systems Minecraft cannot:
 programmable logic blocks, first-class energy/fluid networks, scriptable mob
 AI, procedural dungeons, server-side minigames and more.
 
-![OpenBlock v0.0.2 tech preview — textured terrain, trees, boulders and sky, rendered by the wgpu client](docs/img/v0.0.2-screenshot.png)
+![OpenBlock v0.0.3 tech preview — textured terrain with a crosshair, hotbar and block icons](docs/img/v0.0.3-screenshot.png)
 
-<p align="center"><em>v0.0.2, seed 42: textured procedural terrain with greedy-meshed chunks and ambient occlusion (offscreen capture on Fedora 45, RADV).</em></p>
+<p align="center"><em>v0.0.3, seed 42: textured greedy-meshed terrain with the new HUD — crosshair and hotbar with isometric block icons (offscreen capture on Fedora 45, RADV).</em></p>
 
-> **Status: v0.0.2 tech preview.** A runnable single-player vertical slice now
+> **Status: v0.0.3 tech preview.** A runnable single-player vertical slice now
 > exists: procedural terrain, chunk streaming, walk/fly physics, block
 > break/place, hotbar selection, save/load and a headless host with a
 > determinism smoke test. It is the first slice of MS-03, not a finished game:
@@ -238,8 +238,11 @@ Measured on the reference dev machine (Fedora 45, RADV integrated GPU,
 gate. Full log: [`docs/plan/08-measurements.md`](docs/plan/08-measurements.md).
 
 Controls: mouse look (click to capture), `WASD` move, `Space` jump, `Shift`
-sprint, `F` toggle fly, left/right click break/place, `1`–`8` select block,
-`Esc` release the pointer. Saves live under
+sprint, `F` toggle fly, left/right click break/place, `1`–`8` or the mouse wheel
+select a block. `F3` toggles the debug overlay, `F1` toggles the HUD, `F2` saves
+a screenshot, `Esc` opens the pause/settings menu (render distance, FOV, mouse
+sensitivity, fullscreen, HUD/debug toggles, save and quit). Settings are saved to
+`<data-dir>/config.json`; worlds live under
 `${XDG_DATA_HOME:-~/.local/share}/openblock/worlds/`.
 
 The client needs a Vulkan-capable GPU and driver (Fedora:
