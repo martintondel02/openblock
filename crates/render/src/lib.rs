@@ -16,6 +16,7 @@ pub mod mesh;
 pub mod offscreen;
 pub mod outline;
 mod pipeline;
+pub mod resource_pack;
 pub mod textures;
 pub mod ui;
 
@@ -31,6 +32,7 @@ pub use frustum::{FRUSTUM_PLANE_COUNT, aabb_visible, section_bounds, section_vis
 pub use mesh::{MesherStats, SNAPSHOT_SIZE, SectionSnapshot, mesh_section, mesh_section_with_stats};
 pub use offscreen::OffscreenRenderer;
 pub use outline::{BlockOutline, DEFAULT_EDGE_COLOR, DEFAULT_INFLATION, OUTLINE_VERTEX_COUNT, OutlineVertex};
+pub use resource_pack::{ResourcePackLayers, TextureLoadError, TextureSource, load_resource_pack};
 pub use textures::{TexturePack, TexturePackStyle};
 pub use ui::{GLYPH_SIZE, LINE_HEIGHT, UiFrame, UiRenderer, UiStats, UiTexture, UiVertex, glyph_advance, line_height};
 
@@ -227,6 +229,8 @@ pub enum RenderError {
     SurfaceOutOfDate,
     /// The surface timed out or was lost.
     SurfaceLost,
+    /// A block texture source could not be loaded.
+    Texture(String),
 }
 
 impl std::fmt::Display for RenderError {
@@ -237,11 +241,18 @@ impl std::fmt::Display for RenderError {
             RenderError::Surface(reason) => write!(f, "window surface error: {reason}"),
             RenderError::SurfaceOutOfDate => write!(f, "window surface is out of date"),
             RenderError::SurfaceLost => write!(f, "window surface was lost"),
+            RenderError::Texture(reason) => write!(f, "block texture loading failed: {reason}"),
         }
     }
 }
 
 impl std::error::Error for RenderError {}
+
+impl From<TextureLoadError> for RenderError {
+    fn from(error: TextureLoadError) -> Self {
+        RenderError::Texture(error.to_string())
+    }
+}
 
 /// GPU resources for one section mesh.
 #[derive(Debug)]
@@ -280,7 +291,7 @@ pub struct Renderer {
     pub(crate) uniform_buffer: wgpu::Buffer,
     /// Small per-frame outline vertex buffer (24 line-list vertices).
     pub(crate) outline_buffer: wgpu::Buffer,
-    /// Procedural block texture array and sampler.
+    /// Block texture array and sampler (procedural or user resource pack).
     ///
     /// Kept alive here even though the bind group also retains its view.
     _textures: BlockTextureArray,
@@ -310,6 +321,15 @@ impl Renderer {
 
     /// Creates a renderer using the requested procedural texture-pack style.
     pub fn new_with_style(window: Arc<Window>, style: TexturePackStyle) -> Result<Self, RenderError> {
+        Self::new_with_source(window, TextureSource::Style(style))
+    }
+
+    /// Creates a renderer with an arbitrary block texture source.
+    ///
+    /// `source` may be a procedural style or a user-local Minecraft resource
+    /// pack. Resource-pack load failures become [`RenderError::Texture`] and
+    /// leave no partially initialised renderer behind.
+    pub fn new_with_source(window: Arc<Window>, source: TextureSource) -> Result<Self, RenderError> {
         // wgpu 30's `InstanceDescriptor` has no `Default` impl; this constructor
         // is its `default()` equivalent and needs no display handle. On native
         // platforms `Arc<Window>` satisfies raw-window-handle's blanket
@@ -377,7 +397,7 @@ impl Renderer {
 
         let uniform_buffer = pipeline::create_camera_buffer(&device);
         let outline_buffer = pipeline::create_outline_buffer(&device);
-        let textures = BlockTextureArray::new_with_style(&device, &queue, style);
+        let textures = BlockTextureArray::new_with_source(&device, &queue, &source)?;
         let ui = ui::UiRenderer::new(&device, &queue, &textures, format);
         let bind_group_layout = pipeline::create_bind_group_layout(&device);
         let bind_group = pipeline::create_bind_group(&device, &bind_group_layout, &uniform_buffer, &textures);
@@ -425,23 +445,49 @@ impl Renderer {
 
     /// Rebuilds the block texture array and every bind group that references it.
     ///
-    /// Cheap enough for a settings change: generated textures are 16x16 or 32x32
-    /// per layer and the world pipeline itself does not change.
-    pub fn set_texture_style(&mut self, style: TexturePackStyle) {
-        if self._textures.style() == style {
-            return;
+    /// Cheap enough for a settings change: procedural textures are 16x16 or 32x32
+    /// per layer and the world pipeline itself does not change. A resource-pack
+    /// failure returns [`RenderError::Texture`] and leaves the current textures,
+    /// bind group and UI untouched.
+    pub fn set_texture_source(&mut self, source: TextureSource) -> Result<(), RenderError> {
+        if self._textures.source() == &source {
+            return Ok(());
         }
-        let textures = BlockTextureArray::new_with_style(&self.device, &self.queue, style);
+        let textures = BlockTextureArray::new_with_source(&self.device, &self.queue, &source)?;
         let layout = pipeline::create_bind_group_layout(&self.device);
         self.bind_group = pipeline::create_bind_group(&self.device, &layout, &self.uniform_buffer, &textures);
         self.ui = ui::UiRenderer::new(&self.device, &self.queue, &textures, self.config.format);
         self._textures = textures;
-        log::info!("texture style set to {}", style.name());
+        log::info!("texture source set to {}", source.label());
+        Ok(())
+    }
+
+    /// Rebuilds the block textures for a procedural style.
+    ///
+    /// This is the infallible compatibility wrapper around
+    /// [`Self::set_texture_source`]; procedural styles always load.
+    pub fn set_texture_style(&mut self, style: TexturePackStyle) {
+        if let Err(error) = self.set_texture_source(TextureSource::Style(style)) {
+            log::error!("failed to set texture style {}: {error}", style.name());
+        }
     }
 
     /// Currently active procedural texture-pack style.
+    ///
+    /// For a resource-pack source this is the style used for missing layers
+    /// (Classic by default); use [`Self::texture_source`] for the exact source.
     pub fn texture_style(&self) -> TexturePackStyle {
         self._textures.style()
+    }
+
+    /// Currently active block texture source.
+    /// Base-level texture edge length in texels (procedural or resource pack).
+    pub fn texture_resolution(&self) -> u32 {
+        self._textures.resolution()
+    }
+
+    pub fn texture_source(&self) -> &TextureSource {
+        self._textures.source()
     }
 
     /// Uploads (or replaces) the mesh for a section.

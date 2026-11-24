@@ -77,6 +77,8 @@ pub const MAX_FOV_DEGREES: f32 = 110.0;
 pub const MIN_MOUSE_SENSITIVITY: f32 = 0.05;
 /// Largest supported mouse sensitivity multiplier.
 pub const MAX_MOUSE_SENSITIVITY: f32 = 3.0;
+/// Longest accepted persisted resource-pack path, in bytes.
+pub const MAX_TEXTURE_PACK_PATH_BYTES: usize = 4096;
 
 /// Persistent user settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -94,8 +96,12 @@ pub struct Settings {
     pub show_debug_overlay: bool,
     /// Worker threads for chunk meshing; `None` selects the automatic default.
     pub mesh_workers: Option<usize>,
-    /// Procedural texture-pack style.
+    /// Procedural texture-pack style, used when no external resource pack is
+    /// selected and as the fallback when one fails to load.
     pub texture_style: TextureStyle,
+    /// Optional path to a Minecraft-style resource pack, persisted after a
+    /// successful `--texture-pack` launch.
+    pub texture_pack: Option<String>,
 }
 
 impl Default for Settings {
@@ -108,6 +114,7 @@ impl Default for Settings {
             show_debug_overlay: false,
             mesh_workers: None,
             texture_style: TextureStyle::Classic,
+            texture_pack: None,
         }
     }
 }
@@ -134,6 +141,29 @@ impl Settings {
         }
         before != *self
     }
+
+    /// Why the persisted resource-pack path cannot be used, if it cannot.
+    fn texture_pack_rejection_reason(&self) -> Option<&'static str> {
+        let path = self.texture_pack.as_deref()?;
+        if path.is_empty() {
+            Some("path is empty")
+        } else if path.len() > MAX_TEXTURE_PACK_PATH_BYTES {
+            Some("path is longer than 4096 bytes")
+        } else if path.chars().any(char::is_control) {
+            Some("path contains control characters")
+        } else {
+            None
+        }
+    }
+
+    /// Clears an unusable resource-pack path, returning the reason it was rejected.
+    fn validate_texture_pack(&mut self) -> Option<&'static str> {
+        let reason = self.texture_pack_rejection_reason();
+        if reason.is_some() {
+            self.texture_pack = None;
+        }
+        reason
+    }
 }
 
 /// Path of the settings document for a data directory.
@@ -158,6 +188,12 @@ pub fn load_settings(data_dir: &Path) -> Settings {
     };
     match serde_json::from_str::<Settings>(&text) {
         Ok(mut settings) => {
+            if let Some(reason) = settings.validate_texture_pack() {
+                log::warn!(
+                    "ignoring texture pack path in {}: {reason}; using the procedural texture style",
+                    path.display()
+                );
+            }
             if settings.clamp() {
                 log::warn!("settings in {} were out of range and have been clamped", path.display());
             }
@@ -175,6 +211,7 @@ pub fn save_settings(data_dir: &Path, settings: &Settings) -> io::Result<()> {
     fs::create_dir_all(data_dir)?;
     let path = settings_path(data_dir);
     let mut settings = sanitised(settings);
+    settings.validate_texture_pack();
     settings.clamp();
     let text =
         serde_json::to_string_pretty(&settings).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -230,10 +267,80 @@ mod tests {
             fullscreen: true,
             show_debug_overlay: true,
             mesh_workers: Some(6),
+            texture_pack: Some("packs/rotrBLOCKS V88".to_string()),
             ..Settings::default()
         };
         save_settings(&dir, &settings).expect("save");
         assert_eq!(load_settings(&dir), settings);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn texture_pack_is_optional_and_round_trips() {
+        let dir = temp_dir("pack-roundtrip");
+        let settings = Settings {
+            texture_pack: Some("/tmp/packs/example".to_string()),
+            ..Settings::default()
+        };
+        save_settings(&dir, &settings).expect("save");
+        let text = fs::read_to_string(settings_path(&dir)).expect("read");
+        assert!(text.contains("\"texture_pack\": \"/tmp/packs/example\""));
+        assert_eq!(load_settings(&dir).texture_pack.as_deref(), Some("/tmp/packs/example"));
+
+        let settings = Settings {
+            texture_pack: None,
+            ..Settings::default()
+        };
+        save_settings(&dir, &settings).expect("save");
+        assert_eq!(load_settings(&dir).texture_pack, None);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn empty_persisted_texture_pack_is_read_as_none() {
+        let dir = temp_dir("pack-empty");
+        fs::write(settings_path(&dir), br#"{"texture_pack": ""}"#).expect("write");
+        let settings = load_settings(&dir);
+        assert_eq!(settings.texture_pack, None);
+        assert_eq!(
+            settings.render_distance_chunks,
+            Settings::default().render_distance_chunks
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_persisted_texture_pack_is_rejected() {
+        let dir = temp_dir("pack-invalid");
+        for (label, value) in [
+            ("nul", r#""bad\u0000path""#.to_string()),
+            ("newline", r#""bad\npath""#.to_string()),
+            ("long", format!("\"{}\"", "a".repeat(MAX_TEXTURE_PACK_PATH_BYTES + 1))),
+        ] {
+            fs::write(
+                settings_path(&dir),
+                format!(r#"{{"render_distance_chunks": 8, "texture_pack": {value}}}"#),
+            )
+            .expect("write");
+            let settings = load_settings(&dir);
+            assert_eq!(settings.texture_pack, None, "{label} path must be rejected");
+            // The rest of the settings document still loads.
+            assert_eq!(settings.render_distance_chunks, 8, "{label}");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn longest_accepted_texture_pack_path_is_kept() {
+        let dir = temp_dir("pack-longest");
+        let path = "b".repeat(MAX_TEXTURE_PACK_PATH_BYTES);
+        fs::write(
+            settings_path(&dir),
+            serde_json::json!({ "texture_pack": path }).to_string(),
+        )
+        .expect("write");
+        let settings = load_settings(&dir);
+        assert_eq!(settings.texture_pack.as_deref(), Some(path.as_str()));
         let _ = fs::remove_dir_all(dir);
     }
 

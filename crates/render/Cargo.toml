@@ -22,6 +22,4 @@ pollster.workspace = true
 log.workspace = true
 font8x8.workspace = true
 winit.workspace = true
-
-[dev-dependencies]
 png.workspace = true

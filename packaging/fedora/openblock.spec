@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           openblock
-Version:        0.0.5
+Version:        0.0.6
 Release:        1%{?dist}
 Summary:        Fast, deeply moddable, server-first voxel sandbox
 
@@ -127,6 +127,13 @@ update-desktop-database &>/dev/null || :
 %config(noreplace) %{_sysconfdir}/openblock-server/server.toml
 
 %changelog
+* Tue Nov 24 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.0.6-1
+- Load Minecraft-format resource packs at runtime (--texture-pack PATH), with
+  standard block filenames, animated-texture first frames, per-layer procedural
+  fallback, vanilla biome tinting for grayscale grass/leaves and grass-side
+  overlay compositing. The choice persists in config.json and can be toggled in
+  the settings menu; pack assets are never bundled.
+
 * Tue Nov 24 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.0.5-1
 - Inventory screen (E) with all blocks and hotbar assignment, 9-slot hotbar.
 - Hold-to-mine with per-block hardness, progress bar and targeted-block outline.

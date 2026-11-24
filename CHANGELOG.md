@@ -6,6 +6,30 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [0.0.6] — 2026-11-24 (tech preview, resource packs)
+
+### Added
+- Runtime loading of Minecraft-format resource packs for block textures:
+  `--texture-pack PATH` / `--resource-pack PATH`, `--no-texture-pack`, and a
+  Texture pack row in the pause/settings menu. The selection persists in
+  `config.json`; missing packs fall back to the procedural style with a clear
+  warning.
+- The loader accepts a pack root, `assets/minecraft`, `textures/block`, or a flat
+  block-PNG directory; resolves standard Minecraft filenames with fallbacks;
+  crops animated textures to their first frame; scales mixed resolutions to one
+  mipmapped array (16–256 px); falls back per layer to the procedural pack
+  (e.g. water); applies 0/255 cut-out alpha to leaves and opaque alpha elsewhere.
+- Vanilla-style biome tinting: grayscale grass tops and leaves get the plains
+  grass/foliage tint, and `grass_block_side_overlay.png` is tinted and composited
+  over the grass side, so high-resolution Minecraft packs look correct.
+- F3 shows the active texture source and texel resolution; startup logs it.
+
+### Notes
+- No pack assets are bundled or redistributed. The reference test used a local
+  pack with 128×128 block textures: 128 px array, 8 mip levels, only `debug` and
+  `water` fall back to procedural layers.
+- Test count: 216 -> 244.
+
 ## [0.0.5] — 2026-11-24 (tech preview, gameplay slice)
 
 ### Added

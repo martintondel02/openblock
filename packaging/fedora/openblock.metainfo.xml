@@ -29,6 +29,13 @@
     <content_attribute id="social-chat">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.0.6" date="2026-11-24" type="development">
+      <description>
+        <p>Runtime loading of Minecraft-format resource packs for block textures
+        with biome tinting, per-layer fallback, persisted selection and an
+        in-game settings toggle.</p>
+      </description>
+    </release>
     <release version="0.0.5" date="2026-11-24" type="development">
       <description>
         <p>Inventory and hotbar management, hold-to-mine with block hardness and

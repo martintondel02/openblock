@@ -216,3 +216,18 @@ Snapshot capture costs ~25.9 µs per solid section, so 32 submissions/frame cost
   bedrock/water unbreakable) so tools and future content can reuse it.
 - World tests: 216 total (biome determinism/surfaces/trees, environment/outline
   CPU and GPU tests, inventory/mining/UI tests, plus the pre-existing suites).
+
+## 2026-11-24 — v0.0.6 (runtime resource packs)
+
+- Added a runtime loader for Minecraft-format block texture packs; no assets are
+  bundled. Reference local pack (rotrBLOCKS 128×): target array 128×128, 8 mip
+  levels, only `debug` and `water` fall back to procedural layers; loading time is
+  dominated by PNG decode and is done once at startup.
+- Biome tinting/compositing (grayscale grass + leaves, grass-side overlay) is CPU
+  work done once during load and has no per-frame cost.
+- Texture memory: 14 layers × 128² × 4 B × 1.33 mip ≈ 1.2 MiB, well inside the
+  renderer budget. The world pipeline, UI pipeline and benchmark gates are
+  unchanged.
+- Test count: 244 (216 in v0.0.5), including synthetic-pack CPU tests for layout
+  resolution, scaling, animated frames, alpha and tinting, GPU array/renderer
+  tests, and an ignored real-pack load test.

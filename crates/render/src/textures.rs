@@ -11,6 +11,12 @@
 //! The world and UI share the same array, view and sampler. Magnification stays
 //! nearest-filtered for crisp pixel art while minification and mip selection are
 //! linear, so distant blocks do not shimmer.
+//!
+//! A user-local Minecraft resource pack can replace the procedural catalogue at
+//! runtime: [`BlockTextureArray::new_with_source`] decodes it through
+//! [`crate::resource_pack::load_resource_pack`] and falls back per layer to a
+//! procedural style for files the pack does not contain. No pack assets ship with
+//! OpenBlock; see [`crate::resource_pack`] for the supported layouts and limits.
 
 #[path = "texture_packs.rs"]
 pub mod texture_packs;
@@ -18,6 +24,8 @@ pub mod texture_packs;
 pub use texture_packs::{TexturePack, TexturePackStyle, generate_texture_pack};
 
 use ob_content::textures::{COUNT, NAMES};
+
+use crate::resource_pack::{TextureLoadError, TextureSource, load_resource_pack_with_fallback};
 
 /// Edge length of one layer in the default [`TexturePackStyle::Classic`] pack.
 ///
@@ -40,8 +48,12 @@ pub struct BlockTextureArray {
     pub(crate) view: wgpu::TextureView,
     /// Repeat sampler shared by every layer.
     pub(crate) sampler: wgpu::Sampler,
-    /// Style this array was generated from.
-    style: TexturePackStyle,
+    /// Where this array's pixels came from.
+    source: TextureSource,
+    /// Procedural style used to fill layers the source does not provide.
+    ///
+    /// Equal to the generated style for [`TextureSource::Style`] arrays.
+    fallback_style: TexturePackStyle,
     /// Base-level edge length in texels.
     resolution: u32,
 }
@@ -61,6 +73,68 @@ impl BlockTextureArray {
         let resolution = pack.resolution();
         let mip_levels = pack.mip_level_count();
         debug_assert_eq!(mip_levels, style.resolution().trailing_zeros() + 1);
+        let mips: Vec<&[u8]> = (0..mip_levels)
+            .map(|level| pack.mip(level).expect("every mip level in the pack is uploaded"))
+            .collect();
+        Self::upload(device, queue, resolution, &mips, TextureSource::Style(style), style)
+    }
+
+    /// Uploads the block catalogue for any [`TextureSource`].
+    ///
+    /// A [`TextureSource::Style`] is generated locally and can never fail.
+    /// A [`TextureSource::ResourcePack`] is decoded from the user's pack; missing
+    /// layers use the [`TexturePackStyle::Classic`] fallback and any load error is
+    /// returned unchanged so the caller can keep its previous textures.
+    pub fn new_with_source(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: &TextureSource,
+    ) -> Result<Self, TextureLoadError> {
+        match source {
+            TextureSource::Style(style) => Ok(Self::new_with_style(device, queue, *style)),
+            TextureSource::ResourcePack(path) => {
+                Self::from_resource_pack(device, queue, path, TexturePackStyle::Classic)
+            }
+        }
+    }
+
+    /// Uploads a user-local Minecraft resource pack.
+    ///
+    /// `fallback` fills catalogue layers the pack does not contain. The array's
+    /// [`Self::source`] records `path` as given; [`Self::style`] reports `fallback`.
+    pub fn from_resource_pack(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        path: &std::path::Path,
+        fallback: TexturePackStyle,
+    ) -> Result<Self, TextureLoadError> {
+        let layers = load_resource_pack_with_fallback(path, fallback)?;
+        let mips: Vec<&[u8]> = layers.mips.iter().map(Vec::as_slice).collect();
+        Ok(Self::upload(
+            device,
+            queue,
+            layers.size,
+            &mips,
+            TextureSource::ResourcePack(path.to_path_buf()),
+            fallback,
+        ))
+    }
+
+    /// Creates the GPU texture, view and sampler and uploads a full mip chain.
+    ///
+    /// The mip dimensions follow `resolution >> level`, which matches both the
+    /// procedural power-of-two packs and the repeated-halving chain generated for
+    /// non-power-of-two resource-pack sizes.
+    fn upload(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        resolution: u32,
+        mips: &[&[u8]],
+        source: TextureSource,
+        fallback_style: TexturePackStyle,
+    ) -> Self {
+        let mip_levels = mips.len() as u32;
+        debug_assert!(mip_levels >= 1);
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("block-textures"),
@@ -76,9 +150,10 @@ impl BlockTextureArray {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        for level in 0..mip_levels {
-            let edge = resolution >> level;
-            let pixels = pack.mip(level).expect("every mip level in the pack is uploaded");
+        for (level, pixels) in mips.iter().enumerate() {
+            let level = level as u32;
+            let edge = (resolution >> level).max(1);
+            debug_assert_eq!(pixels.len(), COUNT * (edge * edge * 4) as usize);
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &texture,
@@ -130,7 +205,8 @@ impl BlockTextureArray {
             _texture: texture,
             view,
             sampler,
-            style,
+            source,
+            fallback_style,
             resolution,
         }
     }
@@ -145,9 +221,19 @@ impl BlockTextureArray {
         &self.sampler
     }
 
-    /// The style this array was generated from.
+    /// Procedural style backing this array.
+    ///
+    /// For [`TextureSource::Style`] arrays this is the generated style. For
+    /// resource-pack arrays it is the procedural style used for layers the pack
+    /// does not provide (Classic unless another fallback was requested). Use
+    /// [`Self::source`] to tell the two cases apart.
     pub fn style(&self) -> TexturePackStyle {
-        self.style
+        self.fallback_style
+    }
+
+    /// Where this array's pixels came from.
+    pub fn source(&self) -> &TextureSource {
+        &self.source
     }
 
     /// Base-level edge length in texels.

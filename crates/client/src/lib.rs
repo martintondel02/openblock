@@ -8,7 +8,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,7 +16,8 @@ use ob_content::{BlockId, Registry};
 use ob_core::config::{Settings, TextureStyle, load_settings, save_settings};
 use ob_math::{BlockPos, ChunkPos, SEA_LEVEL, SectionPos, WorldVec};
 use ob_render::{
-    BlockOutline, Camera, DAY_LENGTH_TICKS, Environment, OffscreenRenderer, Renderer, SceneParams, UiFrame,
+    BlockOutline, Camera, DAY_LENGTH_TICKS, Environment, OffscreenRenderer, Renderer, SceneParams, TextureSource,
+    UiFrame,
 };
 use ob_server::{Host, HostConfig};
 use ob_sim::{BlockAction, PlayerInput, REACH};
@@ -88,6 +89,10 @@ pub struct ClientOptions {
     pub mesh_workers: usize,
     /// Texture style override for this run (persisted settings otherwise).
     pub texture_style: Option<TextureStyle>,
+    /// External Minecraft-style resource pack for this run; persisted when given.
+    pub texture_pack: Option<std::path::PathBuf>,
+    /// Clear the persisted resource pack and use the procedural style.
+    pub no_texture_pack: bool,
     /// Time-of-day override in 0..=1 for screenshots (0 midnight, 0.5 noon).
     pub time_of_day: Option<f32>,
 }
@@ -106,6 +111,8 @@ impl Default for ClientOptions {
             seconds: None,
             mesh_workers: default_mesh_workers(),
             texture_style: None,
+            texture_pack: None,
+            no_texture_pack: false,
             time_of_day: None,
         }
     }
@@ -166,7 +173,8 @@ fn screenshot_with_mode(
     path: &std::path::Path,
     mode: ScreenshotMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (settings, _data_dir) = effective_settings(options);
+    let (mut settings, data_dir) = effective_settings(options);
+    persist_texture_pack_choice(options, &mut settings, &data_dir);
     let registry = Arc::new(Registry::base());
     let config = HostConfig {
         seed: options.seed,
@@ -198,11 +206,8 @@ fn screenshot_with_mode(
     let mut camera = Camera::new(eye, yaw, pitch);
     camera.far = (host.render_distance_chunks() as f32 * 16.0 + 48.0).max(128.0);
 
-    let mut renderer = OffscreenRenderer::new_with_style(
-        SCREENSHOT_WIDTH,
-        SCREENSHOT_HEIGHT,
-        render_texture_style(settings.texture_style),
-    )?;
+    let (mut renderer, texture_source) = create_offscreen_renderer(options, &settings)?;
+    log_texture_source(&texture_source);
 
     // Compose a showcase frame: HUD or inventory drawn over the world.
     // Screenshot mode is also the headless verification path for the UI
@@ -323,6 +328,9 @@ impl App {
 struct GameState {
     window: Arc<Window>,
     renderer: Renderer,
+    /// Active texture source, kept so the F3 overlay and settings row can name
+    /// it and toggle back to the procedural style.
+    texture_source: TextureSource,
     host: Host,
     registry: Arc<Registry>,
     mesh_scheduler: MeshScheduler,
@@ -486,13 +494,72 @@ impl GameState {
                         self.apply_fullscreen(self.ui.settings.fullscreen);
                     }
                     MenuItem::TextureStylePrevious | MenuItem::TextureStyleNext => {
-                        self.renderer
-                            .set_texture_style(render_texture_style(self.ui.settings.texture_style));
+                        // Style rows switch the active source to Style(new style)
+                        // for this run. A persisted external pack stays saved, so
+                        // the texture-pack row (or the next launch) can re-enable
+                        // it.
+                        let style = render_texture_style(self.ui.settings.texture_style);
+                        self.set_active_texture_style(style);
+                    }
+                    MenuItem::ToggleTexturePack => {
+                        self.toggle_texture_pack();
                     }
                     _ => {}
                 }
                 self.persist_settings();
                 false
+            }
+        }
+    }
+
+    /// Switches to a procedural style and remembers it as the active source.
+    fn set_active_texture_style(&mut self, style: ob_render::TexturePackStyle) {
+        let source = TextureSource::Style(style);
+        match self.renderer.set_texture_source(source.clone()) {
+            Ok(()) => {
+                self.texture_source = source;
+                self.sync_ui_texture_source();
+                log::info!("textures: {}", self.texture_source.label());
+            }
+            Err(err) => log::warn!("could not switch to texture style {}: {err}", style.name()),
+        }
+    }
+
+    /// Toggles between the active external pack and the procedural fallback.
+    ///
+    /// Enabling is only possible when a persisted pack path exists; disabling
+    /// always clears the persisted path. Failed switches leave the active
+    /// source and settings untouched.
+    fn toggle_texture_pack(&mut self) {
+        match texture_toggle_target(&self.texture_source, &self.ui.settings) {
+            TextureToggle::Noop => {}
+            TextureToggle::Disable => {
+                let style = render_texture_style(self.ui.settings.texture_style);
+                let source = TextureSource::Style(style);
+                match self.renderer.set_texture_source(source.clone()) {
+                    Ok(()) => {
+                        self.texture_source = source;
+                        self.ui.settings.texture_pack = None;
+                        self.sync_ui_texture_source();
+                        log::info!("textures: {}", self.texture_source.label());
+                    }
+                    Err(err) => log::warn!("could not switch to the built-in texture style: {err}"),
+                }
+            }
+            TextureToggle::Enable(path) => {
+                let source = TextureSource::ResourcePack(path.clone());
+                match self.renderer.set_texture_source(source.clone()) {
+                    Ok(()) => {
+                        self.texture_source = source;
+                        self.ui.settings.texture_pack = Some(path.to_string_lossy().into_owned());
+                        self.sync_ui_texture_source();
+                        log::info!("textures: {}", self.texture_source.label());
+                    }
+                    Err(err) => log::warn!(
+                        "could not load texture pack {}: {err}; keeping the built-in style",
+                        path.display()
+                    ),
+                }
             }
         }
     }
@@ -554,7 +621,19 @@ impl GameState {
             fov_degrees: self.ui.settings.fov_degrees,
             time_of_day: Environment::from_ticks(self.host.tick_count() + DAY_LENGTH_TICKS / 4, DAY_LENGTH_TICKS)
                 .time_of_day,
+            texture_source: self.texture_source_description(),
         };
+    }
+
+    /// F3 label for the active texture source. Procedural styles include their
+    /// resolution; the renderer does not expose a loaded pack's resolution.
+    fn texture_source_description(&self) -> String {
+        describe_texture_source(&self.texture_source, self.renderer.texture_resolution())
+    }
+
+    /// Keeps the settings-row display in sync with the active source.
+    fn sync_ui_texture_source(&mut self) {
+        self.ui.active_texture_pack = active_texture_pack_label(&self.texture_source);
     }
 
     fn update_title(&mut self) {
@@ -861,7 +940,11 @@ impl GameState {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let path = self.data_dir.join("screenshots").join(format!("openblock-{stamp}.png"));
-        let mut renderer = match OffscreenRenderer::new(SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT) {
+        let mut renderer = match OffscreenRenderer::new_with_source(
+            SCREENSHOT_WIDTH,
+            SCREENSHOT_HEIGHT,
+            self.texture_source.clone(),
+        ) {
             Ok(renderer) => renderer,
             Err(err) => {
                 log::warn!("screenshot failed: {err}");
@@ -1207,10 +1290,10 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        let (settings, data_dir) = effective_settings(&self.options);
-        let renderer = match Renderer::new_with_style(Arc::clone(&window), render_texture_style(settings.texture_style))
-        {
-            Ok(renderer) => renderer,
+        let (mut settings, data_dir) = effective_settings(&self.options);
+        persist_texture_pack_choice(&self.options, &mut settings, &data_dir);
+        let (renderer, texture_source) = match create_window_renderer(Arc::clone(&window), &self.options, &settings) {
+            Ok(pair) => pair,
             Err(err) => {
                 log::error!("{err}");
                 log::error!(
@@ -1220,6 +1303,7 @@ impl ApplicationHandler for App {
                 return;
             }
         };
+        log_texture_source(&texture_source);
         log::info!("GPU: {}", renderer.adapter_summary());
         log::info!(
             "settings: {} (render distance {} chunks, fov {:.0}, sensitivity {:.2}x, textures {})",
@@ -1243,7 +1327,8 @@ impl ApplicationHandler for App {
             let size = window.inner_size();
             (size.width.max(1) as f32, size.height.max(1) as f32)
         };
-        let ui = UiState::from_settings(settings);
+        let mut ui = UiState::from_settings(settings);
+        ui.active_texture_pack = active_texture_pack_label(&texture_source);
         let applied_render_distance = ui.settings.render_distance_chunks;
         let mut host = match Host::open(Arc::clone(&registry), config) {
             Ok(host) => host,
@@ -1261,6 +1346,7 @@ impl ApplicationHandler for App {
         let mut state = GameState {
             window,
             renderer,
+            texture_source,
             host,
             registry,
             mesh_scheduler,
@@ -1565,6 +1651,156 @@ fn render_texture_style(style: TextureStyle) -> ob_render::TexturePackStyle {
     }
 }
 
+/// Resolves which texture source this run should use.
+///
+/// Precedence: explicit `--texture-pack`/`--resource-pack` wins, then
+/// `--no-texture-pack` forces the procedural style, then a persisted pack path,
+/// and finally the persisted procedural style.
+pub fn resolve_texture_source(options: &ClientOptions, settings: &Settings) -> TextureSource {
+    if let Some(path) = &options.texture_pack {
+        return TextureSource::ResourcePack(path.clone());
+    }
+    if options.no_texture_pack {
+        return TextureSource::Style(render_texture_style(settings.texture_style));
+    }
+    if let Some(path) = settings.texture_pack.as_deref().filter(|path| !path.is_empty()) {
+        return TextureSource::ResourcePack(PathBuf::from(path));
+    }
+    TextureSource::Style(render_texture_style(settings.texture_style))
+}
+
+/// What the texture-pack settings row does when activated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TextureToggle {
+    /// Re-enable the persisted resource pack.
+    Enable(PathBuf),
+    /// Return to the procedural style and clear the persisted pack.
+    Disable,
+    /// No pack is active and none is saved.
+    Noop,
+}
+
+/// Pure toggle decision used by the settings row and its tests.
+fn texture_toggle_target(source: &TextureSource, settings: &Settings) -> TextureToggle {
+    match source {
+        TextureSource::ResourcePack(_) => TextureToggle::Disable,
+        TextureSource::Style(_) => match settings.texture_pack.as_deref().filter(|path| !path.is_empty()) {
+            Some(path) => TextureToggle::Enable(PathBuf::from(path)),
+            None => TextureToggle::Noop,
+        },
+    }
+}
+
+/// Persists an explicit CLI pack choice without saving unrelated CLI overrides.
+///
+/// The in-memory settings are updated immediately so the rest of startup sees
+/// the selection; the save itself starts from the settings on disk so a
+/// `--render-distance` or `--texture-style` override is not silently persisted.
+fn persist_texture_pack_choice(options: &ClientOptions, settings: &mut Settings, data_dir: &Path) {
+    let selection = if let Some(path) = &options.texture_pack {
+        Some(Some(path.to_string_lossy().into_owned()))
+    } else if options.no_texture_pack {
+        Some(None)
+    } else {
+        None
+    };
+    let Some(selection) = selection else {
+        return;
+    };
+    settings.texture_pack = selection.clone();
+
+    let mut disk_settings = load_settings(data_dir);
+    if disk_settings.texture_pack == selection {
+        return;
+    }
+    disk_settings.texture_pack = selection;
+    match save_settings(data_dir, &disk_settings) {
+        Ok(()) => log::info!(
+            "saved texture pack selection to {}",
+            ob_core::config::settings_path(data_dir).display()
+        ),
+        Err(err) => log::warn!("could not save texture pack selection: {err}"),
+    }
+}
+
+/// Human-readable description of a texture source and its texel resolution.
+fn describe_texture_source(source: &TextureSource, resolution: u32) -> String {
+    format!("{} {}px", source.label(), resolution)
+}
+
+/// Label shown by the settings row for the active source, if it is a pack.
+fn active_texture_pack_label(source: &TextureSource) -> Option<String> {
+    match source {
+        TextureSource::ResourcePack(_) => Some(source.label()),
+        TextureSource::Style(_) => None,
+    }
+}
+
+/// Logs the active source at startup.
+fn log_texture_source(source: &TextureSource) {
+    match source {
+        TextureSource::ResourcePack(path) => {
+            log::info!("textures: resource pack {} ({})", path.display(), source.label());
+        }
+        TextureSource::Style(_) => log::info!("textures: {}", source.label()),
+    }
+}
+
+/// Builds the offscreen renderer, falling back to the procedural style when a
+/// requested resource pack cannot be loaded.
+fn create_offscreen_renderer(
+    options: &ClientOptions,
+    settings: &Settings,
+) -> Result<(OffscreenRenderer, TextureSource), ob_render::RenderError> {
+    let source = resolve_texture_source(options, settings);
+    match OffscreenRenderer::new_with_source(SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT, source.clone()) {
+        Ok(renderer) => Ok((renderer, source)),
+        Err(ob_render::RenderError::Texture(reason)) => {
+            if let TextureSource::ResourcePack(path) = &source {
+                log::warn!(
+                    "could not load texture pack {}: {reason}; falling back to the built-in {} style",
+                    path.display(),
+                    settings.texture_style.name()
+                );
+                let style = render_texture_style(settings.texture_style);
+                let renderer = OffscreenRenderer::new_with_style(SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT, style)?;
+                Ok((renderer, TextureSource::Style(style)))
+            } else {
+                Err(ob_render::RenderError::Texture(reason))
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Builds the windowed renderer, falling back to the procedural style when a
+/// requested resource pack cannot be loaded.
+fn create_window_renderer(
+    window: Arc<Window>,
+    options: &ClientOptions,
+    settings: &Settings,
+) -> Result<(Renderer, TextureSource), ob_render::RenderError> {
+    let source = resolve_texture_source(options, settings);
+    match Renderer::new_with_source(Arc::clone(&window), source.clone()) {
+        Ok(renderer) => Ok((renderer, source)),
+        Err(ob_render::RenderError::Texture(reason)) => {
+            if let TextureSource::ResourcePack(path) = &source {
+                log::warn!(
+                    "could not load texture pack {}: {reason}; falling back to the built-in {} style",
+                    path.display(),
+                    settings.texture_style.name()
+                );
+                let style = render_texture_style(settings.texture_style);
+                let renderer = Renderer::new_with_style(window, style)?;
+                Ok((renderer, TextureSource::Style(style)))
+            } else {
+                Err(ob_render::RenderError::Texture(reason))
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Writes an RGBA8 image to a PNG file.
 fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent()
@@ -1613,6 +1849,13 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
                 options.texture_style =
                     Some(TextureStyle::from_name(value).ok_or_else(|| format!("unknown texture style '{value}'"))?);
             }
+            "texture-pack" | "resource-pack" => {
+                if value.is_empty() {
+                    return Err(format!("--{name} requires a path"));
+                }
+                options.texture_pack = Some(value.into());
+            }
+            "no-texture-pack" => options.no_texture_pack = true,
             "mesh-workers" => {
                 options.mesh_workers = value
                     .parse()
@@ -1695,5 +1938,156 @@ mod tests {
         let error = options_from_args(&[("screenshot-inventory".to_string(), String::new())])
             .expect_err("empty path must fail");
         assert!(error.contains("--screenshot-inventory"));
+    }
+
+    #[test]
+    fn texture_pack_flags_are_parsed_and_aliased() {
+        let path = PathBuf::from("/tmp/packs/example");
+        let options = options_from_args(&[("texture-pack".to_string(), path.to_string_lossy().into_owned())])
+            .expect("valid flag");
+        assert_eq!(options.texture_pack.as_deref(), Some(path.as_path()));
+        assert!(!options.no_texture_pack);
+
+        let options = options_from_args(&[("resource-pack".to_string(), path.to_string_lossy().into_owned())])
+            .expect("alias must parse");
+        assert_eq!(options.texture_pack.as_deref(), Some(path.as_path()));
+
+        let options = options_from_args(&[("no-texture-pack".to_string(), String::new())]).expect("valid flag");
+        assert!(options.no_texture_pack);
+        assert_eq!(options.texture_pack, None);
+
+        let error =
+            options_from_args(&[("texture-pack".to_string(), String::new())]).expect_err("empty path must fail");
+        assert!(error.contains("--texture-pack"));
+        let error =
+            options_from_args(&[("resource-pack".to_string(), String::new())]).expect_err("empty alias path must fail");
+        assert!(error.contains("--resource-pack"));
+    }
+
+    #[test]
+    fn resolve_texture_source_precedence_is_cli_pack_then_no_pack_then_saved_then_style() {
+        let mut settings = Settings {
+            texture_style: TextureStyle::Lush,
+            texture_pack: Some("/saved/pack".into()),
+            ..Settings::default()
+        };
+        let mut options = ClientOptions::default();
+
+        // Persisted pack wins over the persisted style.
+        match resolve_texture_source(&options, &settings) {
+            TextureSource::ResourcePack(path) => assert_eq!(path, PathBuf::from("/saved/pack")),
+            TextureSource::Style(_) => panic!("persisted pack must be used"),
+        }
+
+        // `--no-texture-pack` beats the persisted pack.
+        options.no_texture_pack = true;
+        match resolve_texture_source(&options, &settings) {
+            TextureSource::Style(style) => assert_eq!(style, ob_render::TexturePackStyle::Lush),
+            TextureSource::ResourcePack(path) => panic!("no-pack must win, got {}", path.display()),
+        }
+
+        // `--texture-pack` beats both no-pack and the persisted pack.
+        options.texture_pack = Some("/cli/pack".into());
+        match resolve_texture_source(&options, &settings) {
+            TextureSource::ResourcePack(path) => assert_eq!(path, PathBuf::from("/cli/pack")),
+            TextureSource::Style(_) => panic!("CLI pack must win"),
+        }
+
+        // Nothing saved and no flags: procedural style.
+        settings.texture_pack = None;
+        let options = ClientOptions::default();
+        match resolve_texture_source(&options, &settings) {
+            TextureSource::Style(style) => assert_eq!(style, ob_render::TexturePackStyle::Lush),
+            TextureSource::ResourcePack(path) => panic!("unexpected pack {}", path.display()),
+        }
+
+        // Empty persisted value is treated as unset.
+        settings.texture_pack = Some(String::new());
+        match resolve_texture_source(&options, &settings) {
+            TextureSource::Style(_) => {}
+            TextureSource::ResourcePack(path) => panic!("empty path must be ignored, got {}", path.display()),
+        }
+    }
+
+    #[test]
+    fn texture_pack_row_toggle_target_depends_on_active_source_and_saved_path() {
+        let saved = Settings {
+            texture_pack: Some("/saved/pack".into()),
+            ..Settings::default()
+        };
+        let active_pack = TextureSource::ResourcePack(PathBuf::from("/saved/pack"));
+        assert_eq!(texture_toggle_target(&active_pack, &saved), TextureToggle::Disable);
+
+        let style = TextureSource::Style(ob_render::TexturePackStyle::Classic);
+        assert_eq!(
+            texture_toggle_target(&style, &saved),
+            TextureToggle::Enable(PathBuf::from("/saved/pack"))
+        );
+
+        let none = Settings::default();
+        assert_eq!(texture_toggle_target(&style, &none), TextureToggle::Noop);
+        let empty = Settings {
+            texture_pack: Some(String::new()),
+            ..Settings::default()
+        };
+        assert_eq!(texture_toggle_target(&style, &empty), TextureToggle::Noop);
+    }
+
+    #[test]
+    fn texture_source_labels_are_reported_for_f3_and_logs() {
+        let style = TextureSource::Style(ob_render::TexturePackStyle::Painterly);
+        assert_eq!(describe_texture_source(&style, 32), "painterly 32px");
+        assert_eq!(active_texture_pack_label(&style), None);
+
+        let pack = TextureSource::ResourcePack(PathBuf::from("/tmp/packs/rotrBLOCKS V88"));
+        assert_eq!(describe_texture_source(&pack, 128), "rotrBLOCKS V88 128px");
+        assert_eq!(active_texture_pack_label(&pack).as_deref(), Some("rotrBLOCKS V88"));
+    }
+
+    #[test]
+    fn cli_texture_pack_choice_is_persisted_without_other_cli_overrides() {
+        let dir = std::env::temp_dir().join(format!(
+            "openblock-client-pack-choice-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let disk = Settings {
+            render_distance_chunks: 5,
+            texture_pack: Some("/old/pack".into()),
+            ..Settings::default()
+        };
+        save_settings(&dir, &disk).expect("save seed settings");
+
+        // A CLI render-distance override must not leak into the saved file when
+        // only the pack selection is persisted.
+        let mut runtime = Settings {
+            render_distance_chunks: 11,
+            texture_pack: Some("/old/pack".into()),
+            ..Settings::default()
+        };
+        let options = ClientOptions {
+            texture_pack: Some(PathBuf::from("/new/pack")),
+            render_distance_chunks: 11,
+            ..ClientOptions::default()
+        };
+        persist_texture_pack_choice(&options, &mut runtime, &dir);
+        assert_eq!(runtime.texture_pack.as_deref(), Some("/new/pack"));
+        let loaded = load_settings(&dir);
+        assert_eq!(loaded.texture_pack.as_deref(), Some("/new/pack"));
+        assert_eq!(loaded.render_distance_chunks, 5);
+
+        // `--no-texture-pack` clears both the runtime and persisted selection.
+        let options = ClientOptions {
+            no_texture_pack: true,
+            render_distance_chunks: 11,
+            ..ClientOptions::default()
+        };
+        persist_texture_pack_choice(&options, &mut runtime, &dir);
+        assert_eq!(runtime.texture_pack, None);
+        assert_eq!(load_settings(&dir).texture_pack, None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

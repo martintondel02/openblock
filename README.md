@@ -243,6 +243,31 @@ cargo run --release -p ob_client --bin openblock -- --seed 42 --fly --seconds 10
 sunrise, 0.5 noon, 0.75 sunset); in game the clock advances with the simulation
 and starts at sunrise.
 
+## Resource packs (local)
+
+OpenBlock can load block textures from any Minecraft-format resource pack at
+runtime — useful for high-resolution or hand-painted packs:
+
+```sh
+cargo run --release -p ob_client --bin openblock -- \
+  --texture-pack "/path/to/resource pack"
+```
+
+- Accepts the pack root, its `assets/minecraft` directory, a `textures/block`
+  directory, or any directory holding block PNGs.
+- Uses standard Minecraft file names (`grass_block_top.png`, `stone.png`,
+  `oak_leaves.png`, …). Animated textures use their first frame; missing layers
+  (e.g. water) fall back to the procedural classic layer.
+- Applies Minecraft's vanilla biome tint to grayscale grass/leaves and composites
+  `grass_block_side_overlay.png` with the tinted fringe, so high-resolution packs
+  look as intended.
+- The choice is saved in `config.json` and can be toggled in
+  **Esc → Settings → Texture pack**. `--no-texture-pack` clears it.
+- **Licensing:** OpenBlock never bundles or redistributes pack assets; the loader
+  reads your local files. Use only packs whose licence allows your usage, and do
+  not redistribute screenshots or builds containing third-party textures unless
+  the pack's terms permit it.
+
 ## Texture styles
 
 ![Four OpenBlock texture styles: classic, painterly, lush and minimal](docs/img/v0.0.4-texture-styles.png)

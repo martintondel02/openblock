@@ -38,7 +38,7 @@ pub struct OffscreenRenderer {
     uniform_buffer: wgpu::Buffer,
     /// Small per-frame outline vertex buffer.
     outline_buffer: wgpu::Buffer,
-    /// Procedural block texture array and sampler.
+    /// Block texture array and sampler (procedural or user resource pack).
     ///
     /// Kept alive here even though the bind group also retains its view.
     _textures: BlockTextureArray,
@@ -80,6 +80,14 @@ impl OffscreenRenderer {
 
     /// Creates an offscreen renderer with a specific texture-pack style.
     pub fn new_with_style(width: u32, height: u32, style: crate::TexturePackStyle) -> Result<Self, RenderError> {
+        Self::new_with_source(width, height, crate::TextureSource::Style(style))
+    }
+
+    /// Creates an offscreen renderer with an arbitrary block texture source.
+    ///
+    /// A resource-pack load failure returns [`RenderError::Texture`] before any
+    /// render target or pipeline is created.
+    pub fn new_with_source(width: u32, height: u32, source: crate::TextureSource) -> Result<Self, RenderError> {
         let width = width.max(1);
         let height = height.max(1);
 
@@ -120,7 +128,7 @@ impl OffscreenRenderer {
 
         let uniform_buffer = pipeline::create_camera_buffer(&device);
         let outline_buffer = pipeline::create_outline_buffer(&device);
-        let textures = BlockTextureArray::new_with_style(&device, &queue, style);
+        let textures = BlockTextureArray::new_with_source(&device, &queue, &source)?;
         let ui = UiRenderer::new(&device, &queue, &textures, COLOR_FORMAT);
         let bind_group_layout = pipeline::create_bind_group_layout(&device);
         let bind_group = pipeline::create_bind_group(&device, &bind_group_layout, &uniform_buffer, &textures);
@@ -161,21 +169,47 @@ impl OffscreenRenderer {
         self.stats
     }
 
-    /// Rebuilds the block texture array and its bind groups for a new style.
-    pub fn set_texture_style(&mut self, style: crate::TexturePackStyle) {
-        if self._textures.style() == style {
-            return;
+    /// Rebuilds the block texture array and its bind groups for a new source.
+    ///
+    /// The current textures survive a failed resource-pack load unchanged.
+    pub fn set_texture_source(&mut self, source: crate::TextureSource) -> Result<(), RenderError> {
+        if self._textures.source() == &source {
+            return Ok(());
         }
-        let textures = BlockTextureArray::new_with_style(&self.device, &self.queue, style);
+        let textures = BlockTextureArray::new_with_source(&self.device, &self.queue, &source)?;
         let layout = pipeline::create_bind_group_layout(&self.device);
         self.bind_group = pipeline::create_bind_group(&self.device, &layout, &self.uniform_buffer, &textures);
         self.ui = UiRenderer::new(&self.device, &self.queue, &textures, COLOR_FORMAT);
         self._textures = textures;
+        log::info!("offscreen texture source set to {}", source.label());
+        Ok(())
+    }
+
+    /// Rebuilds the block textures for a procedural style.
+    ///
+    /// Infallible compatibility wrapper around [`Self::set_texture_source`].
+    pub fn set_texture_style(&mut self, style: crate::TexturePackStyle) {
+        if let Err(error) = self.set_texture_source(crate::TextureSource::Style(style)) {
+            log::error!("failed to set offscreen texture style {}: {error}", style.name());
+        }
     }
 
     /// Currently active procedural texture-pack style.
+    ///
+    /// For a resource-pack source this is the style used for missing layers;
+    /// use [`Self::texture_source`] for the exact source.
     pub fn texture_style(&self) -> crate::TexturePackStyle {
         self._textures.style()
+    }
+
+    /// Currently active block texture source.
+    /// Base-level texture edge length in texels (procedural or resource pack).
+    pub fn texture_resolution(&self) -> u32 {
+        self._textures.resolution()
+    }
+
+    pub fn texture_source(&self) -> &crate::TextureSource {
+        self._textures.source()
     }
 
     /// Rebuilds the cached GPU meshes for every non-empty loaded section.
@@ -526,6 +560,9 @@ fn request_adapter(instance: &wgpu::Instance) -> Result<wgpu::Adapter, RenderErr
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use ob_content::{BlockId, Registry};
     use ob_math::{BlockPos, ChunkPos, Vec4, WorldVec};
@@ -1522,5 +1559,117 @@ mod tests {
                 outline.is_some()
             );
         }
+    }
+
+    /// Scratch directory for a synthetic resource pack, removed on drop.
+    struct TempPack {
+        path: PathBuf,
+    }
+
+    impl TempPack {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos());
+            let path = std::env::temp_dir().join(format!(
+                "ob-offscreen-pack-{}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+                unique
+            ));
+            std::fs::create_dir_all(&path).expect("create the synthetic pack");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempPack {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Writes one solid RGBA8 block texture into a synthetic pack.
+    fn write_pack_texture(block_dir: &Path, name: &str, size: u32, colour: [u8; 4]) {
+        let mut pixels = vec![0u8; (size * size * 4) as usize];
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            pixel.copy_from_slice(&colour);
+        }
+        let file = std::fs::File::create(block_dir.join(name)).expect("create a pack texture");
+        let mut encoder = png::Encoder::new(io::BufWriter::new(file), size, size);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("write a pack texture header");
+        writer.write_image_data(&pixels).expect("write pack texture pixels");
+    }
+
+    /// Builds a tiny 8x8 pack with only the textures the test world needs.
+    fn synthetic_resource_pack() -> TempPack {
+        let pack = TempPack::new();
+        let block_dir = pack.path.join("assets/minecraft/textures/block");
+        std::fs::create_dir_all(&block_dir).expect("create the synthetic block directory");
+        write_pack_texture(&block_dir, "stone.png", 8, [120, 120, 124, 255]);
+        write_pack_texture(&block_dir, "grass_block_top.png", 8, [70, 150, 60, 255]);
+        write_pack_texture(&block_dir, "grass_block_side.png", 8, [100, 80, 50, 255]);
+        write_pack_texture(&block_dir, "dirt.png", 8, [110, 85, 55, 255]);
+        write_pack_texture(&block_dir, "oak_leaves.png", 8, [40, 130, 45, 255]);
+        pack
+    }
+
+    #[test]
+    fn offscreen_renderer_loads_a_resource_pack_source() {
+        if std::env::var_os("OPENBLOCK_NO_GPU_TESTS").is_some() {
+            eprintln!("skipping offscreen_renderer_loads_a_resource_pack_source: OPENBLOCK_NO_GPU_TESTS is set");
+            return;
+        }
+        let pack = synthetic_resource_pack();
+        let source = crate::TextureSource::ResourcePack(pack.path.clone());
+        let mut renderer = match OffscreenRenderer::new_with_source(96, 54, source.clone()) {
+            Ok(renderer) => renderer,
+            Err(RenderError::NoAdapter(reason)) => {
+                eprintln!("skipping offscreen_renderer_loads_a_resource_pack_source: no GPU adapter ({reason})");
+                return;
+            }
+            Err(error) => panic!("failed to create the resource-pack offscreen renderer: {error}"),
+        };
+        eprintln!("resource-pack offscreen GPU: {}", renderer.adapter_summary());
+        assert_eq!(renderer.texture_source(), &source);
+        assert_eq!(renderer.texture_style(), crate::TexturePackStyle::Classic);
+
+        let registry = Arc::new(Registry::base());
+        let world = test_world(&registry);
+        let mut camera = Camera::new(WorldVec::new(8.0, 76.0, 8.0), 0.6, -1.0);
+        camera.far = 128.0;
+        renderer
+            .render_world(&world, &camera)
+            .expect("render the test world with a resource pack");
+        assert!(renderer.stats().sections > 0, "the test platform must be visible");
+        assert_eq!(renderer.read_rgba().len(), 96 * 54 * 4);
+
+        // A failed load must be reported, not panic, and must leave the current
+        // bind group and UI usable.
+        let missing = crate::TextureSource::ResourcePack(pack.path.join("does-not-exist"));
+        let error = renderer
+            .set_texture_source(missing)
+            .expect_err("a missing pack path must fail");
+        assert!(matches!(error, RenderError::Texture(_)), "unexpected error: {error}");
+        assert_eq!(
+            renderer.texture_source(),
+            &source,
+            "a failed load must keep the previous textures"
+        );
+        renderer
+            .render_world(&world, &camera)
+            .expect("render after a failed resource-pack load");
+
+        renderer
+            .set_texture_source(crate::TextureSource::Style(crate::TexturePackStyle::Classic))
+            .expect("procedural styles always load");
+        assert_eq!(
+            renderer.texture_source(),
+            &crate::TextureSource::Style(crate::TexturePackStyle::Classic)
+        );
+        renderer.set_texture_style(crate::TexturePackStyle::Minimal);
+        assert_eq!(renderer.texture_style(), crate::TexturePackStyle::Minimal);
     }
 }

@@ -83,6 +83,8 @@ pub enum MenuItem {
     TextureStylePrevious,
     /// Select the next texture style.
     TextureStyleNext,
+    /// Toggle between the external resource pack and the built-in style.
+    ToggleTexturePack,
 }
 
 /// A rectangle in UI pixels, origin top-left.
@@ -168,6 +170,8 @@ pub struct DebugStats {
     pub fov_degrees: f32,
     /// Normalised time of day (0 midnight, 0.5 noon).
     pub time_of_day: f32,
+    /// Active texture source label, e.g. `painterly 32px` or a pack folder name.
+    pub texture_source: String,
 }
 
 impl DebugStats {
@@ -195,6 +199,14 @@ impl DebugStats {
                 "FOV {:.0}   Render distance {} chunks",
                 self.fov_degrees, self.render_distance
             ),
+            format!(
+                "Textures: {}",
+                if self.texture_source.is_empty() {
+                    "built-in"
+                } else {
+                    &self.texture_source
+                }
+            ),
             format!("Seed {}", self.seed),
             format!(
                 "Chunks {}   Sections drawn {}/{}   Draws {}",
@@ -217,8 +229,8 @@ impl DebugStats {
                 self.ticks
             ),
         ];
-        if lines.len() < 12 {
-            lines.resize(12, String::new());
+        if lines.len() < 13 {
+            lines.resize(13, String::new());
         }
         lines
     }
@@ -278,6 +290,8 @@ pub struct UiState {
     pub break_flash_seconds: f32,
     /// Cursor position in UI pixels.
     pub cursor: (f32, f32),
+    /// Display name of the active external resource pack, if one is loaded.
+    pub active_texture_pack: Option<String>,
     /// Drag value for a future settings slider.
     pub dragging: bool,
 }
@@ -298,6 +312,7 @@ impl Default for UiState {
             break_flash: None,
             break_flash_seconds: 0.0,
             cursor: (0.0, 0.0),
+            active_texture_pack: None,
             dragging: false,
         }
     }
@@ -429,6 +444,7 @@ impl UiState {
                 MenuItem::SensitivityUp,
                 MenuItem::TextureStylePrevious,
                 MenuItem::TextureStyleNext,
+                MenuItem::ToggleTexturePack,
                 MenuItem::ToggleFullscreen,
                 MenuItem::ToggleDebugOverlay,
                 MenuItem::ToggleHud,
@@ -455,6 +471,20 @@ impl UiState {
                 format!("Texture style  {}  (<)", self.settings.texture_style.name())
             }
             MenuItem::TextureStyleNext => "(>)".into(),
+            MenuItem::ToggleTexturePack => {
+                if let Some(name) = &self.active_texture_pack {
+                    format!("Texture pack  {name}  (toggle)")
+                } else if self
+                    .settings
+                    .texture_pack
+                    .as_deref()
+                    .is_some_and(|path| !path.is_empty())
+                {
+                    "Texture pack  built-in  (toggle)".into()
+                } else {
+                    "Texture pack  built-in only".into()
+                }
+            }
             MenuItem::ToggleFullscreen => {
                 format!("Fullscreen  {}", if self.settings.fullscreen { "on" } else { "off" })
             }
@@ -510,6 +540,9 @@ impl UiState {
                 self.settings.texture_style = self.settings.texture_style.next();
                 true
             }
+            // The renderer switch and persistence are side effects handled by
+            // the client, which owns the active `TextureSource`.
+            MenuItem::ToggleTexturePack => false,
             MenuItem::ToggleFullscreen => {
                 self.settings.fullscreen = !self.settings.fullscreen;
                 true
@@ -779,7 +812,32 @@ mod tests {
         let items = state.menu_items();
         assert!(items.contains(&MenuItem::TextureStylePrevious));
         assert!(items.contains(&MenuItem::TextureStyleNext));
+        assert!(items.contains(&MenuItem::ToggleTexturePack));
         assert_eq!(items.last(), Some(&MenuItem::Back));
+    }
+
+    #[test]
+    fn texture_pack_row_label_reflects_the_active_source() {
+        let mut state = UiState::default();
+        assert_eq!(
+            state.row_label(MenuItem::ToggleTexturePack),
+            "Texture pack  built-in only"
+        );
+
+        state.settings.texture_pack = Some("/packs/rotrBLOCKS".into());
+        assert_eq!(
+            state.row_label(MenuItem::ToggleTexturePack),
+            "Texture pack  built-in  (toggle)"
+        );
+
+        state.active_texture_pack = Some("rotrBLOCKS V88".into());
+        assert_eq!(
+            state.row_label(MenuItem::ToggleTexturePack),
+            "Texture pack  rotrBLOCKS V88  (toggle)"
+        );
+        // Applying the row itself is a no-op in the UI model; the client owns
+        // the renderer switch.
+        assert!(!state.apply(MenuItem::ToggleTexturePack));
     }
 
     #[test]
@@ -874,14 +932,16 @@ mod tests {
             window: [1280, 720],
             fov_degrees: 70.0,
             time_of_day: 0.5,
+            texture_source: "painterly 32px".into(),
         };
         let left = stats.left_lines();
-        assert_eq!(left.len(), 12);
+        assert_eq!(left.len(), 13);
         let joined = left.join("\n");
         for needle in [
             "120 FPS",
             "Chunk",
             "Facing north",
+            "Textures: painterly 32px",
             "Seed 42",
             "Target openblock:grass",
             "Mesh workers 7",
