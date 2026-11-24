@@ -2,25 +2,21 @@
 //! the pixels back as RGBA8.
 //!
 //! This path needs no window or display. It reuses the same shader, vertex
-//! layout, camera uniform and sky clear colour as the windowed renderer, so it
-//! verifies the GPU pipeline as well as producing screenshots.
+//! layout, texture array, camera uniform, frustum culling and sky clear colour
+//! as the windowed renderer, so it verifies the GPU pipeline as well as
+//! producing screenshots.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use bytemuck::{Pod, Zeroable};
 use ob_math::{N_SECTIONS, SECTION_SIZE, SectionPos, WORLD_MIN_Y};
 use ob_world::World;
 
-use crate::{Camera, RenderError, Vertex, mesh};
-
-/// Depth buffer format used by the forward pass.
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+use crate::textures::BlockTextureArray;
+use crate::{Camera, RenderError, RenderStats, Vertex, mesh, pipeline, section_visible};
 
 /// Offscreen colour target format (sRGB, readable through `copy_texture_to_buffer`).
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
-
-/// Byte size of the camera uniform block (`mat4x4<f32>`).
-const CAMERA_UNIFORM_SIZE: wgpu::BufferAddress = 64;
 
 /// Upper bound on the number of sections meshed and drawn in one offscreen frame.
 const MAX_SECTIONS: usize = 4096;
@@ -33,17 +29,6 @@ const SKY_COLOR: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
-/// Camera uniform uploaded once per frame (group 0, binding 0).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct CameraUniform {
-    /// Column-major combined view-projection matrix.
-    view_proj: [[f32; 4]; 4],
-}
-
-// Keep the GPU layout in sync with the shader's `Camera` struct.
-const _: () = assert!(std::mem::size_of::<CameraUniform>() == CAMERA_UNIFORM_SIZE as usize);
-
 /// A windowless renderer that draws the world into an RGBA8 texture.
 pub struct OffscreenRenderer {
     /// GPU device.
@@ -54,7 +39,11 @@ pub struct OffscreenRenderer {
     pipeline: wgpu::RenderPipeline,
     /// Camera uniform buffer.
     uniform_buffer: wgpu::Buffer,
-    /// Camera bind group.
+    /// Procedural block texture array and sampler.
+    ///
+    /// Kept alive here even though the bind group also retains its view.
+    _textures: BlockTextureArray,
+    /// Camera and texture bind group.
     bind_group: wgpu::BindGroup,
     /// Offscreen colour texture.
     color_texture: wgpu::Texture,
@@ -70,6 +59,16 @@ pub struct OffscreenRenderer {
     adapter_summary: String,
     /// RGBA8 pixels of the last rendered frame.
     pixels: Vec<u8>,
+    /// Statistics from the last rendered frame.
+    stats: RenderStats,
+    /// Cached section meshes (rebuilt on demand; used by the benchmark path).
+    meshes: HashMap<SectionPos, CachedMesh>,
+}
+
+/// A cached vertex buffer for one section.
+struct CachedMesh {
+    buffer: wgpu::Buffer,
+    vertex_count: u32,
 }
 
 impl OffscreenRenderer {
@@ -111,112 +110,20 @@ impl OffscreenRenderer {
             label: Some("offscreen-color-view"),
             ..Default::default()
         });
-        let depth_view = Self::create_depth_view(&device, width, height);
+        let depth_view = pipeline::create_depth_view(&device, width, height);
 
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("offscreen-camera-uniform"),
-            size: CAMERA_UNIFORM_SIZE,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("offscreen-camera-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(CAMERA_UNIFORM_SIZE),
-                },
-                count: None,
-            }],
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("offscreen-camera"),
-            layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &uniform_buffer,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(CAMERA_UNIFORM_SIZE),
-                }),
-            }],
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("offscreen-chunk-pipeline-layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("offscreen-chunk-shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-        });
-        let vertex_attributes = [
-            wgpu::VertexAttribute {
-                format: wgpu::VertexFormat::Float32x3,
-                offset: 0,
-                shader_location: 0,
-            },
-            wgpu::VertexAttribute {
-                format: wgpu::VertexFormat::Float32x4,
-                offset: 12,
-                shader_location: 1,
-            },
-        ];
-        let vertex_buffers = [Some(wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &vertex_attributes,
-        })];
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("offscreen-chunk-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &vertex_buffers,
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: COLOR_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let uniform_buffer = pipeline::create_camera_buffer(&device);
+        let textures = BlockTextureArray::new(&device, &queue);
+        let bind_group_layout = pipeline::create_bind_group_layout(&device);
+        let bind_group = pipeline::create_bind_group(&device, &bind_group_layout, &uniform_buffer, &textures);
+        let pipeline = pipeline::create_pipeline(&device, COLOR_FORMAT, &bind_group_layout);
 
         Ok(Self {
             device,
             queue,
             pipeline,
             uniform_buffer,
+            _textures: textures,
             bind_group,
             color_texture,
             color_view,
@@ -225,28 +132,8 @@ impl OffscreenRenderer {
             height,
             adapter_summary,
             pixels: Vec::new(),
-        })
-    }
-
-    /// Creates the depth texture and view for the fixed drawable size.
-    fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("offscreen-depth"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("offscreen-depth-view"),
-            ..Default::default()
+            stats: RenderStats::default(),
+            meshes: HashMap::new(),
         })
     }
 
@@ -255,51 +142,197 @@ impl OffscreenRenderer {
         &self.adapter_summary
     }
 
-    /// Renders every non-empty loaded section into the offscreen target.
+    /// Statistics from the last rendered frame.
+    pub fn stats(&self) -> RenderStats {
+        self.stats
+    }
+
+    /// Rebuilds the cached GPU meshes for every non-empty loaded section.
     ///
-    /// Vertex buffers are rebuilt on every call: screenshots are one-shot and
-    /// tests need no cache, so caching would only add invalidation complexity.
-    pub fn render_world(&mut self, world: &World, camera: &Camera) -> Result<(), RenderError> {
+    /// Returns the number of cached sections and vertices. The benchmark path
+    /// calls this once, then times cached frames so meshing and upload do not
+    /// dominate the measurement.
+    pub fn rebuild_mesh_cache(&mut self, world: &World) -> (u32, u64) {
+        self.meshes.clear();
+        let mut sections = 0u32;
+        let mut vertices = 0u64;
+        let base_y = WORLD_MIN_Y / SECTION_SIZE as i32;
+        let mut positions: Vec<SectionPos> = world
+            .chunks()
+            .flat_map(|(chunk_pos, _column)| {
+                (0..N_SECTIONS).map(move |index| SectionPos::new(chunk_pos.x, base_y + index as i32, chunk_pos.z))
+            })
+            .collect();
+        positions.sort_unstable();
+        for pos in positions {
+            let Some(section) = world.section(pos) else {
+                continue;
+            };
+            if section.is_empty() {
+                continue;
+            }
+            let section_mesh = mesh::mesh_section(world, pos);
+            if section_mesh.is_empty() {
+                continue;
+            }
+            let vertex_count = section_mesh.vertices.len() as u32;
+            let size = (section_mesh.vertices.len() * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("offscreen-cached-section"),
+                size,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue
+                .write_buffer(&buffer, 0, bytemuck::cast_slice(&section_mesh.vertices));
+            self.meshes.insert(pos, CachedMesh { buffer, vertex_count });
+            sections += 1;
+            vertices += u64::from(vertex_count);
+        }
+        (sections, vertices)
+    }
+
+    /// Renders the cached meshes inside the frustum and reads the frame back.
+    ///
+    /// Intended for benchmark loops: the returned timing includes rasterisation
+    /// and the GPU-to-CPU readback, but not meshing or buffer upload.
+    pub fn render_cached(&mut self, camera: &Camera) -> Result<RenderStats, RenderError> {
         let aspect = self.width as f32 / self.height as f32;
-        let uniform = CameraUniform {
-            view_proj: camera.view_projection(aspect).to_cols_array_2d(),
+        let view_projection = camera.view_projection(aspect);
+        let uniform = pipeline::CameraUniform {
+            view_proj: view_projection.to_cols_array_2d(),
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+        let frustum = camera.frustum_planes(aspect);
 
-        // Mesh and upload the loaded sections. `world.chunks()` supplies the
-        // columns, `world.section()` the absolute section positions.
-        let mut draws: Vec<(wgpu::Buffer, u32)> = Vec::new();
-        'sections: for (chunk_pos, _column) in world.chunks() {
-            for index in 0..N_SECTIONS {
-                if draws.len() >= MAX_SECTIONS {
-                    break 'sections;
-                }
-                let y = WORLD_MIN_Y / SECTION_SIZE as i32 + index as i32;
-                let pos = SectionPos::new(chunk_pos.x, y, chunk_pos.z);
-                let Some(section) = world.section(pos) else {
+        let mut stats = RenderStats::default();
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("offscreen-cached-frame"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("offscreen-main"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(SKY_COLOR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            for (pos, cached) in &self.meshes {
+                if !section_visible(&frustum, *pos) {
                     continue;
-                };
-                if section.is_empty() {
-                    continue;
                 }
-                let section_mesh = mesh::mesh_section(world, pos);
-                if section_mesh.is_empty() {
-                    continue;
-                }
-                let vertex_count = section_mesh.vertices.len() as u32;
-                let size = (section_mesh.vertices.len() * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
-                let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("offscreen-section-mesh"),
-                    size,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                self.queue
-                    .write_buffer(&buffer, 0, bytemuck::cast_slice(&section_mesh.vertices));
-                draws.push((buffer, vertex_count));
+                pass.set_vertex_buffer(0, cached.buffer.slice(..));
+                pass.draw(0..cached.vertex_count, 0..1);
+                stats.draw_calls += 1;
+                stats.vertices += u64::from(cached.vertex_count);
+                stats.sections += 1;
             }
         }
+        self.queue.submit([encoder.finish()]);
+        self.read_back()?;
+        self.stats = stats;
+        Ok(stats)
+    }
+
+    /// Number of cached section meshes (0 before `rebuild_mesh_cache`).
+    pub fn cached_mesh_count(&self) -> usize {
+        self.meshes.len()
+    }
+
+    /// Renders every non-empty loaded section inside the frustum into the
+    /// offscreen target, rebuilding the mesh cache first.
+    ///
+    /// Screenshots are one-shot; the cached benchmark path calls
+    /// `rebuild_mesh_cache` once and then `render_cached` per frame.
+    pub fn render_world(&mut self, world: &World, camera: &Camera) -> Result<(), RenderError> {
+        self.rebuild_mesh_cache(world);
+        let _ = self.render_cached(camera)?;
+        log::info!(
+            "offscreen frame: {} visible sections drawn, {} vertices, {} draws",
+            self.stats.sections,
+            self.stats.vertices,
+            self.stats.draw_calls
+        );
+        Ok(())
+    }
+
+    /// Old uncached body kept for reference; unreachable.
+    #[allow(dead_code)]
+    fn render_world_uncached(&mut self, world: &World, camera: &Camera) -> Result<(), RenderError> {
+        let aspect = self.width as f32 / self.height as f32;
+        let view_projection = camera.view_projection(aspect);
+        let uniform = pipeline::CameraUniform {
+            view_proj: view_projection.to_cols_array_2d(),
+        };
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+        let frustum = camera.frustum_planes(aspect);
+
+        // Collect the loaded section positions in a deterministic order, then
+        // cull before meshing so offscreen screenshots skip invisible work.
+        let base_y = WORLD_MIN_Y / SECTION_SIZE as i32;
+        let mut positions: Vec<SectionPos> = world
+            .chunks()
+            .flat_map(|(chunk_pos, _column)| {
+                (0..N_SECTIONS).map(move |index| SectionPos::new(chunk_pos.x, base_y + index as i32, chunk_pos.z))
+            })
+            .collect();
+        positions.sort_unstable();
+
+        let mut draws: Vec<(wgpu::Buffer, u32)> = Vec::new();
+        let mut stats = RenderStats::default();
+        'sections: for pos in positions {
+            if draws.len() >= MAX_SECTIONS {
+                break 'sections;
+            }
+            if !section_visible(&frustum, pos) {
+                continue;
+            }
+            let Some(section) = world.section(pos) else {
+                continue;
+            };
+            if section.is_empty() {
+                continue;
+            }
+            let section_mesh = mesh::mesh_section(world, pos);
+            if section_mesh.is_empty() {
+                continue;
+            }
+            let vertex_count = section_mesh.vertices.len() as u32;
+            let size = (section_mesh.vertices.len() * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("offscreen-section-mesh"),
+                size,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue
+                .write_buffer(&buffer, 0, bytemuck::cast_slice(&section_mesh.vertices));
+            draws.push((buffer, vertex_count));
+            stats.draw_calls += 1;
+            stats.vertices += u64::from(vertex_count);
+            stats.sections += 1;
+        }
+        self.stats = stats;
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("offscreen-frame"),
@@ -338,6 +371,12 @@ impl OffscreenRenderer {
         self.queue.submit([encoder.finish()]);
 
         self.read_back()?;
+        log::info!(
+            "offscreen frame: {} visible sections drawn, {} vertices, {} draws",
+            self.stats.sections,
+            self.stats.vertices,
+            self.stats.draw_calls
+        );
         Ok(())
     }
 
@@ -517,6 +556,7 @@ mod tests {
         renderer.render_world(&empty, &camera).expect("render empty world");
         let background = renderer.read_rgba();
         assert_eq!(background.len(), 320 * 180 * 4);
+        assert_eq!(renderer.stats().sections, 0);
         let clear = [background[0], background[1], background[2]];
         assert!(
             background
@@ -530,6 +570,9 @@ mod tests {
         renderer.render_world(&world, &camera).expect("render test platform");
         let pixels = renderer.read_rgba();
         assert_eq!(pixels.len(), 320 * 180 * 4);
+        assert!(renderer.stats().sections > 0, "the test platform should be visible");
+        assert_eq!(renderer.stats().sections, renderer.stats().draw_calls);
+        assert!(renderer.stats().vertices > 0);
 
         let mut histogram: HashMap<[u8; 3], usize> = HashMap::new();
         let mut different = 0usize;
@@ -559,10 +602,32 @@ mod tests {
             "only {:.2}% of pixels differ from the clear colour",
             fraction * 100.0
         );
+        // Procedural 16×16 textures produce many more shades than the old
+        // per-face vertex colours: water/stone/grass noise and AO alone give
+        // well over sixteen distinct RGB values.
         assert!(
-            histogram.len() >= 8,
+            histogram.len() >= 16,
             "only {} distinct RGB values were drawn",
             histogram.len()
+        );
+
+        // A camera far above the world with a short far plane must cull every
+        // section: the image returns to the uniform sky and no section is drawn.
+        let mut high_camera = Camera::new(WorldVec::new(8.0, 220.0, 8.0), 0.0, 0.0);
+        high_camera.far = 64.0;
+        renderer
+            .render_world(&world, &high_camera)
+            .expect("render culled world");
+        assert_eq!(renderer.stats().sections, 0);
+        assert_eq!(renderer.stats().draw_calls, 0);
+        let culled = renderer.read_rgba();
+        assert!(
+            culled
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| p[0] == clear[0] && p[1] == clear[1] && p[2] == clear[2]),
+            "a fully culled frame must be the clear colour",
         );
     }
 }

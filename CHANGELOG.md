@@ -6,6 +6,39 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [0.0.2] — 2026-11-24 (tech preview, MS-04 slice)
+
+### Added
+- Textured rendering: 14-layer procedural block texture array (grass, dirt,
+  stone, sand, water, logs, leaves, bedrock, gravel, clay, snow), UV+layer
+  vertex format, texture-array sampling in the shared pipeline.
+- Greedy meshing with ambient occlusion: per-face/slice masks merged by
+  texture, brightness and AO key; a 16x16 water surface becomes 6 quads, a 4x4
+  platform top becomes 1 quad.
+- Frustum culling for both the windowed and offscreen renderers; culled
+  sections are no longer meshed or drawn.
+- Benchmark harness: `openblock-tools bench` with cached-geometry frames,
+  p50/p95/max timing, JSON reports and a `--max-frame-ms` CI gate (lavapipe on
+  Ubuntu).
+- World-generation quality: mountains and plateaus, snow peaks, stone slopes,
+  sand/gravel/clay shores, connected tree canopies and sparse boulders.
+- Client diagnostics: `--seconds N` runs the window for N seconds and prints
+  mean FPS with p50/p95/p99 frame times; `--x11` forces the X11 backend.
+- Graceful server shutdown: Ctrl-C/SIGTERM saves before exit.
+
+### Changed
+- Save format v2: zstd-compressed payload using the pure-Rust zstd crate, with
+  compact uniform light storage (no 8 KiB array for uniform sections) and v1
+  read compatibility. The 169-chunk reference world shrank from 35.6 MiB to
+  48.9 KiB; host memory for 504 sections dropped from 4,416 KiB to 576 KiB.
+- Content registry has 12 block types with per-face textures; hotbar unchanged.
+- `RenderStats.sections` now counts sections drawn after culling.
+
+### Measured
+- See [docs/plan/08-measurements.md](docs/plan/08-measurements.md): 115 FPS at a
+  128-block radius and 135 FPS at a 192-block radius on RADV integrated graphics
+  at 1280x720 (steady state); 0.62 ms p50 for cached offscreen frames.
+
 ## [0.0.1] — 2026-11-24 (tech preview, specification stage)
 
 The first runnable build: a windowed voxel client on wgpu 30 and a headless

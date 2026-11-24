@@ -20,3 +20,5 @@ path = "src/bin/openblock_tools.rs"
 ob_core.workspace = true
 ob_content.workspace = true
 ob_world.workspace = true
+ob_server.workspace = true
+ob_render.workspace = true

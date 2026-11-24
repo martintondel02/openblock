@@ -18,14 +18,14 @@ fn main() {
         Err(message) => {
             eprintln!("openblock: {message}");
             eprintln!(
-                "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--fly] [--x11] [--screenshot PATH] [--version]"
+                "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--fly] [--x11] [--screenshot PATH] [--seconds N] [--version]"
             );
             std::process::exit(2);
         }
     };
     if flags.iter().any(|(name, _)| name == "help") {
         println!(
-            "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--fly] [--x11] [--screenshot PATH] [--version]"
+            "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--fly] [--x11] [--screenshot PATH] [--seconds N] [--version]"
         );
         println!("  --screenshot PATH  render one offscreen frame to a PNG and exit (no window)");
         return;

@@ -29,6 +29,12 @@
     <content_attribute id="social-chat">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.0.2" date="2026-11-24" type="development">
+      <description>
+        <p>Textured greedy-meshed rendering, frustum culling, compressed saves
+        (729x smaller on the reference world) and a benchmark harness.</p>
+      </description>
+    </release>
     <release version="0.0.1" date="2026-11-24" type="development">
       <description>
         <p>Tech preview: a runnable single-player vertical slice (procedural

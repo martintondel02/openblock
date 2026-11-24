@@ -128,15 +128,16 @@ allowed_deps = [
   "ob_audio",
 ]
 
-# Tooling. The CLI is headless by default; the optional thumbnail preview is
-# the only presentation edge allowed here, and it is outside the 1.0 gate.
+# Tooling. The CLI is headless: the benchmark renders through ob_render without
+# opening a window, and the optional thumbnail preview is the only other
+# presentation edge allowed here.
 [[crates]]
 name = "ob_tools"
 layer = "tooling"
 gpu_free = false
 allowed_deps = [
   "ob_math", "ob_core", "ob_content", "ob_world", "ob_worldgen",
-  "ob_protocol", "ob_render", "ob_ui",
+  "ob_protocol", "ob_server", "ob_render", "ob_ui",
 ]
 
 # Developer-only; never shipped. May depend on any workspace crate.

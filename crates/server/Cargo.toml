@@ -24,3 +24,4 @@ ob_world.workspace = true
 ob_worldgen.workspace = true
 ob_sim.workspace = true
 log.workspace = true
+ctrlc.workspace = true

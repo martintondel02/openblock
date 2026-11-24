@@ -1,4 +1,12 @@
-//! CPU voxel meshing: visible faces, per-face shading and vertex ambient occlusion.
+//! CPU voxel meshing: greedy per-face rectangles with baked ambient occlusion.
+//!
+//! For each of the six face directions the mesher walks the sixteen slices
+//! along that face's normal. A slice builds a 16×16 visibility mask; every
+//! visible cell carries a merge key of `(texture layer, face brightness, four
+//! corner AO factors)`. Equal keys are expanded into maximal rectangles
+//! (column first, then row) and each rectangle becomes one quad whose UVs
+//! cover the rectangle in block units, so a 16×16 texture tiles correctly
+//! without an atlas.
 
 #![allow(missing_docs)] // TODO(MS-04): re-enable once the v0.0.1 API surface settles
 
@@ -8,8 +16,8 @@ use ob_world::World;
 
 use crate::{MeshData, Vertex};
 
-/// Number of blocks along one section axis, as an integer.
-const SECTION_EDGE: i32 = SECTION_SIZE as i32;
+/// Number of blocks along one section axis.
+const SECTION_EDGE: usize = SECTION_SIZE;
 
 /// Ambient-occlusion brightness indexed by the number of occluding neighbours
 /// around a vertex corner (0..=3).
@@ -31,10 +39,11 @@ struct Face {
     u: [i32; 3],
     /// Second in-plane axis.
     v: [i32; 3],
-    /// Corner of the quad relative to the block position (components 0 or 1).
-    base: [i32; 3],
     /// Directional shading multiplier.
     brightness: f32,
+    /// Face selector for [`ob_content::BlockTextures::for_face`]: 0 = +Y,
+    /// 1 = -Y, 2..=5 = sides.
+    texture_face: u8,
 }
 
 /// Faces in +X, -X, +Y, -Y, +Z, -Z order.
@@ -43,88 +52,113 @@ const FACES: [Face; 6] = [
         normal: [1, 0, 0],
         u: [0, 0, -1],
         v: [0, 1, 0],
-        base: [1, 0, 1],
         brightness: 0.72,
+        texture_face: 2,
     },
     Face {
         normal: [-1, 0, 0],
         u: [0, 0, 1],
         v: [0, 1, 0],
-        base: [0, 0, 0],
         brightness: 0.72,
+        texture_face: 3,
     },
     Face {
         normal: [0, 1, 0],
         u: [1, 0, 0],
         v: [0, 0, -1],
-        base: [0, 1, 1],
         brightness: 1.0,
+        texture_face: 0,
     },
     Face {
         normal: [0, -1, 0],
         u: [1, 0, 0],
         v: [0, 0, 1],
-        base: [0, 0, 0],
         brightness: 0.45,
+        texture_face: 1,
     },
     Face {
         normal: [0, 0, 1],
         u: [1, 0, 0],
         v: [0, 1, 0],
-        base: [0, 0, 1],
         brightness: 0.85,
+        texture_face: 4,
     },
     Face {
         normal: [0, 0, -1],
         u: [-1, 0, 0],
         v: [0, 1, 0],
-        base: [1, 0, 0],
         brightness: 0.85,
+        texture_face: 5,
     },
 ];
+
+/// Face axes resolved to indices and signs, plus the plane offset.
+#[derive(Debug, Clone, Copy)]
+struct FaceAxes {
+    normal_axis: usize,
+    u_axis: usize,
+    v_axis: usize,
+    u_sign: i32,
+    v_sign: i32,
+    plane_offset: f32,
+    texture_face: u8,
+}
+
+impl Face {
+    /// Resolves the face's integer vectors once per direction.
+    fn axes(self) -> FaceAxes {
+        let normal_axis = axis_index(self.normal);
+        let u_axis = axis_index(self.u);
+        let v_axis = axis_index(self.v);
+        FaceAxes {
+            normal_axis,
+            u_axis,
+            v_axis,
+            u_sign: self.u[u_axis],
+            v_sign: self.v[v_axis],
+            plane_offset: if self.normal[normal_axis] > 0 { 1.0 } else { 0.0 },
+            texture_face: self.texture_face,
+        }
+    }
+}
+
+/// Merge key shared by equal cells of one slice.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MergeKey {
+    layer: u32,
+    brightness: f32,
+    ao: [f32; 4],
+}
+
+/// One merged rectangle in slice coordinates.
+#[derive(Debug, Clone, Copy)]
+struct Rect {
+    u: usize,
+    v: usize,
+    width: usize,
+    height: usize,
+}
 
 /// Meshing statistics for one section, used by tests and profiling.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MesherStats {
-    /// Visible faces emitted.
+    /// Visible faces emitted after greedy merging (quads, not triangles).
     pub faces: u32,
-    /// Vertices emitted.
+    /// Vertices emitted (six per quad).
     pub vertices: u32,
 }
 
 /// Builds the mesh for one section, reading neighbouring sections through the world.
-///
-/// The v0.0.1 mesher emits one quad per visible face with baked directional
-/// shading and per-corner ambient occlusion. Greedy meshing arrives at MS-04.
 pub fn mesh_section(world: &World, pos: SectionPos) -> MeshData {
     mesh_section_with_stats(world, pos).0
 }
 
-/// Returns the mesh and its statistics in one pass.
+/// Returns the greedy mesh and its statistics in one pass.
 pub fn mesh_section_with_stats(world: &World, pos: SectionPos) -> (MeshData, MesherStats) {
     let mut mesh = MeshData::default();
     let origin = pos.origin();
-    for y in 0..SECTION_EDGE {
-        for z in 0..SECTION_EDGE {
-            for x in 0..SECTION_EDGE {
-                let block_pos = BlockPos::new(origin.x + x, origin.y + y, origin.z + z);
-                let block_id = world.get_block(block_pos);
-                if block_id == BlockId::AIR {
-                    continue;
-                }
-                let block = world.block_type(block_id);
-                for face in &FACES {
-                    let neighbour = world.block_type(world.get_block(block_pos.offset(
-                        face.normal[0],
-                        face.normal[1],
-                        face.normal[2],
-                    )));
-                    if face_visible(block, neighbour) {
-                        emit_face(&mut mesh.vertices, world, block_pos, block, face);
-                    }
-                }
-            }
-        }
+    for face in FACES {
+        mesh_face(&mut mesh.vertices, world, origin, face);
     }
     let vertices = mesh.vertices.len() as u32;
     let stats = MesherStats {
@@ -134,33 +168,164 @@ pub fn mesh_section_with_stats(world: &World, pos: SectionPos) -> (MeshData, Mes
     (mesh, stats)
 }
 
+/// Meshes every slice of one face direction into merged quads.
+fn mesh_face(out: &mut Vec<Vertex>, world: &World, origin: BlockPos, face: Face) {
+    let axes = face.axes();
+    for slice in 0..SECTION_EDGE {
+        let mut mask: [[Option<MergeKey>; SECTION_EDGE]; SECTION_EDGE] = [[None; SECTION_EDGE]; SECTION_EDGE];
+        // `mask` is indexed `[u][v]`; iterate rows and cells so the loop
+        // variables are not also used as slice indices.
+        for (u, row) in mask.iter_mut().enumerate() {
+            for (v, cell) in row.iter_mut().enumerate() {
+                let mut local = [0i32; 3];
+                local[axes.normal_axis] = slice as i32;
+                local[axes.u_axis] = u as i32;
+                local[axes.v_axis] = v as i32;
+                let block_pos = origin.offset(local[0], local[1], local[2]);
+                let block_id = world.get_block(block_pos);
+                if block_id == BlockId::AIR {
+                    continue;
+                }
+                let block = world.block_type(block_id);
+                let neighbour_pos = block_pos.offset(face.normal[0], face.normal[1], face.normal[2]);
+                if !face_visible(block, world.block_type(world.get_block(neighbour_pos))) {
+                    continue;
+                }
+                let ao = face_ambient_occlusion(world, block_pos, &face);
+                *cell = Some(MergeKey {
+                    layer: u32::from(block.textures.for_face(axes.texture_face).0),
+                    brightness: face.brightness,
+                    ao,
+                });
+            }
+        }
+        emit_greedy(out, origin, &axes, slice, &mask);
+    }
+}
+
+/// Expands equal merge keys into maximal rectangles and emits one quad each.
+fn emit_greedy(
+    out: &mut Vec<Vertex>,
+    origin: BlockPos,
+    axes: &FaceAxes,
+    slice: usize,
+    mask: &[[Option<MergeKey>; SECTION_EDGE]; SECTION_EDGE],
+) {
+    let mut consumed = [[false; SECTION_EDGE]; SECTION_EDGE];
+    for v in 0..SECTION_EDGE {
+        for u in 0..SECTION_EDGE {
+            if consumed[u][v] {
+                continue;
+            }
+            let Some(key) = mask[u][v] else {
+                continue;
+            };
+
+            // Column first: extend along U while keys match.
+            let mut width = 1;
+            while u + width < SECTION_EDGE && !consumed[u + width][v] && mask[u + width][v] == Some(key) {
+                width += 1;
+            }
+
+            // Then row: extend along V while the whole run still matches.
+            let mut height = 1;
+            'expand_v: while v + height < SECTION_EDGE {
+                for offset in 0..width {
+                    if consumed[u + offset][v + height] || mask[u + offset][v + height] != Some(key) {
+                        break 'expand_v;
+                    }
+                }
+                height += 1;
+            }
+
+            for row in 0..height {
+                for column in 0..width {
+                    consumed[u + column][v + row] = true;
+                }
+            }
+
+            emit_quad(out, origin, axes, slice, Rect { u, v, width, height }, key);
+        }
+    }
+}
+
+/// Emits the two CCW triangles of one merged rectangle.
+fn emit_quad(out: &mut Vec<Vertex>, origin: BlockPos, axes: &FaceAxes, slice: usize, rect: Rect, key: MergeKey) {
+    // The rectangle covers the half-open block interval `rect.u..rect.u + width`
+    // (and likewise in V). Walk the corners in the actual U/V direction so the
+    // winding stays counter-clockwise from outside regardless of axis signs.
+    let u0 = if axes.u_sign > 0 {
+        rect.u as f32
+    } else {
+        (rect.u + rect.width) as f32
+    };
+    let u1 = if axes.u_sign > 0 {
+        (rect.u + rect.width) as f32
+    } else {
+        rect.u as f32
+    };
+    let v0 = if axes.v_sign > 0 {
+        rect.v as f32
+    } else {
+        (rect.v + rect.height) as f32
+    };
+    let v1 = if axes.v_sign > 0 {
+        (rect.v + rect.height) as f32
+    } else {
+        rect.v as f32
+    };
+
+    let plane = slice as f32 + axes.plane_offset;
+    let corner = |along_u: f32, along_v: f32| {
+        let mut position = [0.0f32; 3];
+        position[axes.normal_axis] = plane;
+        position[axes.u_axis] = along_u;
+        position[axes.v_axis] = along_v;
+        [
+            origin.x as f32 + position[0],
+            origin.y as f32 + position[1],
+            origin.z as f32 + position[2],
+        ]
+    };
+    let positions = [corner(u0, v0), corner(u1, v0), corner(u1, v1), corner(u0, v1)];
+    let width = rect.width as f32;
+    let height = rect.height as f32;
+    // Texture row 0 is the top of the image, while the first quad corner sits
+    // at the start of the V axis. Flip V so an upright side texture (the grass
+    // band on `grass_side`, bark stripes on `log_side`) is not upside down.
+    let uvs = [[0.0, height], [width, height], [width, 0.0], [0.0, 0.0]];
+
+    for index in TRIANGLE_INDICES {
+        out.push(Vertex {
+            position: positions[index],
+            uv: uvs[index],
+            layer: key.layer,
+            light: key.brightness * key.ao[index],
+        });
+    }
+}
+
 /// Whether `neighbour` leaves the face of `current` visible.
 ///
-/// Opaque blocks hide every face. Fluids hide their shared face against the
-/// same fluid, while a fluid/air boundary (for example a water surface) stays
-/// visible. Air, leaves and other non-opaque blocks never occlude.
+/// Opaque blocks hide every face; a non-opaque block hides its shared face
+/// against an identical block (water against water, leaves against leaves).
+/// A fluid/air or fluid/opaque boundary follows the normal rules, so the water
+/// surface stays visible.
 fn face_visible(current: &BlockType, neighbour: &BlockType) -> bool {
     if neighbour.opaque {
         return false;
     }
-    !(current.fluid && neighbour.fluid && current.id == neighbour.id)
+    current.id != neighbour.id
 }
 
-/// Emits the six vertices of one visible face with baked shading and AO.
-fn emit_face(out: &mut Vec<Vertex>, world: &World, block_pos: BlockPos, block: &BlockType, face: &Face) {
-    // Quad corner parameter pairs: base, +u, +u+v, +v.
+/// Ambient-occlusion factor for each of a face's four corners.
+///
+/// Corner order is `(u0,v0), (u1,v0), (u1,v1), (u0,v1)`. The three blocks
+/// sharing a corner in the layer in front of the face (two sides and the
+/// diagonal) are counted with [`World::is_opaque`].
+fn face_ambient_occlusion(world: &World, block_pos: BlockPos, face: &Face) -> [f32; 4] {
     const CORNERS: [(i32, i32); 4] = [(0, 0), (1, 0), (1, 1), (0, 1)];
-
-    let mut positions = [[0.0f32; 3]; 4];
-    let mut colors = [[0.0f32; 4]; 4];
-    for (index, (su, sv)) in CORNERS.into_iter().enumerate() {
-        let x = block_pos.x + face.base[0] + su * face.u[0] + sv * face.v[0];
-        let y = block_pos.y + face.base[1] + su * face.u[1] + sv * face.v[1];
-        let z = block_pos.z + face.base[2] + su * face.u[2] + sv * face.v[2];
-        positions[index] = [x as f32, y as f32, z as f32];
-
-        // Sample the three blocks sharing this corner in the layer in front of
-        // the face: two sides and the diagonal.
+    CORNERS.map(|(su, sv)| {
         let side_u = if su == 0 { -1 } else { 1 };
         let side_v = if sv == 0 { -1 } else { 1 };
         let layer = face.normal;
@@ -186,31 +351,18 @@ fn emit_face(out: &mut Vec<Vertex>, world: &World, block_pos: BlockPos, block: &
         )) {
             occluders += 1;
         }
-        let ao = AO_FACTORS[occluders as usize];
-        let shade = face.brightness * ao;
-        colors[index] = [
-            block.color[0] * shade,
-            block.color[1] * shade,
-            block.color[2] * shade,
-            1.0,
-        ];
-    }
-    push_quad_colors(out, positions, colors);
+        AO_FACTORS[occluders as usize]
+    })
 }
 
-/// Pushes a flat-shaded quad as two triangles (kept for future unshaded passes).
-#[allow(dead_code)] // reserved for passes that do not bake per-corner AO
-pub(crate) fn push_quad(out: &mut Vec<Vertex>, corners: [[f32; 3]; 4], color: [f32; 4]) {
-    push_quad_colors(out, corners, [color; 4]);
-}
-
-/// Pushes a quad with one baked colour per corner as two triangles.
-pub(crate) fn push_quad_colors(out: &mut Vec<Vertex>, corners: [[f32; 3]; 4], colors: [[f32; 4]; 4]) {
-    for index in TRIANGLE_INDICES {
-        out.push(Vertex {
-            position: corners[index],
-            color: colors[index],
-        });
+/// Index of the non-zero component of an axis-aligned integer vector.
+fn axis_index(vector: [i32; 3]) -> usize {
+    if vector[0] != 0 {
+        0
+    } else if vector[1] != 0 {
+        1
+    } else {
+        2
     }
 }
 
@@ -218,7 +370,7 @@ pub(crate) fn push_quad_colors(out: &mut Vec<Vertex>, corners: [[f32; 3]; 4], co
 mod tests {
     use std::sync::Arc;
 
-    use ob_content::{BlockId, Registry};
+    use ob_content::{BlockId, Registry, textures};
     use ob_math::{BlockPos, ChunkPos};
     use ob_world::ChunkColumn;
 
@@ -246,18 +398,19 @@ mod tests {
         SectionPos::new(0, 0, 0)
     }
 
-    fn assert_color_near(actual: [f32; 4], expected: [f32; 3]) {
-        assert!(
-            (actual[0] - expected[0]).abs() < 1e-5
-                && (actual[1] - expected[1]).abs() < 1e-5
-                && (actual[2] - expected[2]).abs() < 1e-5
-                && (actual[3] - 1.0).abs() < 1e-5,
-            "colour {actual:?} does not match {expected:?}",
-        );
+    /// Vertices of every quad lying in the given horizontal plane.
+    fn quads_at_y(mesh: &MeshData, y: f32) -> Vec<&[Vertex]> {
+        mesh.vertices
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .filter(|quad| quad.iter().all(|vertex| (vertex.position[1] - y).abs() < 1e-5))
+            .map(|quad| &quad[..])
+            .collect()
     }
 
     #[test]
-    fn single_stone_block_emits_six_faces() {
+    fn single_textured_block_emits_six_quads() {
         let mut world = world_with_chunk(ChunkPos::new(0, 0));
         let stone = block(&world, "openblock:stone");
         assert!(world.set_block(BlockPos::new(0, 0, 0), stone));
@@ -268,47 +421,87 @@ mod tests {
         assert_eq!(mesh.vertices.len(), 36);
         assert_eq!(mesh.triangle_count(), 12);
         assert_eq!(mesh_section(&world, section()).vertices.len(), mesh.vertices.len());
+
+        // FACES order is +X, -X, +Y, -Y, +Z, -Z; all AO factors are 1.0 for an
+        // isolated block, so each quad's light equals the face brightness.
+        let expected_lights = [0.72, 0.72, 1.0, 0.45, 0.85, 0.85];
+        for (quad, expected) in mesh.vertices.as_chunks::<6>().0.iter().zip(expected_lights) {
+            for vertex in quad {
+                assert_eq!(vertex.layer, u32::from(textures::STONE.0));
+                assert!(
+                    (vertex.light - expected).abs() < 1e-5,
+                    "face brightness {} should be {expected}",
+                    vertex.light,
+                );
+            }
+        }
     }
 
     #[test]
-    fn two_adjacent_stone_blocks_emit_ten_faces() {
+    fn two_adjacent_stone_blocks_cover_ten_unit_faces_in_six_quads() {
+        // The old per-face mesher emitted one quad per exposed face (10). A
+        // correct greedy mesher merges the coplanar runs of two touching
+        // identical blocks, covering the same 10 unit faces with 6 quads:
+        // merged top, bottom, front and back plus the two end caps.
         let mut world = world_with_chunk(ChunkPos::new(0, 0));
         let stone = block(&world, "openblock:stone");
         assert!(world.set_block(BlockPos::new(0, 0, 0), stone));
         assert!(world.set_block(BlockPos::new(1, 0, 0), stone));
 
-        let (_, stats) = mesh_section_with_stats(&world, section());
-        assert_eq!(stats.faces, 10);
-        assert_eq!(stats.vertices, 60);
+        let (mesh, stats) = mesh_section_with_stats(&world, section());
+        assert_eq!(stats.faces, 6);
+        assert_eq!(stats.vertices, 36);
+        assert_eq!(mesh.triangle_count(), 12);
+
+        // Sum the merged rectangles' UV extents: that is the number of unit
+        // block faces the six quads cover.
+        let unit_faces: f32 = mesh
+            .vertices
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .map(|quad| {
+                let min_u = quad.iter().map(|vertex| vertex.uv[0]).fold(f32::MAX, f32::min);
+                let max_u = quad.iter().map(|vertex| vertex.uv[0]).fold(f32::MIN, f32::max);
+                let min_v = quad.iter().map(|vertex| vertex.uv[1]).fold(f32::MAX, f32::min);
+                let max_v = quad.iter().map(|vertex| vertex.uv[1]).fold(f32::MIN, f32::max);
+                (max_u - min_u) * (max_v - min_v)
+            })
+            .sum();
+        assert!((unit_faces - 10.0).abs() < 1e-5, "covered {unit_faces} unit faces");
+
+        let top = quads_at_y(&mesh, 1.0);
+        assert_eq!(top.len(), 1, "two coplanar top faces should merge");
+        let uvs: Vec<[f32; 2]> = top[0].iter().map(|vertex| vertex.uv).collect();
+        assert_eq!(uvs.iter().map(|uv| uv[0]).fold(f32::MIN, f32::max), 2.0);
+        assert_eq!(uvs.iter().map(|uv| uv[1]).fold(f32::MIN, f32::max), 1.0);
     }
 
     #[test]
-    fn fully_enclosed_solid_section_emits_no_faces() {
-        // A section-level equivalent of "a stone block fully surrounded by
-        // stone": every block of the section is stone and every one of the six
-        // neighbouring section layers is stone too, so not a single face is
-        // exposed.
+    fn fully_enclosed_solid_section_emits_no_quads() {
+        // A solid 16³ section with an opaque block layer against every one of
+        // its six boundaries: every candidate face has an opaque neighbour.
         let mut world = World::new(registry(), 7);
         for (x, z) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
             world.insert_chunk(ChunkColumn::new(ChunkPos::new(x, z)));
         }
         let stone = block(&world, "openblock:stone");
 
-        for y in 0..SECTION_EDGE {
-            for z in 0..SECTION_EDGE {
-                for x in 0..SECTION_EDGE {
+        for y in 0..SECTION_EDGE as i32 {
+            for z in 0..SECTION_EDGE as i32 {
+                for x in 0..SECTION_EDGE as i32 {
                     assert!(world.set_block(BlockPos::new(x, y, z), stone));
                 }
             }
         }
-        for a in 0..SECTION_EDGE {
-            for b in 0..SECTION_EDGE {
+        for a in 0..SECTION_EDGE as i32 {
+            for b in 0..SECTION_EDGE as i32 {
                 for (x, y, z) in [
-                    (SECTION_EDGE, a, b),
+                    (SECTION_EDGE as i32, a, b),
                     (-1, a, b),
-                    (a, SECTION_EDGE, b),
+                    (a, SECTION_EDGE as i32, b),
                     (a, -1, b),
-                    (a, b, SECTION_EDGE),
+                    (a, b, SECTION_EDGE as i32),
                     (a, b, -1),
                 ] {
                     assert!(world.set_block(BlockPos::new(x, y, z), stone));
@@ -323,61 +516,35 @@ mod tests {
     }
 
     #[test]
-    fn empty_section_emits_no_geometry() {
-        let world = world_with_chunk(ChunkPos::new(0, 0));
-        let (mesh, stats) = mesh_section_with_stats(&world, section());
-        assert_eq!(stats, MesherStats::default());
-        assert!(mesh.is_empty());
-
-        // A section whose chunk is not loaded also meshes to nothing.
-        let missing = mesh_section(&world, SectionPos::new(4, 0, 4));
-        assert!(missing.is_empty());
-    }
-
-    #[test]
-    fn water_surface_renders_its_top_face() {
+    fn flat_platform_top_merges_into_one_quad_with_full_uv_extent() {
         let mut world = world_with_chunk(ChunkPos::new(0, 0));
-        let water = block(&world, "openblock:water");
-        assert!(world.set_block(BlockPos::new(0, 0, 0), water));
+        let stone = block(&world, "openblock:stone");
+        for z in 0..4 {
+            for x in 0..4 {
+                assert!(world.set_block(BlockPos::new(x, 0, z), stone));
+            }
+        }
 
         let (mesh, stats) = mesh_section_with_stats(&world, section());
-        assert_eq!(stats.faces, 6);
-        assert_eq!(stats.vertices, 36);
-
-        let base_color = world.registry().block(water).color;
-        let top_vertices: Vec<&Vertex> = mesh
-            .vertices
-            .iter()
-            .filter(|vertex| {
-                (vertex.position[1] - 1.0).abs() < 1e-5
-                    && (vertex.color[0] - base_color[0]).abs() < 1e-5
-                    && (vertex.color[1] - base_color[1]).abs() < 1e-5
-                    && (vertex.color[2] - base_color[2]).abs() < 1e-5
-            })
-            .collect();
-        assert_eq!(
-            top_vertices.len(),
-            6,
-            "the top water face should use the unshaded base colour",
-        );
-        for vertex in top_vertices {
-            assert_color_near(vertex.color, base_color);
+        // Top, bottom and four sides: each side run is a 4×1 rectangle.
+        assert_eq!(stats.faces, 6, "a 4×4 platform should greedy-merge to six quads");
+        let top = quads_at_y(&mesh, 1.0);
+        assert_eq!(top.len(), 1, "the 4×4 +Y face should be a single quad");
+        let uvs: Vec<[f32; 2]> = top[0].iter().map(|vertex| vertex.uv).collect();
+        let min_u = uvs.iter().map(|uv| uv[0]).fold(f32::MAX, f32::min);
+        let max_u = uvs.iter().map(|uv| uv[0]).fold(f32::MIN, f32::max);
+        let min_v = uvs.iter().map(|uv| uv[1]).fold(f32::MAX, f32::min);
+        let max_v = uvs.iter().map(|uv| uv[1]).fold(f32::MIN, f32::max);
+        assert_eq!((max_u - min_u, max_v - min_v), (4.0, 4.0));
+        // All top vertices sample the stone layer with full +Y brightness.
+        for vertex in top[0] {
+            assert_eq!(vertex.layer, u32::from(textures::STONE.0));
+            assert!((vertex.light - 1.0).abs() < 1e-5);
         }
     }
 
     #[test]
-    fn water_against_water_hides_the_shared_face() {
-        let mut world = world_with_chunk(ChunkPos::new(0, 0));
-        let water = block(&world, "openblock:water");
-        assert!(world.set_block(BlockPos::new(0, 0, 0), water));
-        assert!(world.set_block(BlockPos::new(1, 0, 0), water));
-
-        let (_, stats) = mesh_section_with_stats(&world, section());
-        assert_eq!(stats.faces, 10);
-    }
-
-    #[test]
-    fn meshing_is_deterministic() {
+    fn ambient_occlusion_is_deterministic() {
         fn patterned_world() -> World {
             let mut world = world_with_chunk(ChunkPos::new(0, 0));
             let stone = block(&world, "openblock:stone");
@@ -411,7 +578,157 @@ mod tests {
         assert!(!first_mesh.vertices.is_empty());
         for (a, b) in first_mesh.vertices.iter().zip(&second_mesh.vertices) {
             assert_eq!(a.position, b.position);
-            assert_eq!(a.color, b.color);
+            assert_eq!(a.uv, b.uv);
+            assert_eq!(a.layer, b.layer);
+            assert_eq!(a.light.to_bits(), b.light.to_bits());
+        }
+    }
+
+    #[test]
+    fn occluded_corner_uses_the_three_occluder_ao_factor() {
+        let mut world = world_with_chunk(ChunkPos::new(0, 0));
+        let stone = block(&world, "openblock:stone");
+        assert!(world.set_block(BlockPos::new(1, 0, 1), stone));
+        // +Y corner (u0,v0) of the top face samples (-1, +1, 0), (0, +1, +1)
+        // and the diagonal (-1, +1, +1) relative to the block.
+        for pos in [BlockPos::new(0, 1, 1), BlockPos::new(1, 1, 2), BlockPos::new(0, 1, 2)] {
+            assert!(world.set_block(pos, stone));
+        }
+
+        let (mesh, _) = mesh_section_with_stats(&world, section());
+        let lights: Vec<f32> = mesh
+            .vertices
+            .iter()
+            .filter(|vertex| (vertex.position[1] - 1.0).abs() < 1e-5)
+            .map(|vertex| vertex.light)
+            .collect();
+        assert!(
+            lights.iter().any(|light| (light - 0.42).abs() < 1e-5),
+            "expected a fully occluded 0.42 corner, got {lights:?}",
+        );
+    }
+
+    #[test]
+    fn water_surface_merges_and_same_water_faces_are_hidden() {
+        let mut world = world_with_chunk(ChunkPos::new(0, 0));
+        let water = block(&world, "openblock:water");
+        for z in 0..SECTION_EDGE as i32 {
+            for x in 0..SECTION_EDGE as i32 {
+                assert!(world.set_block(BlockPos::new(x, 0, z), water));
+            }
+        }
+
+        let (mesh, stats) = mesh_section_with_stats(&world, section());
+        // One merged top, one merged bottom and four merged side strips; the
+        // faces between adjacent water blocks are hidden.
+        assert_eq!(stats.faces, 6);
+        assert_eq!(stats.vertices, 36);
+        let top = quads_at_y(&mesh, 1.0);
+        assert_eq!(top.len(), 1, "the water surface should be a single merged quad");
+        for vertex in top[0] {
+            assert_eq!(vertex.layer, u32::from(textures::WATER.0));
+            assert!((vertex.light - 1.0).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn quads_wind_counter_clockwise_from_outside() {
+        let mut world = world_with_chunk(ChunkPos::new(0, 0));
+        let stone = block(&world, "openblock:stone");
+        assert!(world.set_block(BlockPos::new(0, 0, 0), stone));
+
+        let (mesh, _) = mesh_section_with_stats(&world, section());
+        assert_eq!(mesh.vertices.len(), 36);
+        for quad in mesh.vertices.as_chunks::<6>().0 {
+            // A single-block face is constant along exactly one axis, and that
+            // constant is either 0 or 1; that axis is the outward normal.
+            let mut expected = [0.0f32; 3];
+            let mut constant_axes = 0;
+            for axis in 0..3 {
+                let value = quad[0].position[axis];
+                if quad.iter().all(|vertex| (vertex.position[axis] - value).abs() < 1e-5) {
+                    constant_axes += 1;
+                    assert!(value == 0.0 || value == 1.0, "face is not on a cube plane");
+                    expected[axis] = if value == 1.0 { 1.0 } else { -1.0 };
+                }
+            }
+            assert_eq!(constant_axes, 1, "a cube face must be constant on one axis");
+
+            let edge1 = [
+                quad[1].position[0] - quad[0].position[0],
+                quad[1].position[1] - quad[0].position[1],
+                quad[1].position[2] - quad[0].position[2],
+            ];
+            let edge2 = [
+                quad[2].position[0] - quad[0].position[0],
+                quad[2].position[1] - quad[0].position[1],
+                quad[2].position[2] - quad[0].position[2],
+            ];
+            let normal = [
+                edge1[1] * edge2[2] - edge1[2] * edge2[1],
+                edge1[2] * edge2[0] - edge1[0] * edge2[2],
+                edge1[0] * edge2[1] - edge1[1] * edge2[0],
+            ];
+            let dot = normal[0] * expected[0] + normal[1] * expected[1] + normal[2] * expected[2];
+            assert!(dot > 0.0, "quad winds clockwise from outside: normal={normal:?}");
+        }
+    }
+
+    #[test]
+    fn empty_section_emits_no_geometry() {
+        let world = world_with_chunk(ChunkPos::new(0, 0));
+        let (mesh, stats) = mesh_section_with_stats(&world, section());
+        assert_eq!(stats, MesherStats::default());
+        assert!(mesh.is_empty());
+
+        // A section whose chunk is not loaded also meshes to nothing.
+        let missing = mesh_section(&world, SectionPos::new(4, 0, 4));
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn textured_grass_block_uses_top_and_side_layers() {
+        let mut world = world_with_chunk(ChunkPos::new(0, 0));
+        let grass = block(&world, "openblock:grass");
+        assert!(world.set_block(BlockPos::new(0, 0, 0), grass));
+
+        let (mesh, _) = mesh_section_with_stats(&world, section());
+        let top = quads_at_y(&mesh, 1.0);
+        assert_eq!(top.len(), 1);
+        for vertex in top[0] {
+            assert_eq!(vertex.layer, u32::from(textures::GRASS_TOP.0));
+        }
+
+        // The +X face lies in the x = 1 plane.
+        let side = mesh
+            .vertices
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .map(|quad| &quad[..])
+            .find(|quad| quad.iter().all(|vertex| (vertex.position[0] - 1.0).abs() < 1e-5));
+        let side = side.expect("the block should have a +X side quad");
+        for vertex in side {
+            assert_eq!(vertex.layer, u32::from(textures::GRASS_SIDE.0));
+            assert!((vertex.light - 0.72).abs() < 1e-5);
+        }
+        // Texture row 0 is the top of the image, so the top edge of a side face
+        // must sample V = 0 and the bottom edge V = 1.
+        for vertex in side {
+            let expected_v = if vertex.position[1] > 0.5 { 0.0 } else { 1.0 };
+            assert!((vertex.uv[1] - expected_v).abs() < 1e-5, "side texture is upside down");
+        }
+
+        // The bottom face uses the distinct dirt texture.
+        let bottom = quads_at_y(&mesh, 0.0)
+            .into_iter()
+            .find(|quad| {
+                quad.iter()
+                    .all(|vertex| vertex.position[0] >= 0.0 && vertex.position[0] <= 1.0)
+            })
+            .expect("the block should have a bottom quad");
+        for vertex in bottom {
+            assert_eq!(vertex.layer, u32::from(textures::DIRT.0));
         }
     }
 
@@ -426,7 +743,7 @@ mod tests {
         let (mesh, stats) = mesh_section_with_stats(&world, section());
         assert_eq!(stats.faces, 5);
         assert_eq!(stats.vertices, 30);
-        let (faces, _) = mesh.vertices.as_chunks::<6>();
+        let faces = mesh.vertices.as_chunks::<6>().0;
         let face_at_far_x_plane = faces
             .iter()
             .any(|quad| quad.iter().all(|vertex| (vertex.position[0] - 16.0).abs() < 1e-5));

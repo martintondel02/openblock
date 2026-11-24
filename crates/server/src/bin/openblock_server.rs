@@ -11,6 +11,7 @@
 
 use std::io::BufRead;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -162,6 +163,16 @@ fn run_smoke(mut host: Host) -> i32 {
 }
 
 fn run_dedicated(host: &mut Host) {
+    // Ctrl-C / SIGTERM must save before exiting, not kill the process mid-tick.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let flag = Arc::clone(&shutdown);
+        if let Err(err) = ctrlc::set_handler(move || {
+            flag.store(true, Ordering::SeqCst);
+        }) {
+            log::warn!("could not install the signal handler: {err}");
+        }
+    }
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -180,6 +191,14 @@ fn run_dedicated(host: &mut Host) {
     let mut ticks_in_window = 0u32;
     let mut tps = 0f32;
     loop {
+        if shutdown.load(Ordering::SeqCst) {
+            log::info!("shutdown signal received");
+            if let Err(err) = host.save() {
+                log::error!("save on shutdown failed: {err}");
+            }
+            log::info!("saved; ran {} ticks", host.tick_count());
+            return;
+        }
         let now = Instant::now();
         if now.duration_since(last_tick) >= TICK {
             last_tick += TICK;

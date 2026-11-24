@@ -58,6 +58,8 @@ pub struct ClientOptions {
     pub force_x11: bool,
     /// Render one offscreen frame to this PNG path, then exit without a window.
     pub screenshot: Option<std::path::PathBuf>,
+    /// Automatically close the window after this many seconds and log frame stats.
+    pub seconds: Option<f32>,
 }
 
 impl Default for ClientOptions {
@@ -70,6 +72,7 @@ impl Default for ClientOptions {
             fly: false,
             force_x11: false,
             screenshot: None,
+            seconds: None,
         }
     }
 }
@@ -194,6 +197,9 @@ struct GameState {
     fps: u32,
     last_save: Instant,
     meshes: HashMap<SectionPos, usize>,
+    started: Instant,
+    auto_exit: Option<Duration>,
+    frame_times: Vec<f32>,
 }
 
 impl GameState {
@@ -213,6 +219,38 @@ impl GameState {
             mode,
             capture,
         ));
+    }
+
+    fn log_frame_stats(&mut self) {
+        if self.frame_times.is_empty() {
+            return;
+        }
+        let mut times = self.frame_times.clone();
+        times.sort_by(f32::total_cmp);
+        let count = times.len();
+        let percentile = |p: f32| -> f32 {
+            let index = ((count as f32 - 1.0) * p / 100.0).round() as usize;
+            times[index.min(count - 1)]
+        };
+        let mean = times.iter().sum::<f32>() / count as f32;
+        log::info!(
+            "frame stats: {} frames in {:.1}s, {:.1} FPS mean, p50 {:.2} ms, p95 {:.2} ms, p99 {:.2} ms, max {:.2} ms",
+            count,
+            self.started.elapsed().as_secs_f32(),
+            1000.0 / mean,
+            percentile(50.0),
+            percentile(95.0),
+            percentile(99.0),
+            times[count - 1],
+        );
+        println!(
+            "fps={:.1} frame_ms p50={:.2} p95={:.2} p99={:.2} max={:.2}",
+            1000.0 / mean,
+            percentile(50.0),
+            percentile(95.0),
+            percentile(99.0),
+            times[count - 1],
+        );
     }
 
     fn capture_pointer(&mut self) {
@@ -323,6 +361,14 @@ impl GameState {
         let now = Instant::now();
         let dt = now - self.last_frame;
         self.last_frame = now;
+        // Exclude the first two seconds: initial streaming, world generation
+        // and shader/pipeline warm-up are not representative of steady state.
+        if self.started.elapsed() >= Duration::from_secs(2) {
+            self.frame_times.push(dt.as_secs_f32() * 1000.0);
+            if self.frame_times.len() > 50_000 {
+                self.frame_times.drain(..25_000);
+            }
+        }
         self.accumulator += dt.min(Duration::from_millis(250));
         let mut ticks = 0;
         while self.accumulator >= TICK && ticks < 5 {
@@ -441,6 +487,12 @@ impl ApplicationHandler for App {
             fps: 0,
             last_save: Instant::now(),
             meshes: HashMap::new(),
+            started: Instant::now(),
+            auto_exit: self
+                .options
+                .seconds
+                .map(|seconds| Duration::from_secs_f32(seconds.max(0.5))),
+            frame_times: Vec::new(),
         };
         if state.fly_toggle {
             let player = state.host.player_mut();
@@ -546,10 +598,21 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(state) = self.state.as_ref() {
-            state.window.request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        if let Some(limit) = state.auto_exit
+            && state.started.elapsed() >= limit
+        {
+            if let Err(err) = state.host.save() {
+                log::warn!("save on auto-exit failed: {err}");
+            }
+            state.log_frame_stats();
+            event_loop.exit();
+            return;
         }
+        state.window.request_redraw();
     }
 }
 
@@ -571,6 +634,13 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
             }
             "fly" => options.fly = true,
             "x11" => options.force_x11 = true,
+            "seconds" => {
+                options.seconds = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("invalid --seconds value '{value}'"))?,
+                );
+            }
             "screenshot" => {
                 if value.is_empty() {
                     return Err("--screenshot requires a path".into());

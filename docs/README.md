@@ -60,6 +60,8 @@ self-contained once you know the terminology from chapter 00.
 | [Team and process](plan/04-team-and-process.md) | How work is organised, including AI-assisted development |
 | [Risks](plan/05-risks.md) | Risk register with mitigations and triggers |
 | [Release and operations](plan/06-release-and-operations.md) | Versioning, release cadence, server distribution, support |
+| [Review findings](plan/07-review-findings.md) | The review board that re-baselined the plan, and dispositions |
+| [Measurements](plan/08-measurements.md) | Living log of measured performance, storage and determinism results |
 | [Review findings](plan/07-review-findings.md) | The 2026-11-24 review board's findings and the re-baseline they triggered |
 
 ## Research

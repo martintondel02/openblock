@@ -1,25 +1,50 @@
-//! World persistence (region format v1 arrives at MS-13; this is the
-//! deterministic v0 snapshot format for the v0.0.1 tech preview).
+//! World persistence: deterministic snapshot format v2 with zstd compression,
+//! plus read compatibility with the uncompressed v1 snapshots written by
+//! v0.0.1.
 //!
-//! The snapshot is a single little-endian byte stream:
+//! A v2 snapshot is a single little-endian byte stream:
 //!
 //! ```text
-//! "OBSV" | version u16 | seed u64 | chunk_count u32
-//! chunk_count x chunk
+//! "OBSV" | version u16 = 2 | seed u64 | compression u8
+//!        | uncompressed_payload_len u32 | compressed_payload_len u32
+//! compressed_payload
 //! crc32c u32
 //! ```
 //!
-//! A chunk stores its XZ position followed by all 24 sections in ascending Y
-//! order. Each section records its storage mode, packed block indices, and
-//! packed light (or the uniform-zero light fast path). The trailing CRC32C
-//! covers every preceding byte. Chunks are written sorted by `(cx, cz)` so the
-//! encoding is independent of hash-map iteration order.
+//! The checksum covers every preceding byte (header and compressed payload).
+//! The payload is the chunk stream:
+//!
+//! ```text
+//! chunk_count u32
+//! chunk_count x (cx i32, cz i32, 24 x section)
+//! ```
+//!
+//! A section stores its block-storage mode (uniform, 4/8/16-bit palette) and
+//! its light. Light uses three encodings: flag 0 for a uniform-zero word, flag
+//! 1 for a dense array of 4096 `u16` words, and flag 2 for a uniform non-zero
+//! word followed by that `u16`. Uniform light therefore costs one or three
+//! bytes instead of 8 KiB. Palette word arrays are still written verbatim;
+//! compression removes their long zero runs.
+//!
+//! Version 1 used the same chunk stream without compression, with light flag 1
+//! always carrying a dense array even for a uniform non-zero value:
+//!
+//! ```text
+//! "OBSV" | version u16 = 1 | seed u64 | chunk_count u32
+//! chunks
+//! crc32c u32
+//! ```
+//!
+//! Chunks are always written sorted by `(cx, cz)`, so the encoding is
+//! independent of hash-map iteration order and identical worlds produce
+//! identical bytes.
 
 use std::sync::Arc;
 
 use ob_content::{BlockId, Registry};
 use ob_math::{ChunkPos, N_SECTIONS, SECTION_SIZE};
 use rustc_hash::FxHashSet;
+use zstd::prelude::{ZSTD_compress, ZSTD_compressBound, ZSTD_decompress, ZSTD_isError};
 
 use crate::chunk::ChunkColumn;
 use crate::light::Light;
@@ -28,12 +53,26 @@ use crate::world::World;
 
 /// Snapshot magic at the start of every byte stream.
 const MAGIC: &[u8; 4] = b"OBSV";
-/// Snapshot format version understood by this build.
-const VERSION: u16 = 1;
-/// Bytes before the first chunk: magic, version, seed, chunk count.
-const HEADER_LEN: usize = 4 + 2 + 8 + 4;
+/// Snapshot format version written by this build.
+const VERSION: u16 = 2;
+/// Bytes before the first chunk in a v1 stream: magic, version, seed, count.
+const V1_HEADER_LEN: usize = 4 + 2 + 8 + 4;
+/// Bytes before the compressed payload in a v2 stream.
+const V2_HEADER_LEN: usize = 4 + 2 + 8 + 1 + 4 + 4;
 /// Bytes in the trailing checksum.
 const CRC_LEN: usize = 4;
+/// Payload is stored verbatim.
+const COMPRESSION_NONE: u8 = 0;
+/// Payload is a zstd frame (level 3).
+const COMPRESSION_ZSTD: u8 = 1;
+/// zstd compression level used for snapshots.
+const ZSTD_LEVEL: i32 = 3;
+/// Upper bound on a decompressed payload, to keep malformed headers from
+/// requesting an unbounded allocation before the payload is parsed.
+const MAX_PAYLOAD_LEN: usize = 256 * 1024 * 1024;
+/// Smallest possible on-disk chunk: position plus 24 uniform sections with
+/// three storage bytes and one uniform-zero light byte each.
+const MIN_CHUNK_BYTES: usize = 8 + N_SECTIONS * 4;
 /// Smallest chunk coordinate whose block coordinates fit in an `i32`.
 const MIN_CHUNK_COORD: i32 = i32::MIN / SECTION_SIZE as i32;
 /// Largest chunk coordinate whose block coordinates fit in an `i32`.
@@ -112,41 +151,39 @@ impl std::error::Error for SaveError {}
 #[derive(Debug, Clone, Default)]
 pub struct WorldSave;
 
-/// Serializes a world to the v0 snapshot format.
+/// Serializes a world to the compressed v2 snapshot format.
 ///
 /// Chunks are emitted in ascending `(cx, cz)` order so repeated saves of the
-/// same world produce identical bytes. The trailing CRC32C covers the header,
-/// every chunk, and is written last (not included in its own checksum).
+/// same world produce identical bytes. The payload is compressed with zstd
+/// level 3. The trailing CRC32C covers the header and compressed payload, and
+/// is written last (not included in its own checksum).
 pub fn to_bytes(world: &World) -> Vec<u8> {
-    let mut chunks: Vec<&ChunkColumn> = world.chunks().map(|(_, chunk)| chunk).collect();
-    chunks.sort_by_key(|chunk| (chunk.pos().x, chunk.pos().z));
+    let payload = encode_payload(world, write_section);
+    let payload_len = u32::try_from(payload.len()).expect("world snapshot payload exceeds 4 GiB");
+    let (compression, body) = compress_payload(&payload);
+    let body_len = u32::try_from(body.len()).expect("compressed world snapshot exceeds 4 GiB");
 
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(V2_HEADER_LEN + body.len() + CRC_LEN);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(&world.seed().to_le_bytes());
-    out.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
-
-    for chunk in chunks {
-        let pos = chunk.pos();
-        out.extend_from_slice(&pos.x.to_le_bytes());
-        out.extend_from_slice(&pos.z.to_le_bytes());
-        for (_, section) in chunk.sections() {
-            write_section(&mut out, section);
-        }
-    }
+    out.push(compression);
+    out.extend_from_slice(&payload_len.to_le_bytes());
+    out.extend_from_slice(&body_len.to_le_bytes());
+    out.extend_from_slice(&body);
 
     let checksum = crc32c(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
     out
 }
 
-/// Loads a world from the v0 snapshot format.
+/// Loads a world from a v1 or v2 snapshot.
 ///
 /// The whole stream is validated before a [`World`] is returned: header,
-/// version, checksum, palette bounds against `registry`, section word counts,
-/// and the absence of trailing bytes. Malformed input yields a [`SaveError`]
-/// and never panics.
+/// version, checksum, payload lengths, compression method, palette bounds
+/// against `registry`, section word counts, light encoding, chunk counts, and
+/// the absence of trailing bytes. Malformed input yields a [`SaveError`] and
+/// never panics.
 pub fn from_bytes(registry: Arc<Registry>, bytes: &[u8]) -> Result<World, SaveError> {
     if !bytes.starts_with(MAGIC) {
         return Err(SaveError::InvalidFormat("wrong magic"));
@@ -158,13 +195,87 @@ pub fn from_bytes(registry: Arc<Registry>, bytes: &[u8]) -> Result<World, SaveEr
     if version > VERSION {
         return Err(SaveError::UnsupportedVersion(version));
     }
-    if version != VERSION {
-        return Err(SaveError::InvalidFormat("unknown format version"));
+    match version {
+        1 => load_v1(registry, bytes),
+        2 => load_v2(registry, bytes),
+        _ => Err(SaveError::InvalidFormat("unknown format version")),
     }
-    if bytes.len() < HEADER_LEN + CRC_LEN {
+}
+
+/// Encodes the chunk stream (chunk count, coordinates and sections).
+///
+/// `write_section` is a parameter so tests can also produce the legacy v1
+/// light encoding from the same world data.
+fn encode_payload(world: &World, write_section: fn(&mut Vec<u8>, &Section)) -> Vec<u8> {
+    let mut chunks: Vec<&ChunkColumn> = world.chunks().map(|(_, chunk)| chunk).collect();
+    chunks.sort_by_key(|chunk| (chunk.pos().x, chunk.pos().z));
+
+    let mut out = Vec::new();
+    let chunk_count = u32::try_from(chunks.len()).expect("world snapshot has more than 4 billion chunks");
+    out.extend_from_slice(&chunk_count.to_le_bytes());
+
+    for chunk in chunks {
+        let pos = chunk.pos();
+        out.extend_from_slice(&pos.x.to_le_bytes());
+        out.extend_from_slice(&pos.z.to_le_bytes());
+        for (_, section) in chunk.sections() {
+            write_section(&mut out, section);
+        }
+    }
+    out
+}
+
+/// Compresses a payload with zstd level 3.
+///
+/// Returns the compression flag and the bytes to store. If the pure-Rust zstd
+/// codec reports an error, the payload is stored verbatim (flag 0) instead of
+/// making the save fail.
+fn compress_payload(payload: &[u8]) -> (u8, Vec<u8>) {
+    let bound = ZSTD_compressBound(payload.len());
+    if bound == 0 && !payload.is_empty() {
+        return (COMPRESSION_NONE, payload.to_vec());
+    }
+    let mut compressed = vec![0u8; bound];
+    let written = ZSTD_compress(&mut compressed, payload, ZSTD_LEVEL);
+    if ZSTD_isError(written) || written > compressed.len() {
+        return (COMPRESSION_NONE, payload.to_vec());
+    }
+    compressed.truncate(written);
+    (COMPRESSION_ZSTD, compressed)
+}
+
+/// Decompresses a v2 payload and validates the declared length.
+fn decode_payload(compression: u8, uncompressed_len: usize, body: &[u8]) -> Result<Vec<u8>, SaveError> {
+    match compression {
+        COMPRESSION_NONE => {
+            if body.len() != uncompressed_len {
+                return Err(SaveError::InvalidFormat("uncompressed payload length mismatch"));
+            }
+            Ok(body.to_vec())
+        }
+        COMPRESSION_ZSTD => {
+            if uncompressed_len > MAX_PAYLOAD_LEN {
+                return Err(SaveError::InvalidFormat("uncompressed payload too large"));
+            }
+            let mut payload = vec![0u8; uncompressed_len];
+            let written = ZSTD_decompress(&mut payload, body);
+            if ZSTD_isError(written) {
+                return Err(SaveError::InvalidFormat("zstd decompression failed"));
+            }
+            if written != uncompressed_len {
+                return Err(SaveError::InvalidFormat("decompressed payload length mismatch"));
+            }
+            Ok(payload)
+        }
+        _ => Err(SaveError::InvalidFormat("unknown compression method")),
+    }
+}
+
+/// Loads the old uncompressed v1 snapshot layout.
+fn load_v1(registry: Arc<Registry>, bytes: &[u8]) -> Result<World, SaveError> {
+    if bytes.len() < V1_HEADER_LEN + CRC_LEN {
         return Err(SaveError::InvalidFormat("truncated header"));
     }
-
     let payload_len = bytes.len() - CRC_LEN;
     let stored_crc = u32::from_le_bytes([
         bytes[payload_len],
@@ -177,10 +288,71 @@ pub fn from_bytes(registry: Arc<Registry>, bytes: &[u8]) -> Result<World, SaveEr
     }
 
     let mut reader = Reader::new(&bytes[..payload_len]);
-    let _magic = reader.read_exact::<4>()?;
-    let _version = reader.read_u16()?;
+    let magic = reader.read_exact::<4>()?;
+    if &magic != MAGIC {
+        return Err(SaveError::InvalidFormat("wrong magic"));
+    }
+    if reader.read_u16()? != 1 {
+        return Err(SaveError::InvalidFormat("unknown format version"));
+    }
     let seed = reader.read_u64()?;
+    read_payload(&mut reader, registry, seed, LightEncoding::V1)
+}
+
+/// Loads the compressed v2 snapshot layout.
+fn load_v2(registry: Arc<Registry>, bytes: &[u8]) -> Result<World, SaveError> {
+    if bytes.len() < V2_HEADER_LEN + CRC_LEN {
+        return Err(SaveError::InvalidFormat("truncated header"));
+    }
+    let checksum_offset = bytes.len() - CRC_LEN;
+    let stored_crc = u32::from_le_bytes([
+        bytes[checksum_offset],
+        bytes[checksum_offset + 1],
+        bytes[checksum_offset + 2],
+        bytes[checksum_offset + 3],
+    ]);
+    if crc32c(&bytes[..checksum_offset]) != stored_crc {
+        return Err(SaveError::InvalidFormat("checksum mismatch"));
+    }
+
+    let compression = bytes[14];
+    let uncompressed_len = u32::from_le_bytes([bytes[15], bytes[16], bytes[17], bytes[18]]);
+    let compressed_len = u32::from_le_bytes([bytes[19], bytes[20], bytes[21], bytes[22]]);
+    let compressed_len = usize::try_from(compressed_len).map_err(|_| SaveError::InvalidFormat("payload too large"))?;
+    let payload_end = V2_HEADER_LEN
+        .checked_add(compressed_len)
+        .ok_or(SaveError::InvalidFormat("payload length overflow"))?;
+    if payload_end > checksum_offset {
+        return Err(SaveError::InvalidFormat("truncated payload"));
+    }
+    if payload_end < checksum_offset {
+        return Err(SaveError::InvalidFormat("trailing bytes after payload"));
+    }
+
+    let uncompressed_len =
+        usize::try_from(uncompressed_len).map_err(|_| SaveError::InvalidFormat("payload too large"))?;
+    let body = &bytes[V2_HEADER_LEN..payload_end];
+    let payload = decode_payload(compression, uncompressed_len, body)?;
+
+    let seed = u64::from_le_bytes([
+        bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13],
+    ]);
+    let mut reader = Reader::new(&payload);
+    read_payload(&mut reader, registry, seed, LightEncoding::V2)
+}
+
+/// Reads the chunk stream shared by both snapshot versions.
+fn read_payload(
+    reader: &mut Reader<'_>,
+    registry: Arc<Registry>,
+    seed: u64,
+    light_encoding: LightEncoding,
+) -> Result<World, SaveError> {
     let chunk_count = reader.read_u32()?;
+    let minimum_payload = u64::from(chunk_count) * MIN_CHUNK_BYTES as u64;
+    if minimum_payload > reader.remaining() as u64 {
+        return Err(SaveError::InvalidFormat("chunk count exceeds payload"));
+    }
 
     let mut world = World::new(Arc::clone(&registry), seed);
     let mut seen: FxHashSet<ChunkPos> = FxHashSet::default();
@@ -197,7 +369,7 @@ pub fn from_bytes(registry: Arc<Registry>, bytes: &[u8]) -> Result<World, SaveEr
 
         let mut sections = Vec::with_capacity(N_SECTIONS);
         for _ in 0..N_SECTIONS {
-            sections.push(read_section(&mut reader, &registry)?);
+            sections.push(read_section(reader, &registry, light_encoding)?);
         }
         world.insert_chunk(ChunkColumn::from_sections(pos, sections));
     }
@@ -208,8 +380,40 @@ pub fn from_bytes(registry: Arc<Registry>, bytes: &[u8]) -> Result<World, SaveEr
     Ok(world)
 }
 
+/// Which light encoding a version's sections use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LightEncoding {
+    /// v1: flag 0 = uniform zero, flag 1 = dense array.
+    V1,
+    /// v2: flag 0 = uniform zero, flag 1 = dense array, flag 2 = uniform word.
+    V2,
+}
+
 /// Writes one section's storage mode, palette/words, and light.
 fn write_section(out: &mut Vec<u8>, section: &Section) {
+    write_storage(out, section);
+
+    match section.light().uniform_value() {
+        Some(0) => out.push(0),
+        Some(value) => {
+            out.push(2);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        None => {
+            out.push(1);
+            let data = section
+                .light()
+                .raw()
+                .expect("non-uniform light always has a dense array");
+            for word in data.iter() {
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+    }
+}
+
+/// Writes one section's block-storage body.
+fn write_storage(out: &mut Vec<u8>, section: &Section) {
     match section.storage() {
         SectionStorage::Uniform(id) => {
             out.push(0);
@@ -225,11 +429,28 @@ fn write_section(out: &mut Vec<u8>, section: &Section) {
             write_paletted(out, 3, section.palette(), section.words(), BITS16_WORDS);
         }
     }
+}
 
-    match section.light().raw() {
-        None => out.push(0),
-        Some(data) => {
+/// Writes a section using the v1 light encoding (dense arrays for every
+/// non-zero container). Test-only, used to construct v1 compatibility fixtures.
+#[cfg(test)]
+fn write_legacy_section(out: &mut Vec<u8>, section: &Section) {
+    write_storage(out, section);
+
+    match section.light().uniform_value() {
+        Some(0) => out.push(0),
+        Some(value) => {
             out.push(1);
+            for _ in 0..BLOCK_COUNT {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        None => {
+            out.push(1);
+            let data = section
+                .light()
+                .raw()
+                .expect("non-uniform light always has a dense array");
             for word in data.iter() {
                 out.extend_from_slice(&word.to_le_bytes());
             }
@@ -253,7 +474,11 @@ fn write_paletted(out: &mut Vec<u8>, mode: u8, palette: &[BlockId], words: &[u64
 }
 
 /// Reads one section, validating block ids and palette indices.
-fn read_section(reader: &mut Reader<'_>, registry: &Registry) -> Result<Section, SaveError> {
+fn read_section(
+    reader: &mut Reader<'_>,
+    registry: &Registry,
+    light_encoding: LightEncoding,
+) -> Result<Section, SaveError> {
     let mode = reader.read_u8()?;
     let storage = match mode {
         0 => {
@@ -266,7 +491,10 @@ fn read_section(reader: &mut Reader<'_>, registry: &Registry) -> Result<Section,
         3 => read_paletted(reader, registry, 16, u16::MAX as usize, BITS16_WORDS)?,
         _ => return Err(SaveError::InvalidFormat("unknown storage mode")),
     };
-    let light = read_light(reader)?;
+    let light = match light_encoding {
+        LightEncoding::V1 => read_light_v1(reader)?,
+        LightEncoding::V2 => read_light_v2(reader)?,
+    };
     Ok(Section::from_parts(storage, light))
 }
 
@@ -327,22 +555,60 @@ fn validate_indices(bits: u8, words: &[u64], palette_len: usize) -> Result<(), S
     Ok(())
 }
 
-/// Reads a section's light payload.
-fn read_light(reader: &mut Reader<'_>) -> Result<Light, SaveError> {
+/// Reads a v1 section's light payload.
+///
+/// v1 always stored a dense array for non-zero light, including sections that
+/// were uniform (sky 15). Those arrays are collapsed on load so an upgraded
+/// v0.0.1 world also becomes compact in memory; light values are unchanged.
+fn read_light_v1(reader: &mut Reader<'_>) -> Result<Light, SaveError> {
     match reader.read_u8()? {
-        0 => Ok(Light::default()),
-        1 => {
-            if reader.remaining() < BLOCK_COUNT * 2 {
-                return Err(SaveError::InvalidFormat("truncated light data"));
-            }
-            let mut data = Box::new([0u16; BLOCK_COUNT]);
-            for slot in data.iter_mut() {
-                *slot = reader.read_u16()?;
-            }
-            Ok(Light::from_raw(Some(data)))
-        }
+        0 => Ok(Light::Uniform(0)),
+        1 => Ok(collapse_if_uniform(read_dense_light(reader)?)),
         _ => Err(SaveError::InvalidFormat("invalid light presence byte")),
     }
+}
+
+/// Collapses a dense light array whose words are all equal to a uniform value.
+fn collapse_if_uniform(light: Light) -> Light {
+    match &light {
+        Light::Uniform(_) => light,
+        Light::Dense(data) => {
+            let first = data[0];
+            if data.iter().all(|&word| word == first) {
+                Light::Uniform(first)
+            } else {
+                light
+            }
+        }
+    }
+}
+
+/// Reads a v2 section's light payload.
+fn read_light_v2(reader: &mut Reader<'_>) -> Result<Light, SaveError> {
+    match reader.read_u8()? {
+        0 => Ok(Light::Uniform(0)),
+        1 => read_dense_light(reader),
+        2 => {
+            let value = reader.read_u16()?;
+            if value == 0 {
+                return Err(SaveError::InvalidFormat("uniform light value must be non-zero"));
+            }
+            Ok(Light::from_uniform(value))
+        }
+        _ => Err(SaveError::InvalidFormat("invalid light encoding flag")),
+    }
+}
+
+/// Reads a dense array of packed light words.
+fn read_dense_light(reader: &mut Reader<'_>) -> Result<Light, SaveError> {
+    if reader.remaining() < BLOCK_COUNT * 2 {
+        return Err(SaveError::InvalidFormat("truncated light data"));
+    }
+    let mut data = Box::new([0u16; BLOCK_COUNT]);
+    for slot in data.iter_mut() {
+        *slot = reader.read_u16()?;
+    }
+    Ok(Light::from_raw(Some(data)))
 }
 
 /// Rejects block ids that the session registry cannot resolve.
@@ -529,7 +795,6 @@ mod tests {
                 assert_eq!(expected_section.mode(), actual_section.mode());
                 assert_eq!(expected_section.palette(), actual_section.palette());
                 assert_eq!(expected_section.words(), actual_section.words());
-                assert_eq!(expected_section.light().raw(), actual_section.light().raw());
                 assert_eq!(expected_section.non_air_count(), actual_section.non_air_count());
                 for index in 0..BLOCK_COUNT {
                     let local = LocalPos::from_index(index);
@@ -537,6 +802,16 @@ mod tests {
                         expected_section.get(local),
                         actual_section.get(local),
                         "block mismatch in {expected_section_pos:?} at {local:?}"
+                    );
+                    assert_eq!(
+                        expected_section.light().sky(local),
+                        actual_section.light().sky(local),
+                        "sky light mismatch in {expected_section_pos:?} at {local:?}"
+                    );
+                    assert_eq!(
+                        expected_section.light().block_rgb(local),
+                        actual_section.light().block_rgb(local),
+                        "block light mismatch in {expected_section_pos:?} at {local:?}"
                     );
                 }
             }
@@ -591,8 +866,7 @@ mod tests {
     fn compact_world(registry: &Arc<Registry>) -> World {
         let mut world = World::new(Arc::clone(registry), 9);
         let mut column = ChunkColumn::new(ChunkPos::new(0, 0));
-        // All sections stay uniform air, but zero the light arrays so the
-        // fixture is small enough to mutate exhaustively in tests.
+        // All sections stay uniform air, with compact uniform-zero lights.
         for index in 0..N_SECTIONS {
             let y = WORLD_MIN_Y / 16 + index as i32;
             let section = column
@@ -608,6 +882,36 @@ mod tests {
         let payload_len = bytes.len() - CRC_LEN;
         let checksum = crc32c(&bytes[..payload_len]);
         bytes[payload_len..].copy_from_slice(&checksum.to_le_bytes());
+    }
+
+    /// Builds a v1 snapshot (uncompressed, old dense light encoding).
+    fn to_v1_bytes(world: &World) -> Vec<u8> {
+        let payload = encode_payload(world, write_legacy_section);
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&world.seed().to_le_bytes());
+        out.extend_from_slice(&payload);
+        let checksum = crc32c(&out);
+        out.extend_from_slice(&checksum.to_le_bytes());
+        out
+    }
+
+    /// Builds a v2 snapshot whose payload is stored without compression.
+    fn to_v2_uncompressed_bytes(world: &World) -> Vec<u8> {
+        let payload = encode_payload(world, write_section);
+        let payload_len = u32::try_from(payload.len()).expect("test payload fits");
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&world.seed().to_le_bytes());
+        out.push(COMPRESSION_NONE);
+        out.extend_from_slice(&payload_len.to_le_bytes());
+        out.extend_from_slice(&payload_len.to_le_bytes());
+        out.extend_from_slice(&payload);
+        let checksum = crc32c(&out);
+        out.extend_from_slice(&checksum.to_le_bytes());
+        out
     }
 
     #[test]
@@ -630,6 +934,7 @@ mod tests {
         let (registry, world) = sample_world();
         let first = to_bytes(&world);
         assert_eq!(first, to_bytes(&world));
+        assert_eq!(first[14], COMPRESSION_ZSTD, "v2 snapshots are compressed by default");
 
         let loaded = from_bytes(Arc::clone(&registry), &first).expect("snapshot is valid");
         assert_eq!(to_bytes(&loaded), first);
@@ -649,18 +954,211 @@ mod tests {
         let registry = base_registry();
         let world = World::new(Arc::clone(&registry), 42);
         let bytes = to_bytes(&world);
-        assert_eq!(bytes.len(), HEADER_LEN + CRC_LEN);
         assert!(bytes.starts_with(MAGIC));
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
             VERSION,
             "empty snapshot uses the current version"
         );
+        assert_eq!(bytes[14], COMPRESSION_ZSTD);
+        let compressed_len = u32::from_le_bytes([bytes[19], bytes[20], bytes[21], bytes[22]]) as usize;
+        assert_eq!(bytes.len(), V2_HEADER_LEN + compressed_len + CRC_LEN);
 
         let loaded = from_bytes(Arc::clone(&registry), &bytes).expect("empty snapshot is valid");
         assert_eq!(loaded.seed(), 42);
         assert_eq!(loaded.chunk_count(), 0);
         assert_eq!(to_bytes(&loaded), bytes);
+    }
+
+    #[test]
+    fn v1_snapshots_still_load_and_upgrade_to_v2() {
+        let (registry, world) = sample_world();
+        let v1 = to_v1_bytes(&world);
+        assert_eq!(u16::from_le_bytes([v1[4], v1[5]]), 1);
+        assert_eq!(&v1[..4], MAGIC);
+
+        let loaded = from_bytes(Arc::clone(&registry), &v1).expect("v1 snapshot is valid");
+        assert_same_world(&world, &loaded);
+
+        // Saving the upgraded world writes a self-consistent v2 snapshot.
+        let upgraded = to_bytes(&loaded);
+        assert_eq!(u16::from_le_bytes([upgraded[4], upgraded[5]]), VERSION);
+        let reloaded = from_bytes(Arc::clone(&registry), &upgraded).expect("upgraded snapshot is valid");
+        assert_same_world(&loaded, &reloaded);
+        assert_eq!(to_bytes(&reloaded), upgraded);
+    }
+
+    #[test]
+    fn v1_dense_uniform_light_is_collapsed_on_load() {
+        let registry = base_registry();
+        let mut world = World::new(Arc::clone(&registry), 11);
+        // A default column uses compact uniform sky-15 light; v1 writes it as a
+        // dense array, but loading must recover the compact representation.
+        world.insert_chunk(ChunkColumn::new(ChunkPos::new(0, 0)));
+        let v1 = to_v1_bytes(&world);
+
+        let loaded = from_bytes(Arc::clone(&registry), &v1).expect("v1 snapshot is valid");
+        let chunk = loaded.chunk(ChunkPos::new(0, 0)).expect("chunk was loaded");
+        for (_, section) in chunk.sections() {
+            assert_eq!(section.light().uniform_value(), Some(15 << 12));
+            assert_eq!(section.light().heap_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn v2_dense_uniform_light_keeps_its_encoding() {
+        let registry = base_registry();
+        let pos = ChunkPos::new(0, 0);
+        let mut sections: Vec<Section> = (0..N_SECTIONS).map(|_| Section::empty()).collect();
+        sections[0] = Section::from_parts(
+            SectionStorage::Uniform(BlockId::AIR),
+            Light::from_raw(Some(Box::new([0x1234u16; BLOCK_COUNT]))),
+        );
+        let mut world = World::new(Arc::clone(&registry), 77);
+        world.insert_chunk(ChunkColumn::from_sections(pos, sections));
+
+        let bytes = to_bytes(&world);
+        let loaded = from_bytes(Arc::clone(&registry), &bytes).expect("snapshot is valid");
+        let loaded_chunk = loaded.chunk(pos).expect("chunk was loaded");
+        let loaded_light = loaded_chunk
+            .section(SectionPos::new(0, WORLD_MIN_Y / 16, 0))
+            .expect("section belongs to the chunk")
+            .light();
+        assert_eq!(loaded_light.uniform_value(), None, "flag 1 stays dense");
+        assert_eq!(loaded_light.raw().expect("dense array")[0], 0x1234);
+        assert_eq!(
+            to_bytes(&loaded),
+            bytes,
+            "a dense-uniform light array is canonical for v2 and must round-trip unchanged"
+        );
+    }
+
+    #[test]
+    fn v1_checksum_is_validated() {
+        let (registry, world) = sample_world();
+        let mut bytes = to_v1_bytes(&world);
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        match from_bytes(registry, &bytes) {
+            Err(SaveError::InvalidFormat("checksum mismatch")) => {}
+            other => panic!("expected checksum mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v2_uncompressed_payload_loads() {
+        let (registry, world) = sample_world();
+        let bytes = to_v2_uncompressed_bytes(&world);
+        assert_eq!(bytes[14], COMPRESSION_NONE);
+        assert_eq!(
+            u32::from_le_bytes([bytes[15], bytes[16], bytes[17], bytes[18]]),
+            u32::from_le_bytes([bytes[19], bytes[20], bytes[21], bytes[22]])
+        );
+
+        let loaded = from_bytes(Arc::clone(&registry), &bytes).expect("uncompressed v2 snapshot is valid");
+        assert_same_world(&world, &loaded);
+        let recompressed = to_bytes(&loaded);
+        let reloaded = from_bytes(registry, &recompressed).expect("recompressed snapshot is valid");
+        assert_same_world(&loaded, &reloaded);
+        assert_eq!(to_bytes(&reloaded), recompressed);
+    }
+
+    #[test]
+    fn v2_light_encoding_uses_compact_uniform_forms() {
+        let registry = base_registry();
+        let mut world = World::new(Arc::clone(&registry), 5);
+        let mut column = ChunkColumn::new(ChunkPos::new(0, 0));
+
+        // Every section starts as uniform air with uniform-zero light.
+        for index in 0..N_SECTIONS {
+            let y = WORLD_MIN_Y / 16 + index as i32;
+            let section = column
+                .section_mut(SectionPos::new(0, y, 0))
+                .expect("section belongs to the column");
+            *section.light_mut() = Light::uniform_sky(0);
+        }
+        // Section 0: uniform non-zero; section 1: dense with one edit.
+        let first_y = WORLD_MIN_Y / 16;
+        *column
+            .section_mut(SectionPos::new(0, first_y, 0))
+            .expect("section belongs to the column")
+            .light_mut() = Light::uniform_sky(15);
+        let dense = column
+            .section_mut(SectionPos::new(0, first_y + 1, 0))
+            .expect("section belongs to the column");
+        *dense.light_mut() = Light::from_uniform(0);
+        dense.light_mut().set_sky(LocalPos { x: 0, y: 0, z: 0 }, 7);
+        world.insert_chunk(column);
+
+        let payload = encode_payload(&world, write_section);
+        assert_eq!(u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]), 1);
+
+        // Skip chunk count and chunk coordinates; all sections use uniform
+        // storage (mode byte + id), so the light flags can be read directly.
+        let mut offset = 12;
+        for index in 0..N_SECTIONS {
+            assert_eq!(payload[offset], 0, "uniform storage mode in section {index}");
+            offset += 1;
+            let id = u16::from_le_bytes([payload[offset], payload[offset + 1]]);
+            assert_eq!(id, BlockId::AIR.0);
+            offset += 2;
+
+            let flag = payload[offset];
+            offset += 1;
+            match index {
+                0 => {
+                    assert_eq!(flag, 2, "uniform non-zero light uses flag 2");
+                    let value = u16::from_le_bytes([payload[offset], payload[offset + 1]]);
+                    assert_eq!(value, 15 << 12);
+                    offset += 2;
+                }
+                1 => {
+                    assert_eq!(flag, 1, "edited light uses a dense array");
+                    offset += BLOCK_COUNT * 2;
+                }
+                _ => assert_eq!(flag, 0, "uniform-zero light uses flag 0"),
+            }
+        }
+        assert_eq!(offset, payload.len(), "payload has no trailing bytes");
+    }
+
+    #[test]
+    fn v2_header_lengths_and_compression_are_validated() {
+        let (registry, world) = sample_world();
+        let bytes = to_bytes(&world);
+
+        let mut unknown_method = bytes.clone();
+        unknown_method[14] = 9;
+        resign(&mut unknown_method);
+        assert!(matches!(
+            from_bytes(Arc::clone(&registry), &unknown_method),
+            Err(SaveError::InvalidFormat("unknown compression method"))
+        ));
+
+        let mut huge_payload = bytes.clone();
+        huge_payload[15..19].copy_from_slice(&u32::MAX.to_le_bytes());
+        resign(&mut huge_payload);
+        assert!(matches!(
+            from_bytes(Arc::clone(&registry), &huge_payload),
+            Err(SaveError::InvalidFormat("uncompressed payload too large"))
+        ));
+
+        let compressed_len = u32::from_le_bytes([bytes[19], bytes[20], bytes[21], bytes[22]]);
+        let mut trailing = bytes.clone();
+        trailing[19..23].copy_from_slice(&(compressed_len + 1).to_le_bytes());
+        resign(&mut trailing);
+        assert!(matches!(
+            from_bytes(Arc::clone(&registry), &trailing),
+            Err(SaveError::InvalidFormat("truncated payload"))
+        ));
+
+        let mut truncated = bytes.clone();
+        truncated[19..23].copy_from_slice(&compressed_len.saturating_sub(1).to_le_bytes());
+        resign(&mut truncated);
+        assert!(matches!(
+            from_bytes(Arc::clone(&registry), &truncated),
+            Err(SaveError::InvalidFormat("trailing bytes after payload"))
+        ));
     }
 
     #[test]
@@ -701,7 +1199,7 @@ mod tests {
         // A structurally truncated but checksummed stream must also fail.
         let compact = compact_world(&registry);
         let compact_bytes = to_bytes(&compact);
-        for len in (HEADER_LEN + CRC_LEN)..compact_bytes.len() {
+        for len in (V2_HEADER_LEN + CRC_LEN)..compact_bytes.len() {
             let mut truncated = compact_bytes[..len].to_vec();
             resign(&mut truncated);
             assert!(
@@ -715,10 +1213,10 @@ mod tests {
     fn newer_version_is_unsupported() {
         let (registry, world) = sample_world();
         let mut bytes = to_bytes(&world);
-        bytes[4..6].copy_from_slice(&2u16.to_le_bytes());
+        bytes[4..6].copy_from_slice(&3u16.to_le_bytes());
         match from_bytes(registry, &bytes) {
-            Err(SaveError::UnsupportedVersion(2)) => {}
-            other => panic!("expected UnsupportedVersion(2), got {other:?}"),
+            Err(SaveError::UnsupportedVersion(3)) => {}
+            other => panic!("expected UnsupportedVersion(3), got {other:?}"),
         }
     }
 

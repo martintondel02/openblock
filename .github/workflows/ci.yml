@@ -44,6 +44,12 @@ jobs:
           bytes=$(wc -c < target/screenshot.png)
           echo "screenshot bytes: $bytes"
           test "$bytes" -gt 5000
+      - name: Offscreen benchmark gate (lavapipe)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mesa-vulkan-drivers libvulkan1
+          cargo run --release --locked -p ob_tools --bin openblock-tools -- bench --frames 30 --width 640 --height 360 --seed 42 --render-distance 6 --data-dir target/bench-data --max-frame-ms 2000
       - name: Docs
         if: matrix.os == 'ubuntu-latest'
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps

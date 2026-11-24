@@ -1,15 +1,19 @@
 //! The GPU renderer built on wgpu: voxel meshing, mesh upload and shading.
 //!
-//! v0.0.1 scope: one forward pass, vertex-coloured chunk geometry with baked
-//! face shading and ambient occlusion, a depth buffer and a sky clear. The
-//! render-graph, GPU-driven submission and post chain in
-//! `docs/spec/03-rendering.md` arrive at MS-04.
+//! v0.0.1 scope: one forward pass, textured greedy-meshed chunk geometry with
+//! baked face shading and ambient occlusion, a 16×16 block texture array, a
+//! depth buffer, section frustum culling and a sky clear. The render graph,
+//! GPU-driven submission and post chain in `docs/spec/03-rendering.md` arrive
+//! with the rest of MS-04.
 
 #![allow(missing_docs)] // TODO(MS-04): re-enable once the v0.0.1 API surface settles
 #![forbid(unsafe_code)]
 
+pub mod frustum;
 pub mod mesh;
 pub mod offscreen;
+mod pipeline;
+pub mod textures;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,25 +22,12 @@ use bytemuck::{Pod, Zeroable};
 use ob_math::{Mat4, SectionPos, WorldVec};
 use winit::window::Window;
 
-pub use mesh::{MesherStats, mesh_section};
+pub use frustum::{FRUSTUM_PLANE_COUNT, aabb_visible, section_bounds, section_visible};
+pub use mesh::{MesherStats, mesh_section, mesh_section_with_stats};
 pub use offscreen::OffscreenRenderer;
 
-/// Depth buffer format used by the forward pass.
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-
-/// Byte size of the camera uniform block (`mat4x4<f32>`).
-const CAMERA_UNIFORM_SIZE: wgpu::BufferAddress = 64;
-
-/// Camera uniform uploaded once per frame (group 0, binding 0).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct CameraUniform {
-    /// Column-major combined view-projection matrix.
-    view_proj: [[f32; 4]; 4],
-}
-
-// Keep the GPU layout in sync with the shader's `Camera` struct.
-const _: () = assert!(std::mem::size_of::<CameraUniform>() == CAMERA_UNIFORM_SIZE as usize);
+use pipeline::CameraUniform;
+use textures::BlockTextureArray;
 
 /// Camera used to render the world.
 #[derive(Debug, Clone, Copy)]
@@ -83,22 +74,40 @@ impl Camera {
         let proj = ob_math::perspective_rh_zo(self.fov_y, aspect.max(0.01), self.near, self.far);
         proj * view
     }
+
+    /// The six normalised world-space frustum planes for an aspect ratio.
+    ///
+    /// The order is left, right, bottom, top, near, far, and the inside
+    /// convention is `a·x + b·y + c·z + d >= 0`.
+    pub fn frustum_planes(&self, aspect: f32) -> [[f32; 4]; FRUSTUM_PLANE_COUNT] {
+        frustum::planes_from_view_projection(&self.view_projection(aspect))
+    }
 }
 
-/// One renderable vertex: world position plus baked RGBA colour.
+/// One renderable vertex: world position, tile UV, texture-array layer and
+/// baked light factor.
+///
+/// The layout is 28 bytes: `position` 12, `uv` 8, `layer` 4, `light` 4.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct Vertex {
     /// World-space position.
     pub position: [f32; 3],
-    /// Baked colour (face shading and ambient occlusion included).
-    pub color: [f32; 4],
+    /// Tile-space UV covering the merged rectangle in block units.
+    pub uv: [f32; 2],
+    /// Index into the block texture array.
+    pub layer: u32,
+    /// Baked light: face brightness times per-corner ambient occlusion.
+    pub light: f32,
 }
+
+// Keep the vertex layout and shader attribute offsets in sync.
+const _: () = assert!(std::mem::size_of::<Vertex>() == 28);
 
 /// A CPU-side mesh for one section.
 #[derive(Debug, Default, Clone)]
 pub struct MeshData {
-    /// Triangle vertices (six per visible face).
+    /// Triangle vertices (six per merged quad).
     pub vertices: Vec<Vertex>,
 }
 
@@ -121,7 +130,7 @@ pub struct RenderStats {
     pub draw_calls: u32,
     /// Vertices drawn.
     pub vertices: u64,
-    /// Number of uploaded section meshes.
+    /// Section meshes drawn after frustum culling.
     pub sections: u32,
 }
 
@@ -185,7 +194,11 @@ pub struct Renderer {
     pub(crate) depth_view: wgpu::TextureView,
     /// Camera uniform buffer.
     pub(crate) uniform_buffer: wgpu::Buffer,
-    /// Camera bind group.
+    /// Procedural block texture array and sampler.
+    ///
+    /// Kept alive here even though the bind group also retains its view.
+    _textures: BlockTextureArray,
+    /// Camera and texture bind group.
     pub(crate) bind_group: wgpu::BindGroup,
     /// Uploaded section meshes.
     pub(crate) meshes: HashMap<SectionPos, GpuMesh>,
@@ -267,106 +280,13 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
-        let depth_view = Self::create_depth_view(&device, width, height);
+        let depth_view = pipeline::create_depth_view(&device, width, height);
 
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("camera-uniform"),
-            size: CAMERA_UNIFORM_SIZE,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("camera-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(CAMERA_UNIFORM_SIZE),
-                },
-                count: None,
-            }],
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera"),
-            layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &uniform_buffer,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(CAMERA_UNIFORM_SIZE),
-                }),
-            }],
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("chunk-pipeline-layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("chunk-shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-        });
-        let vertex_attributes = [
-            wgpu::VertexAttribute {
-                format: wgpu::VertexFormat::Float32x3,
-                offset: 0,
-                shader_location: 0,
-            },
-            wgpu::VertexAttribute {
-                format: wgpu::VertexFormat::Float32x4,
-                offset: 12,
-                shader_location: 1,
-            },
-        ];
-        let vertex_buffers = [Some(wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &vertex_attributes,
-        })];
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("chunk-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &vertex_buffers,
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let uniform_buffer = pipeline::create_camera_buffer(&device);
+        let textures = BlockTextureArray::new(&device, &queue);
+        let bind_group_layout = pipeline::create_bind_group_layout(&device);
+        let bind_group = pipeline::create_bind_group(&device, &bind_group_layout, &uniform_buffer, &textures);
+        let pipeline = pipeline::create_pipeline(&device, format, &bind_group_layout);
 
         Ok(Self {
             instance,
@@ -377,33 +297,12 @@ impl Renderer {
             pipeline,
             depth_view,
             uniform_buffer,
+            _textures: textures,
             bind_group,
             meshes: HashMap::new(),
             adapter_summary,
             stats: RenderStats::default(),
             window,
-        })
-    }
-
-    /// Creates the depth texture and view for the given drawable size.
-    fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("depth"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("depth-view"),
-            ..Default::default()
         })
     }
 
@@ -420,7 +319,7 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
-        self.depth_view = Self::create_depth_view(&self.device, width, height);
+        self.depth_view = pipeline::create_depth_view(&self.device, width, height);
     }
 
     /// Uploads (or replaces) the mesh for a section.
@@ -452,15 +351,17 @@ impl Renderer {
         self.meshes.clear();
     }
 
-    /// Renders one frame of all uploaded section meshes.
+    /// Renders one frame of all uploaded section meshes inside the frustum.
     pub fn render(&mut self, camera: &Camera) -> Result<(), RenderError> {
         let (width, height) = self.size();
         let aspect = width as f32 / height as f32;
+        let view_projection = camera.view_projection(aspect);
         let uniform = CameraUniform {
-            view_proj: camera.view_projection(aspect).to_cols_array_2d(),
+            view_proj: view_projection.to_cols_array_2d(),
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+        let frustum = camera.frustum_planes(aspect);
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -476,14 +377,12 @@ impl Renderer {
 
         // Sort the draws so the submitted command stream is deterministic even
         // though meshes live in a hash map; depth testing makes the result
-        // independent of draw order either way.
+        // independent of draw order either way. Culled sections are skipped
+        // and never counted in the frame statistics.
         let mut order: Vec<SectionPos> = self.meshes.keys().copied().collect();
         order.sort_unstable();
 
-        let mut stats = RenderStats {
-            sections: self.meshes.len() as u32,
-            ..RenderStats::default()
-        };
+        let mut stats = RenderStats::default();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
@@ -519,6 +418,9 @@ impl Renderer {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             for pos in order {
+                if !section_visible(&frustum, pos) {
+                    continue;
+                }
                 let Some(mesh) = self.meshes.get(&pos) else {
                     continue;
                 };
@@ -529,6 +431,7 @@ impl Renderer {
                 pass.draw(0..mesh.vertex_count, 0..1);
                 stats.draw_calls += 1;
                 stats.vertices += u64::from(mesh.vertex_count);
+                stats.sections += 1;
             }
         }
         self.stats = stats;
@@ -572,5 +475,20 @@ fn request_adapter(instance: &wgpu::Instance, surface: &wgpu::Surface<'_>) -> Re
                 ))
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vertex_layout_matches_the_shader() {
+        assert_eq!(std::mem::size_of::<Vertex>(), 28);
+        assert_eq!(std::mem::align_of::<Vertex>(), 4);
+        assert_eq!(std::mem::offset_of!(Vertex, position), 0);
+        assert_eq!(std::mem::offset_of!(Vertex, uv), 12);
+        assert_eq!(std::mem::offset_of!(Vertex, layer), 20);
+        assert_eq!(std::mem::offset_of!(Vertex, light), 24);
     }
 }

@@ -41,11 +41,11 @@ OpenBlock is designed to express content and systems Minecraft cannot:
 programmable logic blocks, first-class energy/fluid networks, scriptable mob
 AI, procedural dungeons, server-side minigames and more.
 
-![OpenBlock v0.0.1 tech preview — procedurally generated terrain, trees and sky, rendered by the wgpu client](docs/img/v0.0.1-screenshot.png)
+![OpenBlock v0.0.2 tech preview — textured terrain, trees, boulders and sky, rendered by the wgpu client](docs/img/v0.0.2-screenshot.png)
 
-<p align="center"><em>v0.0.1, seed 42: procedural terrain and trees rendered by the wgpu client (offscreen capture on Fedora 45, RADV).</em></p>
+<p align="center"><em>v0.0.2, seed 42: textured procedural terrain with greedy-meshed chunks and ambient occlusion (offscreen capture on Fedora 45, RADV).</em></p>
 
-> **Status: v0.0.1 tech preview.** A runnable single-player vertical slice now
+> **Status: v0.0.2 tech preview.** A runnable single-player vertical slice now
 > exists: procedural terrain, chunk streaming, walk/fly physics, block
 > break/place, hotbar selection, save/load and a headless host with a
 > determinism smoke test. It is the first slice of MS-03, not a finished game:
@@ -223,7 +223,19 @@ cargo run --release -p ob_server --bin openblock-server -- --world demo --seed 4
 
 # Headless render check / screenshot (works without a display; needs a Vulkan driver)
 cargo run --release -p ob_client --bin openblock -- --screenshot openblock.png --seed 42 --fly
+
+# Benchmark: cached-geometry render timing, JSON output, optional CI gate
+cargo run --release -p ob_tools --bin openblock-tools -- bench --frames 60 --seed 42 --render-distance 8 --json bench.json
+
+# Measure the real window for 10 seconds and print p50/p95/p99 frame times
+cargo run --release -p ob_client --bin openblock -- --seed 42 --fly --seconds 10
 ```
+
+Measured on the reference dev machine (Fedora 45, RADV integrated GPU,
+1280×720): **115 FPS at a 128-block radius, 135 FPS at a 192-block radius**
+(steady state, p95 ≤ 17 ms), and **0.62 ms p50** for a cached offscreen frame at
+1280×720. These are 720p integrated-GPU numbers, not the 512-block discrete-GPU
+gate. Full log: [`docs/plan/08-measurements.md`](docs/plan/08-measurements.md).
 
 Controls: mouse look (click to capture), `WASD` move, `Space` jump, `Shift`
 sprint, `F` toggle fly, left/right click break/place, `1`–`8` select block,

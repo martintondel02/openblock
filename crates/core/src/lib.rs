@@ -13,7 +13,7 @@ pub use log::{debug, error, info, warn};
 /// Product version of the workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Save format version understood by this build.
-pub const SAVE_FORMAT_VERSION: u16 = 1;
+pub const SAVE_FORMAT_VERSION: u16 = 2;
 /// Protocol version (no networking at v0.0.1; reserved for MS-06).
 pub const PROTOCOL_VERSION: u16 = 0;
 

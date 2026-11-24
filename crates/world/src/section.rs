@@ -331,26 +331,25 @@ impl Section {
 
     /// Re-derives the section light from the registry's opacity rules and the
     /// vertical sky occlusion handled by [`crate::chunk::ChunkColumn`].
+    ///
+    /// The result is built through [`Light::from_fn`], which collapses to a
+    /// compact uniform container when every block receives the same sky light
+    /// (fully solid or fully open sections).
     pub fn seed_sky_light(&mut self, registry: &Registry) {
-        for y in (0..SECTION_SIZE).rev() {
-            for z in 0..SECTION_SIZE {
-                for x in 0..SECTION_SIZE {
-                    let pos = LocalPos {
-                        x: x as u8,
-                        y: y as u8,
-                        z: z as u8,
-                    };
-                    let block = registry.block(self.get(pos));
-                    if block.opaque {
-                        self.light.set_sky(pos, 0);
-                    } else if block.fluid {
-                        self.light.set_sky(pos, 12);
-                    } else {
-                        self.light.set_sky(pos, 15);
-                    }
-                }
-            }
-        }
+        let light = Light::from_fn(|pos| {
+            let block = registry.block(self.get(pos));
+            let sky: u8 = if block.opaque {
+                0
+            } else if block.fluid {
+                12
+            } else {
+                15
+            };
+            // Only the sky nibble is reseeded; existing block light is kept.
+            let (red, green, blue) = self.light().block_rgb(pos);
+            (u16::from(sky) << 12) | (u16::from(red) << 8) | (u16::from(green) << 4) | u16::from(blue)
+        });
+        self.light = light;
     }
 }
 
@@ -416,6 +415,50 @@ mod tests {
         s.light_mut().set_block(pos(1, 2, 3), 4, 5, 6);
         assert_eq!(s.light().sky(pos(1, 2, 3)), 9);
         assert_eq!(s.light().block_rgb(pos(1, 2, 3)), (4, 5, 6));
+    }
+
+    #[test]
+    fn seed_sky_light_keeps_uniform_sections_compact() {
+        use ob_content::Registry;
+
+        let registry = Registry::base();
+        let stone = registry.id_or_air("openblock:stone");
+        let water = registry.id_or_air("openblock:water");
+
+        let mut solid = Section::uniform(stone);
+        solid.seed_sky_light(&registry);
+        assert_eq!(solid.light().uniform_value(), Some(0));
+        assert_eq!(solid.light().heap_bytes(), 0);
+        assert!(solid.light().is_uniform_zero());
+        assert_eq!(solid.light().sky(pos(3, 7, 9)), 0);
+
+        let mut open = Section::empty();
+        open.seed_sky_light(&registry);
+        assert_eq!(open.light().uniform_value(), Some(15 << 12));
+        assert_eq!(open.light().heap_bytes(), 0);
+        assert_eq!(open.light().sky(pos(3, 7, 9)), 15);
+
+        let mut fluid = Section::uniform(water);
+        fluid.seed_sky_light(&registry);
+        assert_eq!(fluid.light().uniform_value(), Some(12 << 12));
+        assert_eq!(fluid.light().heap_bytes(), 0);
+
+        // One opaque block among open air is not uniform and must stay dense.
+        let mut mixed = Section::empty();
+        mixed.set(pos(0, 0, 0), stone);
+        mixed.seed_sky_light(&registry);
+        assert_eq!(mixed.light().uniform_value(), None);
+        assert_eq!(mixed.light().heap_bytes(), BLOCK_COUNT * 2);
+        assert_eq!(mixed.light().sky(pos(0, 0, 0)), 0);
+        assert_eq!(mixed.light().sky(pos(0, 1, 0)), 15);
+
+        // Reseeding sky light must not erase existing block light.
+        let mut lit = Section::empty();
+        lit.light_mut().set_block(pos(2, 3, 4), 4, 5, 6);
+        lit.seed_sky_light(&registry);
+        assert_eq!(lit.light().block_rgb(pos(2, 3, 4)), (4, 5, 6));
+        assert_eq!(lit.light().sky(pos(2, 3, 4)), 15);
+        assert_eq!(lit.light().block_rgb(pos(0, 0, 0)), (0, 0, 0));
     }
 
     #[test]
