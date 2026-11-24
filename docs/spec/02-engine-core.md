@@ -1,7 +1,7 @@
 # 02 — Engine Core
 
 > Status: normative - Last updated: 2026-11-24
-> Depends on: [DEC-002](../decisions.md), [DEC-007](../decisions.md), [DEC-021](../decisions.md), [DEC-035](../decisions.md), [conventions](00-conventions.md), [technical architecture](01-technical-architecture.md)
+> Depends on: [DEC-002](../decisions.md), [DEC-007](../decisions.md), [DEC-021](../decisions.md), [DEC-035](../decisions.md), [DEC-038](../decisions.md), [DEC-042](../decisions.md), [DEC-043](../decisions.md), [conventions](00-conventions.md), [technical architecture](01-technical-architecture.md)
 > Implements: MS-02
 
 ## 1. Purpose and scope
@@ -25,7 +25,7 @@ boundaries are owned by [chapter 01](01-technical-architecture.md) and are refer
 | REQ-CORE-004 | Simulation systems MUST execute in a total order; cross-system parallelism is allowed only in presentation stages, or for a system explicitly declared `ParallelSafe` with a documented order-independent reduction. | schedule dump, replay hashes |
 | REQ-CORE-005 | The ordered simulation schedule MUST have a reviewed golden digest; an unreviewed reorder MUST fail CI. | `schedule.golden` test |
 | REQ-CORE-006 | Every system MUST declare read and write access over registered resources; a parallel stage MUST reject conflicting systems without an ordering edge. | conflict test |
-| REQ-CORE-007 | Simulation MUST advance only in integer ticks at 20 Hz by default or 30 Hz when the host selects it; the rate MUST be immutable for a session and replicated. | clock, protocol tests |
+| REQ-CORE-007 | Simulation MUST advance only in integer ticks at the fixed 20 Hz gameplay rate; a 30 Hz setting MUST raise only the snapshot/replication rate, never the simulation rate ([DEC-038](../decisions.md)). | clock, protocol tests |
 | REQ-CORE-008 | Tick arithmetic MUST be drift-free: the executed tick count MUST stay within one tick of wall clock over 24 h. | mock-clock test |
 | REQ-CORE-009 | Catch-up MUST be capped at 5 ticks per frame; dropped ticks MUST be counted, logged and recorded for replay, never silently skipped. | clock unit test |
 | REQ-CORE-010 | Pause and single-step MUST be refused when the host has remote peers; a server MUST NOT pause. | integration test |
@@ -40,7 +40,7 @@ boundaries are owned by [chapter 01](01-technical-architecture.md) and are refer
 | REQ-CORE-019 | Suspend and resume MUST reset the clock, drop accumulated ticks and re-establish connections; no tick catch-up. | injected lifecycle test |
 | REQ-CORE-020 | Services MUST follow §3.6, have one owner thread, and shut down in reverse order within REQ-ARCH-013 deadlines. | lifecycle tests |
 | REQ-CORE-021 | The service registry MUST be frozen after init; a hot-path lock around service lookup is forbidden. | API test, review |
-| REQ-CORE-022 | Entities MUST have a persistent, monotonic, never-reused `NetId`; a `hecs::Entity` MUST never be saved or sent. | save round-trip, protocol test |
+| REQ-CORE-022 | Entities MUST have a session-monotonic, never-reused `NetId`; entities that survive restarts MUST additionally carry a persistent UUID, and a `hecs::Entity` MUST never be saved or sent ([DEC-043](../decisions.md)). | save round-trip, protocol test |
 | REQ-CORE-023 | Components MUST be fixed at spawn; adding or removing them during a tick and iterating archetypes for simulation output are forbidden. | review, replay hashes |
 | REQ-CORE-024 | Simulation iteration MUST use a deterministic key order (`SimIndex` or sorted `NetId`), never raw query or hash-map order. | determinism harness |
 | REQ-CORE-025 | Configuration MUST layer defaults < file < environment < CLI, validate against a generated schema and reject unknown keys with the offending path. | config tests |
@@ -156,7 +156,7 @@ rather than an accident.
 
 ```rust
 pub struct TickClock {
-    rate: TickRate,              // 20 or 30 for sessions; tools may use others
+    rate: TickRate,              // fixed 20 Hz for gameplay; never configurable (DEC-038)
     origin: Instant,
     paused_at: Option<Instant>,
     paused_total: Duration,
@@ -307,7 +307,7 @@ pub struct EntityStore {
     net_ids: Vec<NetId>,                // indexed by SimIndex, dense
     slot_of: FxHashMap<NetId, SimIndex>,
     free: Vec<SimIndex>,
-    next_net_id: u64,                   // persisted with the world
+    next_net_id: u64,                   // session-local; never persisted (DEC-043)
     despawn_queue: Vec<NetId>,
 }
 
@@ -327,9 +327,11 @@ despawns are deferred into a command buffer applied at the end of `PostTick` in 
 so the entity set is constant for the whole tick. `PreparedQuery` is cached per system and never
 built per entity or per section.
 
-`NetId` is allocated at spawn from `next_net_id` and persisted, while `hecs::Entity` is session-local
-and never saved or sent. Ids are never reused, not even after despawn, which makes replication and
-replay immune to alias bugs at the cost of 8 bytes per historical entity. Simulation systems that
+`NetId` is allocated at spawn from the session-local `next_net_id`; NetIds are never persisted, a
+restart begins a new sequence, and entities that must survive restarts additionally carry a
+persistent UUID ([DEC-043](../decisions.md)). `hecs::Entity` is session-local and never saved or sent. Ids
+are never reused within a session, not even after despawn, which makes replication and replay immune
+to alias bugs at the cost of 8 bytes per id for the session's lifetime. Simulation systems that
 produce ordered output sort by `NetId` or iterate `SimIndex` order; raw archetype order is forbidden
 for anything simulation-visible. Block entities are not ECS entities: they live in a per-section
 side table keyed by local index, as specified in [chapter 05](05-world-model.md).
@@ -348,10 +350,10 @@ Validation covers ranges, enums and cross-field rules (`shadow_cascades` in 1..=
 `simulation_distance <= render_distance` on a hosting client) and reports every failure at once.
 
 Each key declares a reload class: `Live` (render quality, volume, UI scale, verbosity), `NextSession`
-(simulation distance), `Restart` (graphics backend, allocator policy) and `Session` (tick rate, game
-rules — host-owned and client-immutable). The watcher debounces 250 ms, applies transactionally and
-keeps the last good document on any validation error. Secrets never reach logs: redaction covers
-`*_key`, `*_token`, `*_secret` and absolute home paths.
+(simulation distance), `Restart` (graphics backend, allocator policy) and `Session` (game rules —
+host-owned and client-immutable; the simulation tick itself is fixed at 20 Hz, DEC-038). The watcher
+debounces 250 ms, applies transactionally and keeps the last good document on any validation error.
+Secrets never reach logs: redaction covers `*_key`, `*_token`, `*_secret` and absolute home paths.
 
 ### 3.9 Diagnostics
 
@@ -412,8 +414,10 @@ panic. A failure prints seed, tick and log path — exactly what a replay needs.
 and counts, `Disable` stops scheduling for the session, `Fatal` is reserved for simulation
 invariants where continuing would corrupt the world. A presentation system may be disabled and
 restarted; a failing simulation system is a bug, and the process exits 70 after writing a crash
-report. The client release profile uses `panic = "abort"`; whether the server should use
-`panic = "unwind"` so a poisoned job or a WASM trap can be contained is open as DEC-042.
+report. Client and distribution builds use `panic = "abort"`; the dedicated server uses
+`panic = "unwind"` (a `server` cargo profile) so a poisoned job, a malformed-packet handler or a WASM
+trap is contained rather than ending every player's session, while renderer and GPU failures still
+terminate rather than continue in a corrupt state ([DEC-042](../decisions.md)).
 
 ### 3.12 Platform testing strategy
 
@@ -480,7 +484,7 @@ reported numbers, not the mean.
 | Schedule conflict or cycle | builder validation | refuse to start, name both systems or the path | fix registration, retry |
 | Service init failure | `ServiceError` | abort start-up, shut down earlier services | fix config or dependency |
 | Hung shutdown | per-service deadline | log, leak the service, exit 70 if critical | restart |
-| Job panic | panic hook, job boundary | crash report, exit under abort | restart; DEC-042 may contain it |
+| Job panic | panic hook, job boundary | crash report and exit under client `abort`; the server unwinds and contains the job ([DEC-042](../decisions.md)) | restart the job or process |
 | Starved queue | depth, deadline counters | shed background work, keep `Immediate` | automatic |
 | Clock gap after suspend | monotonic gap above 2 s | reset origin, drop ticks, no catch-up | automatic |
 | Wall clock change | never read by simulation | no effect | none |
@@ -520,29 +524,25 @@ nightly and before a release. A budget regression beyond tolerance blocks the me
 
 ## 8. Open questions
 
-1. **Server panic policy (proposed DEC-042, owner MS-02).** The client keeps `panic = "abort"`. The
-   server would benefit from `panic = "unwind"` so a poisoned job, malformed packet handler or WASM
-   trap can be contained instead of ending every player's session. The cost is unwind tables, a
-   larger binary and the risk of continuing with inconsistent state; decide with the MS-09
-   containment tests before MS-07 ships.
-2. **Job system substrate (proposed DEC-043, owner MS-02).** Rayon pools plus our admission layer is
-   the current design. A custom work-stealing scheduler with per-class deques would give true
-   priority and cheaper cancellation at the cost of a component to maintain and audit. Revisit only
-   if PERF-CORE-005 or PERF-ARCH-006 is missed.
-3. **Hot-reload scope (proposed DEC-044, owner MS-07).** Which server keys may reload live is a
-   per-key property with no published list. Operators need a documented set, and the decision must
-   confirm that a tick-rate change can never be live.
-4. **Entity identity (proposed DEC-045, owner MS-02).** A monotonic `u64` per world never repeats but
-   cannot merge two worlds and reveals entity counts if sent verbatim. A keyed or hashed id is
-   mergeable but needs collision handling. Decide before the save format freezes.
-5. **Simulation parallelism (proposed DEC-046, owner MS-15).** Cross-system parallelism stays
-   forbidden in simulation until region ticking arrives. Region ticking changes update and redstone
-   ordering, so it needs its own decision and a cross-region test suite, not an optimisation pass.
+1. **Job system substrate.** Register item needed: job-system substrate (Rayon pools plus our
+   admission layer, or a custom work-stealing scheduler) (owner MS-02). Rayon pools plus our
+   admission layer is the current design. A custom work-stealing scheduler with per-class deques
+   would give true priority and cheaper cancellation at the cost of a component to maintain and
+   audit. Revisit only if PERF-CORE-005 or PERF-ARCH-006 is missed.
+2. **Hot-reload scope.** Register item needed: published list of hot-reloadable server keys (owner
+   MS-07). Which server keys may reload live is a per-key property with no published list.
+   Operators need a documented set; the simulation tick is fixed at 20 Hz and must never be
+   live-configurable ([DEC-038](../decisions.md)).
+3. **Simulation parallelism.** Register item needed: region-parallel simulation semantics and
+   cross-region ordering (owner MS-15). Cross-system parallelism stays forbidden in simulation
+   until region ticking arrives. Region ticking changes update and redstone ordering, so it needs
+   its own decision and a cross-region test suite, not an optimisation pass.
 
 ## 9. References
 
 - Decisions: [DEC-002](../decisions.md), [DEC-007](../decisions.md), [DEC-021](../decisions.md),
-  [DEC-035](../decisions.md); [conventions](00-conventions.md) §6;
+  [DEC-035](../decisions.md), [DEC-038](../decisions.md), [DEC-042](../decisions.md),
+  [DEC-043](../decisions.md); [conventions](00-conventions.md) §6;
   [technical architecture](01-technical-architecture.md).
 - Chapters: [world model](05-world-model.md), [entities and AI](09-entities-ai.md),
   [UI and UX](13-ui-and-ux.md), [modding](16-modding.md),

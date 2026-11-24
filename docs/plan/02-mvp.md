@@ -46,7 +46,7 @@ bar is the minimum for a build a stranger can use with no developer in the room,
 it is what makes this a game rather than a demo: a loop (explore, gather, build, keep)
 that survives a restart and needs no author present. At A and B that loop is creative
 expression, which is complete; survival is a second loop and is not promised here
-(proposed DEC-038, §13).
+(register item needed, §13).
 
 | # | Test | A `0.0.1` | B `0.1` | C `0.2` |
 | --- | --- | --- | --- | --- |
@@ -326,10 +326,10 @@ milestones**. Scope changes need a DEC (REQ-MVP-006).
 
 ## 13. Open questions
 
-1. **DEC-038 (proposed): MVP is creative-first.** No MVP checkpoint promises a survival
+1. **Register item needed: MVP is creative-first.** No MVP checkpoint promises a survival
    loop. The roadmap places survival at MS-10, but the promise is unstated, and an
    unstated boundary is the first thing negotiated in public. Owner: MS-05.
-2. **DEC-039 (proposed): release gate.** A public MVP build needs the playable bar plus
+2. **Register item needed: release gate.** A public MVP build needs the playable bar plus
    3 testers at A, 5 at B and 3 pairs at C, with a recorded demo. Without numbers, "we
    tested it" is unfalsifiable. Owner: MS-03.
 3. **macOS support level at A.** Source build versus signed app; blocked by the signing

@@ -149,7 +149,8 @@ wall-clock or thread-identity inputs to simulation state.
 
 *Why:* client prediction and reconciliation, replays, deterministic tests and
 server-side anti-cheat all require it. A 20 Hz tick matches the genre's feel and
-is affordable; 30 Hz is offered for PvP servers at +50% simulation cost.
+is affordable; a 30 Hz *snapshot* rate is offered for PvP servers at a modest
+replication cost, without changing simulation timing (DEC-038).
 See [research/04](research/04-networking-sota.md) §2.
 
 ### DEC-008 — Server authority; clients predict, never decide
@@ -580,9 +581,9 @@ far more expensive than before it.
 ## 6. Amendments and clarifications (2026-11-24)
 
 The first full specification pass proposed many new decisions. They are
-registered here with canonical IDs; chapters that proposed provisional numbers
-(`DEC-038…DEC-046`, `DEC-060…DEC-065`) are reconciled to these IDs by the
-consistency pass. The register is authoritative.
+registered here with canonical IDs; chapters that proposed provisional numbers in the
+038–046 and 060–065 ranges are reconciled to these IDs by the consistency pass.
+The register is authoritative.
 
 ### DEC-038 — Simulation tick is fixed at 20 Hz; 30 Hz is a replication rate
 **Status:** settled · **Reversal cost:** high · **Owner:** MS-06 · **Amends:** DEC-007
@@ -687,6 +688,16 @@ with a dry-run report. This protects player builds and modded worlds.
 | OPEN-006 | Whether WASM mods may ship client presentation code (vs server-only) | MS-09 | before 0.1 |
 | OPEN-007 | Native plugin policy details (signing, separate process, crash containment) | MS-09 | post-1.0 |
 | OPEN-008 | Whether to support WebTransport/web client at all | MS-13 | post-1.0 |
+| OPEN-009 | Metal (and any adapter without indirect-first-instance) must escalate render mesh clusters to 64³; DEC-004 caps clusters at 32³ and the 16 B/quad record cannot encode 64³ merges. Either amend DEC-004 for a Metal-only escalation or accept extra sub-draws. | MS-04 | before MS-12 |
+| OPEN-010 | The dynamic-light binning pass (up to 256 lights, 16×16-pixel tiles) has no row in the ch03 pass inventory or the 5.65 ms GPU sum; assign it a pass budget or fold it into cull/upload. | MS-04/MS-12 | before 0.1 |
+| OPEN-011 | Anti-cheat enforcement defaults: default mode, kick/ban thresholds, opt-in auto-ban. | MS-15 | before 1.0 |
+| OPEN-012 | Whether server-side ore obfuscation ships as an opt-in anti-cheat setting and how it interacts with DEC-018/DEC-045. | MS-15 | before 1.0 |
+| OPEN-013 | Performance-waiver policy (time-boxed, lead-approved, never for memory or save durability) so security fixes are not blocked by a perf gate. | MS-00 | before 0.1 |
+| OPEN-014 | Release channels, support windows and withdrawal rules become normative rather than habit. | MS-16 | before 1.0 |
+| OPEN-015 | One incident severity scale and disclosure timeline shared by risk, release and security docs. | MS-16 | before 1.0 |
+| OPEN-016 | Which Gate-class benchmark scenes run on every PR inside the 8-minute bench lane. | MS-02 | before 0.1 |
+| OPEN-017 | Evidence-bundle retention and access model for anti-cheat (default 7 days, max 30, operator-only export). | MS-15 | before 1.0 |
+| OPEN-018 | When the forward-compatibility promise for saves starts (at 1.0, or at the first public alpha). | MS-13 | before 0.1 |
 
 ## 8. Rejected alternatives (recorded so we don't relitigate)
 

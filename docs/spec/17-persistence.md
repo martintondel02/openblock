@@ -1,7 +1,7 @@
 # 17 — Persistence
 
 > Status: draft for review - Last updated: 2026-11-24
-> Depends on: [DEC-004](../decisions.md), [DEC-005](../decisions.md), [DEC-006](../decisions.md), [DEC-007](../decisions.md), [DEC-033](../decisions.md), [DEC-035](../decisions.md), [05-world-model](05-world-model.md), [06-worldgen](06-worldgen.md)
+> Depends on: [DEC-004](../decisions.md), [DEC-005](../decisions.md), [DEC-006](../decisions.md), [DEC-007](../decisions.md), [DEC-033](../decisions.md), [DEC-035](../decisions.md), [DEC-046](../decisions.md), [DEC-047](../decisions.md), [05-world-model](05-world-model.md), [06-worldgen](06-worldgen.md)
 > Implements: MS-13; consumed by MS-03 (first saves), MS-07 (server backups), MS-16 (1.0 format freeze)
 
 > Note: `docs/research/09-persistence-assets-packaging.md` did not exist when this
@@ -215,7 +215,7 @@ Each component is `u16 id | u32 len | len bytes`. Known ids:
 | 2 | sections | per section: `y i16`, mode `u8` (0 uniform, 1 packed), `bits u8`, palette length `u16`, `data_len u32`, then palette (varint ids) and packed `u64` words in YZX order |
 | 3 | block entities | count, then `packed_pos u32`, type dictionary id (varint), payload length (varint), payload |
 | 4 | entities | count, then UUID (`16 B`), type dictionary id, payload |
-| 5 | scheduled ticks | count, then `packed_pos u32`, type dictionary id, `delay u32` ticks, `priority u8` |
+| 5 | scheduled ticks | count, then `packed_pos u32`, type dictionary id, `delay u32` ticks (remaining, against the saved world tick), `priority u8` |
 | 6 | heightmaps | three 16×16 maps at 9 bits per entry, packed (288 bytes each): surface, motion-blocking, ocean floor |
 | 7 | light | per section: `y i16`, mode (0 uniform, 1 packed), one `u16` for uniform or 4,096 × `u16` (sky4 + R4 + G4 + B4) |
 | 8 | structure refs | count, then `start_id u64`, structure dictionary id, `piece_mask u64` |
@@ -344,7 +344,10 @@ then the payload header and component limits. Any failure quarantines the chunk:
 its bytes are copied to `quarantine/<region>/<cx>.<cz>.obc`, the index entry gets
 status `quarantined`, the world keeps loading, and a warning names the file. An
 edited chunk is never regenerated automatically; an unedited one may be, if
-`repair.regenerate_unedited` is enabled.
+`repair.regenerate_unedited` is enabled. That repair path covers missing or unreadable payloads
+only: a chunk whose stored generator fingerprint differs from the active generator is not corrupt,
+so it loads as saved and is reported, and regeneration remains the explicit operator action of
+[DEC-047](../decisions.md).
 
 Recovery on open:
 
@@ -598,19 +601,21 @@ growth beyond the compaction threshold.
 
 | # | Question | Proposal | Owner |
 | --- | --- | --- | --- |
-| 1 | What exactly does the 1.0 forward-compatibility promise cover — read forever, or migrate forever? | **DEC-040**: 1.x writes are readable by every later 1.x through migrations; the chain is supported indefinitely and a skipped-version migration is tested. | MS-16 |
-| 2 | DEC-033 lists scheduled ticks among the sidecars; this chapter stores them in the chunk payload for locality. | **DEC-041** (clarifies DEC-033): ticks live per chunk; sidecars stay world metadata. Revisit only if a tick-heavy server shows write amplification. | MS-13 |
-| 3 | Are hard-link backups acceptable on all target filesystems, or is a full copy the only supported mode? | Detect support at runtime, fall back to copy, and state the space cost in the backup UI. | MS-13 |
-| 4 | Default retention (24 hourly / 7 daily / 4 weekly) and whether backups count against the world-size budget. | Keep the default, exclude `backups/` from the budget, surface both numbers in the UI. | MS-13 / MS-16 |
-| 5 | Do we need a read-only "inspect" mode for a newer world without migrating? | Not in v1: refusing is safer than a partial decode; reconsider if tooling needs it. | MS-13 |
-| 6 | DEC-033's parenthetical names temp+fsync+rename for all writes; chunk commits use an in-file double buffer instead. | **DEC-042** records the clarification and the two mechanisms (in-file index swap for chunks, temp+rename for whole files). | MS-13 / MS-16 |
+| 1 | What exactly does the 1.0 forward-compatibility promise cover — read forever, or migrate forever? | Register item needed: forward-compatibility scope for 1.x worlds (owner MS-16). Working position: every 1.x write is readable by every later 1.x through migrations, the chain is supported indefinitely, and a skipped-version migration is tested. | MS-16 |
+| 2 | How does a world report saved chunks whose generator fingerprint no longer matches the active generator? | The chunks load as saved and are never regenerated silently ([DEC-046](../decisions.md), [DEC-047](../decisions.md)); regeneration stays the explicit `world regen_chunks` action. Reporting cadence and whether `world list` flags the mismatch are unregistered. Register item needed: fingerprint-mismatch reporting policy (owner MS-13). | MS-13 |
+| 3 | Structure starts in a per-region `.obs` sidecar or in a level-wide index? | §3.4 keeps the per-dimension `.obs` sidecar and treats a level-wide index as a derived `/locate` cache; confirm at the MS-13 format freeze ([06 §8](06-worldgen.md#8-open-questions)). Register item needed: structure-start index placement (owner MS-13). | MS-13 |
+| 4 | Are hard-link backups acceptable on all target filesystems, or is a full copy the only supported mode? | Detect support at runtime, fall back to copy, and state the space cost in the backup UI. | MS-13 |
+| 5 | Default retention (24 hourly / 7 daily / 4 weekly) and whether backups count against the world-size budget. | Keep the default, exclude `backups/` from the budget, surface both numbers in the UI. | MS-13 / MS-16 |
+| 6 | Do we need a read-only "inspect" mode for a newer world without migrating? | Not in v1: refusing is safer than a partial decode; reconsider if tooling needs it. | MS-13 |
+| 7 | What is the exact atomic-publish contract for chunk commits versus whole-file writes? | [DEC-033](../decisions.md) fixes the split: chunk commits swap the in-file double-buffered index/header, while whole files and sidecars use temp + fsync + rename. Register item needed: formalise the two mechanisms and their fsync barriers in the save-format decision (owner MS-13 / MS-16). | MS-13 / MS-16 |
 
 ## 9. References
 
 - Decisions: [DEC-004](../decisions.md) (sections), [DEC-005](../decisions.md)
   (palettes and light), [DEC-006](../decisions.md) (resource IDs), [DEC-007](../decisions.md)
   (ticks), [DEC-033](../decisions.md) (save format), [DEC-035](../decisions.md)
-  (performance gates).
+  (performance gates), [DEC-046](../decisions.md) (integer-only generation),
+  [DEC-047](../decisions.md) (no silent regeneration).
 - Spec: [00-conventions](00-conventions.md) §5–§6; [05-world-model](05-world-model.md);
   [06-worldgen](06-worldgen.md) §3.8 and §4 (structure starts, template format);
   [15-content-system](15-content-system.md) (`ids.json`, pack hashes);

@@ -1,7 +1,7 @@
 # 01 — Technical Architecture
 
 > Status: normative - Last updated: 2026-11-24
-> Depends on: [DEC-002](../decisions.md), [DEC-003](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-020](../decisions.md), [DEC-024](../decisions.md), [DEC-028](../decisions.md), [conventions](00-conventions.md)
+> Depends on: [DEC-002](../decisions.md), [DEC-003](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-020](../decisions.md), [DEC-024](../decisions.md), [DEC-028](../decisions.md), [DEC-042](../decisions.md), [conventions](00-conventions.md)
 > Implements: MS-00, MS-02, MS-03
 
 ## 1. Purpose and scope
@@ -312,7 +312,7 @@ buffer for the overlay and crash reports.
 (§4.5) into the data directory. Reports are local files: nothing is uploaded automatically and
 there is no telemetry endpoint. A diagnostics bundle adds the manifest, redacted config, thread
 inventory, recent spans, metrics and GPU capabilities, excluding world data, chat and identities
-unless the user opts in. See DEC-039 in §8.
+unless the user opts in. Retention and export policy remain §8 item 2.
 
 **Feature flags.** Features exist for platform backends, optional tool capabilities and developer
 overlays. They MUST NOT change simulation semantics, save bytes or wire bytes (REQ-ARCH-022); CI
@@ -324,10 +324,10 @@ quality are forbidden — that is what runtime presets are for.
 filesystem, network decode, content load, mod calls, GPU device and surface operations. A panic is
 reserved for a proven invariant violation. Library crates deny `clippy::unwrap_used` and
 `clippy::expect_used` outside tests, and untrusted-input crates also deny `clippy::indexing_slicing`
-and `clippy::panic`. Under the default `panic = "abort"` profile a panicking job writes a crash
-report and stops the process, because continuing a half-updated world is worse than restarting;
-whether the server should unwind and contain job panics is DEC-042 in
-[chapter 02 §8](02-engine-core.md#8-open-questions).
+and `clippy::panic`. Client and distribution builds use `panic = "abort"`; a panicking job writes a
+crash report and stops the process, because continuing a half-updated world is worse than
+restarting. The dedicated server builds with `panic = "unwind"` (a dedicated `server` cargo profile)
+so a poisoned job or WASM trap is contained and the host stays alive ([DEC-042](../decisions.md)).
 
 **Unsafe.** Every crate root carries `#![forbid(unsafe_code)]` except these audited modules; the
 list is closed, and adding one needs an architecture change and two maintainer reviews.
@@ -348,7 +348,7 @@ enforced rather than documented.
 | --- | --- | --- |
 | World generation | bit-exact across platforms and between hosts | state hashes over golden seeds |
 | Content freeze | registry order and IDs are a pure function of the packs | pack-hash test |
-| Simulation tick | bit-exact given state, inputs and tick rate | replay hashes, checkpoints |
+| Simulation tick | bit-exact given state, inputs and the tick index | replay hashes, checkpoints |
 | Lighting | integer propagation, part of the state hash | hash and edit-replay tests |
 | Physics | `f64` with pinned transcendentals ([DEC-021](../decisions.md), provisional) | cross-platform hash, OPEN-002 |
 | Meshing; replication | deterministic per input; payload deterministic, timing not | mesh digests; convergence test |
@@ -547,28 +547,28 @@ it in review is cheaper than discovering a GPU dependency in a server image afte
 
 ## 8. Open questions
 
-1. **Presentation pipeline depth (proposed DEC-038, owner MS-04).** Two frames in flight with
+1. **Presentation pipeline depth.** Register item needed: presentation pipeline depth (two or three
+   frames in flight) after the MS-04 measurement (owner MS-04). Two frames in flight with
    drop-stale is the current design. A three-deep pipeline would smooth pacing at the cost of
    input-to-photon latency; the answer depends on the MS-04 measurement of the 144 FPS mode.
-2. **Crash-report and diagnostics policy (proposed DEC-039, owner MS-14).** Local-only reports with
-   opt-in export match [vision P7](../vision.md), but retention, redaction rules and the support
-   workflow need a decision before the first public alpha.
-3. **Feature-flag and build matrix (proposed DEC-040, owner MS-00).** Which features may exist and
-   which binaries ship them is policy in §3.6, not a decision; the risk is a "minimal client" that
-   silently changes behaviour.
-4. **Shared job system in single-player (proposed DEC-041, owner MS-03).** One pool set with class
-   priorities is the current design; separate pools isolate latency better on 8+ cores but
-   oversubscribe 4-core machines.
-5. **Documentation consistency (owner MS-00, no DEC needed).** `docs/README.md` lists
-   `adr/0004-section-size-and-storage.md` as "32³ sections" while [DEC-004](../decisions.md) settles
-   16³, and the ADR directory is empty; the register is authoritative and the links need a fix.
+2. **Crash-report and diagnostics policy.** Register item needed: crash-report retention, redaction
+   and support-export policy (owner MS-14). Local-only reports with opt-in export match
+   [vision P7](../vision.md), but retention, redaction rules and the support workflow need a
+   decision before the first public alpha.
+3. **Feature-flag and build matrix.** Register item needed: feature-flag and binary build-matrix
+   policy (owner MS-00). Which features may exist and which binaries ship them is policy in §3.6,
+   not a decision; the risk is a "minimal client" that silently changes behaviour.
+4. **Shared job system in single-player.** Register item needed: whether single-player uses one
+   shared job pool set or separate pools (owner MS-03). One pool set with class priorities is the
+   current design; separate pools isolate latency better on 8+ cores but oversubscribe 4-core
+   machines.
 
 ## 9. References
 
 - Decisions: [DEC-002](../decisions.md), [DEC-003](../decisions.md), [DEC-007](../decisions.md),
   [DEC-008](../decisions.md), [DEC-020](../decisions.md), [DEC-024](../decisions.md),
-  [DEC-028](../decisions.md), [DEC-033](../decisions.md), [DEC-035](../decisions.md);
-  [conventions](00-conventions.md).
+  [DEC-028](../decisions.md), [DEC-033](../decisions.md), [DEC-035](../decisions.md),
+  [DEC-042](../decisions.md); [conventions](00-conventions.md).
 - Chapters: [engine core](02-engine-core.md), [rendering](03-rendering.md),
   [world model](05-world-model.md), [modding](16-modding.md), [persistence](17-persistence.md),
   [networking](18-networking-multiplayer.md), [testing](24-testing-benchmarks.md),

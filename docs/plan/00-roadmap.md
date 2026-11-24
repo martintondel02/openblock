@@ -359,3 +359,39 @@ If the team is one person and today is day zero:
    visible.
 5. Do **not** start with the worldgen or the mobs. The vertical slice is the
    single most important de-risking step in the entire plan.
+
+## 18. Open questions
+
+1. **Funding and staffing shape (owner: project lead, before Phase B).** The
+   calendar scenarios assume full-time effort; the roadmap does not assume a
+   funding source. Decide whether to pursue grants/sponsorship before or after
+   the `0.1` alpha. → [Team and process](04-team-and-process.md) §7.
+2. **Whether `0.0.1` is distributed publicly (owner: MS-03).** A public tech
+   preview recruits contributors earlier but commits to save compatibility
+   messaging and support load.
+3. **Benchmark hardware (owner: MS-00/MS-04).** The performance gates require a
+   dedicated bench box or a stable self-hosted runner; hosting cost is not yet
+   budgeted.
+4. **Content production timing (owner: MS-08/MS-14).** When to commission the
+   real art/audio pack depends on the first public release date; see §12.
+5. **Whether to ship 1.0 on Steam (owner: MS-16).** Steam adds Deck verification,
+   store review and revenue-share considerations but reaches far more players
+   than GitHub Releases alone. → [Platforms](01-milestones.md).
+
+## 19. References
+
+- [Vision](../vision.md), [decision register](../decisions.md)
+- [Milestones](01-milestones.md), [MVP definition](02-mvp.md),
+  [Work breakdown](03-work-breakdown.md), [Team and process](04-team-and-process.md),
+  [Risks](05-risks.md), [Release and operations](06-release-and-operations.md)
+- [Performance budgets](../spec/25-performance-budgets.md)
+- Research: [Weft teardown](../research/01-weft-teardown.md),
+  [engine stack](../research/02-engine-and-render-stack.md),
+  [voxel rendering](../research/03-voxel-rendering-sota.md),
+  [networking](../research/04-networking-sota.md),
+  [Minecraft inventory](../research/05-minecraft-feature-inventory.md),
+  [modding](../research/06-modding-and-content-system.md),
+  [legal](../research/07-legal-licensing-and-ip.md),
+  [UI/audio/i18n](../research/08-ui-audio-localization.md),
+  [persistence/packaging](../research/09-persistence-assets-packaging.md),
+  [custom content](../research/10-custom-content-and-differentiation.md)

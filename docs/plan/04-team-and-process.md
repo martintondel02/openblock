@@ -388,13 +388,13 @@ loop.
 
 ## 12. Open questions
 
-1. **DEC-042 (proposed): governance rule.** Lazy consensus, 5-day DEC window, maintainer
+1. **Register item needed: governance rule.** Lazy consensus, 5-day DEC window, maintainer
    vote, and lead tie-break limited to scope, legal, security and conduct. The register
    states DCO and maintainers but not the decision procedure. Owner: MS-00.
-2. **DEC-043 (proposed): AI contribution policy.** The trailer, human sign-off, two-human
+2. **Register item needed: AI contribution policy.** The trailer, human sign-off, two-human
    rule for security-critical paths and the asset restrictions in §6. DEC-036 requires
    "explicit provenance rules" without defining them. Owner: MS-00.
-3. **DEC-044 (proposed): money and entity.** The funding table in §9, the no-paywall and
+3. **Register item needed: money and entity.** The funding table in §9, the no-paywall and
    no-marketplace rules, and when a legal entity is formed. Owner: MS-16.
 4. **Code of conduct version.** The repository carries Contributor Covenant 2.1; 3.0
    changes enforcement wording. Owner: MS-00, with a moderation review.

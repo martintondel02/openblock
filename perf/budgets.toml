@@ -1,0 +1,369 @@
+# OpenBlock performance budget manifest.
+#
+# Normative definition: docs/spec/25-performance-budgets.md (section 4.1).
+# The schema is generated from the types in that chapter; a typo in an ID, a
+# missing unit, or an unknown scene is a load error, not a silent default.
+#
+# This file is the seed of the manifest: rows are added milestone by milestone.
+# The rule (spec/25 REQ-PERF-001) is that every budget defined in spec/25 has a
+# row here before the milestone that must demonstrate it. IDs are append-only;
+# a withdrawn budget keeps its ID with status = "withdrawn".
+#
+# Field values are copied from spec/25 (sections 3.3, 5.1-5.7). Where a single
+# budget row states several limits (average + 1% low, or per-player + total),
+# the `metric`/`percentile` pair names the primary gated measurement and
+# `notes` records the rest.
+
+schema = "openblock.budgets/1"
+
+# --- Frame and CPU -------------------------------------------------------
+
+[[budget]]
+id = "PERF-FRAME-002"
+area = "frame"
+metric = "fps"
+direction = "higher_is_better"
+limit = 120.0
+unit = "fps"
+percentile = 0
+scene = "flythrough"
+preset = "high"
+tier = "reference"
+gate = "gate"
+tolerance_pct = 10.0
+owner_ms = "MS-04"
+status = "active"
+notes = "Average >= 120, 1% low >= 90, p99 frame <= 12 ms, no frame > 33 ms, 512 blocks."
+
+[[budget]]
+id = "PERF-FRAME-003"
+area = "frame"
+metric = "fps"
+direction = "higher_is_better"
+limit = 144.0
+unit = "fps"
+percentile = 0
+scene = "flythrough"
+preset = "performance"
+tier = "reference"
+gate = "gate"
+tolerance_pct = 10.0
+owner_ms = "MS-04"
+status = "active"
+notes = "Average >= 144, 1% low >= 120, p99 frame <= 8.5 ms, 512 blocks; performance mode gate."
+
+[[budget]]
+id = "PERF-FRAME-005"
+area = "frame"
+metric = "input_to_photon"
+direction = "lower_is_better"
+limit = 25.0
+unit = "ms"
+percentile = 99
+scene = "flythrough"
+preset = "high"
+tier = "bench_box"
+gate = "gate"
+tolerance_pct = 10.0
+owner_ms = "MS-06"
+status = "active"
+notes = "<= 3 frame periods p99; <= 1 additional frame versus single-player at 80 ms RTT."
+
+[[budget]]
+id = "PERF-CPU-001"
+area = "cpu"
+metric = "cpu_time"
+direction = "lower_is_better"
+limit = 0.15
+unit = "ms"
+percentile = 95
+scene = "flythrough"
+preset = "high"
+tier = "reference"
+gate = "gate"
+tolerance_pct = 10.0
+owner_ms = "MS-04"
+status = "active"
+notes = "Input, events and simulation handoff (with PERF-CPU-002)."
+
+[[budget]]
+id = "PERF-CPU-004"
+area = "cpu"
+metric = "cpu_time"
+direction = "lower_is_better"
+limit = 0.15
+unit = "ms"
+percentile = 95
+scene = "flythrough"
+preset = "high"
+tier = "reference"
+gate = "gate"
+tolerance_pct = 10.0
+owner_ms = "MS-05"
+status = "active"
+notes = "UI layout and text for visible screens."
+
+# --- GPU ----------------------------------------------------------------
+
+[[budget]]
+id = "PERF-GPU-001"
+area = "gpu"
+metric = "gpu_time"
+direction = "lower_is_better"
+limit = 6.00
+unit = "ms"
+percentile = 95
+scene = "flythrough"
+preset = "high"
+tier = "reference"
+gate = "gate"
+tolerance_pct = 10.0
+owner_ms = "MS-04"
+status = "active"
+notes = "All GPU passes <= 6.00 ms; pass sum <= 5.65 ms."
+
+[[budget]]
+id = "PERF-GPU-002"
+area = "gpu"
+metric = "gpu_time"
+direction = "lower_is_better"
+limit = 4.00
+unit = "ms"
+percentile = 95
+scene = "flythrough"
+preset = "performance"
+tier = "reference"
+gate = "gate"
+tolerance_pct = 10.0
+owner_ms = "MS-12"
+status = "active"
+notes = "All GPU passes <= 4.00 ms at the 144 FPS mode; pass sum <= 3.33 ms."
+
+# --- Tick and server -----------------------------------------------------
+
+[[budget]]
+id = "PERF-TICK-001"
+area = "tick"
+metric = "cpu_time"
+direction = "lower_is_better"
+limit = 12.0
+unit = "ms"
+percentile = 99
+scene = "tick50"
+preset = "n/a"
+tier = "server"
+gate = "gate"
+tolerance_pct = 10.0
+owner_ms = "MS-08"
+status = "active"
+notes = "World tick at 2,000 loaded columns."
+
+[[budget]]
+id = "PERF-TICK-005"
+area = "tick"
+metric = "cpu_time"
+direction = "lower_is_better"
+limit = 4.0
+unit = "ms"
+percentile = 99
+scene = "tick50"
+preset = "n/a"
+tier = "server"
+gate = "gate"
+tolerance_pct = 10.0
+owner_ms = "MS-15"
+status = "active"
+notes = "Replication and interest at 50 players; tick-thread share (phase total is PERF-NET-016)."
+
+[[budget]]
+id = "PERF-TICK-009"
+area = "tick"
+metric = "tick_p99"
+direction = "lower_is_better"
+limit = 35.0
+unit = "ms"
+percentile = 99
+scene = "tick50"
+preset = "n/a"
+tier = "server"
+gate = "gate"
+tolerance_pct = 10.0
+owner_ms = "MS-15"
+status = "active"
+notes = "Total tick, 2,000 columns and 50 players (PERF-ARCH-002)."
+
+[[budget]]
+id = "PERF-SRV-001"
+area = "server"
+metric = "tick_p99"
+direction = "lower_is_better"
+limit = 35.0
+unit = "ms"
+percentile = 99
+scene = "tick16"
+preset = "n/a"
+tier = "server"
+gate = "gate"
+tolerance_pct = 10.0
+owner_ms = "MS-07"
+status = "active"
+notes = "16 bots, 4 vCPU / 8 GiB, 20 TPS; RSS <= 2 GiB + 20 MB/player."
+
+[[budget]]
+id = "PERF-SRV-003"
+area = "server"
+metric = "rss"
+direction = "lower_is_better"
+limit = 3000.0
+unit = "mb"
+percentile = 95
+scene = "tick50"
+preset = "n/a"
+tier = "server"
+gate = "gate"
+tolerance_pct = 10.0
+owner_ms = "MS-15"
+status = "active"
+notes = "Server RSS at 50 players, including per-player connection buffers."
+
+# --- Memory and loading --------------------------------------------------
+
+[[budget]]
+id = "PERF-MEM-010"
+area = "mem"
+metric = "rss"
+direction = "lower_is_better"
+limit = 2000.0
+unit = "mb"
+percentile = 95
+scene = "flythrough"
+preset = "high"
+tier = "reference"
+gate = "gate"
+tolerance_pct = 10.0
+owner_ms = "MS-04"
+status = "active"
+notes = "Client RSS target at 512 blocks including a 15% fragmentation allowance; ceiling is PERF-MEM-011 (4 GiB)."
+
+[[budget]]
+id = "PERF-MEM-012"
+area = "mem"
+metric = "gpu_allocated"
+direction = "lower_is_better"
+limit = 768.0
+unit = "mb"
+percentile = 95
+scene = "flythrough"
+preset = "high"
+tier = "reference"
+gate = "gate"
+tolerance_pct = 10.0
+owner_ms = "MS-04"
+status = "active"
+notes = "GPU allocated total at 512 blocks."
+
+[[budget]]
+id = "PERF-LOAD-001"
+area = "load"
+metric = "startup_time"
+direction = "lower_is_better"
+limit = 10.0
+unit = "s"
+percentile = 95
+scene = "empty"
+preset = "high"
+tier = "reference"
+gate = "gate"
+tolerance_pct = 10.0
+owner_ms = "MS-03"
+status = "active"
+notes = "Cold start to interactive main menu, no pipeline cache, SATA SSD."
+
+# --- Network -------------------------------------------------------------
+
+[[budget]]
+id = "PERF-NET-004"
+area = "net"
+metric = "startup_time"
+direction = "lower_is_better"
+limit = 5.0
+unit = "s"
+percentile = 95
+scene = "join"
+preset = "high"
+tier = "server"
+gate = "gate"
+tolerance_pct = 15.0
+owner_ms = "MS-06"
+status = "active"
+notes = "Join to playable (spawn 3x3 columns plus a 96-block ring) at 10 Mbit/s."
+
+[[budget]]
+id = "PERF-NET-005"
+area = "net"
+metric = "startup_time"
+direction = "lower_is_better"
+limit = 90.0
+unit = "s"
+percentile = 95
+scene = "join"
+preset = "high"
+tier = "server"
+gate = "report"
+tolerance_pct = 15.0
+owner_ms = "MS-06"
+status = "active"
+notes = "Full 512-block interest set, fresh terrain, at 10 Mbit/s; <= 150 s for built worlds; background and cancellable."
+
+[[budget]]
+id = "PERF-NET-009"
+area = "net"
+metric = "rss"
+direction = "lower_is_better"
+limit = 512.0
+unit = "kb"
+percentile = 95
+scene = "tick50"
+preset = "n/a"
+tier = "server"
+gate = "gate"
+tolerance_pct = 10.0
+owner_ms = "MS-07"
+status = "active"
+notes = "Connection buffers per player; <= 8 MiB server-wide plus the per-player share."
+
+# --- Tools and mods ------------------------------------------------------
+
+[[budget]]
+id = "PERF-TOOL-003"
+area = "tool"
+metric = "wall_time"
+direction = "lower_is_better"
+limit = 25.0
+unit = "min"
+percentile = 95
+scene = "ci"
+preset = "n/a"
+tier = "bench_box"
+gate = "warn"
+tolerance_pct = 5.0
+owner_ms = "MS-00"
+status = "active"
+notes = "PR CI wall time excluding queue; full benchmark suite (five scenes x three runs) <= 20 min."
+
+[[budget]]
+id = "PERF-MOD-001"
+area = "mod"
+metric = "cpu_time"
+direction = "lower_is_better"
+limit = 0.30
+unit = "ms"
+percentile = 95
+scene = "mods"
+preset = "high"
+tier = "reference"
+gate = "gate"
+tolerance_pct = 10.0
+owner_ms = "MS-09"
+status = "active"
+notes = "Single WASM mod, client per-frame; server counterpart <= 1.5 ms/tick p99."

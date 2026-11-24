@@ -56,7 +56,8 @@ synonyms; when a new term is needed, add it here first.
 | **Palette** | A per-section mapping from dense local indices to block state IDs, plus the bit-packed array of indices. |
 | **Block entity** | Extra per-position data that is too large to live in the block state (chest contents, sign text, furnace progress, mod-defined data). |
 | **Region** | A 32×32-chunk group, the unit of on-disk storage and (with `TICK_REGION` granularity) of scheduled ticking. |
-| **Tick** | One step of the authoritative simulation at a fixed `TICK_RATE` (default 20 Hz, configurable to 30 Hz on servers; DEC-007). Never tied to frame rate. |
+| **Cull batch** | A group of sections culled and submitted together (8×4×8 sections in the MVP renderer). Chapter 03 historically calls these "regions"; in every other context *region* means the 32×32-chunk storage unit above. |
+| **Tick** | One step of the authoritative simulation at a **fixed 20 Hz** (DEC-007, amended by DEC-038). A server may raise the *snapshot rate* to 30 Hz; the simulation tick never changes. Never tied to frame rate. |
 | **Frame** | One presentation step on a client, at whatever rate the display allows. Frames interpolate between ticks. |
 | **Snapshot** | An immutable, versioned view of simulation state handed from the simulation to rendering, networking or persistence. |
 
@@ -87,7 +88,7 @@ synonyms; when a new term is needed, add it here first.
 | **Tag** | A named set of resource IDs, used to express group membership (`openblock:mineable/pickaxe`, `openblock:logs`) without hardcoding. |
 | **Host ABI** | The stable interface the engine exposes to WASM mods: host functions, events, queries and capability grants. |
 | **Capability** | A permission a mod must declare (and the server must allow) to touch a subsystem: networking, filesystem, world writes, UI. |
-| **Pack hash** | A hash over the resolved content registry + protocol version, used to verify that client and server agree on content. |
+| **Pack hash** | `BLAKE3(protocol version, content hash, view hash)`: identifies the exact resolved content (registries, balance profile) plus asset view that a client and server must agree on. See spec/15 §3.6. |
 
 ### 3.4 Networking
 

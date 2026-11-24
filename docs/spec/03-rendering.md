@@ -1,7 +1,7 @@
 # 03 — Rendering: Device, Render Graph and the Voxel Geometry Pipeline
 
 > Status: normative - Last updated: 2026-11-24
-> Depends on: DEC-002, DEC-004, DEC-005, DEC-011, DEC-012, DEC-013, DEC-014, DEC-016, DEC-017, DEC-018, DEC-035; [conventions](00-conventions.md), [technical architecture](01-technical-architecture.md), [world model](05-world-model.md), [performance budgets](25-performance-budgets.md)
+> Depends on: DEC-002, DEC-004, DEC-005, DEC-011, DEC-012, DEC-013, DEC-014, DEC-016, DEC-017, DEC-018, DEC-035, DEC-038; [conventions](00-conventions.md), [technical architecture](01-technical-architecture.md), [world model](05-world-model.md), [performance budgets](25-performance-budgets.md)
 > Implements: MS-03, MS-04
 
 ## 1. Purpose and scope
@@ -55,7 +55,7 @@ in blocks; the default is 512 blocks = 32 chunk columns of 16 blocks.
 | REQ-RENDER-029 | Presets are data (potato, low, medium, high, ultra) mapping to §3.11 settings; no automatic preset changes state unreported in the UI. | Settings schema test |
 | REQ-RENDER-030 | Profiling exposes per-pass timestamps, CPU scopes, per-pass markers and the §3.12 scenes with p50/p95/p99. | CI artifact check |
 | REQ-RENDER-031 | Device loss, surface loss and OOM recover without a process restart; meshes rebuild from world state. | Fault-injection test |
-| REQ-RENDER-032 | Golden-image, validation-layer and performance gates pass on all three desktop backends. | CI job |
+| REQ-RENDER-032 | Golden-image and validation-layer gates pass on all three desktop backends; the performance envelope is gated on the reference machine, with macOS Metal a `Warn` tier until MS-13 proves it ([25 §3.1](25-performance-budgets.md#31-hardware-tiers)). | CI job |
 
 ## 3. Design
 
@@ -135,8 +135,9 @@ graph alone. Release builds bake the same structure as constants.
 ### 3.3 Frame structure and CPU/GPU overlap
 
 The renderer occupies `Prepare`/`Render` and `Present`
-([conventions §3.2](00-conventions.md#32-architecture)). Simulation ticks at 20 Hz (30 Hz
-where a server opts in, DEC-007); the renderer interpolates from an immutable snapshot.
+([conventions §3.2](00-conventions.md#32-architecture)). Simulation ticks at 20 Hz, fixed;
+a server setting raises only the snapshot rate to 30 Hz (DEC-038), and the renderer
+interpolates from an immutable snapshot.
 
 | Phase | Work | Budget p95 (ms) |
 | --- | --- | ---: |
@@ -149,10 +150,10 @@ where a server opts in, DEC-007); the renderer interpolates from an immutable sn
 
 The other 0.8 ms of the 2.0 ms CPU frame belongs to simulation, networking, UI and audio
 ([performance budgets](25-performance-budgets.md)). Two frame slots by default
-(`desired_maximum_frame_latency = 2`), three on high/ultra when VRAM allows; each owns a
-256 B-aligned uniform region, one 16 MiB ring slot, a draw-argument buffer pair, a
-timestamp set with readback, a fence and a retired-generation counter for defrag. The CPU
-submits frame *N* and starts *N+1* immediately, blocking only when *N−1*'s fence is
+(`desired_maximum_frame_latency = 2`), with a third available on high/ultra when VRAM
+allows; each owns a 256 B-aligned uniform region, one 16 MiB ring slot, a draw-argument
+buffer pair, a timestamp set with readback, a fence and a retired-generation counter for
+defrag. The CPU submits frame *N* and starts *N+1* immediately, blocking only when *N−1*'s fence is
 unsignalled — the definition of GPU-bound; two frames in flight cost about two frame
 periods of latency, three cost three, so `render.frames_in_flight` is the main latency
 lever after present mode.
@@ -230,7 +231,7 @@ merged; §7 tests exactly that. OPEN-001 closes after the MS-04 corner-edit benc
 | Level | Extent | Count at 512 blocks | Tested by |
 | --- | --- | --- | --- |
 | Region | 8×4×8 sections = 128×64×128 blocks | 486 | CPU, every frame |
-| Cluster | 32³ blocks, or one section | 3,267 (32³) | CPU at MVP, GPU at 1.0 |
+| Cluster | 32³ blocks, or one section | 12,675 (32³) | CPU at MVP, GPU at 1.0 |
 | Quad | one face rectangle | 100k–200k visible | Backface culling in raster |
 
 At 512 blocks the field is 65×65 = 4,225 columns; at 384 blocks of height that is 24
@@ -265,7 +266,7 @@ capacity.
 | Submission path | Gate | Draws per frame | Notes |
 | --- | --- | --- | --- |
 | counted | `MULTI_DRAW_INDIRECT_COUNT` | 1 `multi_draw_indirect_count` per bucket | Vulkan 1.2+/DX12; counts stay on the GPU |
-| portable zero-instance | `MULTI_DRAW_INDIRECT` | 1 `multi_draw_indirect` per bucket over a lagged, clamped capacity; culled entries carry `instance_count = 0` | Metal, GLES/WebGPU. wgpu 30 **loops** MDI arguments on Metal, so capacity is the visible count read back two frames earlier plus 25%, and cluster size rises to 64³ on this path to keep arguments near 1,000 |
+| portable zero-instance | `MULTI_DRAW_INDIRECT` | 1 `multi_draw_indirect` per bucket over a lagged, clamped capacity; culled entries carry `instance_count = 0` | Metal, GLES/WebGPU. wgpu 30 **loops** MDI arguments on Metal, so capacity is the visible count read back two frames earlier plus 25%, and cluster size rises to 64³ on this path to keep arguments under 2,000 at the 1024-block ceiling |
 | per-cluster | `INDIRECT_FIRST_INSTANCE` absent | one indirect draw per cluster | Portable tier only, not shipped at 1.0 |
 
 The Metal constraint shapes the design: `indirect_count` is a no-op stub in wgpu 30's Metal
@@ -327,7 +328,7 @@ bumps the cache epoch so a late mesher result cannot resurrect a stale handle.
 On `DeviceLost` the renderer drops all GPU resources, recreates device, surface and cache
 handle and re-requests meshes for loaded clusters. No CPU mesh copy is retained — 200 MB at
 512 blocks to serve a rare event is not worth it; the client's world data is the source of
-truth and remeshing 3,267 clusters at ~40 µs on 8 threads is ~16 ms of worker time. A blocking
+truth and remeshing 12,675 clusters at ~40 µs on 8 threads is ~63 ms of worker time. A blocking
 "graphics device lost, recovering" overlay explains the pause.
 
 ### 3.7 Textures, samplers and material binding
@@ -414,8 +415,9 @@ declared here.
 | 17 | `present` | Present | swapchain | — | — |
 
 The GPU rows sum to 5.65 ms against the 6.0 ms envelope at the 120 FPS gate; the rest is slack
-for barriers, compositor and driver. A preset removes rows and the graph re-derives barriers
-and aliasing.
+for barriers and driver overhead, while the compositor reserve and present margin sit outside
+this envelope ([25 §3.2](25-performance-budgets.md#32-the-frame-envelope)). A preset removes rows
+and the graph re-derives barriers and aliasing.
 
 ### 3.10 LOD, frame pacing and latency
 
@@ -453,7 +455,7 @@ periods, with p50/p99 recorded at MS-04.
 | SSR water | off | off | quarter | half | half + refine |
 | volumetric fog / clouds | off | off | off | fog (half) | fog + clouds |
 | TAA | off (FXAA) | on | on | on | on |
-| particle budget | 1,024 | 4,096 | 8,192 | 16,384 | 32,768 |
+| particle budget | 1,024 | 4,096 | 8,192 | 16,384 | 16,384 (cap) |
 | anisotropy | 1× | 4× | 8× | 8× | 16× |
 | entity distance (blocks) | 48 | 64 | 80 | 96 | 128 |
 | estimated GPU time | 1.9 ms | 2.2 ms | 3.4 ms | **5.7 ms** | 7.6 ms |
@@ -620,29 +622,25 @@ recover within 2 s, and cull time must track region count rather than section co
 ## 8. Open questions
 
 1. **Metal submission policy.** The lagged-count clamp and 64³ cluster override are judgement,
-   not measurement. Proposed **DEC-060**: "Metal submits zero-instance arguments over a lagged
-   visible count, raising cluster size to 64³ when the argument count would exceed 1,024."
-   Owner: MS-04, needs macOS sub-draw measurements before MS-12.
-2. **Frames in flight default.** Proposed **DEC-061**: "Default to 2 frames in flight; expose 3
-   only under high/ultra." Owner: MS-04, closed with MS-06 latency data.
-3. **Behaviour above 768 MB.** Proposed **DEC-062**: "Render distances above 768 blocks require
-   ≥ 4 GiB device-local memory and accept mesh eviction." Owner: MS-12.
-4. **Cluster default after OPEN-001.** Both paths exist; the answer is needed before the
-   save/network format freeze because cluster position appears in mesh cache keys only, not on
-   disk. Owner: MS-04.
+   not measurement. Register item needed: Metal submits zero-instance arguments over a lagged
+   visible count, raising cluster size to 64³ when the argument count would exceed 1,024
+   (owner MS-04); closing it needs macOS sub-draw measurements before MS-12.
+2. **Frames in flight default.** Register item needed: default to 2 frames in flight and expose 3
+   only under high/ultra (owner MS-04). Closed with MS-06 latency data.
+3. **Behaviour above 768 MB.** Register item needed: render distances above 768 blocks require
+   ≥ 4 GiB device-local memory and accept mesh eviction (owner MS-12).
+4. **Cluster default after OPEN-001.** Both paths exist; OPEN-001 sets the deadline before the
+   save/network format freeze even though cluster position appears in mesh cache keys only, not
+   on disk. Owner: MS-04.
 5. **Render-distance gate.** OPEN-003 decides whether 512 blocks at 144 FPS is a ship gate or a
    performance mode; a different answer re-baselines PERF-RENDER-006 and §3.11. Owner: MS-04.
-
-The DEC numbers above are provisional: several chapters of this specification currently propose
-overlapping ids, and the register owner must assign final numbers when the proposals are merged
-into [the decision register](../decisions.md).
 
 ## 9. References
 
 Decisions: [DEC-002](../decisions.md), [DEC-003](../decisions.md), [DEC-004](../decisions.md),
 [DEC-011](../decisions.md), [DEC-012](../decisions.md), [DEC-013](../decisions.md),
 [DEC-014](../decisions.md), [DEC-016](../decisions.md), [DEC-017](../decisions.md),
-[DEC-018](../decisions.md), [DEC-035](../decisions.md).
+[DEC-018](../decisions.md), [DEC-035](../decisions.md), [DEC-038](../decisions.md).
 
 Research: [voxel rendering state of the art](../research/03-voxel-rendering-sota.md) (meshing
 costs, visibility, memory arithmetic), [Weft teardown](../research/01-weft-teardown.md) (GPU

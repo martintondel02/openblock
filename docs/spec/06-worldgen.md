@@ -1,7 +1,7 @@
 # 06 — World Generation
 
 > Status: draft for review - Last updated: 2026-11-24
-> Depends on: [DEC-004](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-018](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-033](../decisions.md), [00-conventions](00-conventions.md) §6
+> Depends on: [DEC-004](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-018](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-033](../decisions.md), [DEC-046](../decisions.md), [DEC-047](../decisions.md), [00-conventions](00-conventions.md) §6
 > Implements: MS-08; consumes MS-01 (`ob_world`, `ob_math`) and MS-05 (content packs)
 
 ## 1. Purpose and scope
@@ -23,7 +23,7 @@ scope (vision §7.1).
 
 | ID | Requirement | Verification |
 | --- | --- | --- |
-| REQ-GEN-001 | Generating a chunk MUST be a pure function of `(world seed, dimension descriptor, generator fingerprint, chunk coordinates)`. It MUST NOT read wall-clock time, thread identity, allocation addresses, unordered iteration order or tick rate. | Hash equality under shuffled job order and `TICK_RATE` 20 vs 30 |
+| REQ-GEN-001 | Generating a chunk MUST be a pure function of `(world seed, dimension descriptor, generator fingerprint, chunk coordinates)`. It MUST NOT read wall-clock time, thread identity, allocation addresses, unordered iteration order or tick rate. | Hash equality under shuffled job order and 1/2/8/32 workers |
 | REQ-GEN-002 | `ob_worldgen` MUST NOT use `f32`/`f64` on any path that produces world data; all arithmetic uses `ob_math::fx` fixed point. | `deny(clippy::float_arithmetic)` + source scan |
 | REQ-GEN-003 | Noise, hashing, RNG and splines MUST come from `ob_math`; platform `libm`, float formatting and target SIMD MUST NOT influence results. | Inspection + golden vectors on three targets |
 | REQ-GEN-004 | Every random stream MUST be derived from a discriminated tuple containing the stage, so adding a stage cannot shift another stream. | Unit test over the stage table and 2²⁰ derivations |
@@ -90,7 +90,7 @@ and noise output is `[-FX_ONE, FX_ONE]`.
 f64 or fixed point; world generation is integer-only either way, because
 cross-platform generation is cheap to guarantee with integers, the client's LOD
 re-derives coarse terrain from the same code, and no `libm`, FMA contraction or
-`target-cpu` choice may change a chunk ([§8](#8-open-questions) item 1).
+`target-cpu` choice may change a chunk ([DEC-046](../decisions.md)).
 
 ### 3.2 The noise stack
 
@@ -374,10 +374,13 @@ called once per instance with a batched argument under the quotas of
 
 ### 3.11 Pregeneration and LOD columns
 
-`openblock-server pregen --world <dir> --radius 1000 --threads 8 [--verify]` (the
+`openblock-server pregen --world <name|uuid|path> --radius 1000 --threads 8 [--resume] [--verify] [--dry-run]` (the
 radius is in blocks, so this covers 2,000×2,000) runs the same pipeline with no
 simulation, streams columns through the normal save path and sets status `Ready`;
-`--verify` re-generates a 1% sample and compares payload hashes (DEC-028).
+`--verify` re-generates a 1% sample and compares payload hashes (DEC-028). The command and its
+options are listed in [chapter 19 §3.3](19-server-administration.md#33-world-management).
+Replacing already-generated chunks is the separate `world regen_chunks` /
+`--regen-chunks` operator action of [DEC-047](../decisions.md), never a side effect of pregen.
 
 LOD columns are the only client-side generation and serve the post-1.0 far renderer
 (DEC-018, [03](03-rendering.md) §5). A `LodColumn` holds four 256-entry arrays —
@@ -509,7 +512,7 @@ more than 10% (DEC-035).
 | Structure cut by a river | river mask evaluated after structures | evaluate first; adaptation fills the channel |
 | Duplicate loot | chest re-rolled after reload | `loot_seed` + `loot_generated` in the block entity |
 | Chunk depends on worker count | shared RNG or unordered iteration | counter-based streams; sorted iteration only |
-| Content change shifts terrain | edit changes the fingerprint | warn, keep old chunks, never silently regenerate; `--regen-chunks` is explicit |
+| Content change shifts terrain | edit changes the fingerprint | warn, keep old chunks, never silently regenerate; `--regen-chunks` is explicit ([DEC-047](../decisions.md)) |
 | Biome overflow | more than 65,535 biomes | cap at 4,096 and fail at freeze |
 | Orphan terrain islands | density interpolation at cell corners | accepted; counted in the corpus, not "cleaned" (cleanup would be non-local) |
 | Spawn in ocean or lava | search too small | 4,096 candidates, then a platform at `(0, sea+1)` with a warning |
@@ -556,19 +559,18 @@ wherever it can be mechanised.
 
 | # | Question | Proposal | Owner |
 | --- | --- | --- | --- |
-| 1 | Worldgen is integer-only regardless of OPEN-002, but this is not in the register. | **DEC-038**: worldgen uses `Fx` fixed point and pinned `ob_math` noise; OPEN-002 does not apply to it. | MS-08 |
-| 2 | What happens to already-generated chunks when the generator fingerprint changes? | **DEC-039**: never regenerate silently; warn, keep old chunks, offer explicit `--regen-chunks`; starts keep their recorded content hash. | MS-08 / MS-13 |
-| 3 | Structure starts in a per-region sidecar or in `level.json`? | Sidecar (17 §3.4); a level-wide index is a derived `/locate` cache. Confirm at the MS-13 freeze. | MS-13 |
-| 4 | Is `depth` plus 3D noise enough for cave-biome selection? | Start there; revisit if lush/dripstone caves look wrong in the MS-08 review. | MS-08 |
-| 5 | Maximum biomes per registry: 65,535 is a `u16` limit, not a design goal. | Cap at 4,096 and error above; measure lookup cost first. | MS-08 |
-| 6 | Base-pack terrain constants will be tuned; does that break the fingerprint promise? | Treat tuning as a content change: new worlds get it, old worlds warn once and keep their chunks. | MS-14 |
+| 1 | Structure starts in a per-region sidecar or in `level.json`? | Sidecar (17 §3.4); a level-wide index is a derived `/locate` cache. Confirm at the MS-13 freeze. | MS-13 |
+| 2 | Is `depth` plus 3D noise enough for cave-biome selection? | Start there; revisit if lush/dripstone caves look wrong in the MS-08 review. | MS-08 |
+| 3 | Maximum biomes per registry: 65,535 is a `u16` limit, not a design goal. | Cap at 4,096 and error above; measure lookup cost first. | MS-08 |
+| 4 | Base-pack terrain constants will be tuned; does that break the fingerprint promise? | Treat tuning as a content change: new worlds get it, old worlds warn once and keep their chunks ([DEC-046](../decisions.md), [DEC-047](../decisions.md)). | MS-14 |
 
 ## 9. References
 
 - Decisions: [DEC-004](../decisions.md) (sections, height), [DEC-007](../decisions.md)
   (ticks), [DEC-008](../decisions.md) (server authority), [DEC-018](../decisions.md)
   (LOD visual-only), [DEC-019](../decisions.md) (packs), [DEC-020](../decisions.md)
-  (mod tiers), [DEC-033](../decisions.md) (save format).
+  (mod tiers), [DEC-033](../decisions.md) (save format), [DEC-046](../decisions.md)
+  (integer-only generation), [DEC-047](../decisions.md) (no silent regeneration).
 - Spec: [00-conventions](00-conventions.md) §4, §6; [05-world-model](05-world-model.md);
   [07-light-and-weather](07-light-and-weather.md); [09-entities-ai](09-entities-ai.md);
   [17-persistence](17-persistence.md); [24-testing-benchmarks](24-testing-benchmarks.md);

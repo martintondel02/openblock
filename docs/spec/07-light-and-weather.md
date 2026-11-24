@@ -1,7 +1,7 @@
 # 07 — Light and Weather
 
 > Status: draft for review · Last updated: 2026-11-24
-> Depends on: [DEC-005](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-015](../decisions.md), [DEC-019](../decisions.md), [DEC-021](../decisions.md), [DEC-027](../decisions.md), [00-conventions](00-conventions.md)
+> Depends on: [DEC-005](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-015](../decisions.md), [DEC-019](../decisions.md), [DEC-021](../decisions.md), [DEC-027](../decisions.md), [DEC-044](../decisions.md), [00-conventions](00-conventions.md)
 > Implements: MS-05, MS-10, MS-12
 
 ## 1. Purpose and scope
@@ -41,7 +41,7 @@ The status is **draft for review** for one reason: [OPEN-004](../decisions.md) h
 | REQ-WX-005 | Each weather-enabled dimension runs one deterministic state machine over `Clear`, `Precipitating` and `Thunder`, with data-defined durations and probabilities. | 10⁶-tick determinism test |
 | REQ-WX-006 | Precipitation type is resolved per position from biome temperature at the surface: snow at ≤ 0 °C, rain above, none in biomes with zero downfall. | Biome temperature matrix test |
 | REQ-WX-007 | Lightning rate scales with thunder intensity; strikes occur only in resident, precipitating columns with sky access. | Seeded rate test |
-| REQ-WX-008 | Lightning damage, ignition, entity transformation and redstone pulse are data-driven and respect `doFireTick` and difficulty. | Rule-table test + gamerule test |
+| REQ-WX-008 | Lightning damage, ignition, entity transformation and redstone pulse are data-driven and respect `do_fire_tick` and difficulty. | Rule-table test + gamerule test |
 | REQ-WX-009 | Time and weather are server-authoritative and replicated in the tick packet; clients interpolate but never decide. | Two-client sync test |
 | REQ-WX-010 | Weather phase, intensity, epoch and world time persist across save/load and replay identically. | Save/load determinism test |
 | REQ-WX-011 | Weather rendering, particles, ambience and sky are presentation-only and may be disabled without changing simulation outcomes. | Headless-vs-client hash comparison |
@@ -243,9 +243,9 @@ The azimuth convention is what keeps the sun rising in the east (+X) and crossin
 | 0.50 | 18:00 | 0 | Sunset |
 | 0.75 | 00:00 | −sin 60° | Midnight |
 
-`day_factor = smoothstep(−0.10, 0.10, sin_alt)`: 0 when the sun is more than ~6° below the horizon, 1 when it is more than ~6° above, linear in between. With `doDaylightCycle` false, `day_time` is frozen and the sky is static while the tick counter keeps advancing for scheduled ticks. Moon phase is `floor(total_ticks / day_length) mod 8` with illumination `[1.00, 0.75, 0.50, 0.25, 0.00, 0.25, 0.50, 0.75]`; moonlight intensity is `0.15 × illumination × (1 − day_factor)`, so a new moon is genuinely dark and a full moon is navigable but never daylight. Whether night sky light should retain a small non-zero floor — Minecraft keeps a residual level — is Open question 2.
+`day_factor = smoothstep(−0.10, 0.10, sin_alt)`: 0 when the sun is more than ~6° below the horizon, 1 when it is more than ~6° above, linear in between. With `do_daylight_cycle` false, `day_time` is frozen and the sky is static while the tick counter keeps advancing for scheduled ticks. Moon phase is `floor(total_ticks / day_length) mod 8` with illumination `[1.00, 0.75, 0.50, 0.25, 0.00, 0.25, 0.50, 0.75]`; moonlight intensity is `0.15 × illumination × (1 − day_factor)`, so a new moon is genuinely dark and a full moon is navigable but never daylight. Whether night sky light should retain a small non-zero floor — Minecraft keeps a residual level — is Open question 2.
 
-**Sleeping.** If the fraction of players in the dimension who are asleep reaches `playersSleepingPercentage` (default 100) and the time is night, the server fast-forwards `day_time` to the next sunrise (the next `t = 0` boundary) over `SLEEP_FAST_FORWARD_TICKS = 100` ticks so clients can animate the sky, clears precipitation with probability 0.5, and wakes the players. The skip is validated server-side; a client cannot request it.
+**Sleeping.** If the fraction of players in the dimension who are asleep reaches `players_sleeping_percentage` (default 100) and the time is night, the server fast-forwards `day_time` to the next sunrise (the next `t = 0` boundary) over `SLEEP_FAST_FORWARD_TICKS = 100` ticks so clients can animate the sky, clears precipitation with probability 0.5, and wakes the players. The skip is validated server-side; a client cannot request it.
 
 ### 3.12 Sky colour, atmosphere and stars
 
@@ -281,7 +281,7 @@ stateDiagram-v2
 | `Precipitating` | 3,000–12,000 | 0.65–1.0 | Rain or snow, resolved per biome |
 | `Thunder` | 3,600–12,000 | 0.85–1.0 | Precipitation plus lightning |
 
-Intensity ramps toward its target at `1/200` per tick, so a storm builds and clears over 10 seconds and the rendering and light transitions have something continuous to follow. Phase and intensity are independent of `day_time`: a storm can start at noon or midnight, and sleeping does not cancel it. `doWeatherCycle` false freezes the machine in its current phase, with intensity held at its target; `doWeatherCycle` is host-only ([08](08-gameplay-survival.md)).
+Intensity ramps toward its target at `1/200` per tick, so a storm builds and clears over 10 seconds and the rendering and light transitions have something continuous to follow. Phase and intensity are independent of `day_time`: a storm can start at noon or midnight, and sleeping does not cancel it. `do_weather_cycle` false freezes the machine in its current phase, with intensity held at its target; `do_weather_cycle` is host-only ([08](08-gameplay-survival.md)).
 
 **Precipitation type** is resolved per column from the biome at the surface and its temperature: no downfall → no precipitation; `temperature ≤ 0 °C` → snow; otherwise rain. Because biomes vary in XZ, a single storm can rain on a plains and snow on a mountain two chunks away; that is correct behaviour, not a seam bug, and it is tested at biome borders. Snow accumulates on exposed surfaces, ice forms on exposed water, and both melt by the `snow_ice_melt` rule ([§3.8](#38-light-based-gameplay-rules)).
 
@@ -294,7 +294,7 @@ Effects are events, not hard-coded behaviour, so content decides what lightning 
 | Effect | Default | Owner |
 | --- | --- | --- |
 | Damage entities within 3 blocks | data-defined damage type and amount, scaled by difficulty | [08](08-gameplay-survival.md) |
-| Ignite the hit block | only if `doFireTick` is true and the block is flammable | [10](10-physics-and-collision.md) |
+| Ignite the hit block | only if `do_fire_tick` is true and the block is flammable | [10](10-physics-and-collision.md) |
 | Transform entities | `lightning_transforms` table in content: entity type in → entity type out | [09](09-entities-ai.md) |
 | Redstone pulse | lightning rods and tagged blocks emit a 1-tick pulse | [12](12-redstone-and-logic.md) |
 | Visual flash and thunder sound | presentation only, one flash and one delayed sound per strike | [04](04-shaders-and-visuals.md), [14](14-audio.md) |
@@ -431,14 +431,14 @@ The light engine holds no light data itself: it reads and writes through the wor
 ## 8. Open questions
 
 1. **Colored versus monochrome block light** — tracked as [OPEN-004](../decisions.md), owner **MS-05**, deadline before `0.1`. §3.10 gives the memory numbers; the decision needs the visual review, not more data.
-2. **Night sky-light floor.** This chapter sets `day_factor = 0` at night, so an unlit surface is light level 0 and mobs spawn. Minecraft retains a residual sky light, which makes surface nights slightly safer and changes spawn pressure. Proposed **DEC-042**: "Night sky light contributes 0 to gameplay light; the base pack compensates with moon-phase ambient light in the render query only." Owner: **MS-05** with MS-10.
-3. **Weather authority scope.** Per-dimension weather, the query-time light penalty and the persistence of `epoch` are specified here but not registered as a decision. Proposed **DEC-043**: "Weather is a deterministic, per-dimension, server-authoritative state machine; its light penalty is applied at query time and never mutates stored light." Owner: **MS-10**.
+2. **Night sky-light floor.** This chapter sets `day_factor = 0` at night, so an unlit surface is light level 0 and mobs spawn. Minecraft retains a residual sky light, which makes surface nights slightly safer and changes spawn pressure. Register item needed: whether night sky light contributes a non-zero floor to gameplay light (owner **MS-05** with MS-10). The working position is that it contributes 0 and the base pack compensates with moon-phase ambient light in the render query only.
+3. **Weather authority scope.** Per-dimension weather, the query-time light penalty and the persistence of `epoch` are specified here but not registered as a decision. Register item needed: weather authority scope (a deterministic, per-dimension, server-authoritative state machine whose light penalty is applied at query time and never mutates stored light) (owner **MS-10**).
 4. **Light palette compression.** Near-uniform sections could store a palette of `LightWord` values with 4-bit indices, roughly halving light memory for cave and sky sections at the cost of a second container kind. Deferred until the 512-block memory benchmark is measured. Owner: **MS-13**, revisit at the format freeze.
-5. **Sleep and weather-clearing rules.** The 0.5 clear probability, the 100-tick fast-forward and the default `playersSleepingPercentage` of 100 are base-pack data rather than engine law. Owner: **MS-10**.
+5. **Sleep and weather-clearing rules.** The 0.5 clear probability, the 100-tick fast-forward and the default `players_sleeping_percentage` of 100 are base-pack data rather than engine law. Owner: **MS-10**.
 
 ## 9. References
 
-- Decisions: [DEC-005](../decisions.md) (packed light, 2 B/block, sky4 + RGB4), [DEC-007](../decisions.md) (fixed tick), [DEC-008](../decisions.md) (server authority), [DEC-015](../decisions.md) (CPU flood fill), [DEC-019](../decisions.md) (content data), [DEC-027](../decisions.md) (protocol and pack hash).
+- Decisions: [DEC-005](../decisions.md) (packed light, 2 B/block, sky4 + RGB4), [DEC-007](../decisions.md) (fixed tick), [DEC-008](../decisions.md) (server authority), [DEC-015](../decisions.md) (CPU flood fill), [DEC-019](../decisions.md) (content data), [DEC-027](../decisions.md) (protocol and pack hash), [DEC-044](../decisions.md) (snake_case rule IDs).
 - [Specification conventions](00-conventions.md); [world model](05-world-model.md); [rendering](03-rendering.md); [shaders and visuals](04-shaders-and-visuals.md); [world generation](06-worldgen.md); [entities and AI](09-entities-ai.md); [networking multiplayer](18-networking-multiplayer.md); [performance budgets](25-performance-budgets.md).
 - [Weft teardown](../research/01-weft-teardown.md) §4.2 — flood fill with per-channel absorption, sky-down shortcut, prelight compared against a reference implementation; [voxel rendering SOTA](../research/03-voxel-rendering-sota.md) §6 — light storage tradeoffs (1/2/4 B per block), 50–300 µs edit relight, 1–3 ms per new column, Starlight-class batching as a latency optimisation.
 - [Minecraft feature inventory](../research/05-minecraft-feature-inventory.md) §3.9 — 0–15 sky/block light, per-dimension skylight, light-aware spawning, 24,000-tick day, biome-dependent snow, reduced sky light during weather.

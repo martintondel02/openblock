@@ -413,11 +413,11 @@ list is wrong and must be split or re-scoped before work continues.
 
 ## 15. Open questions
 
-1. **DEC-040 (proposed): planning currency and granularity.** Dev-days for tasks,
+1. **Register item needed: planning currency and granularity.** Dev-days for tasks,
    dev-weeks for epics and milestones, one issue per outcome, size labels mandatory.
    Without it, estimates drift between trackers and the ±10% rule is unenforceable.
    Owner: MS-00.
-2. **DEC-041 (proposed): content production is budgeted separately.** Art, audio, level
+2. **Register item needed: content production is budgeted separately.** Art, audio, level
    design and QA are not part of the 159 engineering dev-weeks; formalises roadmap §12
    so planning cannot silently absorb them. Owner: MS-16.
 3. **Epic representation.** GitHub issues (`type: epic`) versus a project-board "Epic"

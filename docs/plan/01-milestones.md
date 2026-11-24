@@ -305,9 +305,9 @@ protocol, and a test harness that can reproduce bad networks.
 - [ ] Movement at 80 ms RTT + 2% loss: local player input-to-photon ≤ 1 frame of
       additional latency vs single-player; no rubber-banding during normal
       movement; corrections logged and bounded.
-- [ ] A 512-block-radius join streams progressively and completes in ≤ 60 s on a
-      10 Mbit/s link with the loading UI showing progress, without starving the
-      tick (p99 tick stays ≤ 35 ms during join).
+- [ ] A 512-block-radius join reaches playable in ≤ 5 s and streams the full interest
+      set in ≤ 90 s on a 10 Mbit/s link (PERF-NET-004/005), with the loading UI
+      showing progress and p99 tick ≤ 35 ms during join.
 - [ ] Protocol fuzz: 10 million mutated packets over 24 h produce no panic, no
       OOM, no hang; malformed input closes the connection with a reason.
 - [ ] Content-hash mismatch is rejected with a message naming the mismatched
@@ -714,3 +714,37 @@ a real contract.
 | MS-21 | Native plugins + proxy (1.5) | Signed native plugin tier in a supervised process; multi-server proxy/lobby with transfer | 6–10 |
 | MS-22 | Web and reach (1.6) | WebTransport feasibility report + web client spike; accessibility deep pass; Steam Deck verified | 8–12 |
 | MS-23 | Compatibility gateway (TBD) | Optional isolated Minecraft-client gateway for one pinned MC version, best-effort, never core | 10–16 |
+
+## 11. Open questions
+
+1. **Release cadence per milestone (owner: project lead).** Which milestones get
+   public releases beyond the listed ones (for example an `MS-04` rendering
+   demo video, an `MS-08` worldgen seed album) is a communications decision, not
+   an engineering one.
+2. **Whether `MS-03`'s pre-1.0 save format is ever migrated (owner: MS-03/MS-13).**
+   The plan says pre-`0.1` saves may break; if the tech preview attracts players,
+   we may promise a one-time migration.
+3. **Staffing assumptions per phase (owner: project lead).** The effort numbers
+   assume one experienced engineer; a team of hobbyists with uneven availability
+   changes phase durations, not exit criteria.
+4. **Benchmark hardware ownership (owner: MS-04).** Gates require a stable
+   reference machine and runner; no budget line exists yet.
+5. **Content-production milestone boundaries (owner: MS-14).** Art/audio/level
+   design are budgeted separately and must be scheduled against MS-08/MS-14
+   rather than inserted mid-milestone.
+6. **Whether anti-cheat heuristics are enabled by default (owner: MS-15).** The
+   default enforcement level for public servers is a policy decision with false-
+   positive trade-offs.
+7. **Android timing (owner: MS-19/post-1.0).** The mobile port is post-1.0 in this
+   plan; if player demand concentrates there, the order of post-1.0 milestones
+   changes.
+
+## 12. References
+
+- [Vision](../vision.md), [decision register](../decisions.md),
+  [roadmap](00-roadmap.md), [MVP definition](02-mvp.md),
+  [work breakdown](03-work-breakdown.md), [team and process](04-team-and-process.md),
+  [risks](05-risks.md), [release and operations](06-release-and-operations.md)
+- Specification: [conventions](../spec/00-conventions.md) and all chapters
+  referenced from [the documentation map](../README.md)
+- Research: all documents in [`../research/`](../research/01-weft-teardown.md)
