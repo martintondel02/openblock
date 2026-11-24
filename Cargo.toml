@@ -4,7 +4,7 @@ members = ["crates/*", "xtask"]
 default-members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.8"
+version = "0.0.9"
 edition = "2024"
 rust-version = "1.100"
 license = "MIT OR Apache-2.0"
@@ -30,14 +30,14 @@ serde_json = "1"
 # sources through cc-rs, which the Zig-based sandbox wrapper cannot target.
 zstd = { package = "zstd-pure-rs", version = "0.2" }
 
-ob_core = { path = "crates/core", version = "0.0.8" }
-ob_math = { path = "crates/math", version = "0.0.8" }
-ob_content = { path = "crates/content", version = "0.0.8" }
-ob_world = { path = "crates/world", version = "0.0.8" }
-ob_worldgen = { path = "crates/worldgen", version = "0.0.8" }
-ob_sim = { path = "crates/sim", version = "0.0.8" }
-ob_render = { path = "crates/render", version = "0.0.8" }
-ob_server = { path = "crates/server", version = "0.0.8" }
+ob_core = { path = "crates/core", version = "0.0.9" }
+ob_math = { path = "crates/math", version = "0.0.9" }
+ob_content = { path = "crates/content", version = "0.0.9" }
+ob_world = { path = "crates/world", version = "0.0.9" }
+ob_worldgen = { path = "crates/worldgen", version = "0.0.9" }
+ob_sim = { path = "crates/sim", version = "0.0.9" }
+ob_render = { path = "crates/render", version = "0.0.9" }
+ob_server = { path = "crates/server", version = "0.0.9" }
 
 [profile.dev]
 opt-level = 1

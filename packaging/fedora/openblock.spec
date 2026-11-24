@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           openblock
-Version:        0.0.8
+Version:        0.0.9
 Release:        1%{?dist}
 Summary:        Fast, deeply moddable, server-first voxel sandbox
 
@@ -127,6 +127,20 @@ update-desktop-database &>/dev/null || :
 %config(noreplace) %{_sysconfdir}/openblock-server/server.toml
 
 %changelog
+* Tue Nov 24 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.0.9-1
+- Readable F3 debug overlay: larger line spacing, four grouped sections with
+  gaps and separators, dimmer secondary column, word-wrapped GPU name, adaptive
+  scaling/stacking at small resolutions and a footer that no longer overlaps the
+  hotbar.
+- More breathing room in the settings, crafting, inventory and death screens
+  (larger panels, row pitch/gaps, section spacing) with updated layout tests.
+- Settings can now be lowered as well as raised: explicit clickable < and >
+  arrows on range/choice rows, row-body clicks only focus, plus clearer footer
+  hints; keyboard Left/Right and mouse wheel both directions verified.
+- Dropped items are now collected from a 3 m radius around the player: ready
+  items are attracted toward the player at 7 m/s and picked up at 0.9 m, with
+  the existing pickup delay and partial-pickup behaviour.
+
 * Tue Nov 24 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.0.8-1
 - Crafting and tools: planks, cobblestone and crafting table blocks; sticks and
   wooden/stone pickaxes, axes, shovels and swords; 11 recipes with table gating;

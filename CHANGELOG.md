@@ -6,6 +6,41 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [0.0.9] — 2026-11-24 (tech preview, UI readability, pickup radius)
+
+### Fixed
+- F3 debug overlay readability: text scale 1.8/1.6 with +8 px line gaps, four
+  grouped sections separated by gaps/separators, padded and non-overlapping
+  panels, gold header accent, dimmer secondary column, word-wrapped long GPU
+  names, adaptive side-by-side/stacked/left-only layout for 1280x720 and
+  960x540, and a footer hint that no longer overlaps the hotbar. New
+  `--screenshot-debug` offscreen mode.
+- Settings could previously only be raised when clicking rows because row clicks
+  always applied `+1`. Range/choice rows now draw explicit `<` / `>` hitboxes
+  (hover-highlighted, dimmed at bounds) that adjust down/up respectively; row
+  body clicks only focus, toggles still toggle, and keyboard Left/Right and
+  mouse wheel both directions are covered by regression tests.
+- More spacing in every menu: settings 620x520 (row pitch 44, larger gaps),
+  crafting 620x560 (30 px rows, section headings, scrolls at small heights),
+  inventory slot gaps/footer spacing, and death-screen button spacing; layout
+  and minimum-spacing tests updated.
+
+### Changed
+- Dropped items are collected from a **3 m radius** around the player's chest:
+  ready items are magnet-attracted at 7 m/s and picked up at 0.9 m (the 0.5 s
+  pickup delay and partial pickup/overflow rules are unchanged). New tests for
+  in-radius attraction, out-of-radius behaviour and the radius boundary.
+- Controls/settings footer hints mention clickable arrows; the settings
+  screenshot mode opens the Game tab as before.
+
+### Measured
+- Test count: 367 -> 382 (client 113, server 37 + 2 integration, render 109,
+  world 32, sim 20, content 27, core 16, bins/docs). Save/smoke state hash is
+  unchanged (`62b21c82b5d848e0`, seed 42) because pickup does not alter the
+  smoke scenario. UI layout is CPU-only; no frame-time or GPU-cost change.
+- Docs screenshots added for the spaced F3 overlay and settings arrows
+  (classic textures).
+
 ## [0.0.8] — 2026-11-24 (tech preview, crafting, tools, drops, settings)
 
 ### Added

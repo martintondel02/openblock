@@ -15,21 +15,22 @@ use crate::inventory::{self, display_name};
 use crate::ui_state::UiRect;
 
 /// Width of the crafting panel in UI pixels.
-pub const CRAFTING_PANEL_WIDTH: f32 = 560.0;
+pub const CRAFTING_PANEL_WIDTH: f32 = 620.0;
 /// Height of the crafting panel in UI pixels.
-pub const CRAFTING_PANEL_HEIGHT: f32 = 480.0;
+pub const CRAFTING_PANEL_HEIGHT: f32 = 560.0;
 /// Horizontal inner margin.
-pub const CRAFTING_MARGIN: f32 = 24.0;
+pub const CRAFTING_MARGIN: f32 = 28.0;
 /// Height of one recipe row.
-pub const CRAFTING_ROW_HEIGHT: f32 = 26.0;
-/// Height of a "Basics"/"Tools" section heading.
-pub const CRAFTING_SECTION_HEIGHT: f32 = 20.0;
+pub const CRAFTING_ROW_HEIGHT: f32 = 30.0;
+/// Height of a "Basics"/"Tools" section heading; the section gap is visible
+/// because the heading is taller than the previous content.
+pub const CRAFTING_SECTION_HEIGHT: f32 = 26.0;
 /// Vertical distance from the panel top to the list content.
-pub const CRAFTING_CONTENT_TOP: f32 = 78.0;
+pub const CRAFTING_CONTENT_TOP: f32 = 88.0;
 /// Space reserved below the list for the item info line and key hints.
-pub const CRAFTING_FOOTER_HEIGHT: f32 = 76.0;
-/// Pixels scrolled per wheel notch.
-pub const CRAFTING_SCROLL_STEP: usize = 28;
+pub const CRAFTING_FOOTER_HEIGHT: f32 = 80.0;
+/// Pixels scrolled per wheel notch (one row pitch).
+pub const CRAFTING_SCROLL_STEP: usize = CRAFTING_ROW_HEIGHT as usize;
 
 /// Which section a recipe belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -492,7 +493,7 @@ pub fn draw_crafting_screen(
 
     frame.text(
         panel.x + CRAFTING_MARGIN,
-        panel.y + 14.0,
+        panel.y + 16.0,
         2.6,
         [0.98, 0.99, 1.0, 1.0],
         "Crafting",
@@ -504,7 +505,7 @@ pub fn draw_crafting_screen(
     };
     frame.text(
         panel.x + CRAFTING_MARGIN,
-        panel.y + 46.0,
+        panel.y + 48.0,
         1.2,
         [0.66, 0.73, 0.82, 1.0],
         subtitle,
@@ -514,7 +515,7 @@ pub fn draw_crafting_screen(
         let width = frame.text_width(1.1, label);
         frame.text(
             panel.x + panel.w - CRAFTING_MARGIN - width,
-            panel.y + 47.0,
+            panel.y + 49.0,
             1.1,
             [0.98, 0.83, 0.44, 1.0],
             label,
@@ -522,7 +523,7 @@ pub fn draw_crafting_screen(
     }
     frame.rect(
         panel.x + CRAFTING_MARGIN,
-        panel.y + 64.0,
+        panel.y + 68.0,
         panel.w - CRAFTING_MARGIN * 2.0,
         1.0,
         [0.24, 0.28, 0.35, 1.0],
@@ -539,16 +540,16 @@ pub fn draw_crafting_screen(
             if header_y + CRAFTING_SECTION_HEIGHT > layout.content.y && header_y < content_bottom {
                 frame.text(
                     layout.content.x + 2.0,
-                    header_y + 5.0,
+                    header_y + 7.0,
                     1.15,
                     [0.98, 0.80, 0.42, 1.0],
                     row.section.title(),
                 );
-                let line_x = layout.content.x + 78.0;
+                let line_x = layout.content.x + 82.0;
                 if line_x < layout.content.x + layout.content.w {
                     frame.rect(
                         line_x,
-                        header_y + 11.0,
+                        header_y + 14.0,
                         layout.content.x + layout.content.w - line_x,
                         1.0,
                         [0.22, 0.26, 0.33, 0.9],
@@ -580,7 +581,7 @@ pub fn draw_crafting_screen(
             frame.outline(rect.x, rect.y, rect.w, rect.h, 1.0, [0.55, 0.62, 0.72, 0.8]);
         }
 
-        let icon_size = 20.0;
+        let icon_size = 24.0;
         inventory::draw_item_icon_for(frame, registry, row.output.0, rect.x + 8.0, rect.y + 3.0, icon_size);
 
         let name = row.output_label();
@@ -589,13 +590,13 @@ pub fn draw_crafting_screen(
         } else {
             [0.72, 0.77, 0.84, 1.0]
         };
-        frame.text(rect.x + 36.0, rect.y + 3.0, 1.25, name_color, &name);
+        frame.text(rect.x + 40.0, rect.y + 4.0, 1.25, name_color, &name);
 
-        let mut x = rect.x + 36.0;
+        let mut x = rect.x + 40.0;
         for (index, ingredient) in row.ingredients.iter().enumerate() {
             if index > 0 {
                 let separator = " + ";
-                frame.text(x, rect.y + 13.0, 1.0, [0.58, 0.63, 0.70, 1.0], separator);
+                frame.text(x, rect.y + 17.0, 1.0, [0.58, 0.63, 0.70, 1.0], separator);
                 x += frame.text_width(1.0, separator);
             }
             let part = ingredient.summary();
@@ -604,15 +605,15 @@ pub fn draw_crafting_screen(
             } else {
                 [0.98, 0.55, 0.48, 1.0]
             };
-            frame.text(x, rect.y + 13.0, 1.0, color, &part);
+            frame.text(x, rect.y + 17.0, 1.0, color, &part);
             x += frame.text_width(1.0, &part);
         }
 
         let status = row.status.label();
         let status_width = frame.text_width(1.0, &status);
         frame.text(
-            rect.x + rect.w - 10.0 - status_width,
-            rect.y + 8.0,
+            rect.x + rect.w - 12.0 - status_width,
+            rect.y + 10.0,
             1.0,
             availability_color(row.status),
             &status,
@@ -645,7 +646,7 @@ pub fn draw_crafting_screen(
         };
         frame.text(
             panel.x + CRAFTING_MARGIN,
-            footer_top + 10.0,
+            footer_top + 12.0,
             1.1,
             [0.86, 0.91, 1.0, 1.0],
             &text,
@@ -654,7 +655,7 @@ pub fn draw_crafting_screen(
             let hint = "Place/stand near a crafting table to craft this";
             frame.text(
                 panel.x + CRAFTING_MARGIN,
-                footer_top + 25.0,
+                footer_top + 28.0,
                 1.0,
                 [0.96, 0.72, 0.38, 1.0],
                 hint,
@@ -663,8 +664,8 @@ pub fn draw_crafting_screen(
     }
     frame.text_centered(
         panel.x + panel.w / 2.0,
-        panel.y + panel.h - 25.0,
-        0.95,
+        panel.y + panel.h - 22.0,
+        1.0,
         [0.62, 0.68, 0.76, 1.0],
         "Up/Down: select   Enter/Click: craft   Wheel: scroll   C/Esc: back",
     );
@@ -931,6 +932,56 @@ mod tests {
             assert!(row.rect.x + row.rect.w <= layout.panel.x + layout.panel.w);
             assert!(row.rect.y >= layout.content.y);
             assert!(row.rect.y + row.rect.h <= layout.content.y + layout.content.h);
+        }
+    }
+
+    #[test]
+    fn panel_is_620_by_560_with_row_breathing_room() {
+        let layout = crafting_panel_rect([1280.0, 720.0]);
+        assert_eq!((layout.w, layout.h), (620.0, 560.0));
+        for screen in [[1280.0_f32, 720.0], [960.0, 540.0]] {
+            let panel = crafting_panel_rect(screen);
+            assert!(panel.w <= screen[0] && panel.h <= screen[1]);
+            assert!(CRAFTING_ROW_HEIGHT >= ob_render::line_height(1.25) + 4.0);
+            assert!(CRAFTING_SECTION_HEIGHT >= ob_render::line_height(1.15) + 8.0);
+        }
+    }
+
+    #[test]
+    fn basics_and_tools_sections_have_a_visible_gap() {
+        let registry = Registry::base();
+        let rows = crafting_rows(&registry, &all_available(&registry), true, false, &[]);
+        let layout = crafting_layout([1280.0, 720.0], &rows, 0);
+        let section_change = rows
+            .windows(2)
+            .position(|pair| pair[0].section != pair[1].section)
+            .expect("two sections");
+        let previous = layout.rows[section_change].rect;
+        let next = layout.rows[section_change + 1].rect;
+        assert!(next.y - (previous.y + previous.h) >= CRAFTING_SECTION_HEIGHT - 0.01);
+        assert!(layout.max_scroll == 0, "the spaced list still fits without scrolling");
+    }
+
+    #[test]
+    fn short_screens_scroll_but_keep_every_row_reachable() {
+        let registry = Registry::base();
+        let rows = crafting_rows(&registry, &all_available(&registry), true, false, &[]);
+        let screen = [960.0, 540.0];
+        let mut state = CraftingState::default();
+        let layout = crafting_layout(screen, &rows, 0);
+        assert!(layout.max_scroll > 0, "the taller spaced list scrolls at 540p");
+        assert!(layout.panel.h <= screen[1]);
+        for _ in 0..rows.len() {
+            state.move_selection(1, rows.len());
+            state.ensure_visible(screen, &rows);
+            let layout = crafting_layout(screen, &rows, state.scroll);
+            let rect = layout.rows[state.selected].rect;
+            assert!(
+                rect.y >= layout.content.y - 0.01 && rect.y + rect.h <= layout.content.y + layout.content.h + 0.01,
+                "row {} must be reachable at scroll {}",
+                state.selected,
+                state.scroll
+            );
         }
     }
 

@@ -39,7 +39,8 @@ use inventory::inventory_blocks;
 use mesh_scheduler::MeshScheduler;
 use mining::MiningState;
 use ui_state::{
-    DamageFlash, DeathAction, DebugStats, Screen, SettingsAction, SettingsInfo, SettingsRow, UiState, facing_label,
+    DamageFlash, DeathAction, DebugColumns, DebugStats, Screen, SettingsAction, SettingsInfo, SettingsRow, UiState,
+    facing_label,
 };
 
 /// One fixed simulation tick (20 Hz, DEC-038).
@@ -107,6 +108,8 @@ pub struct ClientOptions {
     pub screenshot_settings: bool,
     /// Render the crafting screen in the offscreen screenshot frame.
     pub screenshot_crafting: bool,
+    /// Render the survival HUD with the F3 debug overlay in the screenshot.
+    pub screenshot_debug: bool,
     /// Seed the host with sample items and vitals for the offscreen screenshot.
     pub screenshot_items: bool,
 }
@@ -132,6 +135,7 @@ impl Default for ClientOptions {
             screenshot_dead: false,
             screenshot_settings: false,
             screenshot_crafting: false,
+            screenshot_debug: false,
             screenshot_items: false,
         }
     }
@@ -157,6 +161,8 @@ pub fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
             ScreenshotMode::Crafting
         } else if options.screenshot_dead {
             ScreenshotMode::Dead
+        } else if options.screenshot_debug {
+            ScreenshotMode::Debug
         } else {
             ScreenshotMode::Hud
         };
@@ -192,6 +198,8 @@ enum ScreenshotMode {
     Settings,
     /// Crafting screen over the world with a deterministic selection.
     Crafting,
+    /// Survival HUD with the F3 debug overlay and deterministic statistics.
+    Debug,
 }
 
 /// Renders one offscreen frame of the world and writes it as a PNG (RGBA8).
@@ -221,7 +229,7 @@ fn screenshot_with_mode(
     let mut host = Host::open(Arc::clone(&registry), config)?;
     host.set_game_mode(map_game_mode(settings.game_mode));
     log::info!("game mode: {}", host.game_mode().name());
-    if options.screenshot_items || mode == ScreenshotMode::Crafting {
+    if options.screenshot_items || matches!(mode, ScreenshotMode::Crafting | ScreenshotMode::Debug) {
         seed_screenshot_items(&mut host, &registry);
     }
     if mode == ScreenshotMode::Crafting {
@@ -259,15 +267,33 @@ fn screenshot_with_mode(
     // Screenshot mode is also the headless verification path for the UI
     // renderer, since it needs no window or surface.
     let screen = [SCREENSHOT_WIDTH as f32, SCREENSHOT_HEIGHT as f32];
-    let mut ui = UiState::from_settings(settings);
+    let mut ui = UiState::from_settings(settings.clone());
     ui.active_texture_pack = active_texture_pack_label(&texture_source);
     ui.hotbar_selected = host.hotbar_selection();
-    if options.screenshot_items || mode == ScreenshotMode::Crafting {
+    if options.screenshot_items || matches!(mode, ScreenshotMode::Crafting | ScreenshotMode::Debug) {
         ui.toasts.push("Picked up Cobblestone x8");
         ui.toasts.push("Picked up Apple x3");
         ui.toasts.push_warning("Inventory full - dropped Log x2");
         ui.block_name_seconds = ui_state::BLOCK_NAME_SECONDS;
     }
+    let environment = options.time_of_day.map(Environment::new).unwrap_or_default();
+    // The debug screenshot reports real world counters. Render the world once
+    // without the overlay to fill `RenderStats` deterministically, then compose
+    // the final frame with the HUD and F3 overlay on top.
+    let debug_render_stats = if mode == ScreenshotMode::Debug {
+        renderer.render_world_scene(
+            host.world(),
+            &camera,
+            &SceneParams {
+                environment,
+                ui: None,
+                outline: None,
+            },
+        )?;
+        Some(renderer.stats())
+    } else {
+        None
+    };
     let mut frame = UiFrame::new(screen[0], screen[1]);
     let centre_x = screen[0] / 2.0;
     let centre_y = screen[1] / 2.0;
@@ -365,8 +391,38 @@ fn screenshot_with_mode(
                 host.game_mode().name(),
             );
         }
+        ScreenshotMode::Debug => {
+            ui.block_name_seconds = ui_state::BLOCK_NAME_SECONDS;
+            let cross = [0.95, 0.97, 1.0, 0.85];
+            frame.rect(centre_x - 1.0, centre_y - 9.0, 2.0, 18.0, cross);
+            frame.rect(centre_x - 9.0, centre_y - 1.0, 18.0, 2.0, cross);
+            draw_vitals_for_mode(&mut frame, &ui, &host, screen);
+            draw_hotbar_for_mode(&mut frame, &ui, &registry, &host, screen);
+            draw_selected_name(&mut frame, &ui, &registry, &host, screen);
+            if survival {
+                ui_state::draw_toasts(&mut frame, &ui.toasts, screen);
+            }
+            let stats = screenshot_debug_stats(
+                &host,
+                &registry,
+                &renderer,
+                &settings,
+                options,
+                &texture_source,
+                debug_render_stats.unwrap_or_default(),
+            );
+            let layout = ui_state::debug_overlay_layout(screen, &stats);
+            draw_debug_overlay(&mut frame, &stats, screen);
+            log::info!(
+                "debug screenshot: {} stats lines, scale {:.1}, columns {:?}, overlay {}x{}",
+                stats.left_lines().len(),
+                layout.left.scale,
+                layout.columns,
+                layout.left.panel.w,
+                layout.left.panel.h,
+            );
+        }
     }
-    let environment = options.time_of_day.map(Environment::new).unwrap_or_default();
     let entities = entity_instances_for(host.item_entities(), &registry, 0.8);
     renderer.set_entities(&entities);
     let scene = SceneParams {
@@ -398,6 +454,92 @@ fn screenshot_with_mode(
         host.player().hunger,
     );
     Ok(())
+}
+
+/// Builds the deterministic F3 statistics snapshot used by `--screenshot-debug`.
+///
+/// World-derived values (position, seed, chunk counts, memory, ticks, target)
+/// and render counters come from the real host and renderer; the frame-rate
+/// fields are fixed because the screenshot has no frame loop, and the movement
+/// label is the idle `walk` state. The result is stable for a given seed.
+fn screenshot_debug_stats(
+    host: &Host,
+    registry: &Registry,
+    renderer: &OffscreenRenderer,
+    settings: &Settings,
+    options: &ClientOptions,
+    texture_source: &TextureSource,
+    render_stats: ob_render::RenderStats,
+) -> DebugStats {
+    let player = host.player();
+    let eye = player.eye();
+    let target_hit = host.world().raycast(eye, player.forward(), 5.0);
+    let target_block = target_hit.map(|hit| host.world().get_block(hit.block));
+    let target = target_hit.map(|hit| {
+        (
+            registry.block(host.world().get_block(hit.block)).id.to_string(),
+            [hit.block.x, hit.block.y, hit.block.z],
+        )
+    });
+    let selected_stack = host.selected_stack();
+    let (held, held_durability) = if let Some(stack) = selected_stack {
+        let item = registry.item(stack.item);
+        let durability = item.tool.and_then(|spec| {
+            stack
+                .durability
+                .map(|remaining| (remaining.min(spec.durability), spec.durability))
+        });
+        (inventory::display_name(item.id), durability)
+    } else {
+        ("empty".to_string(), None)
+    };
+    let held_item = selected_stack.map(|stack| stack.item);
+    let mining_speed = match target_block {
+        Some(block) => registry.mining_speed(block, held_item),
+        None => selected_stack
+            .and_then(|stack| registry.item(stack.item).tool)
+            .map(|spec| spec.speed)
+            .unwrap_or(1.0),
+    };
+    DebugStats {
+        version: ob_core::VERSION.to_string(),
+        fps: 60,
+        frame_p50_ms: 16.67,
+        frame_p95_ms: 17.42,
+        position: [eye.x, eye.y, eye.z],
+        chunk: [
+            (eye.x.floor() as i32).div_euclid(16),
+            (eye.y.floor() as i32).div_euclid(16),
+            (eye.z.floor() as i32).div_euclid(16),
+        ],
+        facing: facing_label(player.yaw),
+        target,
+        seed: host.world().seed(),
+        render_distance: host.render_distance_chunks(),
+        loaded_chunks: host.world().chunk_count(),
+        drawn_sections: render_stats.sections as usize,
+        cached_sections: host.world().chunk_count(),
+        triangles: render_stats.vertices / 3,
+        draw_calls: render_stats.draw_calls as usize,
+        mesh_workers: options.mesh_workers,
+        mesh_in_flight: 0,
+        mesh_completed: 0,
+        mesh_backlog: 0,
+        heap_bytes: host.memory_bytes(),
+        ticks: host.tick_count(),
+        adapter: renderer.adapter_summary().to_string(),
+        window: [SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT],
+        fov_degrees: settings.fov_degrees,
+        time_of_day: 0.5,
+        texture_source: describe_texture_source(texture_source, renderer.texture_resolution()),
+        game_mode: host.game_mode().name(),
+        health: player.health,
+        hunger: player.hunger,
+        movement: "walk",
+        held,
+        held_durability,
+        mining_speed,
+    }
 }
 
 /// Gives the screenshot host a small, deterministic inventory and wounded vitals.
@@ -2026,62 +2168,68 @@ impl GameState {
     }
 }
 
-/// Draws the two-column F3 debug overlay.
+/// Draws the sectioned two-column F3 debug overlay.
+///
+/// Geometry comes from [`ui_state::debug_overlay_layout`], which guarantees a
+/// line step with breathing room, visible section gaps, and two columns that
+/// either sit side by side or stack instead of overlapping. The hardware
+/// column is drawn dimmer and one step smaller than the statistics column.
 fn draw_debug_overlay(frame: &mut UiFrame, stats: &DebugStats, screen: [f32; 2]) {
-    let [width, height] = screen;
-    let scale = 2.0;
-    let line_height = ob_render::line_height(scale);
-    let left = stats.left_lines();
-    let right = stats.right_lines();
-    let left_width = left
-        .iter()
-        .map(|line| frame.text_width(scale, line))
-        .fold(0.0_f32, f32::max)
-        .max(420.0);
-    frame.rect(
-        6.0,
-        6.0,
-        left_width + 18.0,
-        left.len() as f32 * line_height + 14.0,
-        [0.03, 0.04, 0.07, 0.74],
-    );
-    for (index, text_line) in left.iter().enumerate() {
-        frame.text(
-            14.0,
-            13.0 + index as f32 * line_height,
-            scale,
-            [0.94, 0.96, 0.99, 1.0],
-            text_line,
-        );
+    let layout = ui_state::debug_overlay_layout(screen, stats);
+    let left_lines = stats.left_lines();
+    let right_lines = stats.right_lines();
+
+    draw_debug_column(frame, &layout.left, &left_lines, true);
+    if let Some(right) = &layout.right {
+        draw_debug_column(frame, right, &right_lines, false);
     }
-    let right_width = right
-        .iter()
-        .map(|line| frame.text_width(scale, line))
-        .fold(0.0_f32, f32::max);
-    let right_x = width - right_width - 14.0;
-    frame.rect(
-        right_x - 10.0,
-        6.0,
-        right_width + 18.0,
-        right.len() as f32 * line_height + 14.0,
-        [0.03, 0.04, 0.07, 0.74],
-    );
-    for (index, text_line) in right.iter().enumerate() {
-        frame.text(
-            right_x,
-            13.0 + index as f32 * line_height,
-            scale,
-            [0.80, 0.86, 0.94, 1.0],
-            text_line,
+    // Header separator under the version/FPS group.
+    let left_panel = layout.left.panel;
+    if !layout.left.lines.is_empty() {
+        frame.rect(
+            left_panel.x + ui_state::DEBUG_PADDING,
+            layout.header_separator_y,
+            left_panel.w - ui_state::DEBUG_PADDING * 2.0,
+            1.0,
+            [0.52, 0.59, 0.69, 0.9],
         );
     }
     frame.text(
-        14.0,
-        height - 30.0,
-        1.5,
+        ui_state::DEBUG_MARGIN + 4.0,
+        layout.footer_y,
+        ui_state::DEBUG_FOOTER_SCALE,
         [0.80, 0.86, 0.94, 0.9],
         "F3 debug overlay   F1 HUD   F2 screenshot   Esc menu",
     );
+    if layout.columns == DebugColumns::Stacked {
+        // Leave a trace in the logs so layout regressions at narrow sizes are
+        // obvious during manual verification.
+        log::debug!("F3 overlay stacked at {}x{}", screen[0], screen[1]);
+    }
+}
+
+/// Draws one F3 column panel and its text lines.
+fn draw_debug_column(frame: &mut UiFrame, column: &ui_state::DebugColumnLayout, lines: &[String], primary: bool) {
+    frame.rect(
+        column.panel.x,
+        column.panel.y,
+        column.panel.w,
+        column.panel.h,
+        [0.03, 0.04, 0.07, 0.76],
+    );
+    for placement in &column.lines {
+        let Some(text) = lines.get(placement.index) else {
+            continue;
+        };
+        let color = if primary && placement.index == 0 {
+            [0.98, 0.82, 0.45, 1.0]
+        } else if primary {
+            [0.93, 0.96, 0.99, 1.0]
+        } else {
+            [0.78, 0.84, 0.92, 1.0]
+        };
+        frame.text(placement.x, placement.y, column.scale, color, text);
+    }
 }
 
 impl ApplicationHandler for App {
@@ -2546,7 +2694,7 @@ fn effective_settings(options: &ClientOptions) -> (Settings, PathBuf) {
     if let Some(mode) = options.game_mode {
         settings.game_mode = mode;
     }
-    if options.screenshot_dead || options.screenshot_crafting || options.screenshot_items {
+    if options.screenshot_dead || options.screenshot_crafting || options.screenshot_debug || options.screenshot_items {
         settings.game_mode = SettingsGameMode::Survival;
     }
     settings.clamp();
@@ -2832,6 +2980,7 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
             "screenshot-dead" => options.screenshot_dead = true,
             "screenshot-settings" => options.screenshot_settings = true,
             "screenshot-crafting" => options.screenshot_crafting = true,
+            "screenshot-debug" => options.screenshot_debug = true,
             "screenshot-items" => options.screenshot_items = true,
             "survival" => options.game_mode = Some(SettingsGameMode::Survival),
             "creative" => options.game_mode = Some(SettingsGameMode::Creative),
@@ -2841,6 +2990,14 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
     }
     if options.screenshot_dead && options.screenshot.is_none() {
         return Err("--screenshot-dead requires --screenshot PATH".into());
+    }
+    let screenshot_modes = usize::from(options.screenshot_dead)
+        + usize::from(options.screenshot_settings)
+        + usize::from(options.screenshot_crafting)
+        + usize::from(options.screenshot_debug)
+        + usize::from(options.screenshot_inventory.is_some());
+    if screenshot_modes > 1 {
+        return Err("--screenshot screen modes cannot be combined".into());
     }
     if options.screenshot_settings
         && (options.screenshot_dead || options.screenshot_crafting || options.screenshot_inventory.is_some())
@@ -2859,13 +3016,19 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
     if options.screenshot_crafting && options.screenshot.is_none() {
         return Err("--screenshot-crafting requires --screenshot PATH".into());
     }
+    if options.screenshot_debug && options.screenshot.is_none() {
+        return Err("--screenshot-debug requires --screenshot PATH".into());
+    }
     if options.screenshot_items && options.screenshot.is_none() && options.screenshot_inventory.is_none() {
         return Err("--screenshot-items requires --screenshot or --screenshot-inventory PATH".into());
     }
-    if (options.screenshot_dead || options.screenshot_crafting || options.screenshot_items)
+    if (options.screenshot_dead || options.screenshot_crafting || options.screenshot_debug || options.screenshot_items)
         && options.game_mode == Some(SettingsGameMode::Creative)
     {
-        return Err("--screenshot-dead, --screenshot-crafting and --screenshot-items require survival mode".into());
+        return Err(
+            "--screenshot-dead, --screenshot-crafting, --screenshot-debug and --screenshot-items require survival mode"
+                .into(),
+        );
     }
     Ok(options)
 }
@@ -3338,6 +3501,31 @@ mod tests {
 
         let options = options_from_args(&[
             ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+            ("screenshot-debug".to_string(), String::new()),
+        ])
+        .expect("valid debug screenshot");
+        assert!(options.screenshot_debug);
+        assert!(!options.screenshot_dead);
+        let error = options_from_args(&[("screenshot-debug".to_string(), String::new())])
+            .expect_err("debug screenshot needs a path");
+        assert!(error.contains("--screenshot PATH"));
+        let error = options_from_args(&[
+            ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+            ("screenshot-debug".to_string(), String::new()),
+            ("screenshot-dead".to_string(), String::new()),
+        ])
+        .expect_err("screenshot modes cannot be combined");
+        assert!(error.contains("cannot be combined"));
+        let error = options_from_args(&[
+            ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+            ("screenshot-debug".to_string(), String::new()),
+            ("creative".to_string(), String::new()),
+        ])
+        .expect_err("debug screenshot needs survival");
+        assert!(error.contains("survival mode"));
+
+        let options = options_from_args(&[
+            ("screenshot".to_string(), path.to_string_lossy().into_owned()),
             ("screenshot-items".to_string(), String::new()),
         ])
         .expect("valid items screenshot");
@@ -3378,6 +3566,15 @@ mod tests {
             data_dir: Some(dir.clone()),
             screenshot: Some(path),
             screenshot_dead: true,
+            ..ClientOptions::default()
+        };
+        let (settings, _) = effective_settings(&options);
+        assert_eq!(settings.game_mode, SettingsGameMode::Survival);
+
+        let options = ClientOptions {
+            data_dir: Some(dir.clone()),
+            screenshot: Some(PathBuf::from("/tmp/debug.png")),
+            screenshot_debug: true,
             ..ClientOptions::default()
         };
         let (settings, _) = effective_settings(&options);

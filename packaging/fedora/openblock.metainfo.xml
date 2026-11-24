@@ -29,6 +29,13 @@
     <content_attribute id="social-chat">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.0.9" date="2026-11-24" type="development">
+      <description>
+        <p>Readable spaced-out F3 overlay and menus, settings that can be
+        lowered via clickable arrows (not only raised), and dropped items that
+        are attracted and picked up within a 3 m radius.</p>
+      </description>
+    </release>
     <release version="0.0.8" date="2026-11-24" type="development">
       <description>
         <p>Crafting and tools (planks, cobblestone, crafting table, sticks,

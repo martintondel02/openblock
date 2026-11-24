@@ -1,6 +1,6 @@
 //! The `openblock` game client binary.
 
-const USAGE: &str = "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--mesh-workers N] [--survival|--creative] [--fly] [--x11] [--screenshot PATH] [--screenshot-inventory PATH] [--screenshot-dead] [--screenshot-settings] [--screenshot-crafting] [--screenshot-items] [--seconds N] [--texture-style NAME] [--texture-pack PATH] [--no-texture-pack] [--time-of-day F] [--version]";
+const USAGE: &str = "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--mesh-workers N] [--survival|--creative] [--fly] [--x11] [--screenshot PATH] [--screenshot-inventory PATH] [--screenshot-dead] [--screenshot-settings] [--screenshot-crafting] [--screenshot-debug] [--screenshot-items] [--seconds N] [--texture-style NAME] [--texture-pack PATH] [--no-texture-pack] [--time-of-day F] [--version]";
 
 fn main() {
     ob_core::init_logging();
@@ -19,6 +19,7 @@ fn main() {
         println!("          --screenshot-dead renders the death screen; --screenshot-items seeds items and vitals");
         println!("          --screenshot-settings renders the tabbed settings screen over the world");
         println!("          --screenshot-crafting renders the crafting screen over the world");
+        println!("          --screenshot-debug renders the survival HUD with the F3 debug overlay");
         println!("modes:    --survival (default) or --creative; an explicit CLI mode is saved");
         println!("controls: WASD move, Space jump, Shift crouch, Ctrl sprint, F fly, LMB mine,");
         println!("          RMB place/eat/use, C crafting, E inventory, F3 debug, Esc settings");
@@ -39,6 +40,7 @@ fn main() {
         println!("  --screenshot-dead  render the death screen (used with --screenshot PATH)");
         println!("  --screenshot-settings  render the settings screen (used with --screenshot PATH)");
         println!("  --screenshot-crafting  render the crafting screen (used with --screenshot PATH)");
+        println!("  --screenshot-debug  render the HUD and F3 debug overlay (used with --screenshot PATH)");
         println!("  --screenshot-items  seed stones, planks, sticks, tools and 14 HP / 12 hunger (with --screenshot)");
         println!("  --survival         play survival (default; overrides and saves the settings mode)");
         println!("  --creative         play creative (overrides and saves the settings mode)");

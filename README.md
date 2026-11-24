@@ -242,6 +242,17 @@ hungry, and watch out for falls. Health and hunger regenerate or drain over time
 at zero health a respawn screen appears. Creative mode (infinite blocks, no
 damage) remains available via `--creative` and the settings menu.
 
+## Debug overlay and settings
+
+The F3 overlay is grouped and spaced for readability; it scales down and stacks
+its hardware column on smaller windows. The Esc settings screen uses explicit
+`<` / `>` controls on every range/choice row, so values can be raised and
+lowered with the mouse as well as with Left/Right or the scroll wheel.
+
+| F3 debug overlay | Settings (Esc) |
+| --- | --- |
+| ![F3 debug overlay](docs/img/v0.0.9-debug.png) | ![Settings screen](docs/img/v0.0.9-settings.png) |
+
 ## Crafting, tools and dropped items
 
 | Crafting (C) | Settings (Esc) | Inventory |

@@ -264,3 +264,18 @@ Snapshot capture costs ~25.9 µs per solid section, so 32 submissions/frame cost
   `smoke OK hash=62b21c82b5d848e0`, stable across two fresh runs and including
   dropped-item entities.
 - Test count: 367 (293 in v0.0.7).
+
+## 2026-11-24 — v0.0.9 (UI readability, pickup radius)
+
+- F3 overlay layout is pure CPU UI work, drawn in the existing UI pass: 16
+  stat lines in four grouped sections at scale 1.8 (side column 1.6), line step
+  22.4 px with +8 px gaps; no measurable frame-time change. Adaptive
+  side-by-side/stacked/left-only layouts keep 1280x720 and 960x540 readable.
+- Menu spacing changes are static layout constants (settings 620x520, crafting
+  620x560, larger row pitch) with the same UI pass cost.
+- Dropped-item pickup now attracts items within a 3 m radius at 7 m/s and
+  collects at 0.9 m; per-item extra cost is one distance test plus a lerp per
+  tick for the handful of nearby entities. No measurable server-tick change.
+- Smoke hash unchanged (`62b21c82b5d848e0`, seed 42); test count 382 (367 in
+  v0.0.8), including new F3 layout/960x540, menu-spacing, clickable-arrow, and
+  pickup-radius tests.

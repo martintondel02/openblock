@@ -235,11 +235,13 @@ An item entity is `{stack, position, velocity, age, pickup_delay, despawn_age, t
 **Interim v0.0.x implementation.** The host spawns one entity per break drop at
 the broken block's centre with a deterministic hash-derived impulse (no RNG
 state), a 10 ct pickup delay and a 6,000 ct despawn, matching the values above.
-The pickup volume is the player AABB expanded by 0.35 m on every axis (1.3 m
-wide, narrower than the 1.0 m above), and there is no per-tick pickup cap, no
-merging and no lava/fire/cactus destruction. Items sink in water rather than
-floating. Entities are server-authoritative and persist in `items.txt`
-([17](17-persistence.md)).
+The pickup radius is 3.0 m around the player's chest: ready items inside it are
+attracted toward the player at 7 m/s and collected at 0.9 m, while the 10 ct
+pickup delay still applies to every entity. This is wider than the long-term
+1.0 m AABB rule above and intentionally gives the "items fly to me" feel. There
+is no per-tick pickup cap, no merging and no lava/fire/cactus destruction; items
+sink in water rather than floating. Entities are server-authoritative and
+persist in `items.txt` ([17](17-persistence.md)).
 
 ### 3.7 Crafting
 

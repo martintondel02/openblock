@@ -827,10 +827,19 @@ impl Host {
         }
 
         if self.game_mode == GameMode::Survival && !self.player.dead {
+            // Attract every ready item within the pickup radius toward the
+            // player, then collect the ones that reach the chest.
+            for entity in &mut self.items {
+                if entity.age >= items::ITEM_PICKUP_DELAY && items::can_pick_up(&self.player, entity) {
+                    items::attract_item(&self.player, entity, dt);
+                }
+            }
+            let player = self.player.clone();
             let mut index = 0;
             while index < self.items.len() {
+                let chest = items::player_chest(&player);
                 let near = self.items[index].age >= items::ITEM_PICKUP_DELAY
-                    && items::can_pick_up(&self.player, &self.items[index]);
+                    && chest.distance(self.items[index].pos) <= items::ITEM_COLLECT_DISTANCE;
                 if near {
                     let item = self.items[index].stack.item;
                     let count = self.items[index].stack.count;
@@ -1510,6 +1519,9 @@ impl StableHasher {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+
+    use crate::ItemEntity;
+    use crate::items;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2942,6 +2954,71 @@ mod tests {
         assert_eq!(item_count(&host, dirt), 2);
         assert_eq!(host.take_pickup_events(), vec![ItemStack::new(dirt, 2)]);
         assert!(host.take_pickup_events().is_empty(), "the queue drains");
+    }
+
+    #[test]
+    fn pickup_radius_attracts_items_from_a_few_blocks_away() {
+        let (_dir, mut host) = survival_host("pickup-radius", 127);
+        settle_player(&mut host);
+        let dirt = host.registry().item_id("openblock:dirt").unwrap();
+        let feet = host.player().pos;
+        let start = WorldVec::new(feet.x + 2.2, feet.y + 0.1, feet.z);
+        host.spawn_item_entity(start, ItemStack::new(dirt, 1));
+
+        // The pickup delay still applies: no collection during the first ticks.
+        for _ in 0..9 {
+            host.tick(&PlayerInput::default());
+        }
+        assert_eq!(host.item_entities().len(), 1, "delay must still gate pickup");
+        let before = host.item_entities()[0].pos.distance(items::player_chest(host.player()));
+
+        // Once allowed, the item is attracted toward the player and collected.
+        let mut collected = false;
+        for _ in 0..20 {
+            host.tick(&PlayerInput::default());
+            if host.item_entities().is_empty() {
+                collected = true;
+                break;
+            }
+        }
+        assert!(collected, "item inside the pickup radius was not collected");
+        assert_eq!(item_count(&host, dirt), 1);
+        assert_eq!(host.take_pickup_events(), vec![ItemStack::new(dirt, 1)]);
+        assert!(before <= items::ITEM_PICKUP_RADIUS + 1e-9);
+    }
+
+    #[test]
+    fn items_outside_the_pickup_radius_are_left_alone() {
+        let (_dir, mut host) = survival_host("pickup-radius-out", 131);
+        settle_player(&mut host);
+        let dirt = host.registry().item_id("openblock:dirt").unwrap();
+        let feet = host.player().pos;
+        let far = WorldVec::new(feet.x + 5.0, feet.y + 0.1, feet.z);
+        host.spawn_item_entity(far, ItemStack::new(dirt, 1));
+
+        for _ in 0..40 {
+            host.tick(&PlayerInput::default());
+        }
+        assert_eq!(host.item_entities().len(), 1, "far item must not be collected");
+        assert_eq!(item_count(&host, dirt), 0);
+        assert!(host.take_pickup_events().is_empty());
+
+        // The boundary check is a true radius around the player's chest.
+        let player = host.player();
+        let stack = ItemStack::new(dirt, 1);
+        let inside = ItemEntity {
+            id: 99,
+            pos: items::player_chest(player) + WorldVec::new(2.9, 0.0, 0.0),
+            velocity: WorldVec::ZERO,
+            stack,
+            age: 1.0,
+        };
+        let outside = ItemEntity {
+            pos: items::player_chest(player) + WorldVec::new(0.0, 0.0, 3.1),
+            ..inside.clone()
+        };
+        assert!(items::can_pick_up(player, &inside));
+        assert!(!items::can_pick_up(player, &outside));
     }
 
     #[test]

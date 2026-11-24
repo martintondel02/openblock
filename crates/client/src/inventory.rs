@@ -18,17 +18,23 @@ pub const INVENTORY_COLUMNS: usize = 9;
 /// Preferred slot edge length in UI pixels.
 pub const INVENTORY_SLOT_SIZE: f32 = 48.0;
 /// Gap between inventory slots.
-pub const INVENTORY_GAP: f32 = 4.0;
+pub const INVENTORY_GAP: f32 = 8.0;
 /// Horizontal padding inside the inventory panel.
-pub const INVENTORY_PADDING: f32 = 24.0;
+pub const INVENTORY_PADDING: f32 = 26.0;
 /// Space reserved for the title above the grid.
-pub const INVENTORY_TITLE_HEIGHT: f32 = 48.0;
+pub const INVENTORY_TITLE_HEIGHT: f32 = 56.0;
+/// Vertical gap between the grid and the footer separator.
+pub const INVENTORY_GRID_GAP: f32 = 16.0;
 /// Space reserved for the hovered-name and crafting-hint footer below the grid.
-pub const INVENTORY_FOOTER_HEIGHT: f32 = 92.0;
+pub const INVENTORY_FOOTER_HEIGHT: f32 = 108.0;
 /// Minimum distance between the panel and the screen edge.
 pub const INVENTORY_MARGIN: f32 = 24.0;
 /// Horizontal padding inside the survival inventory panel.
-pub const SURVIVAL_PADDING: f32 = 24.0;
+pub const SURVIVAL_PADDING: f32 = 26.0;
+/// Y offsets of the four footer lines, measured from the footer separator.
+pub const INVENTORY_FOOTER_LINES: [f32; 4] = [12.0, 38.0, 62.0, 82.0];
+/// Y offsets of the three creative-inventory footer lines.
+pub const INVENTORY_CREATIVE_FOOTER_LINES: [f32; 3] = [12.0, 40.0, 68.0];
 /// Smallest slot edge length used on very narrow windows.
 const MIN_SLOT_SIZE: f32 = 8.0;
 /// Width of the one-row survival inventory grid, in items.
@@ -58,6 +64,10 @@ pub struct InventoryLayout {
     pub total_rows: usize,
     /// Slot edge length after responsive shrinking.
     pub slot_size: f32,
+    /// Y of the footer separator; drawing and spacing tests share it.
+    pub footer_top: f32,
+    /// Bottom edge of the last visible grid row.
+    pub grid_bottom: f32,
 }
 
 impl InventoryLayout {
@@ -96,6 +106,10 @@ pub struct SurvivalInventoryLayout {
     pub slots: Vec<UiRect>,
     /// Slot edge length after responsive shrinking.
     pub slot_size: f32,
+    /// Y of the footer separator; drawing and spacing tests share it.
+    pub footer_top: f32,
+    /// Bottom edge of the hotbar-slot row.
+    pub grid_bottom: f32,
 }
 
 impl SurvivalInventoryLayout {
@@ -467,7 +481,7 @@ pub fn survival_layout(screen: [f32; 2]) -> SurvivalInventoryLayout {
     let slot_size = slot_from_width.clamp(MIN_SLOT_SIZE, INVENTORY_SLOT_SIZE);
     let grid_width = columns * slot_size + gap * (columns - 1.0);
     let panel_width = grid_width + 2.0 * SURVIVAL_PADDING;
-    let panel_height = INVENTORY_TITLE_HEIGHT + slot_size + INVENTORY_FOOTER_HEIGHT;
+    let panel_height = INVENTORY_TITLE_HEIGHT + slot_size + INVENTORY_GRID_GAP + INVENTORY_FOOTER_HEIGHT;
     let panel = UiRect::new(
         (width - panel_width) / 2.0,
         (height - panel_height) / 2.0,
@@ -483,6 +497,8 @@ pub fn survival_layout(screen: [f32; 2]) -> SurvivalInventoryLayout {
         panel,
         slots,
         slot_size,
+        footer_top: panel.y + panel.h - INVENTORY_FOOTER_HEIGHT,
+        grid_bottom: grid_y + slot_size,
     }
 }
 
@@ -815,7 +831,7 @@ pub fn draw_survival(
     );
     frame.text_centered(
         layout.panel.x + layout.panel.w / 2.0,
-        layout.panel.y + 14.0,
+        layout.panel.y + 18.0,
         2.5,
         white,
         "Inventory",
@@ -855,7 +871,7 @@ pub fn draw_survival(
         }
     }
 
-    let footer_top = layout.panel.y + layout.panel.h - INVENTORY_FOOTER_HEIGHT;
+    let footer_top = layout.footer_top;
     frame.rect(
         layout.panel.x + SURVIVAL_PADDING,
         footer_top,
@@ -871,14 +887,14 @@ pub fn draw_survival(
     let (name, hint) = survival_item_info(registry, inventory[info_slot]);
     frame.text_centered(
         layout.panel.x + layout.panel.w / 2.0,
-        footer_top + 8.0,
+        footer_top + INVENTORY_FOOTER_LINES[0],
         2.0,
         white,
         &name,
     );
     frame.text_centered(
         layout.panel.x + layout.panel.w / 2.0,
-        footer_top + 30.0,
+        footer_top + INVENTORY_FOOTER_LINES[1],
         1.2,
         muted,
         &hint,
@@ -890,7 +906,7 @@ pub fn draw_survival(
     };
     frame.text_centered(
         layout.panel.x + layout.panel.w / 2.0,
-        footer_top + 52.0,
+        footer_top + INVENTORY_FOOTER_LINES[2],
         1.0,
         if near_table {
             [0.96, 0.80, 0.42, 1.0]
@@ -901,7 +917,7 @@ pub fn draw_survival(
     );
     frame.text_centered(
         layout.panel.x + layout.panel.w / 2.0,
-        footer_top + 70.0,
+        footer_top + INVENTORY_FOOTER_LINES[3],
         1.0,
         [0.68, 0.74, 0.82, 1.0],
         "Click/Enter select   Arrows/Wheel navigate   E/Esc close",
@@ -928,7 +944,8 @@ pub fn layout(screen: [f32; 2], item_count: usize, scroll: usize) -> InventoryLa
 
     // Fit as many rows as possible; panel height follows the visible rows.
     let max_panel_height = (height - 2.0 * INVENTORY_MARGIN).max(1.0);
-    let available_grid_height = (max_panel_height - INVENTORY_TITLE_HEIGHT - INVENTORY_FOOTER_HEIGHT).max(0.0);
+    let available_grid_height =
+        (max_panel_height - INVENTORY_TITLE_HEIGHT - INVENTORY_FOOTER_HEIGHT - INVENTORY_GRID_GAP).max(0.0);
     let row_pitch = slot_size + gap;
     let rows_fit = (((available_grid_height + gap) / row_pitch).floor() as usize).max(1);
 
@@ -938,7 +955,7 @@ pub fn layout(screen: [f32; 2], item_count: usize, scroll: usize) -> InventoryLa
     let scroll = scroll.min(max_scroll);
 
     let visible_height = visible_rows as f32 * slot_size + visible_rows.saturating_sub(1) as f32 * gap;
-    let panel_height = INVENTORY_TITLE_HEIGHT + visible_height + INVENTORY_FOOTER_HEIGHT;
+    let panel_height = INVENTORY_TITLE_HEIGHT + visible_height + INVENTORY_GRID_GAP + INVENTORY_FOOTER_HEIGHT;
     let panel = UiRect::new(
         (width - panel_width) / 2.0,
         (height - panel_height) / 2.0,
@@ -974,6 +991,8 @@ pub fn layout(screen: [f32; 2], item_count: usize, scroll: usize) -> InventoryLa
         visible_rows,
         total_rows,
         slot_size,
+        footer_top: panel.y + panel.h - INVENTORY_FOOTER_HEIGHT,
+        grid_bottom: grid_y + visible_height,
     }
 }
 
@@ -1017,7 +1036,7 @@ pub fn draw(frame: &mut UiFrame, ui: &UiState, registry: &Registry, screen: [f32
     );
     frame.text_centered(
         layout.panel.x + layout.panel.w / 2.0,
-        layout.panel.y + 14.0,
+        layout.panel.y + 18.0,
         2.5,
         white,
         "Blocks",
@@ -1053,7 +1072,7 @@ pub fn draw(frame: &mut UiFrame, ui: &UiState, registry: &Registry, screen: [f32
         }
     }
 
-    let footer_top = layout.panel.y + layout.panel.h - INVENTORY_FOOTER_HEIGHT;
+    let footer_top = layout.footer_top;
     frame.rect(
         layout.panel.x + INVENTORY_PADDING,
         footer_top,
@@ -1075,21 +1094,21 @@ pub fn draw(frame: &mut UiFrame, ui: &UiState, registry: &Registry, screen: [f32
         .unwrap_or_else(|| "The registry is empty".to_string());
     frame.text_centered(
         layout.panel.x + layout.panel.w / 2.0,
-        footer_top + 8.0,
+        footer_top + INVENTORY_CREATIVE_FOOTER_LINES[0],
         2.0,
         white,
         &name,
     );
     frame.text_centered(
         layout.panel.x + layout.panel.w / 2.0,
-        footer_top + 30.0,
+        footer_top + INVENTORY_CREATIVE_FOOTER_LINES[1],
         1.2,
         muted,
         &hint,
     );
     frame.text_centered(
         layout.panel.x + layout.panel.w / 2.0,
-        footer_top + 52.0,
+        footer_top + INVENTORY_CREATIVE_FOOTER_LINES[2],
         1.0,
         [0.68, 0.74, 0.82, 1.0],
         "Click/Enter assign   Arrows select   Wheel scroll   E/Esc close",
@@ -1187,7 +1206,7 @@ mod tests {
 
     #[test]
     fn arrow_selection_moves_by_grid_step_and_auto_scrolls() {
-        let screen = [800.0, 300.0];
+        let screen = [800.0, 360.0];
         let layout = layout(screen, 100, 0);
         assert_eq!(layout.visible_rows, 2);
 
@@ -1249,6 +1268,41 @@ mod tests {
         assert_eq!(state.hovered, Some(index));
         assert_eq!(display_name(registry.block(items[index]).id), "Log");
         assert_eq!(state.update_hover((0.0, 0.0), screen, items.len()), None);
+    }
+
+    #[test]
+    fn inventory_rows_and_footer_have_breathing_room() {
+        let registry = Registry::base();
+        let items = inventory_blocks(&registry);
+        for screen in [[1280.0_f32, 720.0], [960.0, 540.0]] {
+            let creative = layout(screen, items.len(), 0);
+            assert_eq!(creative.slot_size, INVENTORY_SLOT_SIZE);
+            assert!(
+                creative.footer_top - creative.grid_bottom >= INVENTORY_GRID_GAP - 0.01,
+                "grid must clear the footer at {screen:?}"
+            );
+            assert!(creative.slots[0].rect.y - (creative.panel.y + INVENTORY_TITLE_HEIGHT) >= -0.01);
+            for pair in creative
+                .slots
+                .windows(2)
+                .filter(|pair| pair[0].rect.y == pair[1].rect.y)
+            {
+                assert!(pair[1].rect.x - (pair[0].rect.x + pair[0].rect.w) >= INVENTORY_GAP - 0.01);
+            }
+
+            let survival = survival_layout(screen);
+            assert!(survival.footer_top - survival.grid_bottom >= INVENTORY_GRID_GAP - 0.01);
+            assert!(survival.grid_bottom > survival.panel.y + INVENTORY_TITLE_HEIGHT);
+            for pair in survival.slots.windows(2) {
+                assert!(pair[1].x - (pair[0].x + pair[0].w) >= INVENTORY_GAP - 0.01);
+                assert!((pair[0].w - INVENTORY_SLOT_SIZE).abs() < 0.01);
+            }
+        }
+        for pair in INVENTORY_FOOTER_LINES.windows(2) {
+            assert!(pair[1] - pair[0] >= ob_render::line_height(1.2) + 4.0);
+        }
+        let last_line_bottom = INVENTORY_FOOTER_LINES[INVENTORY_FOOTER_LINES.len() - 1] + ob_render::line_height(1.0);
+        assert!(last_line_bottom <= INVENTORY_FOOTER_HEIGHT - 8.0);
     }
 
     #[test]

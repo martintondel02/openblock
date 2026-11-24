@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use ob_content::{ItemType, Registry};
-use ob_math::{Aabb, BlockPos, WORLD_MAX_Y, WORLD_MIN_Y, WorldVec};
+use ob_math::{BlockPos, WORLD_MAX_Y, WORLD_MIN_Y, WorldVec};
 use ob_sim::{GRAVITY, Player};
 use ob_world::World;
 
@@ -30,8 +30,12 @@ pub(crate) const ITEM_PICKUP_DELAY: f64 = 0.5;
 pub(crate) const ITEM_DESPAWN_AGE: f64 = 300.0;
 /// Dropped items below this height despawn (the void).
 pub(crate) const ITEM_DESPAWN_Y: f64 = -64.0;
-/// Extra distance around the player AABB in which items are collected.
-pub(crate) const ITEM_PICKUP_EXPANSION: f64 = 0.35;
+/// Radius around the player in which dropped items are attracted and collected.
+pub(crate) const ITEM_PICKUP_RADIUS: f64 = 3.0;
+/// Distance to the player's chest at which an attracted item is collected.
+pub(crate) const ITEM_COLLECT_DISTANCE: f64 = 0.9;
+/// Speed in metres per second at which attracted items fly toward the player.
+pub(crate) const ITEM_MAGNET_SPEED: f64 = 7.0;
 /// Small offset above a block top at which a settled item rests.
 pub(crate) const ITEM_REST_OFFSET: f64 = 0.1;
 
@@ -203,18 +207,34 @@ fn move_vertical(world: &World, entity: &mut ItemEntity, delta_y: f64) {
     }
 }
 
-/// Whether `entity` is close enough to `player` to be collected.
+/// Whether `entity` is within the player's pickup radius.
 ///
-/// Uses the player AABB expanded by [`ITEM_PICKUP_EXPANSION`] on every axis
-/// (feet - 0.35 m to feet + 2.15 m vertically, 1.3 m wide horizontally), which
-/// is the compact form of the 1.35 m pickup radius.
+/// Distance is measured from the player's chest to the entity position; items
+/// inside [`ITEM_PICKUP_RADIUS`] are attracted toward the player and collected
+/// once they reach [`ITEM_COLLECT_DISTANCE`].
 pub(crate) fn can_pick_up(player: &Player, entity: &ItemEntity) -> bool {
-    let bounds = player.aabb();
-    let expanded = Aabb::new(
-        bounds.min - WorldVec::splat(ITEM_PICKUP_EXPANSION),
-        bounds.max + WorldVec::splat(ITEM_PICKUP_EXPANSION),
-    );
-    expanded.contains_point(entity.pos)
+    player_chest(player).distance(entity.pos) <= ITEM_PICKUP_RADIUS
+}
+
+/// Player chest position used as the magnet/pickup target.
+pub(crate) fn player_chest(player: &Player) -> WorldVec {
+    WorldVec::new(player.pos.x, player.pos.y + 0.9, player.pos.z)
+}
+
+/// Moves an attracted item one step toward the player's chest.
+///
+/// Returns the distance remaining after the step. The caller still applies the
+/// collect-distance test, so this only runs for entities inside the radius.
+pub(crate) fn attract_item(player: &Player, entity: &mut ItemEntity, dt: f64) -> f64 {
+    let target = player_chest(player);
+    let delta = target - entity.pos;
+    let distance = delta.length();
+    if distance > f64::EPSILON {
+        let step = (ITEM_MAGNET_SPEED * dt).min(distance);
+        entity.pos += delta * (step / distance);
+        entity.velocity = WorldVec::ZERO;
+    }
+    distance - (ITEM_MAGNET_SPEED * dt).min(distance)
 }
 
 /// Serializes the entities to deterministic, header-free `items.txt` lines.

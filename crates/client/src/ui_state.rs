@@ -50,32 +50,67 @@ pub const TOAST_SECONDS: f32 = 2.5;
 /// Maximum number of toasts shown at once.
 pub const MAX_TOASTS: usize = 3;
 /// Width of a death-screen button.
-pub const DEATH_BUTTON_WIDTH: f32 = 220.0;
+pub const DEATH_BUTTON_WIDTH: f32 = 240.0;
 /// Height of a death-screen button.
-pub const DEATH_BUTTON_HEIGHT: f32 = 40.0;
+pub const DEATH_BUTTON_HEIGHT: f32 = 44.0;
 /// Vertical gap between death-screen buttons.
-pub const DEATH_BUTTON_GAP: f32 = 14.0;
+pub const DEATH_BUTTON_GAP: f32 = 20.0;
 /// Death-screen note explaining that the inventory survives.
 pub const DEATH_NOTE: &str = "The world keeps your inventory";
 
 /// Width of the modal settings panel in UI pixels.
-pub const SETTINGS_PANEL_WIDTH: f32 = 560.0;
+pub const SETTINGS_PANEL_WIDTH: f32 = 620.0;
 /// Height of the modal settings panel in UI pixels.
-pub const SETTINGS_PANEL_HEIGHT: f32 = 460.0;
+pub const SETTINGS_PANEL_HEIGHT: f32 = 520.0;
 /// Horizontal inner margin of the settings panel.
-pub const SETTINGS_MARGIN: f32 = 24.0;
+pub const SETTINGS_MARGIN: f32 = 28.0;
 /// Height of the tab strip.
-pub const SETTINGS_TAB_HEIGHT: f32 = 32.0;
+pub const SETTINGS_TAB_HEIGHT: f32 = 34.0;
+/// Top offset of the tab strip below the panel title.
+pub const SETTINGS_TAB_TOP: f32 = 72.0;
+/// Gap between two settings tabs.
+pub const SETTINGS_TAB_GAP: f32 = 8.0;
 /// Height of a focusable settings row.
 pub const SETTINGS_ROW_HEIGHT: f32 = 34.0;
-/// Vertical distance between settings rows.
-pub const SETTINGS_ROW_STEP: f32 = 38.0;
+/// Vertical distance between settings rows; the extra pixels are a visible
+/// breathing gap between two focusable rows.
+pub const SETTINGS_ROW_STEP: f32 = 44.0;
+/// Vertical distance from the panel top to the first settings row.
+pub const SETTINGS_CONTENT_TOP: f32 = 132.0;
 /// Width of a footer button.
-pub const SETTINGS_BUTTON_WIDTH: f32 = 150.0;
+pub const SETTINGS_BUTTON_WIDTH: f32 = 160.0;
 /// Height of a footer button.
-pub const SETTINGS_BUTTON_HEIGHT: f32 = 34.0;
+pub const SETTINGS_BUTTON_HEIGHT: f32 = 38.0;
 /// Gap between the two footer buttons.
-pub const SETTINGS_BUTTON_GAP: f32 = 16.0;
+pub const SETTINGS_BUTTON_GAP: f32 = 24.0;
+/// Width of one clickable `<` or `>` adjustment arrow.
+pub const SETTINGS_ARROW_WIDTH: f32 = 22.0;
+/// Height of one clickable adjustment arrow.
+pub const SETTINGS_ARROW_HEIGHT: f32 = 26.0;
+/// Horizontal gap between the two adjustment arrows.
+pub const SETTINGS_ARROW_GAP: f32 = 10.0;
+/// Right margin of the increment arrow inside a row.
+pub const SETTINGS_ARROW_RIGHT_MARGIN: f32 = 12.0;
+/// Gap between a row value and the decrement arrow.
+pub const SETTINGS_VALUE_GAP: f32 = 16.0;
+/// Width of the range progress track drawn under the value.
+pub const SETTINGS_SLIDER_WIDTH: f32 = 110.0;
+/// Gap between the slider track and the decrement arrow.
+pub const SETTINGS_SLIDER_GAP: f32 = 16.0;
+/// Height of the summary box shown under the Game-tab rows.
+pub const SETTINGS_SUMMARY_HEIGHT: f32 = 40.0;
+/// Vertical gap between the last row and a summary/source box.
+pub const SETTINGS_SUMMARY_GAP: f32 = 16.0;
+/// Row pitch of the two-column Controls reference.
+pub const SETTINGS_CONTROLS_ROW_STEP: f32 = 26.0;
+/// Height of the row used to draw the Controls reference.
+pub const SETTINGS_CONTROLS_TEXT_HEIGHT: f32 = 10.0;
+/// Top offset of the footer separator, measured from the panel bottom.
+pub const SETTINGS_FOOTER_Y_FROM_BOTTOM: f32 = 70.0;
+/// Top offset of the first footer hint line, measured from the panel bottom.
+pub const SETTINGS_HINT_Y_FROM_BOTTOM: f32 = 60.0;
+/// Vertical distance between footer hint lines.
+pub const SETTINGS_HINT_STEP: f32 = 14.0;
 /// Smallest render distance the settings screen offers, in chunks.
 pub const SETTINGS_MIN_RENDER_DISTANCE: i32 = 2;
 /// Largest render distance the settings screen offers, in chunks.
@@ -94,8 +129,8 @@ pub const SETTINGS_MAX_MOUSE_SENSITIVITY: f32 = 3.0;
 pub const SETTINGS_SENSITIVITY_STEP: f32 = 0.1;
 /// Footer hint lines, split so they fit the panel at the 8x8 font.
 pub const SETTINGS_HINT_LINES: [&str; 2] = [
-    "Tab: switch   Up/Down: select   Left/Right: change",
-    "Enter: activate   Esc: back to game",
+    "Tab: switch   Up/Down: select   Left/Right or scroll: change",
+    "Click < > to change   Enter: activate   Esc: back",
 ];
 /// Note shown on the Controls tab.
 pub const SETTINGS_PERSISTENCE_NOTE: &str = "Settings save automatically";
@@ -747,13 +782,349 @@ impl DebugStats {
     }
 
     /// Right column lines: hardware and window information.
+    ///
+    /// Long adapter descriptions (Mesa reports the CPU as well as the GPU) are
+    /// wrapped so the secondary column stays narrow enough to sit beside the
+    /// left column at 1280x720. Every character is preserved.
     pub fn right_lines(&self) -> Vec<String> {
-        vec![
+        let mut lines = Vec::new();
+        for text in [
             format!("GPU {}", self.adapter),
             format!("Window {}x{}", self.window[0], self.window[1]),
             "Renderer wgpu (Vulkan)".to_string(),
             "Mesh pipeline: greedy + AO".to_string(),
-        ]
+        ] {
+            lines.extend(wrap_words(&text, DEBUG_RIGHT_WRAP_COLUMNS));
+        }
+        lines
+    }
+}
+
+/// Maximum number of characters per line in the F3 right column.
+pub const DEBUG_RIGHT_WRAP_COLUMNS: usize = 34;
+
+/// Wraps `text` at spaces, keeping every character (ASCII-only input in the
+/// overlay). Words longer than `max_chars` are split so wrapping terminates.
+fn wrap_words(text: &str, max_chars: usize) -> Vec<String> {
+    let max_chars = max_chars.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split(' ') {
+        if word.is_empty() {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            continue;
+        }
+        let mut word = word.to_string();
+        loop {
+            let extra = usize::from(!current.is_empty());
+            if current.chars().count() + extra + word.chars().count() <= max_chars {
+                if !current.is_empty() {
+                    current.push(' ');
+                }
+                current.push_str(&word);
+                break;
+            }
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                continue;
+            }
+            // A single word is longer than the column: hard-split it.
+            let mut chunk = String::new();
+            let mut rest = String::new();
+            for (index, character) in word.chars().enumerate() {
+                if index < max_chars {
+                    chunk.push(character);
+                } else {
+                    rest.push(character);
+                }
+            }
+            lines.push(chunk);
+            if rest.is_empty() {
+                break;
+            }
+            word = rest;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Glyph scale of the F3 overlay's left column.
+pub const DEBUG_TEXT_SCALE: f32 = 1.8;
+/// Glyph scale of the dimmer hardware column.
+pub const DEBUG_SECONDARY_SCALE: f32 = 1.6;
+/// Extra leading between two F3 text lines, in addition to the glyph height.
+///
+/// The old overlay drew 16 px glyphs on a 16 px line step, so consecutive lines
+/// touched. A minimum of six extra pixels keeps descenders apart; eight is used.
+pub const DEBUG_LINE_GAP: f32 = 8.0;
+/// Extra vertical gap between two F3 sections.
+pub const DEBUG_SECTION_GAP: f32 = 10.0;
+/// Inner padding of an F3 column panel.
+pub const DEBUG_PADDING: f32 = 14.0;
+/// Horizontal gap between the left and right F3 panels.
+pub const DEBUG_COLUMN_GAP: f32 = 24.0;
+/// Vertical gap between the two panels when they are stacked.
+pub const DEBUG_PANEL_GAP: f32 = 12.0;
+/// Margin between the F3 panels and the screen edge.
+pub const DEBUG_MARGIN: f32 = 8.0;
+/// Space kept free at the bottom of the screen for the control hint.
+pub const DEBUG_FOOTER_SPACE: f32 = 30.0;
+/// Scale of the footer hint line.
+pub const DEBUG_FOOTER_SCALE: f32 = 1.2;
+/// Candidate glyph scales, largest first, used to fit narrow screens.
+pub const DEBUG_SCALES: [f32; 9] = [1.8, 1.7, 1.6, 1.5, 1.4, 1.3, 1.2, 1.1, 1.0];
+/// Section index of every line returned by [`DebugStats::left_lines`].
+pub const DEBUG_LEFT_SECTIONS: [usize; 16] = [0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3];
+
+/// How the two F3 columns are arranged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugColumns {
+    /// Hardware column to the right of the stats column.
+    SideBySide,
+    /// Hardware column below the stats column on narrow screens.
+    Stacked,
+    /// Hardware column omitted because even the stacked form does not fit.
+    LeftOnly,
+}
+
+/// Placement of one F3 text line inside its column panel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DebugLinePlacement {
+    /// Index into the source line list.
+    pub index: usize,
+    /// Section index used for grouping.
+    pub section: usize,
+    /// Left edge of the glyphs.
+    pub x: f32,
+    /// Top edge of the glyphs.
+    pub y: f32,
+    /// Measured advance width at the column scale.
+    pub width: f32,
+}
+
+/// One F3 column with its panel background and line placement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DebugColumnLayout {
+    /// Panel background rectangle.
+    pub panel: UiRect,
+    /// Glyph scale used by the column.
+    pub scale: f32,
+    /// Placed lines, top to bottom.
+    pub lines: Vec<DebugLinePlacement>,
+}
+
+/// Pure geometry of the F3 overlay for a target size.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DebugOverlayLayout {
+    /// Arrangement of the two columns.
+    pub columns: DebugColumns,
+    /// Left statistics column, always present.
+    pub left: DebugColumnLayout,
+    /// Right hardware column, omitted only on very small targets.
+    pub right: Option<DebugColumnLayout>,
+    /// Y of the separator drawn under the header line.
+    pub header_separator_y: f32,
+    /// Y of the footer hint.
+    pub footer_y: f32,
+}
+
+/// Line step of the F3 overlay at `scale`, including the breathing gap.
+pub fn debug_line_step(scale: f32) -> f32 {
+    ob_render::line_height(scale) + DEBUG_LINE_GAP
+}
+
+/// Height of a column panel for `line_count` lines split into `sections`.
+fn debug_panel_height(line_count: usize, section_count: usize, scale: f32) -> f32 {
+    if line_count == 0 {
+        return DEBUG_PADDING * 2.0;
+    }
+    line_count as f32 * ob_render::line_height(scale)
+        + line_count.saturating_sub(1) as f32 * DEBUG_LINE_GAP
+        + section_count.saturating_sub(1) as f32 * DEBUG_SECTION_GAP
+        + DEBUG_PADDING * 2.0
+}
+
+/// Places one column starting at `top_left`.
+fn debug_column(
+    frame: &UiFrame,
+    lines: &[String],
+    sections: &[usize],
+    scale: f32,
+    top_left: (f32, f32),
+    max_width: f32,
+) -> DebugColumnLayout {
+    let mut placements = Vec::with_capacity(lines.len());
+    let mut y = top_left.1 + DEBUG_PADDING;
+    let mut previous_section = None;
+    let mut widest = 0.0_f32;
+    for (index, text) in lines.iter().enumerate() {
+        let section = sections.get(index).copied().unwrap_or(0);
+        if previous_section.is_some_and(|previous| previous != section) {
+            y += DEBUG_SECTION_GAP;
+        }
+        previous_section = Some(section);
+        let line_width = frame.text_width(scale, text);
+        widest = widest.max(line_width);
+        placements.push(DebugLinePlacement {
+            index,
+            section,
+            x: top_left.0 + DEBUG_PADDING,
+            y,
+            width: line_width,
+        });
+        y += debug_line_step(scale);
+    }
+    let panel_height = debug_panel_height(lines.len(), debug_section_count(sections), scale);
+    let panel_width = (widest + DEBUG_PADDING * 2.0).min(max_width);
+    DebugColumnLayout {
+        panel: UiRect::new(top_left.0, top_left.1, panel_width, panel_height),
+        scale,
+        lines: placements,
+    }
+}
+
+/// Attempts one column arrangement at `scale`, returning it when it fits.
+fn debug_layout_at(
+    screen: [f32; 2],
+    left_lines: &[String],
+    right_lines: &[String],
+    scale: f32,
+) -> Option<DebugOverlayLayout> {
+    let measure = UiFrame::new(screen[0], screen[1]);
+    let right_scale = (scale - 0.2).max(1.0);
+    let available_width = (screen[0] - DEBUG_MARGIN * 2.0).max(1.0);
+    let available_height = (screen[1] - DEBUG_MARGIN * 2.0 - DEBUG_FOOTER_SPACE).max(1.0);
+    let left_width = left_lines
+        .iter()
+        .map(|line| measure.text_width(scale, line))
+        .fold(0.0_f32, f32::max);
+    let right_width = right_lines
+        .iter()
+        .map(|line| measure.text_width(right_scale, line))
+        .fold(0.0_f32, f32::max);
+    let left_height = debug_panel_height(left_lines.len(), debug_section_count(&DEBUG_LEFT_SECTIONS), scale);
+    let right_height = debug_panel_height(right_lines.len(), 1, right_scale);
+    let right_sections = vec![0; right_lines.len()];
+
+    let fit_columns = |left: DebugColumnLayout, right: Option<DebugColumnLayout>, columns| {
+        let panel_bottom = right.as_ref().map_or(left.panel.y + left.panel.h, |right| {
+            (left.panel.y + left.panel.h).max(right.panel.y + right.panel.h)
+        });
+        // The control hint sits just below the overlay panels so it never lands
+        // on top of the hotbar (which is centred at the bottom of the screen).
+        let footer_y = panel_bottom + 6.0;
+        let footer_bottom = footer_y + ob_render::line_height(DEBUG_FOOTER_SCALE);
+        let hotbar_top = screen[1] - HOTBAR_SLOT_SIZE - 18.0;
+        (panel_bottom <= available_height + DEBUG_MARGIN && footer_bottom <= hotbar_top - 4.0).then_some(
+            DebugOverlayLayout {
+                columns,
+                header_separator_y: left
+                    .lines
+                    .first()
+                    .map_or(DEBUG_MARGIN, |line| line.y + ob_render::line_height(scale) + 2.0),
+                left,
+                right,
+                footer_y,
+            },
+        )
+    };
+
+    let side_by_side_width = left_width + DEBUG_PADDING * 2.0 + DEBUG_COLUMN_GAP + right_width + DEBUG_PADDING * 2.0;
+    if side_by_side_width <= available_width && left_height <= available_height {
+        let left = debug_column(
+            &measure,
+            left_lines,
+            &DEBUG_LEFT_SECTIONS,
+            scale,
+            (DEBUG_MARGIN, DEBUG_MARGIN),
+            available_width,
+        );
+        let right = debug_column(
+            &measure,
+            right_lines,
+            &right_sections,
+            right_scale,
+            (DEBUG_MARGIN + left.panel.w + DEBUG_COLUMN_GAP, DEBUG_MARGIN),
+            available_width,
+        );
+        return fit_columns(left, Some(right), DebugColumns::SideBySide);
+    }
+    if left_height + DEBUG_PANEL_GAP + right_height <= available_height {
+        let left = debug_column(
+            &measure,
+            left_lines,
+            &DEBUG_LEFT_SECTIONS,
+            scale,
+            (DEBUG_MARGIN, DEBUG_MARGIN),
+            available_width,
+        );
+        let right = debug_column(
+            &measure,
+            right_lines,
+            &right_sections,
+            right_scale,
+            (DEBUG_MARGIN, DEBUG_MARGIN + left.panel.h + DEBUG_PANEL_GAP),
+            available_width,
+        );
+        return fit_columns(left, Some(right), DebugColumns::Stacked);
+    }
+    None
+}
+
+/// Number of distinct section indices in `sections`.
+fn debug_section_count(sections: &[usize]) -> usize {
+    let mut count = 0;
+    let mut previous = None;
+    for section in sections {
+        if previous != Some(*section) {
+            count += 1;
+            previous = Some(*section);
+        }
+    }
+    count
+}
+
+/// Computes the F3 overlay geometry for a deterministic stats snapshot.
+///
+/// The largest scale that keeps both columns (and the footer) on screen is
+/// chosen. When the columns do not fit side by side, the hardware column is
+/// stacked below the stats column; on very small targets it is omitted so the
+/// remaining text stays readable.
+pub fn debug_overlay_layout(screen: [f32; 2], stats: &DebugStats) -> DebugOverlayLayout {
+    let left_lines = stats.left_lines();
+    let right_lines = stats.right_lines();
+    for scale in DEBUG_SCALES {
+        if let Some(layout) = debug_layout_at(screen, &left_lines, &right_lines, scale) {
+            return layout;
+        }
+    }
+    // The smallest scale still does not fit: omit the secondary column and
+    // keep the most important information readable.
+    let scale = DEBUG_SCALES[DEBUG_SCALES.len() - 1];
+    let measure = UiFrame::new(screen[0], screen[1]);
+    let available_width = (screen[0] - DEBUG_MARGIN * 2.0).max(1.0);
+    let left = debug_column(
+        &measure,
+        &left_lines,
+        &DEBUG_LEFT_SECTIONS,
+        scale,
+        (DEBUG_MARGIN, DEBUG_MARGIN),
+        available_width,
+    );
+    DebugOverlayLayout {
+        columns: DebugColumns::LeftOnly,
+        header_separator_y: left
+            .lines
+            .first()
+            .map_or(DEBUG_MARGIN, |line| line.y + ob_render::line_height(scale) + 2.0),
+        footer_y: left.panel.y + left.panel.h + 6.0,
+        left,
+        right: None,
     }
 }
 
@@ -1059,6 +1430,88 @@ impl UiState {
         }
     }
 
+    /// Whether `settings_adjust(delta)` would change `row`.
+    ///
+    /// Drawing dims a `<` or `>` arrow that would have no effect, and click
+    /// handling uses the same answer so a click never appears to do nothing
+    /// silently.
+    pub fn settings_can_adjust(&self, row: SettingsRow, delta: i32) -> bool {
+        if delta == 0 || !self.settings_row_enabled(row) {
+            return false;
+        }
+        match row {
+            SettingsRow::RenderDistance => {
+                let value = self.settings.render_distance_chunks;
+                if delta < 0 {
+                    value > SETTINGS_MIN_RENDER_DISTANCE
+                } else {
+                    value < SETTINGS_MAX_RENDER_DISTANCE
+                }
+            }
+            SettingsRow::Fov => {
+                let value = if self.settings.fov_degrees.is_finite() {
+                    self.settings.fov_degrees
+                } else {
+                    Settings::default().fov_degrees
+                };
+                if delta < 0 {
+                    value > SETTINGS_MIN_FOV_DEGREES
+                } else {
+                    value < SETTINGS_MAX_FOV_DEGREES
+                }
+            }
+            SettingsRow::MouseSensitivity => {
+                let value = if self.settings.mouse_sensitivity.is_finite() {
+                    self.settings.mouse_sensitivity
+                } else {
+                    Settings::default().mouse_sensitivity
+                };
+                if delta < 0 {
+                    value > SETTINGS_MIN_MOUSE_SENSITIVITY
+                } else {
+                    value < SETTINGS_MAX_MOUSE_SENSITIVITY
+                }
+            }
+            SettingsRow::GameMode | SettingsRow::TextureStyle => true,
+            SettingsRow::ShowHud | SettingsRow::DebugOverlay | SettingsRow::Fullscreen | SettingsRow::TexturePack => {
+                true
+            }
+            SettingsRow::MeshWorkers => false,
+        }
+    }
+
+    /// Left and right adjustment-arrow rectangles for every row.
+    ///
+    /// The vector is aligned with [`Self::settings_rows`]; rows that do not
+    /// offer arrows (toggles, actions, read-only rows and disabled rows) are
+    /// `None`. Drawing and hit-testing both use these rectangles.
+    pub fn settings_arrow_rects(&self, screen: [f32; 2]) -> Vec<Option<(UiRect, UiRect)>> {
+        self.settings_rows()
+            .into_iter()
+            .zip(self.settings_row_rects(screen))
+            .map(|(row, rect)| {
+                let shows_arrows = matches!(row.kind(), SettingsRowKind::Range | SettingsRowKind::Choice)
+                    && self.settings_row_enabled(row);
+                shows_arrows.then(|| settings_arrow_rects_for(rect))
+            })
+            .collect()
+    }
+
+    /// Adjustment arrow under `cursor`: the row index and `-1`/`+1`.
+    pub fn settings_arrow_at(&self, screen: [f32; 2], cursor: (f32, f32)) -> Option<(usize, i32)> {
+        for (index, arrows) in self.settings_arrow_rects(screen).iter().enumerate() {
+            if let Some((left, right)) = arrows {
+                if left.contains(cursor.0, cursor.1) {
+                    return Some((index, -1));
+                }
+                if right.contains(cursor.0, cursor.1) {
+                    return Some((index, 1));
+                }
+            }
+        }
+        None
+    }
+
     /// Display value drawn on the right of a row.
     pub fn settings_row_value(&self, row: SettingsRow, info: &SettingsInfo) -> String {
         match row {
@@ -1291,8 +1744,10 @@ impl UiState {
 
     /// Handles a click at [`Self::cursor`].
     ///
-    /// Tab clicks switch tabs without closing the screen; row and button clicks
-    /// activate them. Clicks outside the panel are ignored.
+    /// Tab clicks switch tabs without closing the screen. Footer buttons act on
+    /// click. On a row, the explicit `<`/`>` arrows change the value; clicking
+    /// the row body only focuses it for range and choice rows, while toggles
+    /// and actions still activate. Read-only rows do nothing.
     pub fn settings_click(&mut self, screen: [f32; 2]) -> Option<SettingsAction> {
         if self.screen != Screen::Settings {
             return None;
@@ -1303,12 +1758,24 @@ impl UiState {
             return None;
         }
         let row_count = self.settings_rows().len();
-        let focus = self
-            .settings_hovered_button
-            .map(|index| row_count + index)
-            .or(self.settings_hovered_row)?;
-        self.settings_selected_row = focus;
-        self.settings_activate()
+        if let Some(index) = self.settings_hovered_button {
+            self.settings_selected_row = row_count + index;
+            return self.settings_activate();
+        }
+        let row_index = self.settings_hovered_row?;
+        let row = *self.settings_rows().get(row_index)?;
+        self.settings_selected_row = row_index;
+        if let Some((arrow_row, delta)) = self.settings_arrow_at(screen, self.cursor)
+            && arrow_row == row_index
+        {
+            return self.settings_adjust(delta).map(SettingsAction::Adjust);
+        }
+        match row.kind() {
+            // Clicking the body only moves focus; the visible arrows are the
+            // explicit adjustment affordance.
+            SettingsRowKind::Range | SettingsRowKind::Choice | SettingsRowKind::ReadOnly => None,
+            SettingsRowKind::Toggle | SettingsRowKind::Action => self.settings_activate(),
+        }
     }
 
     /// Row hit rectangles for the active tab and target size.
@@ -1422,14 +1889,8 @@ impl UiState {
     }
 }
 
-/// First y offset of settings content, relative to the panel top.
-const SETTINGS_CONTENT_TOP: f32 = 112.0;
 /// Footer button top, measured from the panel bottom.
-const SETTINGS_BUTTON_Y_FROM_BOTTOM: f32 = 102.0;
-/// Footer separator, measured from the panel bottom.
-const SETTINGS_FOOTER_Y_FROM_BOTTOM: f32 = 52.0;
-/// First footer hint line, measured from the panel bottom.
-const SETTINGS_HINT_Y_FROM_BOTTOM: f32 = 42.0;
+const SETTINGS_BUTTON_Y_FROM_BOTTOM: f32 = 116.0;
 
 /// Steps a cyclic index by one in the direction of `delta`.
 fn step_index(index: usize, len: usize, delta: i32) -> usize {
@@ -1496,16 +1957,35 @@ pub fn settings_panel_rect(screen: [f32; 2]) -> UiRect {
 /// Bounds of the four tab buttons.
 pub fn settings_tab_rects(screen: [f32; 2]) -> [UiRect; 4] {
     let panel = settings_panel_rect(screen);
-    let gap = 6.0;
-    let width = (panel.w - SETTINGS_MARGIN * 2.0 - gap * 3.0) / 4.0;
+    let width = (panel.w - SETTINGS_MARGIN * 2.0 - SETTINGS_TAB_GAP * 3.0) / 4.0;
     std::array::from_fn(|index| {
         UiRect::new(
-            panel.x + SETTINGS_MARGIN + index as f32 * (width + gap),
-            panel.y + 62.0,
+            panel.x + SETTINGS_MARGIN + index as f32 * (width + SETTINGS_TAB_GAP),
+            panel.y + SETTINGS_TAB_TOP,
             width,
             SETTINGS_TAB_HEIGHT,
         )
     })
+}
+
+/// Left (`<`) and right (`>`) adjustment-arrow rectangles inside a row.
+///
+/// The returned rectangles sit at the right edge of the row, with the value
+/// right-aligned before the decrement arrow so the two never overlap.
+pub fn settings_arrow_rects_for(row: UiRect) -> (UiRect, UiRect) {
+    let right = UiRect::new(
+        row.x + row.w - SETTINGS_ARROW_RIGHT_MARGIN - SETTINGS_ARROW_WIDTH,
+        row.y + (row.h - SETTINGS_ARROW_HEIGHT) / 2.0,
+        SETTINGS_ARROW_WIDTH,
+        SETTINGS_ARROW_HEIGHT,
+    );
+    let left = UiRect::new(
+        right.x - SETTINGS_ARROW_GAP - SETTINGS_ARROW_WIDTH,
+        right.y,
+        SETTINGS_ARROW_WIDTH,
+        SETTINGS_ARROW_HEIGHT,
+    );
+    (left, right)
 }
 
 /// Bounds of the Resume and Save & quit buttons.
@@ -1542,13 +2022,13 @@ pub fn draw_settings_screen(frame: &mut UiFrame, ui: &UiState, info: &SettingsIn
     let row_rects = ui.settings_row_rects(screen);
     match ui.settings_tab {
         SettingsTab::Game => {
-            draw_settings_rows(frame, ui, &rows, &row_rects);
+            draw_settings_rows(frame, ui, &rows, &row_rects, screen);
             draw_game_summary(frame, ui, info, panel, rows.len());
         }
-        SettingsTab::Display => draw_settings_rows(frame, ui, &rows, &row_rects),
+        SettingsTab::Display => draw_settings_rows(frame, ui, &rows, &row_rects, screen),
         SettingsTab::Controls => draw_controls_reference(frame, panel),
         SettingsTab::Textures => {
-            draw_settings_rows(frame, ui, &rows, &row_rects);
+            draw_settings_rows(frame, ui, &rows, &row_rects, screen);
             draw_texture_source(frame, info, panel, rows.len());
         }
     }
@@ -1573,7 +2053,7 @@ fn draw_settings_panel(frame: &mut UiFrame, panel: UiRect) {
 fn draw_settings_header(frame: &mut UiFrame, panel: UiRect) {
     frame.text(
         panel.x + SETTINGS_MARGIN,
-        panel.y + 14.0,
+        panel.y + 18.0,
         2.6,
         [0.98, 0.99, 1.0, 1.0],
         "Settings",
@@ -1582,14 +2062,14 @@ fn draw_settings_header(frame: &mut UiFrame, panel: UiRect) {
     let version_width = frame.text_width(1.2, &version);
     frame.text(
         panel.x + panel.w - SETTINGS_MARGIN - version_width,
-        panel.y + 22.0,
+        panel.y + 27.0,
         1.2,
         [0.64, 0.70, 0.79, 1.0],
         &version,
     );
     frame.rect(
         panel.x + SETTINGS_MARGIN,
-        panel.y + 52.0,
+        panel.y + 58.0,
         panel.w - SETTINGS_MARGIN * 2.0,
         1.0,
         [0.24, 0.28, 0.35, 1.0],
@@ -1622,14 +2102,16 @@ fn draw_settings_tabs(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2]) {
         } else {
             [0.62, 0.68, 0.76, 1.0]
         };
-        frame.text_centered(rect.center().0, rect.y + 10.0, 1.45, color, tab.name());
+        frame.text_centered(rect.center().0, rect.y + 11.0, 1.45, color, tab.name());
     }
 }
 
-fn draw_settings_rows(frame: &mut UiFrame, ui: &UiState, rows: &[SettingsRowInfo], rects: &[UiRect]) {
+fn draw_settings_rows(frame: &mut UiFrame, ui: &UiState, rows: &[SettingsRowInfo], rects: &[UiRect], screen: [f32; 2]) {
+    let arrows = ui.settings_arrow_rects(screen);
+    let hovered_arrow = ui.settings_arrow_at(screen, ui.cursor);
     for (index, (info, rect)) in rows.iter().zip(rects.iter()).enumerate() {
         if info.row == SettingsRow::MeshWorkers {
-            frame.rect(rect.x, rect.y - 6.0, rect.w, 1.0, [0.19, 0.23, 0.29, 0.9]);
+            frame.rect(rect.x, rect.y - 9.0, rect.w, 1.0, [0.19, 0.23, 0.29, 0.9]);
         }
         if index == ui.settings_selected_row {
             frame.rect(rect.x, rect.y, rect.w, rect.h, [0.16, 0.21, 0.29, 0.96]);
@@ -1641,27 +2123,64 @@ fn draw_settings_rows(frame: &mut UiFrame, ui: &UiState, rows: &[SettingsRowInfo
         } else {
             [0.50, 0.55, 0.63, 1.0]
         };
-        frame.text(rect.x + 14.0, rect.y + 10.0, 1.5, label_color, info.label);
+        frame.text(rect.x + 16.0, rect.y + 11.0, 1.5, label_color, info.label);
+        let row_arrows = arrows.get(index).copied().flatten();
+        let value_right = row_arrows.map_or(rect.x + rect.w - 14.0, |(left, _)| left.x - SETTINGS_VALUE_GAP);
         let value_color = settings_value_color(info);
         let value_width = frame.text_width(1.35, &info.value);
-        frame.text(
-            rect.x + rect.w - 12.0 - value_width,
-            rect.y + 10.0,
-            1.35,
-            value_color,
-            &info.value,
-        );
+        frame.text(value_right - value_width, rect.y + 11.0, 1.35, value_color, &info.value);
+        if let Some((left, right)) = row_arrows {
+            let left_active = ui.settings_can_adjust(info.row, -1);
+            let right_active = ui.settings_can_adjust(info.row, 1);
+            draw_settings_arrow(frame, left, "<", left_active, hovered_arrow == Some((index, -1)));
+            draw_settings_arrow(frame, right, ">", right_active, hovered_arrow == Some((index, 1)));
+        }
         if let Some(fraction) = ui.settings_row_fraction(info.row) {
-            let track_x = rect.x + rect.w - 150.0;
-            let track_y = rect.y + rect.h - 8.0;
-            frame.rect(track_x, track_y, 130.0, 3.0, [0.10, 0.12, 0.16, 1.0]);
-            let filled = 130.0 * fraction;
+            let track_width = SETTINGS_SLIDER_WIDTH;
+            let track_x = row_arrows.map_or(rect.x + rect.w - track_width - 14.0, |(left, _)| {
+                left.x - SETTINGS_SLIDER_GAP - track_width
+            });
+            let track_y = rect.y + rect.h - 7.0;
+            frame.rect(track_x, track_y, track_width, 3.0, [0.10, 0.12, 0.16, 1.0]);
+            let filled = track_width * fraction;
             if filled > 0.0 {
                 frame.rect(track_x, track_y, filled, 3.0, [0.88, 0.69, 0.28, 1.0]);
             }
             frame.rect(track_x + filled - 2.0, track_y - 2.0, 4.0, 7.0, [0.98, 0.83, 0.43, 1.0]);
         }
     }
+}
+
+fn draw_settings_arrow(frame: &mut UiFrame, rect: UiRect, glyph: &str, enabled: bool, hovered: bool) {
+    let background = if hovered && enabled {
+        [0.28, 0.34, 0.44, 0.98]
+    } else if enabled {
+        [0.13, 0.17, 0.23, 0.92]
+    } else {
+        [0.09, 0.11, 0.14, 0.75]
+    };
+    frame.rect(rect.x, rect.y, rect.w, rect.h, background);
+    let border = if hovered && enabled {
+        [0.98, 0.84, 0.46, 1.0]
+    } else if enabled {
+        [0.42, 0.49, 0.59, 0.95]
+    } else {
+        [0.22, 0.25, 0.30, 0.8]
+    };
+    frame.outline(rect.x, rect.y, rect.w, rect.h, 1.0, border);
+    let color = if enabled {
+        [0.95, 0.97, 1.0, 1.0]
+    } else {
+        [0.45, 0.50, 0.57, 0.9]
+    };
+    let text_height = ob_render::line_height(1.4);
+    frame.text_centered(
+        rect.center().0,
+        rect.y + (rect.h - text_height) / 2.0,
+        1.4,
+        color,
+        glyph,
+    );
 }
 
 fn settings_value_color(info: &SettingsRowInfo) -> [f32; 4] {
@@ -1684,20 +2203,26 @@ fn settings_value_color(info: &SettingsRowInfo) -> [f32; 4] {
 
 fn draw_game_summary(frame: &mut UiFrame, ui: &UiState, info: &SettingsInfo, panel: UiRect, row_count: usize) {
     let x = panel.x + SETTINGS_MARGIN;
-    let y = panel.y + SETTINGS_CONTENT_TOP + row_count as f32 * SETTINGS_ROW_STEP + 14.0;
+    let y = panel.y + SETTINGS_CONTENT_TOP + row_count as f32 * SETTINGS_ROW_STEP + SETTINGS_SUMMARY_GAP;
     let width = panel.w - SETTINGS_MARGIN * 2.0;
-    frame.rect(x, y, width, 34.0, [0.09, 0.11, 0.15, 0.96]);
-    frame.outline(x, y, width, 34.0, 1.0, [0.20, 0.24, 0.31, 1.0]);
+    frame.rect(x, y, width, SETTINGS_SUMMARY_HEIGHT, [0.09, 0.11, 0.15, 0.96]);
+    frame.outline(x, y, width, SETTINGS_SUMMARY_HEIGHT, 1.0, [0.20, 0.24, 0.31, 1.0]);
     let mode = game_mode_label(ui.settings.game_mode);
     let health = vital_value(info.health);
     let hunger = vital_value(info.hunger);
     let text = format!("{mode}   Health {health:.0} / 20   Hunger {hunger:.0} / 20");
-    frame.text(x + 12.0, y + 11.0, 1.2, [0.90, 0.94, 0.99, 1.0], &text);
+    frame.text(
+        x + 14.0,
+        y + (SETTINGS_SUMMARY_HEIGHT - ob_render::line_height(1.2)) / 2.0,
+        1.2,
+        [0.90, 0.94, 0.99, 1.0],
+        &text,
+    );
 }
 
 fn draw_texture_source(frame: &mut UiFrame, info: &SettingsInfo, panel: UiRect, row_count: usize) {
     let x = panel.x + SETTINGS_MARGIN;
-    let y = panel.y + SETTINGS_CONTENT_TOP + row_count as f32 * SETTINGS_ROW_STEP + 14.0;
+    let y = panel.y + SETTINGS_CONTENT_TOP + row_count as f32 * SETTINGS_ROW_STEP + SETTINGS_SUMMARY_GAP;
     let source = if info.texture_source.is_empty() {
         "built-in"
     } else {
@@ -1712,7 +2237,7 @@ fn draw_texture_source(frame: &mut UiFrame, info: &SettingsInfo, panel: UiRect, 
     let text = format!("Active texture source: {source} ({resolution})");
     frame.rect(
         x,
-        y - 8.0,
+        y - 10.0,
         panel.w - SETTINGS_MARGIN * 2.0,
         1.0,
         [0.19, 0.23, 0.29, 0.9],
@@ -1724,9 +2249,11 @@ fn draw_controls_reference(frame: &mut UiFrame, panel: UiRect) {
     let columns = controls_reference_columns();
     let top = panel.y + SETTINGS_CONTENT_TOP;
     let column_x = [panel.x + SETTINGS_MARGIN + 8.0, panel.x + panel.w / 2.0 + 8.0];
+    let mut last_y = top;
     for (column, bindings) in columns.iter().enumerate() {
         for (index, binding) in bindings.iter().enumerate() {
-            let y = top + index as f32 * 20.0;
+            let y = top + index as f32 * SETTINGS_CONTROLS_ROW_STEP;
+            last_y = last_y.max(y);
             frame.text(column_x[column], y, 1.1, [0.96, 0.80, 0.42, 1.0], binding.keys);
             frame.text(
                 column_x[column] + 104.0,
@@ -1737,10 +2264,10 @@ fn draw_controls_reference(frame: &mut UiFrame, panel: UiRect) {
             );
         }
     }
-    let note_y = top + 7.0 * 20.0 + 14.0;
+    let note_y = last_y + SETTINGS_CONTROLS_TEXT_HEIGHT + 22.0;
     frame.rect(
         panel.x + SETTINGS_MARGIN,
-        note_y - 10.0,
+        note_y - 12.0,
         panel.w - SETTINGS_MARGIN * 2.0,
         1.0,
         [0.19, 0.23, 0.29, 0.9],
@@ -1785,7 +2312,7 @@ fn draw_settings_buttons(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2]) {
         } else {
             [0.84, 0.88, 0.93, 1.0]
         };
-        frame.text_centered(rect.center().0, rect.y + 11.0, 1.5, label_color, button.label());
+        frame.text_centered(rect.center().0, rect.y + 13.0, 1.5, label_color, button.label());
     }
 }
 
@@ -1802,7 +2329,7 @@ fn draw_settings_footer(frame: &mut UiFrame, panel: UiRect) {
     for (index, line) in SETTINGS_HINT_LINES.iter().enumerate() {
         frame.text_centered(
             panel.x + panel.w / 2.0,
-            hint_y + index as f32 * 12.0,
+            hint_y + index as f32 * SETTINGS_HINT_STEP,
             1.0,
             [0.62, 0.68, 0.76, 1.0],
             line,
@@ -2017,7 +2544,7 @@ pub fn draw_toasts(frame: &mut UiFrame, toasts: &ToastQueue, screen: [f32; 2]) {
 /// Positions of the two death-screen buttons.
 pub fn death_button_rects(screen: [f32; 2]) -> [UiRect; 2] {
     let x = (screen[0] - DEATH_BUTTON_WIDTH) / 2.0;
-    let first_y = screen[1] / 2.0 + 32.0;
+    let first_y = screen[1] / 2.0 + 34.0;
     [
         UiRect::new(x, first_y, DEATH_BUTTON_WIDTH, DEATH_BUTTON_HEIGHT),
         UiRect::new(
@@ -2036,8 +2563,8 @@ pub fn draw_death_screen(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2]) {
     frame.rect(0.0, 0.0, width, height, [0.35, 0.02, 0.03, 0.20]);
     let centre_x = width / 2.0;
     let centre_y = height / 2.0;
-    frame.text_centered(centre_x, centre_y - 132.0, 4.0, [1.0, 0.88, 0.86, 1.0], "You died");
-    frame.text_centered(centre_x, centre_y - 76.0, 1.5, [0.95, 0.82, 0.80, 1.0], DEATH_NOTE);
+    frame.text_centered(centre_x, centre_y - 142.0, 4.0, [1.0, 0.88, 0.86, 1.0], "You died");
+    frame.text_centered(centre_x, centre_y - 84.0, 1.5, [0.95, 0.82, 0.80, 1.0], DEATH_NOTE);
     let rects = death_button_rects(screen);
     for (index, (rect, label)) in rects.iter().zip(["Respawn", "Save & quit"]).enumerate() {
         let active = index == ui.death_selected || ui.death_hovered == Some(index);
@@ -2053,9 +2580,9 @@ pub fn draw_death_screen(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2]) {
             [0.50, 0.22, 0.22, 1.0]
         };
         frame.outline(rect.x, rect.y, rect.w, rect.h, if active { 2.0 } else { 1.0 }, border);
-        frame.text_centered(rect.center().0, rect.y + 11.0, 2.0, [0.96, 0.92, 0.90, 1.0], label);
+        frame.text_centered(rect.center().0, rect.y + 14.0, 2.0, [0.96, 0.92, 0.90, 1.0], label);
     }
-    let hint_y = rects[1].y + rects[1].h + 24.0;
+    let hint_y = rects[1].y + rects[1].h + 26.0;
     frame.text_centered(
         centre_x,
         hint_y,
@@ -2086,6 +2613,45 @@ pub fn facing_label(yaw: f32) -> &'static str {
 mod tests {
     use super::*;
     use ob_core::config::TextureStyle;
+
+    /// Deterministic stats snapshot shared by the F3 layout tests.
+    fn sample_debug_stats() -> DebugStats {
+        DebugStats {
+            version: "0.0.8".into(),
+            fps: 60,
+            frame_p50_ms: 16.67,
+            frame_p95_ms: 18.02,
+            position: [123.456, 78.0, -234.567],
+            chunk: [7, 4, -14],
+            facing: "north (-Z)",
+            target: Some(("openblock:grass".into(), [1, 2, 3])),
+            seed: 0,
+            render_distance: 6,
+            loaded_chunks: 217,
+            drawn_sections: 244,
+            cached_sections: 1133,
+            triangles: 106398,
+            draw_calls: 244,
+            mesh_workers: 7,
+            mesh_in_flight: 3,
+            mesh_completed: 999,
+            mesh_backlog: 1,
+            heap_bytes: 2 * 1024 * 1024,
+            ticks: 1234,
+            adapter: "Test GPU (vulkan, radv)".into(),
+            window: [1280, 720],
+            fov_degrees: 70.0,
+            time_of_day: 0.5,
+            texture_source: "classic 16px".into(),
+            game_mode: "survival",
+            health: 14.0,
+            hunger: 12.0,
+            held: "Stone Pickaxe".into(),
+            held_durability: Some((129, 131)),
+            mining_speed: 4.0,
+            movement: "walk",
+        }
+    }
 
     #[test]
     fn screen_starts_in_playing_with_hud_visible() {
@@ -2521,6 +3087,266 @@ mod tests {
     }
 
     #[test]
+    fn settings_rows_have_minimum_breathing_room_on_every_tab() {
+        let mut state = UiState::default();
+        state.open_settings();
+        for screen in [[1280.0_f32, 720.0], [960.0, 540.0]] {
+            let panel = settings_panel_rect(screen);
+            for tab in SettingsTab::ALL {
+                state.settings_select_tab(tab);
+                let rows = state.settings_row_rects(screen);
+                for pair in rows.windows(2) {
+                    let pitch = pair[1].y - pair[0].y;
+                    assert!(
+                        pitch >= ob_render::line_height(1.5) + 4.0,
+                        "{tab:?} rows at {screen:?} are too close: {pitch}"
+                    );
+                    assert!(
+                        pair[1].y - (pair[0].y + pair[0].h) >= 6.0,
+                        "{tab:?} hit boxes need a visible gap at {screen:?}"
+                    );
+                }
+                let buttons = settings_button_rects(screen);
+                for row in rows {
+                    assert!(row.x >= panel.x && row.x + row.w <= panel.x + panel.w);
+                    assert!(row.y >= panel.y && row.y + row.h <= panel.y + panel.h);
+                    assert!(row.y + row.h <= buttons[0].y, "rows must clear the buttons");
+                }
+            }
+            // Tabs, hints and buttons must also fit at the smaller target.
+            let tabs = settings_tab_rects(screen);
+            for tab in tabs {
+                assert!(tab.x >= panel.x && tab.x + tab.w <= panel.x + panel.w);
+                assert!(tab.y >= panel.y && tab.y + tab.h <= panel.y + panel.h);
+            }
+            let buttons = settings_button_rects(screen);
+            for button in buttons {
+                assert!(button.y + button.h <= panel.y + panel.h);
+            }
+        }
+        assert!(SETTINGS_CONTROLS_ROW_STEP >= ob_render::line_height(1.1) + 4.0);
+        let controls_note_bottom = SETTINGS_CONTENT_TOP
+            + 6.0 * SETTINGS_CONTROLS_ROW_STEP
+            + SETTINGS_CONTROLS_TEXT_HEIGHT
+            + 22.0
+            + ob_render::line_height(1.2);
+        assert!(
+            controls_note_bottom <= SETTINGS_PANEL_HEIGHT - 116.0,
+            "the Controls note must clear the footer buttons"
+        );
+    }
+
+    #[test]
+    fn settings_arrow_hit_boxes_are_separate_and_hit_testable() {
+        let mut state = UiState::default();
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Display);
+        let screen = [1280.0, 720.0];
+        let rows = state.settings_row_rects(screen);
+        let arrows = state.settings_arrow_rects(screen);
+        assert_eq!(rows.len(), 5);
+        assert!(arrows[0].is_some(), "render distance is a range");
+        assert!(arrows[1].is_some(), "FOV is a range");
+        assert!(arrows[2].is_some(), "sensitivity is a range");
+        assert!(arrows[3].is_none(), "fullscreen is a toggle");
+        assert!(arrows[4].is_none(), "mesh workers is read-only");
+        let (left, right) = arrows[0].expect("render distance arrows");
+        assert!(left.x + left.w < right.x, "arrows must not touch");
+        assert!(right.x + right.w <= rows[0].x + rows[0].w);
+        assert_eq!(state.settings_arrow_at(screen, left.center()), Some((0, -1)));
+        assert_eq!(state.settings_arrow_at(screen, right.center()), Some((0, 1)));
+        assert_eq!(
+            state.settings_arrow_at(screen, (left.x - 24.0, left.center().1)),
+            None,
+            "the row body is not an arrow"
+        );
+        assert_eq!(state.settings_arrow_at(screen, (1.0, 1.0)), None);
+    }
+
+    #[test]
+    fn settings_click_left_arrow_decreases_and_row_body_only_focuses() {
+        use ob_core::config::GameMode;
+        let mut state = UiState::default();
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Display);
+        let screen = [1280.0, 720.0];
+        let rows = state.settings_row_rects(screen);
+        let (left, right) = state.settings_arrow_rects(screen)[0].expect("render distance arrows");
+        assert_eq!(state.settings.render_distance_chunks, 6);
+        state.cursor = left.center();
+        assert_eq!(
+            state.settings_click(screen),
+            Some(SettingsAction::Adjust(SettingsRow::RenderDistance))
+        );
+        assert_eq!(state.settings.render_distance_chunks, 5, "left arrow decrements");
+        state.cursor = rows[0].center();
+        assert_eq!(state.settings_click(screen), None, "the row body only focuses");
+        assert_eq!(state.settings.render_distance_chunks, 5, "body click must not increase");
+        assert_eq!(state.settings_focused_row(), Some(SettingsRow::RenderDistance));
+        state.cursor = right.center();
+        assert_eq!(
+            state.settings_click(screen),
+            Some(SettingsAction::Adjust(SettingsRow::RenderDistance))
+        );
+        assert_eq!(state.settings.render_distance_chunks, 6, "right arrow increments");
+        state.cursor = rows[4].center();
+        assert_eq!(
+            state.settings_click(screen),
+            None,
+            "the read-only mesh-worker row does nothing"
+        );
+
+        // Choice rows also only focus on a body click and wrap backwards on `<`.
+        state.settings_select_tab(SettingsTab::Game);
+        let game_rows = state.settings_row_rects(screen);
+        state.cursor = game_rows[0].center();
+        assert_eq!(state.settings_click(screen), None);
+        assert_eq!(state.settings.game_mode, GameMode::Survival);
+        let (left, _) = state.settings_arrow_rects(screen)[0].expect("game mode arrows");
+        state.cursor = left.center();
+        assert_eq!(
+            state.settings_click(screen),
+            Some(SettingsAction::Adjust(SettingsRow::GameMode))
+        );
+        assert_eq!(state.settings.game_mode, GameMode::Creative, "choice wraps backwards");
+    }
+
+    #[test]
+    fn settings_adjust_minus_one_decrements_every_range_and_clamps() {
+        let mut state = UiState::default();
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Display);
+        state.settings_selected_row = 0;
+        assert_eq!(state.settings.render_distance_chunks, 6);
+        assert_eq!(state.settings_adjust(-1), Some(SettingsRow::RenderDistance));
+        assert_eq!(state.settings.render_distance_chunks, 5);
+        state.settings.render_distance_chunks = SETTINGS_MIN_RENDER_DISTANCE;
+        assert_eq!(state.settings_adjust(-1), None);
+        assert!(!state.settings_can_adjust(SettingsRow::RenderDistance, -1));
+
+        state.settings_selected_row = 1;
+        assert_eq!(state.settings.fov_degrees, 70.0);
+        assert_eq!(state.settings_adjust(-1), Some(SettingsRow::Fov));
+        assert!((state.settings.fov_degrees - 65.0).abs() < 1e-6);
+        state.settings.fov_degrees = SETTINGS_MIN_FOV_DEGREES;
+        assert_eq!(state.settings_adjust(-1), None);
+        assert!(!state.settings_can_adjust(SettingsRow::Fov, -1));
+
+        state.settings_selected_row = 2;
+        assert_eq!(state.settings.mouse_sensitivity, 1.0);
+        assert_eq!(state.settings_adjust(-1), Some(SettingsRow::MouseSensitivity));
+        assert!((state.settings.mouse_sensitivity - 0.9).abs() < 1e-6);
+        state.settings.mouse_sensitivity = SETTINGS_MIN_MOUSE_SENSITIVITY;
+        assert_eq!(state.settings_adjust(-1), None);
+        assert!(!state.settings_can_adjust(SettingsRow::MouseSensitivity, -1));
+    }
+
+    #[test]
+    fn debug_overlay_has_section_spacing_and_never_overlaps_at_1280() {
+        let stats = sample_debug_stats();
+        let screen = [1280.0, 720.0];
+        let layout = debug_overlay_layout(screen, &stats);
+        assert_eq!(layout.columns, DebugColumns::SideBySide);
+        assert_eq!(layout.left.lines.len(), 16);
+        let right = layout.right.as_ref().expect("hardware column");
+        assert!(layout.left.panel.x + layout.left.panel.w + DEBUG_COLUMN_GAP <= right.panel.x + 0.01);
+        assert!(layout.left.panel.y + layout.left.panel.h <= layout.footer_y - 4.0);
+        assert!(right.panel.y + right.panel.h <= layout.footer_y - 4.0);
+        for column in [&layout.left, right] {
+            assert!(column.panel.x >= DEBUG_MARGIN - 0.01);
+            assert!(column.panel.x + column.panel.w <= screen[0] - DEBUG_MARGIN + 0.01);
+            for line in &column.lines {
+                assert!(line.y >= column.panel.y + DEBUG_PADDING - 0.01);
+                assert!(line.y + ob_render::line_height(column.scale) <= column.panel.y + column.panel.h);
+                assert!(line.x + line.width <= column.panel.x + column.panel.w + 0.01);
+            }
+        }
+        // Every consecutive pair in a section keeps a real gap; section changes
+        // add the section gap on top of it.
+        for pair in layout.left.lines.windows(2) {
+            let delta = pair[1].y - pair[0].y;
+            assert!(delta >= debug_line_step(layout.left.scale) - 0.01);
+            assert!(delta >= ob_render::line_height(layout.left.scale) + 6.0);
+            if pair[0].section != pair[1].section {
+                assert!(delta >= debug_line_step(layout.left.scale) + DEBUG_SECTION_GAP - 0.01);
+            }
+        }
+        assert!(layout.header_separator_y > layout.left.lines[0].y);
+        assert!(layout.header_separator_y < layout.left.lines[1].y);
+        assert!(debug_line_step(layout.left.scale) >= ob_render::line_height(layout.left.scale) + 6.0);
+        assert!(layout.footer_y > layout.left.panel.y + layout.left.panel.h);
+        assert!(
+            layout.footer_y + ob_render::line_height(DEBUG_FOOTER_SCALE) < screen[1] - 44.0 - 18.0 - 4.0,
+            "the footer hint stays above the hotbar"
+        );
+    }
+
+    #[test]
+    fn debug_overlay_fits_readably_at_960x540() {
+        let stats = sample_debug_stats();
+        let screen = [960.0, 540.0];
+        let layout = debug_overlay_layout(screen, &stats);
+        assert_ne!(layout.columns, DebugColumns::LeftOnly);
+        assert!(layout.left.scale >= 1.0);
+        let right = layout.right.as_ref().expect("hardware column is kept");
+        match layout.columns {
+            DebugColumns::Stacked => {
+                assert!(right.panel.y >= layout.left.panel.y + layout.left.panel.h);
+            }
+            DebugColumns::SideBySide => {
+                assert!(layout.left.panel.x + layout.left.panel.w + DEBUG_COLUMN_GAP <= right.panel.x + 0.01);
+            }
+            DebugColumns::LeftOnly => unreachable!(),
+        }
+        assert!(right.panel.y + right.panel.h <= layout.footer_y - 4.0);
+        assert!(layout.left.panel.x >= DEBUG_MARGIN - 0.01);
+        assert!(layout.left.panel.x + layout.left.panel.w <= screen[0] - DEBUG_MARGIN + 0.01);
+        assert!(right.panel.x + right.panel.w <= screen[0] - DEBUG_MARGIN + 0.01);
+        assert!(
+            layout.footer_y + ob_render::line_height(DEBUG_FOOTER_SCALE) < screen[1] - 44.0 - 18.0 - 4.0,
+            "the footer hint stays above the hotbar"
+        );
+        for column in [&layout.left, right] {
+            for pair in column.lines.windows(2) {
+                let section_change = pair[0].section != pair[1].section;
+                let minimum = ob_render::line_height(column.scale) + 6.0;
+                if !section_change {
+                    assert!(pair[1].y - pair[0].y >= minimum);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn debug_overlay_degrades_to_the_left_column_on_tiny_screens() {
+        let stats = sample_debug_stats();
+        let screen = [640.0, 360.0];
+        let layout = debug_overlay_layout(screen, &stats);
+        assert_eq!(layout.columns, DebugColumns::LeftOnly);
+        assert!(layout.right.is_none());
+        assert!(!layout.left.lines.is_empty());
+        assert!(layout.left.panel.y + layout.left.panel.h <= screen[1]);
+        assert!(layout.footer_y <= screen[1]);
+    }
+
+    #[test]
+    fn debug_right_column_wraps_long_adapters_without_losing_text() {
+        let mut stats = sample_debug_stats();
+        stats.adapter = "AMD Ryzen 7 9800X3D 8-Core Processor (RADV RAPHAEL_MENDOCINO) (vulkan, radv)".into();
+        let lines = stats.right_lines();
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.chars().count() <= DEBUG_RIGHT_WRAP_COLUMNS)
+        );
+        let joined = lines.join(" ");
+        for needle in ["AMD", "Ryzen", "RAPHAEL_MENDOCINO", "vulkan", "radv"] {
+            assert!(joined.contains(needle), "wrapping dropped {needle}");
+        }
+        assert!(lines.iter().any(|line| line == "Window 1280x720"));
+    }
+
+    #[test]
     fn settings_texture_pack_row_reflects_source_and_enablement() {
         let mut state = UiState::default();
         state.open_settings();
@@ -2637,6 +3463,8 @@ mod tests {
         assert!(SETTINGS_HINT_LINES[0].contains("Tab"));
         assert!(SETTINGS_HINT_LINES[0].contains("Up/Down"));
         assert!(SETTINGS_HINT_LINES[0].contains("Left/Right"));
+        assert!(SETTINGS_HINT_LINES[0].contains("scroll"));
+        assert!(SETTINGS_HINT_LINES[1].contains("< >"));
         assert!(SETTINGS_HINT_LINES[1].contains("Esc"));
     }
 
@@ -2645,13 +3473,18 @@ mod tests {
         let mut state = UiState::default();
         state.open_settings();
         let info = SettingsInfo::default();
-        for tab in SettingsTab::ALL {
-            state.settings_select_tab(tab);
-            let mut frame = UiFrame::new(1280.0, 720.0);
-            draw_settings_screen(&mut frame, &state, &info, [1280.0, 720.0]);
-            let (vertices, quads) = frame.measure();
-            assert!(vertices > 0, "{tab:?} tab must emit geometry");
-            assert!(quads > 40, "{tab:?} tab should draw a full panel, got {quads} quads");
+        for screen in [[1280.0_f32, 720.0], [960.0, 540.0]] {
+            for tab in SettingsTab::ALL {
+                state.settings_select_tab(tab);
+                let mut frame = UiFrame::new(screen[0], screen[1]);
+                draw_settings_screen(&mut frame, &state, &info, screen);
+                let (vertices, quads) = frame.measure();
+                assert!(vertices > 0, "{tab:?} tab must emit geometry at {screen:?}");
+                assert!(
+                    quads > 40,
+                    "{tab:?} tab should draw a full panel at {screen:?}, got {quads} quads"
+                );
+            }
         }
     }
 
@@ -2757,13 +3590,14 @@ mod tests {
     }
 
     #[test]
-    fn settings_panel_is_560_by_460_and_centred() {
+    fn settings_panel_is_620_by_520_and_centred() {
         let panel = settings_panel_rect([1280.0, 720.0]);
         let centre = panel.center();
         assert!((centre.0 - 640.0).abs() < 0.01);
         assert!((centre.1 - 360.0).abs() < 0.01);
         assert_eq!(panel.w, SETTINGS_PANEL_WIDTH);
         assert_eq!(panel.h, SETTINGS_PANEL_HEIGHT);
+        assert_eq!((panel.w, panel.h), (620.0, 520.0));
     }
 
     #[test]
@@ -2908,6 +3742,17 @@ mod tests {
         state.cursor = (0.0, 0.0);
         state.update_death_hover(screen);
         assert_eq!(state.death_hovered, None);
+    }
+
+    #[test]
+    fn death_buttons_have_spacing_and_fit_common_screens() {
+        for screen in [[1280.0_f32, 720.0], [960.0, 540.0]] {
+            let rects = death_button_rects(screen);
+            assert!(rects[1].y - (rects[0].y + rects[0].h) >= ob_render::line_height(2.0) + 4.0);
+            assert!(rects[1].y + rects[1].h + 26.0 + ob_render::line_height(1.2) <= screen[1]);
+            assert!(rects[0].y > screen[1] / 2.0);
+        }
+        assert!(DEATH_BUTTON_HEIGHT >= ob_render::line_height(2.0) + 4.0);
     }
 
     #[test]
