@@ -6,7 +6,7 @@
 //! from the session [`Registry`], so data packs and future block additions show
 //! up without client changes.
 
-use ob_content::{BlockId, Registry};
+use ob_content::{BlockId, ItemId, Registry, ToolKind};
 use ob_render::UiFrame;
 use ob_server::{GameMode, ItemStack};
 use ob_sim::MAX_HUNGER;
@@ -23,8 +23,8 @@ pub const INVENTORY_GAP: f32 = 4.0;
 pub const INVENTORY_PADDING: f32 = 24.0;
 /// Space reserved for the title above the grid.
 pub const INVENTORY_TITLE_HEIGHT: f32 = 48.0;
-/// Space reserved for the hovered-name footer below the grid.
-pub const INVENTORY_FOOTER_HEIGHT: f32 = 76.0;
+/// Space reserved for the hovered-name and crafting-hint footer below the grid.
+pub const INVENTORY_FOOTER_HEIGHT: f32 = 92.0;
 /// Minimum distance between the panel and the screen edge.
 pub const INVENTORY_MARGIN: f32 = 24.0;
 /// Horizontal padding inside the survival inventory panel.
@@ -117,7 +117,127 @@ pub enum HotbarIcon {
     },
     /// The procedural apple icon.
     Apple,
+    /// The procedural stick icon.
+    Stick,
+    /// A procedural pickaxe/axe/shovel/sword icon tinted by tier.
+    Tool {
+        /// Which tool silhouette to draw.
+        kind: ToolKind,
+        /// Harvest tier; level 1 is wooden brown, level 2+ is stone grey.
+        tier: u8,
+    },
 }
+
+/// One coloured rectangle of a procedural item icon.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IconPart {
+    /// Drawable rectangle.
+    pub rect: UiRect,
+    /// Straight-alpha colour.
+    pub color: [f32; 4],
+}
+
+/// Width of the pixel-art grids used by stick and tool icons.
+pub const ITEM_ICON_GRID: usize = 12;
+/// Height of a tool durability bar in UI pixels.
+pub const DURABILITY_BAR_HEIGHT: f32 = 2.0;
+/// Inset of the durability bar from the slot's left and right edges.
+pub const DURABILITY_BAR_INSET: f32 = 3.0;
+/// Vertical distance from the slot's bottom edge to the durability bar.
+pub const DURABILITY_BAR_BOTTOM: f32 = 6.0;
+
+/// Light wood colour of a tool handle.
+const HANDLE_LIGHT: [f32; 4] = [0.61, 0.42, 0.21, 1.0];
+/// Dark wood colour of a tool handle.
+const HANDLE_DARK: [f32; 4] = [0.42, 0.27, 0.13, 1.0];
+/// Wooden tool head.
+const WOOD_HEAD: [f32; 4] = [0.67, 0.47, 0.25, 1.0];
+/// Wooden tool head highlight.
+const WOOD_HEAD_LIGHT: [f32; 4] = [0.82, 0.63, 0.38, 1.0];
+/// Stone tool head.
+const STONE_HEAD: [f32; 4] = [0.54, 0.55, 0.58, 1.0];
+/// Stone tool head highlight.
+const STONE_HEAD_LIGHT: [f32; 4] = [0.75, 0.76, 0.79, 1.0];
+
+/// 12x12 pickaxe silhouette: `+` highlight, `#` head, `h` handle, `H` dark handle.
+const PICKAXE_ART: [&str; ITEM_ICON_GRID] = [
+    "............",
+    "..++++++....",
+    ".+######+...",
+    ".##....##...",
+    ".......hh...",
+    "......hh....",
+    ".....hh.....",
+    "....hh......",
+    "...hh.......",
+    "..hh........",
+    ".hh.........",
+    ".H..........",
+];
+
+/// 12x12 axe silhouette.
+const AXE_ART: [&str; ITEM_ICON_GRID] = [
+    "............",
+    "......+++...",
+    ".....+###+..",
+    ".....#####..",
+    "....+#####..",
+    "....####hh..",
+    ".......hh...",
+    "......hh....",
+    ".....hh.....",
+    "....hh......",
+    "...hh.......",
+    "..H.........",
+];
+
+/// 12x12 shovel silhouette.
+const SHOVEL_ART: [&str; ITEM_ICON_GRID] = [
+    "............",
+    ".....++++...",
+    "....+####+..",
+    "....######..",
+    "....######..",
+    "....+####+..",
+    ".......hh...",
+    "......hh....",
+    ".....hh.....",
+    "....hh......",
+    "...hh.......",
+    "..H.........",
+];
+
+/// 12x12 sword silhouette.
+const SWORD_ART: [&str; ITEM_ICON_GRID] = [
+    "............",
+    ".......++...",
+    "......++#...",
+    ".....++#....",
+    "....++#.....",
+    "...++#......",
+    "..++#.......",
+    ".#####......",
+    "..hh........",
+    "..hh........",
+    "..h.........",
+    "............",
+];
+
+/// 12x12 stick silhouette.
+const STICK_ART: [&str; ITEM_ICON_GRID] = [
+    "............",
+    ".........hh.",
+    "........hh..",
+    ".......hh...",
+    "......hh....",
+    ".....hh.....",
+    "....hh......",
+    "...hh.......",
+    "..hh........",
+    ".hh.........",
+    ".h..........",
+    "............",
+];
 
 /// Which primitive an apple icon part belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,12 +360,100 @@ pub fn survival_item_info(registry: &Registry, stack: Option<ItemStack>) -> (Str
     let name = display_name(item.id);
     let hint = if item.edible() {
         format!("Food +{} hunger", item.food.unwrap_or(0))
+    } else if let Some(spec) = item.tool {
+        let remaining = stack.durability.unwrap_or(spec.durability).min(spec.durability);
+        format!(
+            "{} tool, tier {}   Durability: {remaining} / {}",
+            tool_kind_label(spec.kind),
+            spec.tier,
+            spec.durability
+        )
     } else if let Some(block) = item.block {
         hardness_hint(registry.block(block).hardness)
+    } else if item.id == "openblock:stick" {
+        "Crafting material".to_string()
     } else {
         "No use".to_string()
     };
     (name, hint)
+}
+
+/// Title-cased tool kind used by inventory and F3 hints.
+pub fn tool_kind_label(kind: ToolKind) -> &'static str {
+    match kind {
+        ToolKind::Pickaxe => "Pickaxe",
+        ToolKind::Axe => "Axe",
+        ToolKind::Shovel => "Shovel",
+        ToolKind::Sword => "Sword",
+    }
+}
+
+/// Durability bar fill fraction in `0.0..=1.0`.
+///
+/// A zero or missing maximum reports an empty bar; a remaining value above the
+/// maximum is clamped so a malformed save cannot draw outside the slot.
+pub fn durability_fraction(remaining: u16, max: u16) -> f32 {
+    if max == 0 {
+        return 0.0;
+    }
+    (f32::from(remaining.min(max)) / f32::from(max)).clamp(0.0, 1.0)
+}
+
+/// Colour of a durability bar at `fraction`: green, amber then red.
+pub fn durability_color(fraction: f32) -> [f32; 4] {
+    if !fraction.is_finite() {
+        return [0.85, 0.28, 0.22, 1.0];
+    }
+    let fraction = fraction.clamp(0.0, 1.0);
+    if fraction > 0.5 {
+        [0.45, 0.78, 0.30, 1.0]
+    } else if fraction > 0.2 {
+        [0.92, 0.75, 0.25, 1.0]
+    } else {
+        [0.86, 0.28, 0.22, 1.0]
+    }
+}
+
+/// Tool durability of a stack and its maximum, if it is a tool.
+pub fn stack_durability(registry: &Registry, stack: ItemStack) -> Option<(u16, u16)> {
+    let spec = registry.item(stack.item).tool?;
+    let remaining = stack.durability.unwrap_or(spec.durability).min(spec.durability);
+    Some((remaining, spec.durability))
+}
+
+/// Draws the thin durability bar along the bottom edge of a slot.
+pub fn draw_durability_bar(frame: &mut UiFrame, slot: UiRect, remaining: u16, max: u16) {
+    if max == 0 || slot.w <= DURABILITY_BAR_INSET * 2.0 || slot.h <= DURABILITY_BAR_BOTTOM {
+        return;
+    }
+    let fraction = durability_fraction(remaining, max);
+    let x = slot.x + DURABILITY_BAR_INSET;
+    let width = slot.w - DURABILITY_BAR_INSET * 2.0;
+    let y = slot.y + slot.h - DURABILITY_BAR_BOTTOM;
+    frame.rect(
+        x - 1.0,
+        y - 1.0,
+        width + 2.0,
+        DURABILITY_BAR_HEIGHT + 2.0,
+        [0.02, 0.02, 0.03, 0.9],
+    );
+    frame.rect(x, y, width, DURABILITY_BAR_HEIGHT, [0.18, 0.19, 0.22, 1.0]);
+    if fraction > 0.0 {
+        frame.rect(
+            x,
+            y,
+            width * fraction,
+            DURABILITY_BAR_HEIGHT,
+            durability_color(fraction),
+        );
+    }
+}
+
+/// Draws a stack's durability bar when it is a tool.
+pub fn draw_stack_durability(frame: &mut UiFrame, slot: UiRect, registry: &Registry, stack: ItemStack) {
+    if let Some((remaining, max)) = stack_durability(registry, stack) {
+        draw_durability_bar(frame, slot, remaining, max);
+    }
 }
 
 /// Computes the centred panel and the nine-slot survival hotbar row.
@@ -305,19 +513,111 @@ pub fn count_label(count: u8) -> Option<String> {
     (count > 1).then(|| count.to_string())
 }
 
-/// Icon for an inventory stack: block items use their cube icon and apples use
-/// the procedural icon. Empty slots and unknown non-block items have no icon.
+/// Icon for an inventory stack: block items use their cube icon, and the
+/// procedural apple/stick/tool shapes cover the interim non-block items.
+/// Empty slots and unknown non-block items have no icon.
 pub fn item_icon(registry: &Registry, stack: Option<ItemStack>) -> Option<HotbarIcon> {
     let stack = stack.filter(|stack| stack.count > 0)?;
-    let item = registry.item(stack.item);
-    if let Some(block) = item.block {
+    item_icon_for(registry, stack.item)
+}
+
+/// Icon for an item id, without needing a stack (crafting rows use this).
+pub fn item_icon_for(registry: &Registry, item: ItemId) -> Option<HotbarIcon> {
+    if item.0 as usize >= registry.item_len() {
+        return None;
+    }
+    let item_type = registry.item(item);
+    if let Some(block) = item_type.block {
         let block = registry.block(block);
         return Some(HotbarIcon::Block {
             top: u32::from(block.textures.top.0),
             side: u32::from(block.textures.side.0),
         });
     }
-    (item.id == "openblock:apple").then_some(HotbarIcon::Apple)
+    if let Some(spec) = item_type.tool {
+        return Some(HotbarIcon::Tool {
+            kind: spec.kind,
+            tier: spec.tier,
+        });
+    }
+    match item_type.id {
+        "openblock:apple" => Some(HotbarIcon::Apple),
+        "openblock:stick" => Some(HotbarIcon::Stick),
+        _ => None,
+    }
+}
+
+/// Builds coloured rectangles from one ASCII pixel-art grid.
+fn grid_parts(
+    art: &[&str; ITEM_ICON_GRID],
+    x: f32,
+    y: f32,
+    size: f32,
+    color_for: impl Fn(char) -> Option<[f32; 4]>,
+) -> Vec<IconPart> {
+    let mut parts = Vec::new();
+    let size = size.max(0.0);
+    if !x.is_finite() || !y.is_finite() || size <= 0.0 {
+        return parts;
+    }
+    let unit = size / ITEM_ICON_GRID as f32;
+    for (row, line) in art.iter().enumerate() {
+        for (column, glyph) in line.chars().enumerate() {
+            let Some(color) = color_for(glyph) else {
+                continue;
+            };
+            if column >= ITEM_ICON_GRID {
+                break;
+            }
+            parts.push(IconPart {
+                rect: UiRect::new(x + column as f32 * unit, y + row as f32 * unit, unit, unit),
+                color,
+            });
+        }
+    }
+    parts
+}
+
+/// Colours of a tool head for a tier: wood for tier 1, stone for tier 2+.
+fn tool_head_colors(tier: u8) -> ([f32; 4], [f32; 4]) {
+    if tier <= 1 {
+        (WOOD_HEAD, WOOD_HEAD_LIGHT)
+    } else {
+        (STONE_HEAD, STONE_HEAD_LIGHT)
+    }
+}
+
+fn tool_art(kind: ToolKind) -> [&'static str; ITEM_ICON_GRID] {
+    match kind {
+        ToolKind::Pickaxe => PICKAXE_ART,
+        ToolKind::Axe => AXE_ART,
+        ToolKind::Shovel => SHOVEL_ART,
+        ToolKind::Sword => SWORD_ART,
+    }
+}
+
+/// Procedural stick icon geometry, in draw order.
+pub fn stick_icon_parts(x: f32, y: f32, size: f32) -> Vec<IconPart> {
+    grid_parts(&STICK_ART, x, y, size, |glyph| match glyph {
+        'h' => Some(HANDLE_LIGHT),
+        'H' => Some(HANDLE_DARK),
+        _ => None,
+    })
+}
+
+/// Procedural tool icon geometry, in draw order.
+///
+/// The handle is always wood brown; the head is wood brown for tier 1 and grey
+/// for tier 2+. The art is authored on a 12×12 grid and scaled to `size`.
+pub fn tool_icon_parts(kind: ToolKind, tier: u8, x: f32, y: f32, size: f32) -> Vec<IconPart> {
+    let (head, head_light) = tool_head_colors(tier);
+    grid_parts(&tool_art(kind), x, y, size, |glyph| match glyph {
+        '#' => Some(head),
+        '+' => Some(head_light),
+        'h' => Some(HANDLE_LIGHT),
+        'H' => Some(HANDLE_DARK),
+        _ => None,
+    })
 }
 
 /// Block a right-click would place in the given mode.
@@ -393,11 +693,36 @@ pub fn draw_apple_icon(frame: &mut UiFrame, x: f32, y: f32, size: f32) {
     }
 }
 
-fn draw_item_icon(frame: &mut UiFrame, registry: &Registry, stack: Option<ItemStack>, x: f32, y: f32, size: f32) {
-    match item_icon(registry, stack) {
-        Some(HotbarIcon::Block { top, side }) => frame.block_icon(x, y, size, top, side),
-        Some(HotbarIcon::Apple) => draw_apple_icon(frame, x, y, size),
-        None => {}
+/// Draws an item/block icon; used by the hotbar, survival inventory, crafting
+/// rows and pickup summaries.
+pub fn draw_item_icon(frame: &mut UiFrame, registry: &Registry, stack: Option<ItemStack>, x: f32, y: f32, size: f32) {
+    let Some(icon) = item_icon(registry, stack) else {
+        return;
+    };
+    draw_icon(frame, icon, x, y, size);
+}
+
+/// Draws the icon for an item id (crafting outputs have no stack).
+pub fn draw_item_icon_for(frame: &mut UiFrame, registry: &Registry, item: ItemId, x: f32, y: f32, size: f32) {
+    if let Some(icon) = item_icon_for(registry, item) {
+        draw_icon(frame, icon, x, y, size);
+    }
+}
+
+fn draw_icon(frame: &mut UiFrame, icon: HotbarIcon, x: f32, y: f32, size: f32) {
+    match icon {
+        HotbarIcon::Block { top, side } => frame.block_icon(x, y, size, top, side),
+        HotbarIcon::Apple => draw_apple_icon(frame, x, y, size),
+        HotbarIcon::Stick => {
+            for part in stick_icon_parts(x, y, size) {
+                frame.rect(part.rect.x, part.rect.y, part.rect.w, part.rect.h, part.color);
+            }
+        }
+        HotbarIcon::Tool { kind, tier } => {
+            for part in tool_icon_parts(kind, tier, x, y, size) {
+                frame.rect(part.rect.x, part.rect.y, part.rect.w, part.rect.h, part.color);
+            }
+        }
     }
 }
 
@@ -453,6 +778,7 @@ pub fn draw_survival_hotbar(
                 (slot.w - 12.0).max(0.0),
             );
             draw_stack_count(frame, *slot, stack.count);
+            draw_stack_durability(frame, *slot, registry, stack);
         }
     }
 }
@@ -465,6 +791,7 @@ pub fn draw_survival(
     registry: &Registry,
     inventory: &[Option<ItemStack>; HOTBAR_SLOTS],
     selected: usize,
+    near_table: bool,
     screen: [f32; 2],
 ) {
     let layout = survival_layout(screen);
@@ -524,6 +851,7 @@ pub fn draw_survival(
                 (slot.w - 12.0).max(0.0),
             );
             draw_stack_count(frame, *slot, stack.count);
+            draw_stack_durability(frame, *slot, registry, stack);
         }
     }
 
@@ -555,9 +883,25 @@ pub fn draw_survival(
         muted,
         &hint,
     );
+    let craft_hint = if near_table {
+        "Crafting table nearby: 3x3   Press C to craft"
+    } else {
+        "Press C to craft (2x2 hand)   place a table for 3x3"
+    };
     frame.text_centered(
         layout.panel.x + layout.panel.w / 2.0,
         footer_top + 52.0,
+        1.0,
+        if near_table {
+            [0.96, 0.80, 0.42, 1.0]
+        } else {
+            [0.72, 0.78, 0.86, 1.0]
+        },
+        craft_hint,
+    );
+    frame.text_centered(
+        layout.panel.x + layout.panel.w / 2.0,
+        footer_top + 70.0,
         1.0,
         [0.68, 0.74, 0.82, 1.0],
         "Click/Enter select   Arrows/Wheel navigate   E/Esc close",
@@ -762,18 +1106,25 @@ mod tests {
         let registry = Registry::base();
         let items = inventory_blocks(&registry);
         assert_eq!(items.len(), registry.len() - 1);
-        assert_eq!(items.len(), 11);
+        assert_eq!(items.len(), 14);
         assert!(!items.contains(&BlockId::AIR));
         assert!(items.iter().any(|id| registry.block(*id).id == "openblock:snow"));
         assert!(items.iter().any(|id| registry.block(*id).id == "openblock:gravel"));
         assert!(items.iter().any(|id| registry.block(*id).id == "openblock:clay"));
+        assert!(items.iter().any(|id| registry.block(*id).id == "openblock:planks"));
+        assert!(items.iter().any(|id| registry.block(*id).id == "openblock:cobblestone"));
+        assert!(
+            items
+                .iter()
+                .any(|id| registry.block(*id).id == "openblock:crafting_table")
+        );
     }
 
     #[test]
     fn layout_is_centred_with_nine_columns_and_slots_inside_the_panel() {
         let screen = [1280.0, 720.0];
-        let layout = layout(screen, 11, 0);
-        assert_eq!(layout.slots.len(), 11);
+        let layout = layout(screen, 14, 0);
+        assert_eq!(layout.slots.len(), 14);
         assert_eq!(layout.total_rows, 2);
         assert_eq!(layout.visible_rows, 2);
         let centre = layout.panel.center();
@@ -802,14 +1153,14 @@ mod tests {
     #[test]
     fn hit_testing_maps_slots_and_ignores_outside_points() {
         let screen = [1280.0, 720.0];
-        let layout = layout(screen, 11, 0);
+        let layout = layout(screen, 14, 0);
         let slot = layout.slots[3];
         assert_eq!(layout.hit_test(slot.rect.center().0, slot.rect.center().1), Some(3));
         let slot = layout.slots[10];
         assert_eq!(layout.hit_test(slot.rect.center().0, slot.rect.center().1), Some(10));
         assert_eq!(layout.hit_test(1.0, 1.0), None);
         assert_eq!(layout.slot_rect(10), Some(layout.slots[10].rect));
-        assert_eq!(layout.slot_rect(11), None);
+        assert_eq!(layout.slot_rect(14), None);
     }
 
     #[test]
@@ -1006,6 +1357,137 @@ mod tests {
     }
 
     #[test]
+    fn item_icons_map_sticks_and_every_tool_kind_by_id() {
+        use ob_content::ToolKind;
+        let registry = Registry::base();
+        let icon = |name: &str| {
+            let item = registry.item_id(name).expect("item exists");
+            item_icon_for(&registry, item).expect("icon")
+        };
+        assert_eq!(icon("openblock:stick"), HotbarIcon::Stick);
+        assert_eq!(
+            icon("openblock:wooden_pickaxe"),
+            HotbarIcon::Tool {
+                kind: ToolKind::Pickaxe,
+                tier: 1
+            }
+        );
+        assert_eq!(
+            icon("openblock:wooden_axe"),
+            HotbarIcon::Tool {
+                kind: ToolKind::Axe,
+                tier: 1
+            }
+        );
+        assert_eq!(
+            icon("openblock:stone_shovel"),
+            HotbarIcon::Tool {
+                kind: ToolKind::Shovel,
+                tier: 2
+            }
+        );
+        assert_eq!(
+            icon("openblock:stone_sword"),
+            HotbarIcon::Tool {
+                kind: ToolKind::Sword,
+                tier: 2
+            }
+        );
+        // New block items keep their top/side texture layers.
+        let planks = registry.item_id("openblock:planks").expect("planks item");
+        let planks_block = registry.id("openblock:planks").expect("planks block");
+        match item_icon_for(&registry, planks).expect("planks icon") {
+            HotbarIcon::Block { top, side } => {
+                assert_eq!(top, u32::from(registry.block(planks_block).textures.top.0));
+                assert_eq!(side, u32::from(registry.block(planks_block).textures.side.0));
+            }
+            other => panic!("expected a block icon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn procedural_stick_and_tool_icons_stay_inside_their_box() {
+        use ob_content::ToolKind;
+        for kind in [ToolKind::Pickaxe, ToolKind::Axe, ToolKind::Shovel, ToolKind::Sword] {
+            for tier in [1_u8, 2] {
+                let parts = tool_icon_parts(kind, tier, 10.0, 20.0, 24.0);
+                assert!(!parts.is_empty(), "{kind:?} tier {tier} must draw pixels");
+                let (wood, _) = tool_head_colors(1);
+                let (stone, _) = tool_head_colors(2);
+                let expected = if tier == 1 { wood } else { stone };
+                assert!(
+                    parts.iter().any(|part| part.color == expected),
+                    "{kind:?} tier {tier} must use its tier head colour"
+                );
+                assert!(
+                    parts.iter().any(|part| part.color == HANDLE_LIGHT),
+                    "{kind:?} must draw a handle"
+                );
+                for part in &parts {
+                    assert!(part.rect.w > 0.0 && part.rect.h > 0.0);
+                    assert!(part.rect.x >= 10.0 - 1e-4 && part.rect.y >= 20.0 - 1e-4);
+                    assert!(part.rect.x + part.rect.w <= 34.0 + 1e-3);
+                    assert!(part.rect.y + part.rect.h <= 44.0 + 1e-3);
+                }
+            }
+        }
+        // Swapping the tier must change the head pixels, not the handle.
+        let wood_pick = tool_icon_parts(ToolKind::Pickaxe, 1, 0.0, 0.0, 12.0);
+        let stone_pick = tool_icon_parts(ToolKind::Pickaxe, 2, 0.0, 0.0, 12.0);
+        assert_eq!(wood_pick.len(), stone_pick.len());
+        assert_ne!(wood_pick[0].color, stone_pick[0].color);
+        assert_eq!(
+            wood_pick[wood_pick.len() - 1].color,
+            stone_pick[stone_pick.len() - 1].color
+        );
+
+        let stick = stick_icon_parts(0.0, 0.0, 12.0);
+        assert!(!stick.is_empty());
+        assert!(stick.iter().all(|part| part.rect.x + part.rect.w <= 12.0 + 1e-3));
+        assert!(stick.iter().all(|part| part.rect.y + part.rect.h <= 12.0 + 1e-3));
+        let mut frame = UiFrame::new(1280.0, 720.0);
+        for part in &stick {
+            frame.rect(part.rect.x, part.rect.y, part.rect.w, part.rect.h, part.color);
+        }
+        let (vertices, quads) = frame.measure();
+        assert_eq!(quads, stick.len());
+        assert_eq!(vertices, quads * 6);
+    }
+
+    #[test]
+    fn durability_bar_fraction_and_colours_are_clamped() {
+        assert_eq!(durability_fraction(59, 59), 1.0);
+        assert_eq!(durability_fraction(0, 59), 0.0);
+        assert!((durability_fraction(30, 60) - 0.5).abs() < 1e-6);
+        assert_eq!(durability_fraction(99, 59), 1.0, "malformed values clamp");
+        assert_eq!(durability_fraction(5, 0), 0.0);
+        assert_eq!(durability_color(1.0), [0.45, 0.78, 0.30, 1.0]);
+        assert_eq!(durability_color(0.35), [0.92, 0.75, 0.25, 1.0]);
+        assert_eq!(durability_color(0.1), [0.86, 0.28, 0.22, 1.0]);
+        assert_eq!(durability_color(f32::NAN), [0.85, 0.28, 0.22, 1.0]);
+    }
+
+    #[test]
+    fn tool_stacks_report_durability_and_the_bar_draws_inside_the_slot() {
+        let registry = Registry::base();
+        let stone_pick = registry.item_id("openblock:stone_pickaxe").expect("stone pickaxe item");
+        let stack = ItemStack::for_item(stone_pick, registry.item(stone_pick), 1).with_durability(Some(118));
+        assert_eq!(stack_durability(&registry, stack), Some((118, 131)));
+        let stone = registry.item_id("openblock:stone").expect("stone item");
+        assert_eq!(stack_durability(&registry, ItemStack::new(stone, 1)), None);
+
+        let slot = UiRect::new(10.0, 20.0, 44.0, 44.0);
+        let mut frame = UiFrame::new(1280.0, 720.0);
+        draw_durability_bar(&mut frame, slot, 118, 131);
+        let (_, quads) = frame.measure();
+        assert_eq!(quads, 3, "frame, track and fill");
+        let mut frame = UiFrame::new(1280.0, 720.0);
+        draw_durability_bar(&mut frame, slot, 0, 131);
+        let (_, quads) = frame.measure();
+        assert_eq!(quads, 2, "an empty bar draws no fill cell");
+    }
+
+    #[test]
     fn apple_icon_geometry_is_inside_its_box_and_has_the_expected_parts() {
         let parts = apple_icon_parts(20.0, 30.0, 24.0);
         assert_eq!(parts.len(), 8);
@@ -1110,5 +1592,17 @@ mod tests {
             survival_item_info(&registry, None),
             ("Empty slot".to_string(), "No item".to_string())
         );
+
+        let pick = registry.item_id("openblock:stone_pickaxe").expect("stone pickaxe item");
+        let tool = ItemStack::for_item(pick, registry.item(pick), 1).with_durability(Some(118));
+        let (name, hint) = survival_item_info(&registry, Some(tool));
+        assert_eq!(name, "Stone Pickaxe");
+        assert!(hint.contains("Pickaxe tool, tier 2"), "got {hint}");
+        assert!(hint.contains("Durability: 118 / 131"), "got {hint}");
+
+        let stick = registry.item_id("openblock:stick").expect("stick item");
+        let (name, hint) = survival_item_info(&registry, Some(ItemStack::new(stick, 8)));
+        assert_eq!(name, "Stick");
+        assert_eq!(hint, "Crafting material");
     }
 }

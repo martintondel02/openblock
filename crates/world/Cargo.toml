@@ -15,5 +15,6 @@ path = "src/lib.rs"
 [dependencies]
 ob_math.workspace = true
 ob_content.workspace = true
+log.workspace = true
 rustc-hash.workspace = true
 zstd.workspace = true

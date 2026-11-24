@@ -2,7 +2,7 @@
 //!
 //! The state machine is deliberately GPU-free and time-source agnostic: the
 //! caller passes elapsed seconds and the block currently under the crosshair.
-//! This keeps the break rules (hardness, target changes, one-shot completion)
+//! This keeps the break rules (effective seconds, target changes, one-shot completion)
 //! unit-testable without a window.
 
 use ob_math::{BlockPos, WorldVec};
@@ -19,28 +19,32 @@ pub const MINING_TICK_SIZE: f32 = 3.0;
 
 /// Mutable mining progress for the block currently targeted by the player.
 ///
-/// Progress is `elapsed_seconds / hardness`. A target change, a release (via
+/// Progress is `elapsed_seconds / seconds`, where `seconds` comes from the
+/// authoritative host (`Host::mining_seconds`) and therefore already includes
+/// the selected tool's speed. A target change, a release (via
 /// [`MiningState::stop`] or an `update` with a different `current_target`) or a
 /// completed break resets the active target. Completion is latched once and
 /// returned exactly once from [`MiningState::take_completed`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MiningState {
     target: Option<BlockPos>,
-    hardness: f32,
+    seconds: f32,
     progress: f32,
     completed: Option<BlockPos>,
 }
 
 impl MiningState {
-    /// Starts (or restarts) mining `pos`, which takes `hardness` seconds by hand.
+    /// Starts (or restarts) mining `pos`, which takes `seconds` effective
+    /// seconds with the currently selected tool.
     ///
-    /// Unbreakable blocks (`hardness = f32::INFINITY`) may be recorded as the
-    /// active target for an outline, but [`Self::update`] never advances their
-    /// progress. A pending completion from a previous target is deliberately
-    /// left untouched so it cannot be lost before [`Self::take_completed`].
-    pub fn start(&mut self, pos: BlockPos, hardness: f32) {
+    /// `0.0` (and non-finite durations) mark an unbreakable block: it may be
+    /// recorded as the active target for an outline, but [`Self::update`] never
+    /// advances its progress or reports a completion. A pending completion from
+    /// a previous target is deliberately left untouched so it cannot be lost
+    /// before [`Self::take_completed`].
+    pub fn start(&mut self, pos: BlockPos, seconds: f32) {
         self.target = Some(pos);
-        self.hardness = hardness;
+        self.seconds = seconds;
         self.progress = 0.0;
     }
 
@@ -58,18 +62,14 @@ impl MiningState {
             self.reset_progress();
             return;
         }
-        if !self.hardness.is_finite() {
+        if !self.seconds.is_finite() || self.seconds <= 0.0 {
             self.progress = 0.0;
             return;
         }
         if !dt.is_finite() || dt <= 0.0 {
             return;
         }
-        if self.hardness <= 0.0 {
-            self.progress = 1.0;
-        } else {
-            self.progress = (self.progress + dt / self.hardness).min(1.0);
-        }
+        self.progress = (self.progress + dt / self.seconds).min(1.0);
         if self.progress >= 1.0 {
             self.completed = Some(target);
             self.reset_progress();
@@ -92,6 +92,14 @@ impl MiningState {
     /// Currently mined block, if any.
     pub fn target(&self) -> Option<BlockPos> {
         self.target
+    }
+
+    /// Effective seconds used for the active target, or `0.0` when idle.
+    ///
+    /// The client compares this with the host's current `mining_seconds` so a
+    /// hotbar switch restarts progress instead of keeping a stale timer.
+    pub fn duration_seconds(&self) -> f32 {
+        self.seconds
     }
 
     /// Alias used by renderer integrations that need the targeted block.
@@ -123,7 +131,7 @@ impl MiningState {
 
     fn reset_progress(&mut self) {
         self.target = None;
-        self.hardness = 0.0;
+        self.seconds = 0.0;
         self.progress = 0.0;
     }
 }
@@ -241,26 +249,53 @@ mod tests {
 
     #[test]
     fn unbreakable_blocks_never_progress_or_complete() {
-        let mut mining = MiningState::default();
-        let target = pos(4, 5, 6);
-        mining.start(target, f32::INFINITY);
-        assert!(mining.is_mining());
-        for _ in 0..100 {
-            mining.update(1.0, Some(target));
-            assert_eq!(mining.progress(), 0.0);
+        for seconds in [0.0_f32, f32::INFINITY] {
+            let mut mining = MiningState::default();
+            let target = pos(4, 5, 6);
+            mining.start(target, seconds);
+            assert!(mining.is_mining());
+            assert_eq!(mining.duration_seconds(), seconds);
+            for _ in 0..100 {
+                mining.update(1.0, Some(target));
+                assert_eq!(mining.progress(), 0.0);
+            }
+            assert_eq!(mining.take_completed(), None);
+            assert_eq!(mining.target(), Some(target));
         }
-        assert_eq!(mining.take_completed(), None);
-        assert_eq!(mining.target(), Some(target));
     }
 
     #[test]
-    fn zero_hardness_completes_immediately() {
+    fn positive_seconds_still_complete_and_expose_the_duration() {
         let mut mining = MiningState::default();
         let target = pos(0, 1, 0);
-        mining.start(target, 0.0);
-        mining.update(0.001, Some(target));
+        mining.start(target, 0.25);
+        assert_eq!(mining.duration_seconds(), 0.25);
+        mining.update(0.25, Some(target));
         assert_eq!(mining.take_completed(), Some(target));
         assert_eq!(mining.take_completed(), None);
+        assert_eq!(mining.duration_seconds(), 0.0);
+    }
+
+    #[test]
+    fn content_tool_speed_drives_the_timer() {
+        let registry = ob_content::Registry::base();
+        let stone = registry.id("openblock:stone").expect("stone block");
+        let wood_pick = registry.item_id("openblock:wooden_pickaxe").expect("wooden pickaxe");
+        let seconds = registry.effective_mining_seconds(stone, Some(wood_pick));
+        assert!((seconds - 0.75).abs() < 1e-6);
+        let mut mining = MiningState::default();
+        let target = pos(1, 2, 3);
+        mining.start(target, seconds);
+        mining.update(0.375, Some(target));
+        assert!((mining.progress() - 0.5).abs() < 1e-6);
+        mining.update(0.375, Some(target));
+        assert_eq!(mining.take_completed(), Some(target));
+
+        // Hand mining is slower and unbreakable blocks never start progress.
+        let by_hand = registry.effective_mining_seconds(stone, None);
+        assert!((by_hand - 1.5).abs() < 1e-6);
+        let bedrock = registry.id("openblock:bedrock").expect("bedrock block");
+        assert_eq!(registry.effective_mining_seconds(bedrock, Some(wood_pick)), 0.0);
     }
 
     #[test]

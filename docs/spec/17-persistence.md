@@ -62,7 +62,7 @@ In scope: `ob_world` storage, the `openblock-server` world manager, and the
 | REQ-SAVE-032 | Every write path MUST be idempotent: replaying the journal or re-running a commit MUST NOT duplicate or corrupt data. | Journal replay test |
 | REQ-SAVE-033 | Autosave interval MUST be configurable (10–3,600 s) and default to 60 s. | Config test |
 | REQ-SAVE-034 | A quarantined chunk MUST retain its bytes for forensics under `<world>/quarantine/`. | Quarantine test |
-| REQ-SAVE-035 | While the interim v0.x snapshot format stores dense block ids, it MUST record a content-registry fingerprint and MUST refuse to load when the current registry differs, naming both fingerprints; it MUST NOT silently reinterpret block ids. | Mismatch fixture + pack test |
+| REQ-SAVE-035 | While the interim v0.x snapshot format stores dense block ids, it MUST record a content-registry fingerprint and MUST refuse to load when the current registry differs, naming both fingerprints; it MUST NOT silently reinterpret block ids. A v1-v3 snapshot written before a documented append-only block addition MAY load with a warning, because every earlier id is unchanged; v4+ keeps the strict check. | Mismatch fixture + pack test |
 
 ## 3. Design
 
@@ -514,10 +514,16 @@ MS-13, the reference implementation writes a whole-world snapshot: magic, a
 container version, seed, a content-registry fingerprint (REQ-SAVE-035), a
 compression flag (stored or zstd level 3), uncompressed/compressed payload
 lengths, the payload, and a CRC32C over everything before it. Snapshot v1
-(stored, dense light) and v2 (zstd, compact light) remain readable and are
-upgraded on the next save; v3 adds the registry fingerprint. Dense block ids in
-these snapshots are session-local indices, so a pack reorder is detected instead
-of silently corrupting a world. This format is explicitly not the frozen region
+(stored, dense light), v2 (zstd, compact light) and v3 (registry fingerprint)
+remain readable and are upgraded on the next save; v4 is the current format and
+keeps the strict fingerprint check. Registry block ids in the interim format are
+session-local dense indices and are append-only by policy: the crafting slice
+appends `planks`, `cobblestone` and `crafting_table` without moving any earlier
+id. Consequently a v3 snapshot whose fingerprint predates that append is
+accepted with a warning naming both fingerprints and its ids are interpreted
+unchanged; v1 and v2 carry no fingerprint and load ids unchanged by
+construction. Reordering or removing blocks still fails (an out-of-range id is
+`UnknownBlock`, and v4 rejects any fingerprint change). This format is explicitly not the frozen region
 format and makes no compatibility promise beyond the migration chain above.
 
 **Forward-compatibility promise.** A world written by any `1.x` build opens in any
@@ -526,6 +532,20 @@ older build. Within one `data_version`, unknown components and unknown fields in
 typed payloads are preserved verbatim, so a world that visited a modded server
 does not lose that mod's data when opened without the mod (REQ-SAVE-009); this is
 the mechanism behind the opaque-placeholder round-trip.
+
+**Interim sidecars.** Next to the `world.obs` snapshot the v0.0.x host writes
+header-free text sidecars with the same temp-file + rename atomic replacement:
+`player.txt` (ten whitespace-separated fields), `inventory.txt` (one
+`slot item_resource_id count [durability]` line per non-empty hotbar slot) and
+`items.txt` (one line per live dropped item, sorted by entity id:
+`id x y z vx vy vz item_resource_id count durability age`). Floats use Rust's
+shortest round-trip `Debug` form; `durability` is `-` when the stack has none.
+The files are rewritten atomically with the world in `Host::save`. A missing
+`items.txt` (or `inventory.txt`) means empty; malformed lines and unknown item
+names are skipped with a warning, counts and positions are clamped on load, and
+entity ids are preserved so the next id is `max(id) + 1`. Dropped items are
+authoritative simulation state, so they are included in the state hash in id
+order with positions, velocities and age quantised to `1e-4`.
 
 ### 3.8 Backups, restore, import and export
 

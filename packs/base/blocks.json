@@ -33,7 +33,9 @@
         "side": "stone",
         "bottom": "stone"
       },
-      "hardness": 1.5
+      "hardness": 1.5,
+      "preferred_tool": "pickaxe",
+      "required_tier": 1
     },
     {
       "id": "openblock:dirt",
@@ -50,7 +52,9 @@
         "side": "dirt",
         "bottom": "dirt"
       },
-      "hardness": 0.5
+      "hardness": 0.5,
+      "preferred_tool": "shovel",
+      "required_tier": 0
     },
     {
       "id": "openblock:grass",
@@ -67,7 +71,9 @@
         "side": "grass_side",
         "bottom": "dirt"
       },
-      "hardness": 0.6
+      "hardness": 0.6,
+      "preferred_tool": "shovel",
+      "required_tier": 0
     },
     {
       "id": "openblock:sand",
@@ -84,7 +90,9 @@
         "side": "sand",
         "bottom": "sand"
       },
-      "hardness": 0.5
+      "hardness": 0.5,
+      "preferred_tool": "shovel",
+      "required_tier": 0
     },
     {
       "id": "openblock:water",
@@ -118,7 +126,9 @@
         "side": "log_side",
         "bottom": "log_top"
       },
-      "hardness": 2.0
+      "hardness": 2.0,
+      "preferred_tool": "axe",
+      "required_tier": 0
     },
     {
       "id": "openblock:leaves",
@@ -169,7 +179,9 @@
         "side": "gravel",
         "bottom": "gravel"
       },
-      "hardness": 0.6
+      "hardness": 0.6,
+      "preferred_tool": "shovel",
+      "required_tier": 0
     },
     {
       "id": "openblock:clay",
@@ -186,7 +198,9 @@
         "side": "clay",
         "bottom": "clay"
       },
-      "hardness": 0.6
+      "hardness": 0.6,
+      "preferred_tool": "shovel",
+      "required_tier": 0
     },
     {
       "id": "openblock:snow",
@@ -203,7 +217,66 @@
         "side": "snow",
         "bottom": "snow"
       },
-      "hardness": 0.1
+      "hardness": 0.1,
+      "preferred_tool": "shovel",
+      "required_tier": 0
+    },
+    {
+      "id": "openblock:planks",
+      "solid": true,
+      "opaque": true,
+      "fluid": false,
+      "color": [
+        0.64,
+        0.5,
+        0.3
+      ],
+      "textures": {
+        "top": "planks",
+        "side": "planks",
+        "bottom": "planks"
+      },
+      "hardness": 2.0,
+      "preferred_tool": "axe",
+      "required_tier": 0
+    },
+    {
+      "id": "openblock:cobblestone",
+      "solid": true,
+      "opaque": true,
+      "fluid": false,
+      "color": [
+        0.46,
+        0.46,
+        0.48
+      ],
+      "textures": {
+        "top": "cobblestone",
+        "side": "cobblestone",
+        "bottom": "cobblestone"
+      },
+      "hardness": 2.0,
+      "preferred_tool": "pickaxe",
+      "required_tier": 1
+    },
+    {
+      "id": "openblock:crafting_table",
+      "solid": true,
+      "opaque": true,
+      "fluid": false,
+      "color": [
+        0.55,
+        0.41,
+        0.23
+      ],
+      "textures": {
+        "top": "crafting_table_top",
+        "side": "crafting_table_side",
+        "bottom": "planks"
+      },
+      "hardness": 2.5,
+      "preferred_tool": "axe",
+      "required_tier": 0
     }
   ]
 }

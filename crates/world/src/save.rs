@@ -1,14 +1,13 @@
-//! World persistence: deterministic snapshot format v2 with zstd compression,
-//! plus read compatibility with the uncompressed v1 snapshots written by
-//! v0.0.1.
+//! World persistence: deterministic snapshot format v4 with zstd compression,
+//! plus read compatibility with the v1, v2 and v3 snapshots written by earlier
+//! builds.
 //!
-//! A v2 snapshot is a single little-endian byte stream:
+//! A v4 snapshot is a single little-endian byte stream:
 //!
 //! ```text
-//! "OBSV" | version u16 = 2 | seed u64 | compression u8
-//!        | uncompressed_payload_len u32 | compressed_payload_len u32
-//! compressed_payload
-//! crc32c u32
+//! "OBSV" | version u16 = 4 | seed u64 | registry_fingerprint u64
+//!        | compression u8 | uncompressed_payload_len u32
+//!        | compressed_payload_len u32 | compressed_payload | crc32c u32
 //! ```
 //!
 //! The checksum covers every preceding byte (header and compressed payload).
@@ -25,6 +24,13 @@
 //! word followed by that `u16`. Uniform light therefore costs one or three
 //! bytes instead of 8 KiB. Palette word arrays are still written verbatim;
 //! compression removes their long zero runs.
+//!
+//! Version 3 added the registry fingerprint but did not know about the block
+//! types appended by the crafting slice. Because block ids are append-only,
+//! v1/v2 (which carry no fingerprint) and v3 saves whose fingerprint predates
+//! the append are accepted: ids are interpreted unchanged and a v3 mismatch
+//! logs a warning naming both fingerprints. v4 and later keep the strict
+//! fingerprint check.
 //!
 //! Version 1 used the same chunk stream without compression, with light flag 1
 //! always carrying a dense array even for a uniform non-zero value:
@@ -54,13 +60,15 @@ use crate::world::World;
 /// Snapshot magic at the start of every byte stream.
 const MAGIC: &[u8; 4] = b"OBSV";
 /// Snapshot format version written by this build.
-const VERSION: u16 = 3;
+const VERSION: u16 = 4;
 /// Bytes before the first chunk in a v1 stream: magic, version, seed, count.
 const V1_HEADER_LEN: usize = 4 + 2 + 8 + 4;
 /// Bytes before the compressed payload in a v2 stream.
 const V2_HEADER_LEN: usize = 4 + 2 + 8 + 1 + 4 + 4;
 /// Bytes before the compressed payload in a v3 stream (adds a registry fingerprint).
 const V3_HEADER_LEN: usize = 4 + 2 + 8 + 8 + 1 + 4 + 4;
+/// Bytes before the compressed payload in a v4 stream (same layout as v3).
+const V4_HEADER_LEN: usize = V3_HEADER_LEN;
 /// Bytes in the trailing checksum.
 const CRC_LEN: usize = 4;
 /// Payload is stored verbatim.
@@ -160,7 +168,7 @@ impl std::error::Error for SaveError {}
 #[derive(Debug, Clone, Default)]
 pub struct WorldSave;
 
-/// Serializes a world to the compressed v3 snapshot format.
+/// Serializes a world to the compressed v4 snapshot format.
 ///
 /// Chunks are emitted in ascending `(cx, cz)` order so repeated saves of the
 /// same world produce identical bytes. The payload is compressed with zstd
@@ -172,7 +180,7 @@ pub fn to_bytes(world: &World) -> Vec<u8> {
     let (compression, body) = compress_payload(&payload);
     let body_len = u32::try_from(body.len()).expect("compressed world snapshot exceeds 4 GiB");
 
-    let mut out = Vec::with_capacity(V3_HEADER_LEN + body.len() + CRC_LEN);
+    let mut out = Vec::with_capacity(V4_HEADER_LEN + body.len() + CRC_LEN);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(&world.seed().to_le_bytes());
@@ -187,7 +195,12 @@ pub fn to_bytes(world: &World) -> Vec<u8> {
     out
 }
 
-/// Loads a world from a v1, v2 or v3 snapshot.
+/// Loads a world from a v1, v2, v3 or v4 snapshot.
+///
+/// v1/v2 carry no registry fingerprint, and a v3 save whose fingerprint
+/// differs is still accepted: the append-only block-id invariant makes its ids
+/// valid and a warning names both fingerprints. v4 (the format this build
+/// writes) keeps the strict fingerprint check.
 ///
 /// The whole stream is validated before a [`World`] is returned: header,
 /// version, checksum, payload lengths, compression method, palette bounds
@@ -209,6 +222,7 @@ pub fn from_bytes(registry: Arc<Registry>, bytes: &[u8]) -> Result<World, SaveEr
         1 => load_v1(registry, bytes),
         2 => load_v2(registry, bytes),
         3 => load_v3(registry, bytes),
+        4 => load_v4(registry, bytes),
         _ => Err(SaveError::InvalidFormat("unknown format version")),
     }
 }
@@ -352,10 +366,23 @@ fn load_v2(registry: Arc<Registry>, bytes: &[u8]) -> Result<World, SaveError> {
     read_payload(&mut reader, registry, seed, LightEncoding::V2)
 }
 
-/// Reads the chunk stream shared by both snapshot versions.
-/// Loads the compressed v3 snapshot layout, validating the content-pack fingerprint.
+/// Loads the compressed v3 snapshot layout.
+///
+/// v3 predates the crafting-slice block additions, so a fingerprint mismatch
+/// is a warning rather than an error; see the module docs for the append-only
+/// invariant.
 fn load_v3(registry: Arc<Registry>, bytes: &[u8]) -> Result<World, SaveError> {
-    if bytes.len() < V3_HEADER_LEN + CRC_LEN {
+    load_compressed(registry, bytes, false)
+}
+
+/// Loads the compressed v4 snapshot layout with the strict fingerprint check.
+fn load_v4(registry: Arc<Registry>, bytes: &[u8]) -> Result<World, SaveError> {
+    load_compressed(registry, bytes, true)
+}
+
+/// Shared v3/v4 decoder (the headers are byte-identical).
+fn load_compressed(registry: Arc<Registry>, bytes: &[u8], strict_fingerprint: bool) -> Result<World, SaveError> {
+    if bytes.len() < V4_HEADER_LEN + CRC_LEN {
         return Err(SaveError::InvalidFormat("truncated header"));
     }
     let checksum_offset = bytes.len() - CRC_LEN;
@@ -376,16 +403,26 @@ fn load_v3(registry: Arc<Registry>, bytes: &[u8]) -> Result<World, SaveError> {
     ]);
     let current_registry = registry_fingerprint(&registry);
     if saved_registry != current_registry {
-        return Err(SaveError::RegistryMismatch {
-            saved: saved_registry,
-            current: current_registry,
-        });
+        if strict_fingerprint {
+            return Err(SaveError::RegistryMismatch {
+                saved: saved_registry,
+                current: current_registry,
+            });
+        }
+        // v1-v3 predate the append-only additions: block ids are unchanged, so
+        // the saved ids still resolve. A reorder would likely hit UnknownBlock
+        // or silently reinterpret ids, which is why v4 keeps this strict.
+        log::warn!(
+            "world snapshot registry fingerprint {saved_registry:016x} differs from the current \
+             {current_registry:016x}; loading its block ids unchanged because registry block ids \
+             are append-only"
+        );
     }
     let compression = bytes[22];
     let uncompressed_len = u32::from_le_bytes([bytes[23], bytes[24], bytes[25], bytes[26]]);
     let compressed_len = u32::from_le_bytes([bytes[27], bytes[28], bytes[29], bytes[30]]);
     let compressed_len = usize::try_from(compressed_len).map_err(|_| SaveError::InvalidFormat("payload too large"))?;
-    let payload_end = V3_HEADER_LEN
+    let payload_end = V4_HEADER_LEN
         .checked_add(compressed_len)
         .ok_or(SaveError::InvalidFormat("payload length overflow"))?;
     if payload_end > checksum_offset {
@@ -394,7 +431,7 @@ fn load_v3(registry: Arc<Registry>, bytes: &[u8]) -> Result<World, SaveError> {
     if payload_end < checksum_offset {
         return Err(SaveError::InvalidFormat("trailing bytes after payload"));
     }
-    let body = &bytes[V3_HEADER_LEN..payload_end];
+    let body = &bytes[V4_HEADER_LEN..payload_end];
     let payload = decode_payload(
         compression,
         usize::try_from(uncompressed_len).map_err(|_| SaveError::InvalidFormat("payload too large"))?,
@@ -775,7 +812,10 @@ mod tests {
     }
 
     fn sample_world() -> (Arc<Registry>, World) {
-        let registry = base_registry();
+        sample_world_with(base_registry())
+    }
+
+    fn sample_world_with(registry: Arc<Registry>) -> (Arc<Registry>, World) {
         let air = BlockId::AIR;
         let stone = block(&registry, "openblock:stone");
         let dirt = block(&registry, "openblock:dirt");
@@ -978,6 +1018,24 @@ mod tests {
         out
     }
 
+    /// Builds a v3 snapshot whose payload is stored without compression.
+    fn to_v3_bytes(world: &World) -> Vec<u8> {
+        let payload = encode_payload(world, write_section);
+        let payload_len = u32::try_from(payload.len()).expect("test payload fits");
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&3u16.to_le_bytes());
+        out.extend_from_slice(&world.seed().to_le_bytes());
+        out.extend_from_slice(&registry_fingerprint(world.registry()).to_le_bytes());
+        out.push(COMPRESSION_NONE);
+        out.extend_from_slice(&payload_len.to_le_bytes());
+        out.extend_from_slice(&payload_len.to_le_bytes());
+        out.extend_from_slice(&payload);
+        let checksum = crc32c(&out);
+        out.extend_from_slice(&checksum.to_le_bytes());
+        out
+    }
+
     /// Builds a v2 snapshot whose payload is stored without compression.
     fn to_v2_uncompressed_bytes(world: &World) -> Vec<u8> {
         let payload = encode_payload(world, write_section);
@@ -1015,7 +1073,7 @@ mod tests {
         let (registry, world) = sample_world();
         let first = to_bytes(&world);
         assert_eq!(first, to_bytes(&world));
-        assert_eq!(first[22], COMPRESSION_ZSTD, "v3 snapshots are compressed by default");
+        assert_eq!(first[22], COMPRESSION_ZSTD, "v4 snapshots are compressed by default");
 
         let loaded = from_bytes(Arc::clone(&registry), &first).expect("snapshot is valid");
         assert_eq!(to_bytes(&loaded), first);
@@ -1043,7 +1101,7 @@ mod tests {
         );
         assert_eq!(bytes[22], COMPRESSION_ZSTD);
         let compressed_len = u32::from_le_bytes([bytes[27], bytes[28], bytes[29], bytes[30]]) as usize;
-        assert_eq!(bytes.len(), V3_HEADER_LEN + compressed_len + CRC_LEN);
+        assert_eq!(bytes.len(), V4_HEADER_LEN + compressed_len + CRC_LEN);
 
         let loaded = from_bytes(Arc::clone(&registry), &bytes).expect("empty snapshot is valid");
         assert_eq!(loaded.seed(), 42);
@@ -1052,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_snapshots_still_load_and_upgrade_to_v2() {
+    fn v1_snapshots_still_load_and_upgrade_to_v4() {
         let (registry, world) = sample_world();
         let v1 = to_v1_bytes(&world);
         assert_eq!(u16::from_le_bytes([v1[4], v1[5]]), 1);
@@ -1204,7 +1262,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_header_lengths_and_compression_are_validated() {
+    fn v4_header_lengths_and_compression_are_validated() {
         let (registry, world) = sample_world();
         let bytes = to_bytes(&world);
 
@@ -1280,7 +1338,7 @@ mod tests {
         // A structurally truncated but checksummed stream must also fail.
         let compact = compact_world(&registry);
         let compact_bytes = to_bytes(&compact);
-        for len in (V2_HEADER_LEN + CRC_LEN)..compact_bytes.len() {
+        for len in (V4_HEADER_LEN + CRC_LEN)..compact_bytes.len() {
             let mut truncated = compact_bytes[..len].to_vec();
             resign(&mut truncated);
             assert!(
@@ -1380,7 +1438,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_snapshots_still_load_and_upgrade_to_v3() {
+    fn v2_snapshots_still_load_and_upgrade_to_v4() {
         let (registry, world) = sample_world();
         let v2 = to_v2_uncompressed_bytes(&world);
         assert_eq!(u16::from_le_bytes([v2[4], v2[5]]), 2);
@@ -1396,9 +1454,10 @@ mod tests {
     }
 
     #[test]
-    fn v3_rejects_a_different_registry_fingerprint() {
+    fn v4_rejects_a_different_registry_fingerprint() {
         let (registry, world) = sample_world();
         let bytes = to_bytes(&world);
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 4);
 
         // Same block ordering but changed content (a renamed block id) must be detected.
         let mut blocks: Vec<_> = registry.iter().map(|(_, block)| block.clone()).collect();
@@ -1408,6 +1467,41 @@ mod tests {
             Err(SaveError::RegistryMismatch { saved, current }) => assert_ne!(saved, current),
             other => panic!("expected RegistryMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn v3_old_fingerprint_loads_append_only_and_upgrades_to_v4() {
+        let new_registry = base_registry();
+
+        // Build the v0.0.7 registry: the twelve blocks before planks,
+        // cobblestone and the crafting table were appended.
+        let mut old_blocks: Vec<_> = new_registry.iter().map(|(_, block)| block.clone()).collect();
+        old_blocks.truncate(12);
+        let old_registry = Arc::new(Registry::from_blocks(old_blocks).expect("old registry is valid"));
+        assert_eq!(old_registry.len(), 12);
+        assert_ne!(
+            registry_fingerprint(&old_registry),
+            registry_fingerprint(&new_registry),
+            "the appended blocks must change the fingerprint"
+        );
+
+        let (_, world) = sample_world_with(Arc::clone(&old_registry));
+        let v3 = to_v3_bytes(&world);
+        assert_eq!(u16::from_le_bytes([v3[4], v3[5]]), 3);
+        assert_eq!(
+            u64::from_le_bytes([v3[14], v3[15], v3[16], v3[17], v3[18], v3[19], v3[20], v3[21]]),
+            registry_fingerprint(&old_registry)
+        );
+
+        // This build accepts the old fingerprint, interprets ids unchanged and
+        // then writes the strict v4 format on the next save.
+        let loaded =
+            from_bytes(Arc::clone(&new_registry), &v3).expect("v3 save with a pre-append-only fingerprint must load");
+        assert_same_world(&world, &loaded);
+        let upgraded = to_bytes(&loaded);
+        assert_eq!(u16::from_le_bytes([upgraded[4], upgraded[5]]), VERSION);
+        let reloaded = from_bytes(new_registry, &upgraded).expect("upgraded v4 snapshot is valid");
+        assert_same_world(&loaded, &reloaded);
     }
 
     #[test]

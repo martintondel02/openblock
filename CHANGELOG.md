@@ -6,6 +6,51 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [0.0.8] — 2026-11-24 (tech preview, crafting, tools, drops, settings)
+
+### Added
+- Blocks: planks, cobblestone and crafting table (appended after snow, ids 12-14)
+  with procedural textures in all four styles and resource-pack mappings
+  (`oak_planks`, `cobblestone`, `crafting_table_top/side`).
+- Items/tools: stick and wooden/stone pickaxes, axes, shovels, swords with stack
+  sizes, tool tiers/speeds/durabilities (wood 59, stone 131). Tool-dependent
+  mining speed and drops (stone/cobblestone need a pickaxe to drop), durability
+  wear per broken block, tool-break feedback, procedural tool icons + durability
+  bars in the hotbar/inventory/crafting screens.
+- Recipes: planks, sticks, crafting table, and eight tools; ingredient totals
+  with 3x3 table gating via a crafting table within reach. `C` opens the crafting
+  screen (Basics/Tools sections, availability, ingredient colours, keyboard/mouse
+  navigation) and right-clicking a crafting table opens it too; crafting consumes
+  the selected hotbar ingredients and reports success/failure toasts.
+- Dropped-item entities: broken blocks spawn visible mini-cube items with
+  deterministic impulses, gravity/collision, automatic pickup after 0.5 s,
+  partial pickup when the inventory is almost full, 5-minute despawn, persisted
+  `items.txt`, and a state hash covering them. A render agent added an instanced
+  entity pipeline (textured block cubes + flat-tinted item cubes).
+- Full tabbed Settings screen on Esc: Game (mode, HUD, F3), Display (render
+  distance, FOV, sensitivity, fullscreen), Controls reference (including C and
+  Shift/Ctrl), Textures (style/pack + active source); keyboard + mouse, live
+  application, atomic persistence, Resume/Save & quit buttons.
+- Save format v4: new blocks appended without moving existing ids; v1/v2/v3
+  saves load (v3 fingerprint mismatch tolerated because of the append-only
+  invariant) and are upgraded on the next save. `ob_core::SAVE_FORMAT_VERSION=4`.
+
+### Changed
+- Stone now drops cobblestone instead of stone.
+- Survival mining uses effective tool-aware times, not raw hardness; breaking a
+  block no longer adds items straight to the inventory — drops spawn in the world
+  and are picked up automatically (pickup toasts replace the old direct ones).
+- Settings screen replaces the old pause list; F1/F3 shortcuts are suppressed
+  while it is open.
+
+### Measured
+- Test count: 293 -> 367 (content 27, server 35+2 integration, render 109,
+  sim 20, world 32, client 100, core 16, plus bins/docs). Smoke hash for seed 42
+  is `62b21c82b5d848e0` (save format 4, dropped-item entities included).
+- New textures keep the same 18-layer array with full mip chains; entity
+  rendering adds one instanced draw pass with a per-instance 40-byte buffer and
+  no new textures. Benchmark gate unchanged.
+
 ## [0.0.7] — 2026-11-24 (tech preview, survival foundations)
 
 ### Added

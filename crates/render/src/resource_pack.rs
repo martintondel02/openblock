@@ -419,8 +419,11 @@ fn candidate_files(name: &str) -> &'static [&'static str] {
         "gravel" => &["gravel.png"],
         "clay" => &["clay.png"],
         "snow" => &["snow.png"],
-        // `debug` (and any future name without a Minecraft equivalent) is
-        // procedural by design.
+        "planks" => &["oak_planks.png", "planks_oak.png", "planks.png"],
+        "cobblestone" => &["cobblestone.png"],
+        "crafting_table_top" => &["crafting_table_top.png"],
+        "crafting_table_side" => &["crafting_table_side.png"],
+        // `debug` has no Minecraft equivalent and is procedural by design.
         _ => &[],
     }
 }
@@ -794,11 +797,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::textures::BlockTextureArray;
+    use ob_content::textures::{COBBLESTONE, CRAFTING_TABLE_SIDE, CRAFTING_TABLE_TOP, PLANKS, WATER};
 
     use super::*;
 
     /// Non-debug catalogue files and the NAMES index they feed, in pack order.
-    const PACK_FILES: [(&str, &str); 13] = [
+    const PACK_FILES: [(&str, &str); 17] = [
         ("grass_top", "grass_block_top.png"),
         ("grass_side", "grass_block_side.png"),
         ("dirt", "dirt.png"),
@@ -812,6 +816,10 @@ mod tests {
         ("gravel", "gravel.png"),
         ("clay", "clay.png"),
         ("snow", "snow.png"),
+        ("planks", "oak_planks.png"),
+        ("cobblestone", "cobblestone.png"),
+        ("crafting_table_top", "crafting_table_top.png"),
+        ("crafting_table_side", "crafting_table_side.png"),
     ];
 
     /// Scratch directory that is removed when the test finishes.
@@ -1203,6 +1211,19 @@ mod tests {
             ("gravel.png", layer_colour(ob_content::textures::GRAVEL.0 as usize)),
             ("clay.png", layer_colour(ob_content::textures::CLAY.0 as usize)),
             ("snow.png", layer_colour(ob_content::textures::SNOW.0 as usize)),
+            ("planks_oak.png", layer_colour(ob_content::textures::PLANKS.0 as usize)),
+            (
+                "cobblestone.png",
+                layer_colour(ob_content::textures::COBBLESTONE.0 as usize),
+            ),
+            (
+                "crafting_table_top.png",
+                layer_colour(ob_content::textures::CRAFTING_TABLE_TOP.0 as usize),
+            ),
+            (
+                "crafting_table_side.png",
+                layer_colour(ob_content::textures::CRAFTING_TABLE_SIDE.0 as usize),
+            ),
         ];
         for (file, colour) in files {
             write_solid(&block_dir.join(file), 16, colour);
@@ -1231,6 +1252,33 @@ mod tests {
                 .fallback_layers
                 .contains(&(ob_content::textures::WATER.0 as usize))
         );
+    }
+
+    #[test]
+    fn new_block_candidates_match_vanilla_file_names() {
+        assert_eq!(
+            candidate_files("planks"),
+            &["oak_planks.png", "planks_oak.png", "planks.png"]
+        );
+        assert_eq!(candidate_files("cobblestone"), &["cobblestone.png"]);
+        assert_eq!(candidate_files("crafting_table_top"), &["crafting_table_top.png"]);
+        assert_eq!(candidate_files("crafting_table_side"), &["crafting_table_side.png"]);
+        // The debug layer keeps no Minecraft file; every other catalogue name
+        // must have at least one candidate.
+        for name in NAMES {
+            if name == "debug" {
+                assert!(candidate_files(name).is_empty());
+            } else {
+                assert!(!candidate_files(name).is_empty(), "{name} has no candidate file");
+            }
+        }
+        // A file must resolve to at most one catalogue layer.
+        let mut seen = std::collections::HashSet::new();
+        for name in NAMES {
+            for file in candidate_files(name) {
+                assert!(seen.insert(*file), "{file} is a candidate for more than one layer");
+            }
+        }
     }
 
     #[test]
@@ -1477,17 +1525,28 @@ mod tests {
             );
             eprintln!("  fallback layers ({}): {:?}", fallbacks.len(), fallbacks);
 
-            assert!(layers.size >= 16, "pack resolution {} is below 16", layers.size);
+            // The reference pack is 128x128 and ships every mapped layer except
+            // animated water; the debug layer is procedural by design.
+            assert_eq!(layers.size, 128, "unexpected reference-pack resolution");
+            assert_eq!(fallbacks, vec!["debug", "water"]);
             for (label, index) in [
                 ("leaves", LEAVES.0 as usize),
-                ("grass_top", ob_content::textures::GRASS_TOP.0 as usize),
+                ("grass_top", GRASS_TOP.0 as usize),
                 ("stone", ob_content::textures::STONE.0 as usize),
+                ("planks", PLANKS.0 as usize),
+                ("cobblestone", COBBLESTONE.0 as usize),
+                ("crafting_table_top", CRAFTING_TABLE_TOP.0 as usize),
+                ("crafting_table_side", CRAFTING_TABLE_SIDE.0 as usize),
             ] {
                 assert!(
                     !layers.fallback_layers.contains(&index),
                     "{label} must be loaded from the pack, not fall back; fallbacks: {fallbacks:?}"
                 );
             }
+            assert!(
+                layers.fallback_layers.contains(&(WATER.0 as usize)),
+                "the reference pack has no water texture, so water must fall back"
+            );
         }
     }
 

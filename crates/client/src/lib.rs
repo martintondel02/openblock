@@ -16,10 +16,10 @@ use ob_content::{BlockId, Registry};
 use ob_core::config::{GameMode as SettingsGameMode, Settings, TextureStyle, load_settings, save_settings};
 use ob_math::{BlockPos, ChunkPos, SEA_LEVEL, SectionPos, WorldVec};
 use ob_render::{
-    BlockOutline, Camera, DAY_LENGTH_TICKS, Environment, OffscreenRenderer, Renderer, SceneParams, TextureSource,
-    UiFrame,
+    BlockOutline, Camera, DAY_LENGTH_TICKS, EntityInstance, Environment, OffscreenRenderer, Renderer, SceneParams,
+    TextureSource, UiFrame,
 };
-use ob_server::{GameMode as HostGameMode, Host, HostConfig};
+use ob_server::{GameMode as HostGameMode, Host, HostConfig, ItemEntity};
 use ob_sim::{BlockAction, PlayerInput, REACH};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -28,15 +28,19 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
+pub mod crafting;
 pub mod inventory;
 pub mod mesh_scheduler;
 pub mod mining;
 pub mod ui_state;
 
+use crafting::{CraftingRow, crafting_rows};
 use inventory::inventory_blocks;
 use mesh_scheduler::MeshScheduler;
 use mining::MiningState;
-use ui_state::{DamageFlash, DeathAction, DebugStats, MenuAction, MenuItem, Screen, UiState, facing_label};
+use ui_state::{
+    DamageFlash, DeathAction, DebugStats, Screen, SettingsAction, SettingsInfo, SettingsRow, UiState, facing_label,
+};
 
 /// One fixed simulation tick (20 Hz, DEC-038).
 const TICK: Duration = Duration::from_millis(50);
@@ -99,6 +103,10 @@ pub struct ClientOptions {
     pub game_mode: Option<SettingsGameMode>,
     /// Render the death screen in the offscreen screenshot frame.
     pub screenshot_dead: bool,
+    /// Render the settings screen in the offscreen screenshot frame.
+    pub screenshot_settings: bool,
+    /// Render the crafting screen in the offscreen screenshot frame.
+    pub screenshot_crafting: bool,
     /// Seed the host with sample items and vitals for the offscreen screenshot.
     pub screenshot_items: bool,
 }
@@ -122,6 +130,8 @@ impl Default for ClientOptions {
             time_of_day: None,
             game_mode: None,
             screenshot_dead: false,
+            screenshot_settings: false,
+            screenshot_crafting: false,
             screenshot_items: false,
         }
     }
@@ -141,7 +151,11 @@ pub fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
         return screenshot_with_mode(&options, path, ScreenshotMode::Inventory);
     }
     if let Some(path) = &options.screenshot {
-        let mode = if options.screenshot_dead {
+        let mode = if options.screenshot_settings {
+            ScreenshotMode::Settings
+        } else if options.screenshot_crafting {
+            ScreenshotMode::Crafting
+        } else if options.screenshot_dead {
             ScreenshotMode::Dead
         } else {
             ScreenshotMode::Hud
@@ -174,6 +188,10 @@ enum ScreenshotMode {
     Inventory,
     /// Modal death screen over the world.
     Dead,
+    /// Tabbed settings screen over the world with a deterministic selection.
+    Settings,
+    /// Crafting screen over the world with a deterministic selection.
+    Crafting,
 }
 
 /// Renders one offscreen frame of the world and writes it as a PNG (RGBA8).
@@ -203,8 +221,11 @@ fn screenshot_with_mode(
     let mut host = Host::open(Arc::clone(&registry), config)?;
     host.set_game_mode(map_game_mode(settings.game_mode));
     log::info!("game mode: {}", host.game_mode().name());
-    if options.screenshot_items {
+    if options.screenshot_items || mode == ScreenshotMode::Crafting {
         seed_screenshot_items(&mut host, &registry);
+    }
+    if mode == ScreenshotMode::Crafting {
+        seed_near_crafting_table(&mut host, &registry);
     }
     if mode == ScreenshotMode::Dead {
         host.damage(ob_sim::MAX_HEALTH);
@@ -241,8 +262,8 @@ fn screenshot_with_mode(
     let mut ui = UiState::from_settings(settings);
     ui.active_texture_pack = active_texture_pack_label(&texture_source);
     ui.hotbar_selected = host.hotbar_selection();
-    if options.screenshot_items {
-        ui.toasts.push("Picked up Stone x8");
+    if options.screenshot_items || mode == ScreenshotMode::Crafting {
+        ui.toasts.push("Picked up Cobblestone x8");
         ui.toasts.push("Picked up Apple x3");
         ui.toasts.push_warning("Inventory full - dropped Log x2");
         ui.block_name_seconds = ui_state::BLOCK_NAME_SECONDS;
@@ -275,6 +296,7 @@ fn screenshot_with_mode(
                     &registry,
                     host.inventory(),
                     host.hotbar_selection(),
+                    host.near_crafting_table(),
                     screen,
                 );
             } else {
@@ -295,8 +317,58 @@ fn screenshot_with_mode(
             draw_hotbar_for_mode(&mut frame, &ui, &registry, &host, screen);
             ui_state::draw_death_screen(&mut frame, &ui, screen);
         }
+        ScreenshotMode::Settings => {
+            ui.open_settings();
+            let info = SettingsInfo {
+                health: host.player().health,
+                hunger: host.player().hunger,
+                texture_source: texture_source.label(),
+                texture_resolution: renderer.texture_resolution(),
+                mesh_workers: options.mesh_workers,
+            };
+            ui_state::draw_settings_screen(&mut frame, &ui, &info, screen);
+            log::info!(
+                "settings screenshot: tab {}, row {}, source {} {}px",
+                ui.settings_tab.name(),
+                ui.settings_focused_row().map(|row| row.label()).unwrap_or("Resume"),
+                info.texture_source,
+                info.texture_resolution,
+            );
+        }
+        ScreenshotMode::Crafting => {
+            ui.open_crafting();
+            let rows = crafting_rows_for_host(&host, &registry);
+            if let Some(index) = rows.iter().position(|row| row.output_name == "Stone Pickaxe") {
+                ui.crafting.selected = index;
+            }
+            ui.crafting.ensure_visible(screen, &rows);
+            ui.toasts.push_success("crafted 4 planks");
+            crafting::draw_crafting_screen(
+                &mut frame,
+                &ui.crafting,
+                &rows,
+                &registry,
+                host.near_crafting_table(),
+                host.game_mode() == HostGameMode::Creative,
+                screen,
+            );
+            if survival {
+                ui_state::draw_toasts(&mut frame, &ui.toasts, screen);
+            }
+            log::info!(
+                "crafting screenshot: {} recipes, near table {}, selected {}, mode {}",
+                rows.len(),
+                host.near_crafting_table(),
+                rows.get(ui.crafting.selected)
+                    .map(|row| row.output_name.as_str())
+                    .unwrap_or("none"),
+                host.game_mode().name(),
+            );
+        }
     }
     let environment = options.time_of_day.map(Environment::new).unwrap_or_default();
+    let entities = entity_instances_for(host.item_entities(), &registry, 0.8);
+    renderer.set_entities(&entities);
     let scene = SceneParams {
         environment,
         ui: Some(&frame),
@@ -329,17 +401,223 @@ fn screenshot_with_mode(
 }
 
 /// Gives the screenshot host a small, deterministic inventory and wounded vitals.
+///
+/// Tools are worn by breaking a few leaves so the HUD/inventory screenshots
+/// show a partially filled durability bar. This uses only the public host API;
+/// the leaves are restored to the block that was there before seeding.
 fn seed_screenshot_items(host: &mut Host, registry: &Registry) {
-    for (name, count) in [("openblock:stone", 8_u8), ("openblock:apple", 3), ("openblock:log", 2)] {
+    for (name, count) in [
+        ("openblock:stone", 8_u8),
+        ("openblock:apple", 3),
+        ("openblock:log", 2),
+        ("openblock:planks", 16),
+        ("openblock:stick", 8),
+        ("openblock:cobblestone", 16),
+        ("openblock:crafting_table", 1),
+    ] {
         if let Some(item) = registry.item_id(name) {
             host.give_item(item, count);
+        }
+    }
+    for name in ["openblock:wooden_pickaxe", "openblock:stone_pickaxe"] {
+        if let Some(item) = registry.item_id(name) {
+            host.give_item(item, 1);
+        }
+    }
+    let slot_of = |host: &Host, name: &str| {
+        let item = registry.item_id(name)?;
+        host.inventory()
+            .iter()
+            .position(|stack| stack.is_some_and(|stack| stack.item == item))
+    };
+    let wood_slot = slot_of(host, "openblock:wooden_pickaxe");
+    let stone_slot = slot_of(host, "openblock:stone_pickaxe");
+    let leaves = registry.id_or_air("openblock:leaves");
+    if leaves != BlockId::AIR {
+        if let Some(slot) = wood_slot {
+            wear_tool_on_leaves(host, leaves, slot, 7);
+        }
+        if let Some(slot) = stone_slot {
+            wear_tool_on_leaves(host, leaves, slot, 13);
+        }
+    }
+    host.set_hotbar_selection(stone_slot.unwrap_or(0));
+    log::info!(
+        "screenshot items: selected slot {} held {:?}",
+        host.hotbar_selection(),
+        host.selected_stack()
+    );
+    // A few deterministic dropped-item entities in front of the player show
+    // the entity renderer in the HUD screenshots.
+    let eye = host.player().eye();
+    let forward = host.player().forward();
+    let base = WorldVec::new(
+        eye.x + forward[0] * 3.0,
+        host.player().pos.y + 0.2,
+        eye.z + forward[2] * 3.0,
+    );
+    for (index, (name, count)) in [
+        ("openblock:planks", 2_u8),
+        ("openblock:stick", 1),
+        ("openblock:stone_pickaxe", 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let Some(stack) = registry.item_id(name).and_then(|item| host.make_stack(item, count)) {
+            let offset = (index as f64 - 1.0) * 0.55;
+            let pos = WorldVec::new(base.x + offset, base.y, base.z);
+            host.spawn_item_entity(pos, stack);
         }
     }
     let player = host.player_mut();
     player.health = 14.0;
     player.hunger = 12.0;
     player.dead = false;
-    host.set_hotbar_selection(0);
+}
+
+/// Wears one durability point per successful leaf break without leaving a hole.
+fn wear_tool_on_leaves(host: &mut Host, leaves: BlockId, slot: usize, breaks: usize) {
+    if breaks == 0 {
+        return;
+    }
+    let saved_yaw = host.player().yaw;
+    let saved_pitch = host.player().pitch;
+    {
+        let player = host.player_mut();
+        player.yaw = 0.0;
+        player.pitch = -1.5533;
+    }
+    let eye = host.player().eye();
+    let forward = host.player().forward();
+    let target = host
+        .world()
+        .raycast(eye, forward, REACH)
+        .map(|hit| hit.block)
+        .or_else(|| {
+            Some(BlockPos::new(
+                eye.x.floor() as i32,
+                (eye.y - 1.0).floor() as i32,
+                eye.z.floor() as i32,
+            ))
+        });
+    if let Some(pos) = target {
+        let original = host.world().get_block(pos);
+        host.set_hotbar_selection(slot);
+        for _ in 0..breaks {
+            host.world_mut().set_block(pos, leaves);
+            let action = BlockAction {
+                break_block: true,
+                place_block: false,
+                place: BlockId::AIR,
+            };
+            if !host.apply_action_with_outcome(&action).changed {
+                break;
+            }
+        }
+        if original != BlockId::AIR {
+            host.world_mut().set_block(pos, original);
+        }
+    }
+    let player = host.player_mut();
+    player.yaw = saved_yaw;
+    player.pitch = saved_pitch;
+}
+
+/// Places a hidden crafting table below the screenshot player so the 3x3
+/// crafting recipes are available in the crafting screenshot.
+fn seed_near_crafting_table(host: &mut Host, registry: &Registry) {
+    let table = registry.id_or_air("openblock:crafting_table");
+    if table == BlockId::AIR {
+        return;
+    }
+    let eye = host.player().eye();
+    let pos = BlockPos::new(eye.x.floor() as i32, (eye.y - 3.0).floor() as i32, eye.z.floor() as i32);
+    host.world_mut().set_block(pos, table);
+}
+
+/// Builds the renderer instance for one dropped item entity.
+///
+/// Block items sample the block's top texture layer (matching the mesher/HUD
+/// mapping), while non-block items use a flat tint: red apple, wood-brown
+/// stick, brown wooden tools and grey stone tools. Position adds the requested
+/// 0.15 m bob and the yaw spins deterministically with time and entity id.
+pub fn entity_instance_for(entity: &ItemEntity, registry: &Registry, elapsed: f32) -> EntityInstance {
+    let position = [entity.pos.x as f32, entity.pos.y as f32 + 0.15, entity.pos.z as f32];
+    let yaw = elapsed * 1.8 + entity.id as f32 * 0.7;
+    let stack = entity.stack;
+    if stack.item.0 as usize >= registry.item_len() {
+        return EntityInstance {
+            position,
+            scale: 0.22,
+            yaw,
+            layer: 0,
+            tint: [0.80, 0.80, 0.80],
+            textured: false,
+        };
+    }
+    let item = registry.item(stack.item);
+    if let Some(block) = item.block {
+        let block = registry.block(block);
+        EntityInstance {
+            position,
+            scale: 0.22,
+            yaw,
+            layer: u32::from(block.textures.top.0),
+            tint: [1.0, 1.0, 1.0],
+            textured: true,
+        }
+    } else {
+        EntityInstance {
+            position,
+            scale: 0.22,
+            yaw,
+            layer: 0,
+            tint: entity_item_tint(registry, stack.item),
+            textured: false,
+        }
+    }
+}
+
+/// Flat colour used when a non-block dropped item is rendered as a cube.
+fn entity_item_tint(registry: &Registry, item: ob_content::ItemId) -> [f32; 3] {
+    if item.0 as usize >= registry.item_len() {
+        return [0.80, 0.80, 0.80];
+    }
+    let item_type = registry.item(item);
+    if item_type.id == "openblock:apple" {
+        return [0.78, 0.16, 0.12];
+    }
+    if item_type.id == "openblock:stick" {
+        return [0.55, 0.36, 0.18];
+    }
+    if let Some(spec) = item_type.tool {
+        return if spec.tier <= 1 {
+            [0.62, 0.43, 0.22]
+        } else {
+            [0.55, 0.56, 0.58]
+        };
+    }
+    [0.80, 0.80, 0.80]
+}
+
+/// Maps every dropped entity to a renderer instance, preserving host order.
+pub fn entity_instances_for(entities: &[ItemEntity], registry: &Registry, elapsed: f32) -> Vec<EntityInstance> {
+    entities
+        .iter()
+        .map(|entity| entity_instance_for(entity, registry, elapsed))
+        .collect()
+}
+
+/// Current crafting rows for the host (availability included).
+fn crafting_rows_for_host(host: &Host, registry: &Registry) -> Vec<CraftingRow> {
+    crafting_rows(
+        registry,
+        &host.available_recipes(),
+        host.near_crafting_table(),
+        host.game_mode() == HostGameMode::Creative,
+        host.inventory(),
+    )
 }
 
 /// Draws the survival vitals; creative keeps a clean HUD.
@@ -505,23 +783,26 @@ impl GameState {
         match self.ui.screen {
             Screen::Playing => {
                 self.cancel_mining();
-                self.ui.open_pause();
+                self.keys = [false; 8];
+                self.ui.open_settings();
                 self.release_pointer();
             }
             Screen::Inventory => {
                 // Esc closes the inventory back to gameplay; it must not open
-                // the pause menu.
+                // settings.
                 self.close_inventory();
             }
-            Screen::Settings => {
-                self.ui.apply(MenuItem::Back);
+            Screen::Crafting => {
+                // Esc closes crafting back to gameplay; it must not open
+                // settings.
+                self.close_crafting();
             }
-            Screen::Pause => {
-                self.ui.resume();
+            Screen::Settings => {
+                self.ui.close_settings();
                 self.capture_pointer();
             }
             Screen::Death => {
-                // Focus the buttons instead of opening the pause menu.
+                // Focus the buttons instead of opening settings.
                 self.ui.focus_death_buttons();
             }
         }
@@ -637,89 +918,116 @@ impl GameState {
         self.capture_pointer();
     }
 
+    /// Opens the crafting screen from gameplay and releases the pointer.
+    fn open_crafting(&mut self) {
+        if self.ui.screen != Screen::Playing || self.host.is_dead() {
+            return;
+        }
+        self.cancel_mining();
+        self.ui.open_crafting();
+        self.release_pointer();
+    }
+
+    /// Closes crafting, returns to gameplay and recaptures the pointer.
+    fn close_crafting(&mut self) {
+        self.ui.close_crafting();
+        self.capture_pointer();
+    }
+
+    /// Toggles the crafting screen from gameplay.
+    fn toggle_crafting(&mut self) {
+        if self.ui.screen == Screen::Crafting {
+            self.close_crafting();
+        } else {
+            self.open_crafting();
+        }
+    }
+
+    /// Sends the selected recipe to the authoritative host and reports the
+    /// outcome in the HUD toast queue.
+    fn craft_selected(&mut self) {
+        let rows = crafting_rows_for_host(&self.host, &self.registry);
+        let Some(recipe) = self.ui.crafting.selected_recipe(&rows) else {
+            return;
+        };
+        let outcome = self.host.craft(recipe);
+        if outcome.crafted {
+            self.ui.toasts.push_success(outcome.message);
+        } else {
+            // Failure messages are normal info text (`inventory full`,
+            // `needs a crafting table`, `need 2 more planks`).
+            self.ui.toasts.push(outcome.message);
+        }
+        self.update_title();
+    }
+
     /// Stops any in-flight mining and clears the physical mouse-button latch.
     fn cancel_mining(&mut self) {
         self.mouse_left = false;
         self.mining.stop();
     }
 
-    fn menu_move(&mut self, delta: i32) {
-        let count = self.ui.menu_items().len();
-        if count == 0 {
-            return;
-        }
-        let rows = count as i32;
-        self.ui.selected_row = (self.ui.selected_row as i32 + delta).rem_euclid(rows) as usize;
-    }
-
-    fn activate_selected(&mut self) -> bool {
-        let Some(item) = self.ui.menu_items().get(self.ui.selected_row).copied() else {
-            return false;
-        };
-        let action = match item {
-            MenuItem::Resume => MenuAction::Resume,
-            MenuItem::OpenSettings => MenuAction::OpenSettings,
-            MenuItem::SaveAndQuit => MenuAction::SaveAndQuit,
-            MenuItem::Back => MenuAction::Back,
-            adjustment => {
-                self.ui.apply(adjustment);
-                MenuAction::Adjust(adjustment)
+    /// Drains authoritative pickup events into the bounded toast queue.
+    ///
+    /// The server collects dropped entities during its fixed ticks; this is the
+    /// only place that announces them so break drops are never double-toasted.
+    fn drain_pickup_events(&mut self) {
+        for stack in self.host.take_pickup_events() {
+            if stack.count == 0 || stack.item.0 as usize >= self.registry.item_len() {
+                continue;
             }
-        };
-        self.handle_menu_action(action)
+            let name = inventory::display_name(self.registry.item(stack.item).id);
+            self.ui.toasts.push(format!("Picked up {name} x{}", stack.count));
+        }
     }
 
-    /// Applies a menu action; returns true when the process should exit.
-    fn handle_menu_action(&mut self, action: MenuAction) -> bool {
+    /// Applies the live side effect of a settings row and persists settings.
+    fn apply_settings_row(&mut self, row: SettingsRow) {
+        match row {
+            SettingsRow::RenderDistance => {
+                let requested = self.ui.settings.render_distance_chunks;
+                if self.host.set_render_distance_chunks(requested) {
+                    self.applied_render_distance = requested;
+                }
+            }
+            SettingsRow::Fullscreen => self.apply_fullscreen(self.ui.settings.fullscreen),
+            SettingsRow::GameMode => self.apply_game_mode_setting(),
+            SettingsRow::TextureStyle => {
+                // Style rows switch the active source to Style(new style) for
+                // this run. A persisted external pack stays saved, so the
+                // texture-pack row (or the next launch) can re-enable it.
+                let style = render_texture_style(self.ui.settings.texture_style);
+                self.set_active_texture_style(style);
+            }
+            SettingsRow::TexturePack => self.toggle_texture_pack(),
+            SettingsRow::ShowHud
+            | SettingsRow::DebugOverlay
+            | SettingsRow::Fov
+            | SettingsRow::MouseSensitivity
+            | SettingsRow::MeshWorkers => {}
+        }
+        // The settings screen promises that every change is saved immediately.
+        self.persist_settings();
+    }
+
+    /// Applies a settings action; returns true when the process should exit.
+    fn handle_settings_action(&mut self, action: SettingsAction) -> bool {
         match action {
-            MenuAction::Resume => {
+            SettingsAction::Resume => {
                 self.ui.resume();
                 self.capture_pointer();
+                self.persist_settings();
                 false
             }
-            MenuAction::OpenSettings => {
-                self.ui.apply(MenuItem::OpenSettings);
-                false
-            }
-            MenuAction::Back => {
-                self.ui.apply(MenuItem::Back);
-                false
-            }
-            MenuAction::SaveAndQuit => {
+            SettingsAction::SaveAndQuit => {
                 if let Err(err) = self.host.save() {
                     log::warn!("save on quit failed: {err}");
                 }
                 self.persist_settings();
                 true
             }
-            MenuAction::Adjust(item) => {
-                match item {
-                    MenuItem::RenderDistanceDown | MenuItem::RenderDistanceUp => {
-                        let requested = self.ui.settings.render_distance_chunks;
-                        if self.host.set_render_distance_chunks(requested) {
-                            self.applied_render_distance = requested;
-                        }
-                    }
-                    MenuItem::ToggleFullscreen => {
-                        self.apply_fullscreen(self.ui.settings.fullscreen);
-                    }
-                    MenuItem::ToggleGameMode => {
-                        self.apply_game_mode_setting();
-                    }
-                    MenuItem::TextureStylePrevious | MenuItem::TextureStyleNext => {
-                        // Style rows switch the active source to Style(new style)
-                        // for this run. A persisted external pack stays saved, so
-                        // the texture-pack row (or the next launch) can re-enable
-                        // it.
-                        let style = render_texture_style(self.ui.settings.texture_style);
-                        self.set_active_texture_style(style);
-                    }
-                    MenuItem::ToggleTexturePack => {
-                        self.toggle_texture_pack();
-                    }
-                    _ => {}
-                }
-                self.persist_settings();
+            SettingsAction::Adjust(row) => {
+                self.apply_settings_row(row);
                 false
             }
         }
@@ -787,7 +1095,9 @@ impl GameState {
             (eye.y.floor() as i32).div_euclid(16),
             (eye.z.floor() as i32).div_euclid(16),
         ];
-        let target = self.host.world().raycast(eye, player.forward(), 5.0).map(|hit| {
+        let target_hit = self.host.world().raycast(eye, player.forward(), 5.0);
+        let target_block = target_hit.map(|hit| self.host.world().get_block(hit.block));
+        let target = target_hit.map(|hit| {
             let id = self
                 .registry
                 .block(self.host.world().get_block(hit.block))
@@ -807,6 +1117,33 @@ impl GameState {
         let frame_p50 = percentile(50.0);
         let frame_p95 = percentile(95.0);
         let render_stats = self.renderer.stats();
+        let selected_stack = self.host.selected_stack();
+        let (held, held_durability) = if let Some(stack) = selected_stack {
+            let item = self.registry.item(stack.item);
+            let durability = item.tool.and_then(|spec| {
+                stack
+                    .durability
+                    .map(|remaining| (remaining.min(spec.durability), spec.durability))
+            });
+            (inventory::display_name(item.id), durability)
+        } else if self.host.game_mode() == HostGameMode::Survival {
+            ("empty".to_string(), None)
+        } else {
+            let name = self
+                .ui
+                .hotbar_block(&self.registry, self.ui.hotbar_selected)
+                .map(|block| inventory::display_name(block.id))
+                .unwrap_or_else(|| "empty".to_string());
+            (name, None)
+        };
+        let held_item = selected_stack.map(|stack| stack.item);
+        let mining_speed = match target_block {
+            Some(block) => self.registry.mining_speed(block, held_item),
+            None => selected_stack
+                .and_then(|stack| self.registry.item(stack.item).tool)
+                .map(|spec| spec.speed)
+                .unwrap_or(1.0),
+        };
         self.debug_stats = DebugStats {
             version: ob_core::VERSION.to_string(),
             fps: self.fps,
@@ -838,6 +1175,9 @@ impl GameState {
             game_mode: self.host.game_mode().name(),
             health: player.health,
             hunger: player.hunger,
+            held,
+            held_durability,
+            mining_speed,
             movement: if player.flying {
                 "fly"
             } else if player.sprinting {
@@ -859,6 +1199,17 @@ impl GameState {
     /// Keeps the settings-row display in sync with the active source.
     fn sync_ui_texture_source(&mut self) {
         self.ui.active_texture_pack = active_texture_pack_label(&self.texture_source);
+    }
+
+    /// Runtime values the settings screen displays.
+    fn settings_info(&self) -> SettingsInfo {
+        SettingsInfo {
+            health: self.host.player().health,
+            hunger: self.host.player().hunger,
+            texture_source: self.texture_source.label(),
+            texture_resolution: self.renderer.texture_resolution(),
+            mesh_workers: self.mesh_scheduler.workers(),
+        }
     }
 
     fn update_title(&mut self) {
@@ -884,8 +1235,8 @@ impl GameState {
                 }
             }
             Screen::Inventory => " | INVENTORY (E/Esc to close)",
-            Screen::Pause => " | PAUSED (Esc to resume)",
-            Screen::Settings => " | SETTINGS (Esc to go back)",
+            Screen::Crafting => " | CRAFTING (C/Esc to close)",
+            Screen::Settings => " | SETTINGS (Esc to resume)",
             Screen::Death => " | DEAD (Enter respawn)",
         };
         let movement = if player.flying {
@@ -1140,9 +1491,10 @@ impl GameState {
                 ticks += 1;
             }
         } else {
-            // Menus, death and the pause screen stop simulation and movement.
+            // Menus, settings and death stop simulation and movement.
             self.accumulator = Duration::ZERO;
         }
+        self.drain_pickup_events();
         if self.host.game_mode() == HostGameMode::Survival {
             self.damage_flash.observe(self.host.player().health);
         } else {
@@ -1173,6 +1525,9 @@ impl GameState {
         // Day starts at sunrise: tick 0 is 06:00 rather than midnight.
         let environment = Environment::from_ticks(self.host.tick_count() + DAY_LENGTH_TICKS / 4, DAY_LENGTH_TICKS);
         self.refresh_debug_stats();
+        let elapsed = self.started.elapsed().as_secs_f32();
+        let entity_instances = entity_instances_for(self.host.item_entities(), &self.registry, elapsed);
+        self.renderer.set_entities(&entity_instances);
         let ui_frame = self.build_ui_frame();
         let outline = self
             .mining
@@ -1228,6 +1583,9 @@ impl GameState {
         } else {
             None
         };
+        let elapsed = self.started.elapsed().as_secs_f32();
+        let entities = entity_instances_for(self.host.item_entities(), &self.registry, elapsed);
+        renderer.set_entities(&entities);
         let scene = SceneParams {
             environment: *environment,
             ui: ui_frame.as_ref().or(ui),
@@ -1254,18 +1612,24 @@ impl GameState {
         let [width, height] = screen;
         let playing = self.ui.screen == Screen::Playing;
         let inventory_open = self.ui.screen == Screen::Inventory;
+        let crafting_open = self.ui.screen == Screen::Crafting;
         let death_open = self.ui.screen == Screen::Death;
         let survival = self.host.game_mode() == HostGameMode::Survival;
         let show_hotbar = (playing || inventory_open || death_open) && self.ui.hud_visible;
         let show_crosshair = playing && self.ui.hud_visible && !self.host.is_dead();
         let show_debug = self.ui.debug_overlay;
-        let show_menu = matches!(self.ui.screen, Screen::Pause | Screen::Settings);
-        if !show_hotbar && !show_crosshair && !show_debug && !show_menu && !inventory_open && !death_open {
+        let settings_open = self.ui.screen == Screen::Settings;
+        if !show_hotbar
+            && !show_crosshair
+            && !show_debug
+            && !settings_open
+            && !inventory_open
+            && !crafting_open
+            && !death_open
+        {
             return None;
         }
         let mut frame = UiFrame::new(width, height);
-        let white = [1.0, 1.0, 1.0, 1.0];
-        let text_color = [0.94, 0.96, 0.99, 1.0];
 
         // --- Inventory: dimmed world, hotbar row or creative block grid ---
         if inventory_open {
@@ -1276,6 +1640,7 @@ impl GameState {
                     &self.registry,
                     self.host.inventory(),
                     self.host.hotbar_selection(),
+                    self.host.near_crafting_table(),
                     screen,
                 );
             } else {
@@ -1328,40 +1693,27 @@ impl GameState {
             }
         }
 
-        // --- Pause and settings menus ---
-        if show_menu {
-            frame.rect(0.0, 0.0, width, height, [0.0, 0.0, 0.0, 0.55]);
-            if let Some(panel) = self.ui.panel_rect(screen) {
-                frame.rect(panel.x, panel.y, panel.w, panel.h, [0.07, 0.08, 0.11, 0.95]);
-                frame.outline(panel.x, panel.y, panel.w, panel.h, 2.0, [0.42, 0.48, 0.56, 1.0]);
-                let title = match self.ui.screen {
-                    Screen::Pause => "Paused",
-                    Screen::Settings => "Settings",
-                    Screen::Playing | Screen::Inventory | Screen::Death => "",
-                };
-                frame.text_centered(panel.x + panel.w / 2.0, panel.y + 14.0, 2.5, white, title);
-                let rows = self.ui.menu_rects(screen);
-                for (index, (item, rect)) in self.ui.menu_items().iter().zip(rows.iter()).enumerate() {
-                    let active = index == self.ui.selected_row || self.ui.hovered_row == Some(index);
-                    if active {
-                        frame.rect(rect.x, rect.y, rect.w, rect.h, [0.23, 0.29, 0.37, 0.96]);
-                        frame.outline(rect.x, rect.y, rect.w, rect.h, 1.0, [0.95, 0.80, 0.35, 1.0]);
-                    }
-                    frame.text(rect.x + 10.0, rect.y + 8.0, 1.6, text_color, &self.ui.row_label(*item));
-                }
-                let hint = match self.ui.screen {
-                    Screen::Pause => "Esc resume   Enter/Click select   F3 debug   F2 screenshot",
-                    Screen::Settings => "Esc back   Enter/Click adjust   changes are saved",
-                    Screen::Playing | Screen::Inventory | Screen::Death => "",
-                };
-                frame.text_centered(
-                    panel.x + panel.w / 2.0,
-                    panel.y + panel.h - 30.0,
-                    1.2,
-                    [0.72, 0.78, 0.85, 1.0],
-                    hint,
-                );
+        // --- Crafting screen: modal, with toasts and the F3 overlay on top ---
+        if crafting_open {
+            let rows = crafting_rows_for_host(&self.host, &self.registry);
+            crafting::draw_crafting_screen(
+                &mut frame,
+                &self.ui.crafting,
+                &rows,
+                &self.registry,
+                self.host.near_crafting_table(),
+                self.host.game_mode() == HostGameMode::Creative,
+                screen,
+            );
+            if self.ui.hud_visible {
+                ui_state::draw_toasts(&mut frame, &self.ui.toasts, screen);
             }
+        }
+
+        // --- Tabbed settings screen: modal, with the F3 overlay still on top ---
+        if settings_open {
+            let info = self.settings_info();
+            ui_state::draw_settings_screen(&mut frame, &self.ui, &info, screen);
         }
 
         // --- Death screen: drawn over the HUD, below the F3 overlay ---
@@ -1393,9 +1745,21 @@ impl GameState {
             .raycast(player.eye(), player.forward(), REACH)
             .map(|hit| hit.block);
         let breakable_target = current.and_then(|pos| {
-            let block = self.registry.block(self.host.world().get_block(pos));
-            block.breakable().then_some((pos, block.hardness))
+            let block_id = self.host.world().get_block(pos);
+            let block = self.registry.block(block_id);
+            let seconds = self.host.mining_seconds(block_id) as f32;
+            (block.breakable() && seconds.is_finite() && seconds > 0.0).then_some((pos, seconds))
         });
+
+        // A hotbar switch can change the effective duration while the same
+        // block stays under the crosshair; restart instead of keeping a stale
+        // timer that would desynchronise client prediction from host checks.
+        if let Some((pos, seconds)) = breakable_target
+            && self.mining.target() == Some(pos)
+            && (self.mining.duration_seconds() - seconds).abs() > 1e-6
+        {
+            self.mining.start(pos, seconds);
+        }
 
         self.mining.update(dt.as_secs_f32(), current);
         if let Some(pos) = self.mining.take_completed() {
@@ -1405,9 +1769,9 @@ impl GameState {
             return;
         }
         if self.mining.target().is_none()
-            && let Some((pos, hardness)) = breakable_target
+            && let Some((pos, seconds)) = breakable_target
         {
-            self.mining.start(pos, hardness);
+            self.mining.start(pos, seconds);
         }
     }
 
@@ -1428,25 +1792,22 @@ impl GameState {
         let survival = self.host.game_mode() == HostGameMode::Survival;
         let outcome = self.host.apply_action_with_outcome(&action);
         if outcome.changed {
-            if survival {
-                let mut overflow = outcome.pickup_overflow.clone();
+            if survival && !outcome.drops.is_empty() {
+                // Survival breaks spawn item entities; this is only a subtle
+                // acknowledgement, not a pickup (pickup toasts come from the
+                // host's drained pickup events).
                 for drop in &outcome.drops {
-                    let over = overflow
-                        .iter()
-                        .position(|stack| stack.item == drop.item)
-                        .map(|index| overflow.remove(index).count)
-                        .unwrap_or(0);
-                    let picked = drop.count.saturating_sub(over);
                     let name = inventory::display_name(self.registry.item(drop.item).id);
-                    if picked > 0 {
-                        self.ui.toasts.push(format!("Picked up {name} x{picked}"));
-                    }
-                    if over > 0 {
-                        self.ui
-                            .toasts
-                            .push_warning(format!("Inventory full - dropped {name} x{over}"));
-                    }
+                    self.ui.toasts.push(format!("Dropped {name} x{}", drop.count));
                 }
+            }
+            if let Some(item) = outcome.tool_broke {
+                let name = inventory::display_name(self.registry.item(item).id);
+                self.ui.toasts.push_warning(format!("Your {name} broke!"));
+                // The host removed the tool; stop the current hold so the
+                // player must click again rather than silently mining by hand.
+                self.mouse_left = false;
+                self.mining.stop();
             }
             self.ui.flash_broken_block(name);
         }
@@ -1463,9 +1824,11 @@ impl GameState {
             self.mining.stop();
             return;
         };
-        let block = self.registry.block(self.host.world().get_block(hit.block));
-        if block.breakable() {
-            self.mining.start(hit.block, block.hardness);
+        let block_id = self.host.world().get_block(hit.block);
+        let block = self.registry.block(block_id);
+        let seconds = self.host.mining_seconds(block_id) as f32;
+        if block.breakable() && seconds.is_finite() && seconds > 0.0 {
+            self.mining.start(hit.block, seconds);
         } else {
             self.mining.stop();
         }
@@ -1478,6 +1841,16 @@ impl GameState {
     /// block item; creative keeps the fixed palette pick.
     fn place_block(&mut self) {
         if !self.captured || self.ui.screen != Screen::Playing || self.host.is_dead() {
+            return;
+        }
+        // Right-click always tries a block interaction first. A targeted
+        // crafting table opens the crafting screen; every other block keeps
+        // the normal eat/place rules below.
+        let player = self.host.player();
+        if let Some(hit) = self.host.world().raycast(player.eye(), player.forward(), REACH)
+            && self.registry.block(self.host.world().get_block(hit.block)).id == "openblock:crafting_table"
+        {
+            self.open_crafting();
             return;
         }
         if self.host.game_mode() == HostGameMode::Survival {
@@ -1616,6 +1989,40 @@ impl GameState {
         };
         self.ui.inventory.selected = index;
         self.assign_inventory_selection();
+    }
+
+    /// Moves the crafting selection by `steps` rows and keeps it on screen.
+    fn move_crafting_selection(&mut self, steps: i32) {
+        let rows = crafting_rows_for_host(&self.host, &self.registry);
+        let screen = self.window_screen();
+        self.ui.crafting.move_selection(steps, rows.len());
+        self.ui.crafting.ensure_visible(screen, &rows);
+    }
+
+    /// Scrolls the crafting list by wheel notches.
+    fn scroll_crafting(&mut self, steps: i32) {
+        if steps == 0 {
+            return;
+        }
+        let rows = crafting_rows_for_host(&self.host, &self.registry);
+        let screen = self.window_screen();
+        self.ui.crafting.scroll_by(steps, screen, &rows);
+    }
+
+    /// Updates the crafting hover from the last cursor position.
+    fn update_crafting_hover(&mut self) {
+        let rows = crafting_rows_for_host(&self.host, &self.registry);
+        let screen = self.window_screen();
+        self.ui.crafting.update_hover(self.ui.cursor, screen, &rows);
+    }
+
+    /// Handles a left click on a crafting row: select it and craft it.
+    fn crafting_click(&mut self) {
+        let rows = crafting_rows_for_host(&self.host, &self.registry);
+        let screen = self.window_screen();
+        if self.ui.crafting.click(self.ui.cursor, screen, &rows).is_some() {
+            self.craft_selected();
+        }
     }
 }
 
@@ -1835,6 +2242,7 @@ impl ApplicationHandler for App {
                         KeyCode::KeyD => state.keys[3] = pressed,
                         KeyCode::Space => state.keys[4] = pressed,
                         KeyCode::ShiftLeft => state.keys[5] = pressed,
+                        KeyCode::ShiftRight => state.keys[7] = pressed,
                         KeyCode::ControlLeft => state.keys[6] = pressed,
                         KeyCode::KeyF if pressed && state.ui.screen == Screen::Playing && !state.host.is_dead() => {
                             state.fly_toggle = true;
@@ -1842,40 +2250,68 @@ impl ApplicationHandler for App {
                         KeyCode::KeyE if pressed => match state.ui.screen {
                             Screen::Playing if !state.host.is_dead() => state.open_inventory(),
                             Screen::Inventory => state.close_inventory(),
-                            Screen::Pause | Screen::Settings | Screen::Death => {}
+                            Screen::Crafting => state.close_crafting(),
+                            Screen::Settings | Screen::Death => {}
                             Screen::Playing => {}
                         },
+                        KeyCode::KeyC if pressed => state.toggle_crafting(),
                         KeyCode::Escape if pressed => state.handle_escape(),
-                        KeyCode::F1 if pressed => {
-                            state.ui.apply(MenuItem::ToggleHud);
+                        KeyCode::F1 if pressed && overlay_shortcuts_allowed(state.ui.screen) => {
+                            state.ui.hud_visible = !state.ui.hud_visible;
                             state.persist_settings();
                         }
                         KeyCode::F2 if pressed && state.ui.screen == Screen::Playing && !state.host.is_dead() => {
                             state.screenshot_requested = true;
                         }
-                        KeyCode::F3 if pressed => {
+                        KeyCode::F3 if pressed && overlay_shortcuts_allowed(state.ui.screen) => {
                             state.ui.toggle_debug_overlay();
                             state.persist_settings();
                         }
+                        KeyCode::Tab if pressed => match state.ui.screen {
+                            Screen::Settings => {
+                                if state.keys[5] || state.keys[7] {
+                                    state.ui.settings_tab_prev();
+                                } else {
+                                    state.ui.settings_tab_next();
+                                }
+                            }
+                            Screen::Playing | Screen::Inventory | Screen::Crafting | Screen::Death => {}
+                        },
                         KeyCode::ArrowUp if pressed => match state.ui.screen {
                             Screen::Death => state.ui.move_death_selection(-1),
                             Screen::Inventory => state.move_inventory_selection(0, -1),
-                            Screen::Playing | Screen::Pause | Screen::Settings => state.menu_move(-1),
+                            Screen::Settings => state.ui.settings_row_up(),
+                            Screen::Crafting => state.move_crafting_selection(-1),
+                            Screen::Playing => {}
                         },
                         KeyCode::ArrowDown if pressed => match state.ui.screen {
                             Screen::Death => state.ui.move_death_selection(1),
                             Screen::Inventory => state.move_inventory_selection(0, 1),
-                            Screen::Playing | Screen::Pause | Screen::Settings => state.menu_move(1),
+                            Screen::Settings => state.ui.settings_row_down(),
+                            Screen::Crafting => state.move_crafting_selection(1),
+                            Screen::Playing => {}
                         },
                         KeyCode::ArrowLeft if pressed => match state.ui.screen {
                             Screen::Death => state.ui.move_death_selection(-1),
                             Screen::Inventory => state.move_inventory_selection(-1, 0),
-                            Screen::Playing | Screen::Pause | Screen::Settings => {}
+                            Screen::Settings => {
+                                if let Some(row) = state.ui.settings_adjust(-1) {
+                                    state.apply_settings_row(row);
+                                }
+                            }
+                            Screen::Crafting => state.move_crafting_selection(-1),
+                            Screen::Playing => {}
                         },
                         KeyCode::ArrowRight if pressed => match state.ui.screen {
                             Screen::Death => state.ui.move_death_selection(1),
                             Screen::Inventory => state.move_inventory_selection(1, 0),
-                            Screen::Playing | Screen::Pause | Screen::Settings => {}
+                            Screen::Settings => {
+                                if let Some(row) = state.ui.settings_adjust(1) {
+                                    state.apply_settings_row(row);
+                                }
+                            }
+                            Screen::Crafting => state.move_crafting_selection(1),
+                            Screen::Playing => {}
                         },
                         KeyCode::Enter if pressed => match state.ui.screen {
                             Screen::Death => {
@@ -1889,12 +2325,16 @@ impl ApplicationHandler for App {
                             Screen::Inventory => {
                                 state.assign_inventory_selection();
                             }
-                            Screen::Playing | Screen::Pause | Screen::Settings => {
-                                if state.activate_selected() {
+                            Screen::Settings => {
+                                if let Some(action) = state.ui.settings_activate()
+                                    && state.handle_settings_action(action)
+                                {
                                     state.persist_settings();
                                     event_loop.exit();
                                 }
                             }
+                            Screen::Crafting => state.craft_selected(),
+                            Screen::Playing => {}
                         },
                         KeyCode::Digit1
                         | KeyCode::Digit2
@@ -1946,15 +2386,21 @@ impl ApplicationHandler for App {
                         }
                         return;
                     }
-                    Screen::Pause | Screen::Settings => {
+                    Screen::Settings => {
                         if button == MouseButton::Left {
                             let screen = state.window_screen();
-                            if let Some(action) = state.ui.click(screen)
-                                && state.handle_menu_action(action)
+                            if let Some(action) = state.ui.settings_click(screen)
+                                && state.handle_settings_action(action)
                             {
                                 state.persist_settings();
                                 event_loop.exit();
                             }
+                        }
+                        return;
+                    }
+                    Screen::Crafting => {
+                        if button == MouseButton::Left {
+                            state.crafting_click();
                         }
                         return;
                     }
@@ -1978,10 +2424,11 @@ impl ApplicationHandler for App {
                 state.ui.cursor = (position.x as f32, position.y as f32);
                 match state.ui.screen {
                     Screen::Inventory => state.update_inventory_hover(),
-                    Screen::Pause | Screen::Settings => {
+                    Screen::Settings => {
                         let screen = state.window_screen();
-                        state.ui.update_hover(screen);
+                        state.ui.settings_hover(screen);
                     }
+                    Screen::Crafting => state.update_crafting_hover(),
                     Screen::Death => {
                         let screen = state.window_screen();
                         state.ui.update_death_hover(screen);
@@ -2005,6 +2452,14 @@ impl ApplicationHandler for App {
                     }
                     Screen::Death if steps != 0 => {
                         state.ui.move_death_selection(-steps.signum());
+                    }
+                    Screen::Settings if steps != 0 => {
+                        if let Some(row) = state.ui.settings_adjust(steps.signum()) {
+                            state.apply_settings_row(row);
+                        }
+                    }
+                    Screen::Crafting if steps != 0 => {
+                        state.scroll_crafting(steps);
                     }
                     _ => {}
                 }
@@ -2057,6 +2512,11 @@ impl ApplicationHandler for App {
     }
 }
 
+/// F1/F3 overlay shortcuts are disabled while the settings screen owns input.
+fn overlay_shortcuts_allowed(screen: Screen) -> bool {
+    screen != Screen::Settings
+}
+
 /// Maps the top-row digit keys to zero-based hotbar slots.
 fn digit_slot(code: KeyCode) -> Option<usize> {
     match code {
@@ -2086,7 +2546,7 @@ fn effective_settings(options: &ClientOptions) -> (Settings, PathBuf) {
     if let Some(mode) = options.game_mode {
         settings.game_mode = mode;
     }
-    if options.screenshot_dead || options.screenshot_items {
+    if options.screenshot_dead || options.screenshot_crafting || options.screenshot_items {
         settings.game_mode = SettingsGameMode::Survival;
     }
     settings.clamp();
@@ -2370,6 +2830,8 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
                 options.screenshot_inventory = Some(value.into());
             }
             "screenshot-dead" => options.screenshot_dead = true,
+            "screenshot-settings" => options.screenshot_settings = true,
+            "screenshot-crafting" => options.screenshot_crafting = true,
             "screenshot-items" => options.screenshot_items = true,
             "survival" => options.game_mode = Some(SettingsGameMode::Survival),
             "creative" => options.game_mode = Some(SettingsGameMode::Creative),
@@ -2380,11 +2842,30 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
     if options.screenshot_dead && options.screenshot.is_none() {
         return Err("--screenshot-dead requires --screenshot PATH".into());
     }
+    if options.screenshot_settings
+        && (options.screenshot_dead || options.screenshot_crafting || options.screenshot_inventory.is_some())
+    {
+        return Err(
+            "--screenshot-settings cannot be combined with --screenshot-dead, --screenshot-crafting or --screenshot-inventory"
+                .into(),
+        );
+    }
+    if options.screenshot_crafting && (options.screenshot_dead || options.screenshot_inventory.is_some()) {
+        return Err("--screenshot-crafting cannot be combined with --screenshot-dead or --screenshot-inventory".into());
+    }
+    if options.screenshot_settings && options.screenshot.is_none() {
+        return Err("--screenshot-settings requires --screenshot PATH".into());
+    }
+    if options.screenshot_crafting && options.screenshot.is_none() {
+        return Err("--screenshot-crafting requires --screenshot PATH".into());
+    }
     if options.screenshot_items && options.screenshot.is_none() && options.screenshot_inventory.is_none() {
         return Err("--screenshot-items requires --screenshot or --screenshot-inventory PATH".into());
     }
-    if (options.screenshot_dead || options.screenshot_items) && options.game_mode == Some(SettingsGameMode::Creative) {
-        return Err("--screenshot-dead and --screenshot-items require survival mode".into());
+    if (options.screenshot_dead || options.screenshot_crafting || options.screenshot_items)
+        && options.game_mode == Some(SettingsGameMode::Creative)
+    {
+        return Err("--screenshot-dead, --screenshot-crafting and --screenshot-items require survival mode".into());
     }
     Ok(options)
 }
@@ -2402,6 +2883,14 @@ pub fn world_hash(host: &Host) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_screen_suppresses_f1_and_f3_shortcuts() {
+        assert!(!overlay_shortcuts_allowed(Screen::Settings));
+        assert!(overlay_shortcuts_allowed(Screen::Playing));
+        assert!(overlay_shortcuts_allowed(Screen::Inventory));
+        assert!(overlay_shortcuts_allowed(Screen::Death));
+    }
 
     #[test]
     fn digit_keys_map_to_all_nine_hotbar_slots() {
@@ -2666,6 +3155,170 @@ mod tests {
         persist_game_mode_choice(&options, &mut settings, &resolved_dir);
         assert!(ob_core::config::settings_path(&fresh).exists());
         assert_eq!(load_settings(&fresh).game_mode, SettingsGameMode::Survival);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn screenshot_settings_flag_parses_and_needs_a_screenshot_path() {
+        let path = PathBuf::from("/tmp/settings.png");
+        let options = options_from_args(&[
+            ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+            ("screenshot-settings".to_string(), String::new()),
+        ])
+        .expect("valid settings screenshot");
+        assert_eq!(options.screenshot.as_deref(), Some(path.as_path()));
+        assert!(options.screenshot_settings);
+        assert!(!options.screenshot_dead);
+
+        let error = options_from_args(&[("screenshot-settings".to_string(), String::new())])
+            .expect_err("needs a screenshot path");
+        assert!(error.contains("--screenshot PATH"));
+
+        let error = options_from_args(&[
+            ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+            ("screenshot-settings".to_string(), String::new()),
+            ("screenshot-dead".to_string(), String::new()),
+        ])
+        .expect_err("must not combine modes");
+        assert!(error.contains("cannot be combined"));
+
+        let error = options_from_args(&[
+            ("screenshot-settings".to_string(), String::new()),
+            ("screenshot-inventory".to_string(), path.to_string_lossy().into_owned()),
+        ])
+        .expect_err("must not combine with the inventory screenshot");
+        assert!(error.contains("cannot be combined"));
+    }
+
+    fn dropped(registry: &Registry, id: u64, name: &str, count: u8) -> ItemEntity {
+        let item = registry.item_id(name).expect("item id");
+        ItemEntity {
+            id,
+            pos: WorldVec::new(1.5, 64.0, -2.25),
+            velocity: WorldVec::splat(0.0),
+            stack: ob_server::ItemStack::new(item, count),
+            age: 0.0,
+        }
+    }
+
+    #[test]
+    fn entity_instances_map_block_items_to_their_top_texture() {
+        let registry = Registry::base();
+        let entity = dropped(&registry, 7, "openblock:planks", 2);
+        let instance = entity_instance_for(&entity, &registry, 2.0);
+        assert!(instance.textured);
+        let planks = registry.id("openblock:planks").expect("planks block");
+        assert_eq!(instance.layer, u32::from(registry.block(planks).textures.top.0));
+        assert_eq!(instance.tint, [1.0, 1.0, 1.0]);
+        assert_eq!(instance.scale, 0.22);
+        assert!((instance.position[0] - 1.5).abs() < 1e-6);
+        assert!((instance.position[1] - 64.15).abs() < 1e-6);
+        assert!((instance.position[2] + 2.25).abs() < 1e-6);
+        let expected_yaw = 2.0 * 1.8 + 7.0 * 0.7;
+        assert!((instance.yaw - expected_yaw).abs() < 1e-5);
+
+        let table = dropped(&registry, 8, "openblock:crafting_table", 1);
+        let instance = entity_instance_for(&table, &registry, 0.0);
+        assert_eq!(
+            instance.layer,
+            u32::from(ob_content::textures::CRAFTING_TABLE_TOP.0),
+            "crafting tables must use their distinct top layer"
+        );
+        assert!(instance.textured);
+    }
+
+    #[test]
+    fn entity_instances_tint_apple_stick_and_tool_tiers() {
+        let registry = Registry::base();
+        let instance = |name: &str, id: u64| {
+            let entity = dropped(&registry, id, name, 1);
+            entity_instance_for(&entity, &registry, 0.0)
+        };
+        let apple = instance("openblock:apple", 1);
+        assert!(!apple.textured);
+        assert_eq!(apple.tint, [0.78, 0.16, 0.12]);
+        assert_eq!(apple.layer, 0);
+        let stick = instance("openblock:stick", 2);
+        assert_eq!(stick.tint, [0.55, 0.36, 0.18]);
+        let wooden = instance("openblock:wooden_pickaxe", 3);
+        assert_eq!(wooden.tint, [0.62, 0.43, 0.22]);
+        assert!(!wooden.textured);
+        let stone = instance("openblock:stone_axe", 4);
+        assert_eq!(stone.tint, [0.55, 0.56, 0.58]);
+        assert_eq!(stone.scale, 0.22);
+        assert_eq!(stone.layer, 0);
+    }
+
+    #[test]
+    fn entity_instance_batch_preserves_entity_order_and_offsets() {
+        let registry = Registry::base();
+        let entities = vec![
+            dropped(&registry, 10, "openblock:planks", 1),
+            dropped(&registry, 11, "openblock:apple", 1),
+        ];
+        let instances = entity_instances_for(&entities, &registry, 1.0);
+        assert_eq!(instances.len(), 2);
+        assert!(instances[0].textured);
+        assert!(!instances[1].textured);
+        assert!((instances[0].yaw - (1.0 * 1.8 + 10.0 * 0.7)).abs() < 1e-5);
+        assert!((instances[1].yaw - (1.0 * 1.8 + 11.0 * 0.7)).abs() < 1e-5);
+        assert!(entity_instances_for(&[], &registry, 0.0).is_empty());
+    }
+
+    #[test]
+    fn screenshot_crafting_flag_parses_and_seeds_survival_crafting() {
+        let path = PathBuf::from("/tmp/crafting.png");
+        let options = options_from_args(&[
+            ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+            ("screenshot-crafting".to_string(), String::new()),
+        ])
+        .expect("valid crafting screenshot");
+        assert_eq!(options.screenshot.as_deref(), Some(path.as_path()));
+        assert!(options.screenshot_crafting);
+        assert!(!options.screenshot_settings);
+        assert!(!options.screenshot_items);
+
+        let error = options_from_args(&[("screenshot-crafting".to_string(), String::new())])
+            .expect_err("needs a screenshot path");
+        assert!(error.contains("--screenshot PATH"));
+
+        let error = options_from_args(&[
+            ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+            ("screenshot-crafting".to_string(), String::new()),
+            ("screenshot-dead".to_string(), String::new()),
+        ])
+        .expect_err("must not combine modes");
+        assert!(error.contains("cannot be combined"));
+
+        let dir = std::env::temp_dir().join(format!(
+            "openblock-client-crafting-shot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        save_settings(
+            &dir,
+            &Settings {
+                game_mode: SettingsGameMode::Creative,
+                ..Settings::default()
+            },
+        )
+        .expect("save seed settings");
+        let options = ClientOptions {
+            data_dir: Some(dir.clone()),
+            screenshot: Some(path),
+            screenshot_crafting: true,
+            ..ClientOptions::default()
+        };
+        let (settings, _) = effective_settings(&options);
+        assert_eq!(settings.game_mode, SettingsGameMode::Survival);
+        assert_eq!(
+            load_settings(&dir).game_mode,
+            SettingsGameMode::Creative,
+            "debug screenshots must not rewrite the saved mode"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

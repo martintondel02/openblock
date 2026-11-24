@@ -248,3 +248,19 @@ Snapshot capture costs ~25.9 µs per solid section, so 32 submissions/frame cost
   inventory: `smoke OK hash=00fc740debf500c0` for seed 42.
 - Test count: 293 (items/drops, vitals cadence, inventory/actions/persistence,
   crouch/sprint/ledge tests, HUD/death UI).
+
+## 2026-11-24 — v0.0.8 (crafting, tools, dropped items, settings)
+
+- Texture array grew 14 -> 18 layers (planks, cobblestone, crafting table
+  top/side) in all four styles, still with full mip chains; memory stays under
+  2 MiB at 32 px.
+- Dropped-item entities: one instanced draw pass, one 40-byte instance per item
+  (grows on demand), a static 36-vertex cube and no extra textures/uniforms.
+  Server physics is 20 Hz over a handful of items; pickup/persistence costs are
+  negligible. The chunk benchmark gate is unchanged.
+- Crafting/mining math is a few registry lookups per break/craft; the tool speed
+  table replaces raw hardness in the client mining timer.
+- Save format v4 (append-only registry migration from v1-v3); smoke seed 42:
+  `smoke OK hash=62b21c82b5d848e0`, stable across two fresh runs and including
+  dropped-item entities.
+- Test count: 367 (293 in v0.0.7).

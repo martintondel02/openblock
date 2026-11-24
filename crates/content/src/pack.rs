@@ -16,7 +16,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{BlockTextures, BlockType, Registry, TextureId, textures};
+use crate::{BlockTextures, BlockType, Registry, TextureId, ToolKind, textures};
 
 /// The only supported `format` version of the JSON schema.
 pub const FORMAT_VERSION: u32 = 1;
@@ -149,6 +149,17 @@ pub enum PackError {
         /// Unknown texture name.
         texture: String,
     },
+    /// A block tool rule is inconsistent.
+    InvalidToolRule {
+        /// File being loaded, when the error came from a pack.
+        path: Option<PathBuf>,
+        /// Index of the offending block.
+        index: usize,
+        /// Resource id of the offending block.
+        id: String,
+        /// Why the rule is invalid.
+        reason: &'static str,
+    },
 }
 
 impl PackError {
@@ -196,6 +207,12 @@ impl PackError {
                 id,
                 face,
                 texture,
+            },
+            Self::InvalidToolRule { index, id, reason, .. } => Self::InvalidToolRule {
+                path,
+                index,
+                id,
+                reason,
             },
             other => other,
         }
@@ -296,6 +313,15 @@ impl fmt::Display for PackError {
                      valid textures: {}",
                     textures::NAMES.join(", ")
                 )
+            }
+            Self::InvalidToolRule {
+                path,
+                index,
+                id,
+                reason,
+            } => {
+                write_path(f, path.as_deref())?;
+                write!(f, "invalid tool rule for block {id:?} at block {index}: {reason}")
             }
         }
     }
@@ -418,6 +444,12 @@ struct RawBlock {
     textures: Option<RawTextures>,
     /// Hand-breaking seconds; -1 means unbreakable, omitted means 1.0.
     hardness: Option<f64>,
+    /// Preferred tool kind; omitted means no preferred tool.
+    #[serde(default)]
+    preferred_tool: Option<ToolKind>,
+    /// Minimum tool tier for drops and preferred-tool speed; omitted means 0.
+    #[serde(default)]
+    required_tier: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -496,6 +528,7 @@ fn build_blocks(path: &Path, raw_blocks: &[RawBlock]) -> Result<Vec<BlockType>, 
         let color = validate_color(path, index, &raw.id, raw.color.as_deref())?;
         let textures = resolve_textures(path, index, &raw.id, raw.textures.as_ref())?;
         let hardness = validate_hardness(path, index, &raw.id, raw.hardness)?;
+        validate_tool_rule(path, index, &raw.id, raw.preferred_tool, raw.required_tier)?;
         blocks.push(BlockType {
             id: intern(&raw.id),
             color,
@@ -504,6 +537,8 @@ fn build_blocks(path: &Path, raw_blocks: &[RawBlock]) -> Result<Vec<BlockType>, 
             fluid: raw.fluid,
             textures,
             hardness,
+            preferred_tool: raw.preferred_tool,
+            required_tier: raw.required_tier,
         });
     }
     Ok(blocks)
@@ -534,6 +569,25 @@ fn validate_hardness(path: &Path, index: usize, id: &str, hardness: Option<f64>)
         });
     }
     Ok(value as f32)
+}
+
+/// Validates that a tiered block also declares which tool kind it needs.
+fn validate_tool_rule(
+    path: &Path,
+    index: usize,
+    id: &str,
+    preferred_tool: Option<ToolKind>,
+    required_tier: u8,
+) -> Result<(), PackError> {
+    if required_tier > 0 && preferred_tool.is_none() {
+        return Err(PackError::InvalidToolRule {
+            path: Some(path.to_path_buf()),
+            index,
+            id: id.to_owned(),
+            reason: "required_tier > 0 needs a preferred_tool",
+        });
+    }
+    Ok(())
 }
 
 fn validate_id(id: &str) -> Result<(), &'static str> {
@@ -714,6 +768,9 @@ mod tests {
         assert_eq!(expected.opaque, actual.opaque);
         assert_eq!(expected.fluid, actual.fluid);
         assert_eq!(expected.textures, actual.textures);
+        assert_eq!(expected.hardness, actual.hardness);
+        assert_eq!(expected.preferred_tool, actual.preferred_tool);
+        assert_eq!(expected.required_tier, actual.required_tier);
     }
 
     #[test]
@@ -728,7 +785,12 @@ mod tests {
             assert_block_eq(base_block, loaded_block);
         }
         assert_eq!(loaded.id("openblock:air"), Some(BlockId(0)));
-        assert_eq!(loaded.len(), 12);
+        assert_eq!(loaded.len(), 15);
+        assert_eq!(
+            loaded.block(loaded.id("openblock:cobblestone").unwrap()).preferred_tool,
+            Some(ToolKind::Pickaxe)
+        );
+        assert_eq!(loaded.block(loaded.id("openblock:stone").unwrap()).required_tier, 1);
     }
 
     #[test]
@@ -951,6 +1013,58 @@ mod tests {
         assert!(!block.opaque);
         assert!(!block.fluid);
         assert_eq!(block.textures, BlockTextures::all(textures::DEBUG));
+        assert_eq!(block.preferred_tool, None);
+        assert_eq!(block.required_tier, 0);
+    }
+
+    #[test]
+    fn optional_tool_rules_parse_and_validate() {
+        let temp = TempPack::new("tool_rules");
+        let path = temp.write(
+            "blocks.json",
+            r#"{
+                "format": 1,
+                "blocks": [
+                    { "id": "openblock:air" },
+                    {
+                        "id": "openblock:test_stone",
+                        "hardness": 1.5,
+                        "preferred_tool": "pickaxe",
+                        "required_tier": 1
+                    }
+                ]
+            }"#,
+        );
+        let registry = registry_from_pack(&path).expect("tool rule pack loads");
+        let block = registry.block(registry.id("openblock:test_stone").unwrap());
+        assert_eq!(block.preferred_tool, Some(ToolKind::Pickaxe));
+        assert_eq!(block.required_tier, 1);
+
+        let bad = temp.write(
+            "bad.json",
+            r#"{
+                "format": 1,
+                "blocks": [
+                    { "id": "openblock:air" },
+                    { "id": "openblock:test_stone", "required_tier": 1 }
+                ]
+            }"#,
+        );
+        let error = load_blocks_json(&bad).expect_err("tier without a tool kind must fail");
+        assert!(matches!(error, PackError::InvalidToolRule { .. }), "{error}");
+        assert!(error.to_string().contains("preferred_tool"), "{error}");
+
+        let unknown = temp.write(
+            "unknown_tool.json",
+            r#"{
+                "format": 1,
+                "blocks": [
+                    { "id": "openblock:air" },
+                    { "id": "openblock:test_stone", "preferred_tool": "hammer" }
+                ]
+            }"#,
+        );
+        assert!(load_blocks_json(&unknown).is_err(), "unknown tool kind must fail");
     }
 
     #[test]

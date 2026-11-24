@@ -12,11 +12,12 @@ use std::sync::{Arc, Mutex};
 use ob_math::{N_SECTIONS, SECTION_SIZE, SectionPos, WORLD_MIN_Y};
 use ob_world::World;
 
+use crate::entities::EntitiesRenderer;
 use crate::textures::BlockTextureArray;
 use crate::ui::{UiFrame, UiRenderer};
 use crate::{
-    BlockOutline, Camera, Environment, OUTLINE_VERTEX_COUNT, RenderError, RenderStats, SceneParams, Vertex, mesh,
-    pipeline, section_visible,
+    BlockOutline, Camera, EntityInstance, Environment, OUTLINE_VERTEX_COUNT, RenderError, RenderStats, SceneParams,
+    Vertex, mesh, pipeline, section_visible,
 };
 
 /// Offscreen colour target format (sRGB, readable through `copy_texture_to_buffer`).
@@ -34,6 +35,8 @@ pub struct OffscreenRenderer {
     sky_pipeline: wgpu::RenderPipeline,
     /// Targeted-block outline line-list pipeline.
     outline_pipeline: wgpu::RenderPipeline,
+    /// Dropped-item cube pipeline and instance buffers.
+    entities: EntitiesRenderer,
     /// Camera, fog and environment uniform buffer.
     uniform_buffer: wgpu::Buffer,
     /// Small per-frame outline vertex buffer.
@@ -135,6 +138,7 @@ impl OffscreenRenderer {
         let pipeline = pipeline::create_pipeline(&device, COLOR_FORMAT, &bind_group_layout);
         let sky_pipeline = pipeline::create_sky_pipeline(&device, COLOR_FORMAT, &bind_group_layout);
         let outline_pipeline = pipeline::create_outline_pipeline(&device, COLOR_FORMAT, &bind_group_layout);
+        let entities = EntitiesRenderer::new(&device, &queue, COLOR_FORMAT, &bind_group_layout);
 
         Ok(Self {
             device,
@@ -142,6 +146,7 @@ impl OffscreenRenderer {
             pipeline,
             sky_pipeline,
             outline_pipeline,
+            entities,
             uniform_buffer,
             outline_buffer,
             _textures: textures,
@@ -210,6 +215,14 @@ impl OffscreenRenderer {
 
     pub fn texture_source(&self) -> &crate::TextureSource {
         self._textures.source()
+    }
+
+    /// Replaces the dropped-item entities drawn with the world.
+    ///
+    /// The slice is copied and kept until the next call; an empty slice skips
+    /// the entity draw entirely. The next rendered frame includes them.
+    pub fn set_entities(&mut self, entities: &[EntityInstance]) {
+        self.entities.set(&self.device, &self.queue, entities);
     }
 
     /// Rebuilds the cached GPU meshes for every non-empty loaded section.
@@ -281,9 +294,10 @@ impl OffscreenRenderer {
     ///
     /// This is the offscreen counterpart of [`crate::Renderer::render_scene`]:
     /// the sky pass uses the scene environment, the world loads that colour and
-    /// draws the chunk meshes, the outline (when present) is drawn next with
-    /// `LessEqual` depth testing and no depth writes, and the UI frame is drawn
-    /// last. The GPU-to-CPU readback is included in the returned timing, like
+    /// draws the chunk meshes, dropped-item entities follow in the same pass,
+    /// the outline (when present) is drawn next with `LessEqual` depth testing
+    /// and no depth writes, and the UI frame is drawn last. The GPU-to-CPU
+    /// readback is included in the returned timing, like
     /// [`Self::render_cached_with_ui`].
     pub fn render_cached_scene(
         &mut self,
@@ -370,6 +384,9 @@ impl OffscreenRenderer {
                 stats.vertices += u64::from(cached.vertex_count);
                 stats.sections += 1;
             }
+            // Dropped items are depth-tested against the world geometry and
+            // drawn before the selection outline.
+            self.entities.draw(&mut pass, &self.bind_group);
             // Outline after the world geometry, before the UI pass. The depth
             // buffer already holds the nearest opaque surface, so terrain in
             // front of the selection hides it.
@@ -559,7 +576,7 @@ fn request_adapter(instance: &wgpu::Instance) -> Result<wgpu::Adapter, RenderErr
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -985,6 +1002,114 @@ mod tests {
             icon_colours.len() > 8,
             "block icon produced only {} distinct colours",
             icon_colours.len()
+        );
+    }
+
+    #[test]
+    fn dropped_item_entities_draw_textured_and_flat_cubes() {
+        let Some(mut renderer) = open_renderer(320, 180, "dropped_item_entities_draw_textured_and_flat_cubes") else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let world = test_world(&registry);
+        // Look down at the platform surface from the +Z side.
+        let camera = look_at(WorldVec::new(8.0, 71.0, 17.0), [8.0, 66.5, 8.0]);
+
+        renderer.render_world(&world, &camera).expect("render baseline");
+        let baseline = renderer.read_rgba();
+        assert_eq!(baseline.len(), (320 * 180 * 4) as usize);
+
+        let mut planks = EntityInstance::block([6.8, 66.0, 10.0], 0.6, ob_content::textures::PLANKS.0 as u32);
+        planks.yaw = 0.5;
+        let entities = [
+            planks,
+            EntityInstance::flat([9.2, 66.0, 10.0], 0.6, [0.82, 0.12, 0.10]),
+            EntityInstance::block([8.0, 66.0, 7.5], 0.5, ob_content::textures::COBBLESTONE.0 as u32),
+        ];
+        renderer.set_entities(&entities);
+        renderer
+            .render_world(&world, &camera)
+            .expect("render with dropped items");
+        let with_entities = renderer.read_rgba();
+
+        let mut changed = 0usize;
+        for (before, after) in baseline
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(with_entities.as_chunks::<4>().0.iter())
+        {
+            if before[0].abs_diff(after[0]) > 2 || before[1].abs_diff(after[1]) > 2 || before[2].abs_diff(after[2]) > 2
+            {
+                changed += 1;
+            }
+        }
+        assert!(
+            changed > 60,
+            "only {changed} pixels changed when three entity cubes were added"
+        );
+
+        // The flat apple cube is strongly red at its projected centre.
+        let apple = project(&camera, 320, 180, [9.2, 66.3, 10.0]).expect("apple cube is in front of the camera");
+        let mut red_pixels = 0usize;
+        for y in (apple[1] as i32 - 4).max(0)..=(apple[1] as i32 + 4).min(179) {
+            for x in (apple[0] as i32 - 4).max(0)..=(apple[0] as i32 + 4).min(319) {
+                let offset = ((y as u32 * 320 + x as u32) * 4) as usize;
+                let pixel = &with_entities[offset..offset + 3];
+                if pixel[0] > pixel[1] + 40 && pixel[0] > pixel[2] + 40 {
+                    red_pixels += 1;
+                }
+            }
+        }
+        assert!(
+            red_pixels > 3,
+            "the flat apple cube produced only {red_pixels} red pixels around {apple:?}"
+        );
+
+        // The textured planks cube shows the block texture, not a flat fill.
+        let planks_centre = project(&camera, 320, 180, [6.8, 66.3, 10.0]).expect("planks cube is visible");
+        let mut colours = HashSet::new();
+        let mut textured_changed = 0usize;
+        for y in (planks_centre[1] as i32 - 5).max(0)..=(planks_centre[1] as i32 + 5).min(179) {
+            for x in (planks_centre[0] as i32 - 5).max(0)..=(planks_centre[0] as i32 + 5).min(319) {
+                let offset = ((y as u32 * 320 + x as u32) * 4) as usize;
+                let pixel = [
+                    with_entities[offset],
+                    with_entities[offset + 1],
+                    with_entities[offset + 2],
+                ];
+                colours.insert(pixel);
+                if pixel[0].abs_diff(baseline[offset]) > 2
+                    || pixel[1].abs_diff(baseline[offset + 1]) > 2
+                    || pixel[2].abs_diff(baseline[offset + 2]) > 2
+                {
+                    textured_changed += 1;
+                }
+            }
+        }
+        assert!(
+            colours.len() > 3,
+            "the textured planks cube window has only {} colours",
+            colours.len()
+        );
+        assert!(
+            textured_changed > 5,
+            "the textured planks cube replaced only {textured_changed} baseline pixels"
+        );
+
+        // Clearing the entities must restore the exact baseline frame.
+        renderer.set_entities(&[]);
+        renderer
+            .render_world(&world, &camera)
+            .expect("render without dropped items");
+        let restored = renderer.read_rgba();
+        assert_eq!(restored.len(), baseline.len());
+        assert!(
+            restored
+                .iter()
+                .zip(baseline.iter())
+                .all(|(actual, expected)| actual.abs_diff(*expected) <= 1),
+            "an empty entity list must render the same frame as the default state"
         );
     }
 

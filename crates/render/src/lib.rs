@@ -10,6 +10,7 @@
 #![allow(missing_docs)] // TODO(MS-04): re-enable once the v0.0.1 API surface settles
 #![forbid(unsafe_code)]
 
+pub mod entities;
 pub mod environment;
 pub mod frustum;
 pub mod mesh;
@@ -27,6 +28,7 @@ use bytemuck::{Pod, Zeroable};
 use ob_math::{Mat4, SectionPos, WorldVec};
 use winit::window::Window;
 
+pub use entities::{EntityInstance, entity_layer, entity_layers};
 pub use environment::{DAY_LENGTH_TICKS, Environment, EnvironmentVisual};
 pub use frustum::{FRUSTUM_PLANE_COUNT, aabb_visible, section_bounds, section_visible};
 pub use mesh::{MesherStats, SNAPSHOT_SIZE, SectionSnapshot, mesh_section, mesh_section_with_stats};
@@ -285,6 +287,8 @@ pub struct Renderer {
     pub(crate) sky_pipeline: wgpu::RenderPipeline,
     /// Targeted-block outline line-list pipeline.
     pub(crate) outline_pipeline: wgpu::RenderPipeline,
+    /// Dropped-item cube pipeline and instance buffers.
+    pub(crate) entities: entities::EntitiesRenderer,
     /// Depth texture view.
     pub(crate) depth_view: wgpu::TextureView,
     /// Camera, fog and environment uniform buffer.
@@ -404,6 +408,7 @@ impl Renderer {
         let pipeline = pipeline::create_pipeline(&device, format, &bind_group_layout);
         let sky_pipeline = pipeline::create_sky_pipeline(&device, format, &bind_group_layout);
         let outline_pipeline = pipeline::create_outline_pipeline(&device, format, &bind_group_layout);
+        let entity_renderer = entities::EntitiesRenderer::new(&device, &queue, format, &bind_group_layout);
 
         Ok(Self {
             instance,
@@ -414,6 +419,7 @@ impl Renderer {
             pipeline,
             sky_pipeline,
             outline_pipeline,
+            entities: entity_renderer,
             depth_view,
             uniform_buffer,
             outline_buffer,
@@ -519,19 +525,29 @@ impl Renderer {
         self.meshes.clear();
     }
 
+    /// Replaces the dropped-item entities drawn with the world.
+    ///
+    /// The slice is copied into the renderer and kept until the next call; an
+    /// empty slice disables the entity draw (no draw call is issued). Entities
+    /// are drawn after the world geometry and before the outline and UI passes.
+    pub fn set_entities(&mut self, entities: &[EntityInstance]) {
+        self.entities.set(&self.device, &self.queue, entities);
+    }
+
     /// Renders one frame with a day/night environment, an optional UI overlay
     /// and an optional targeted-block outline.
     ///
     /// The sky gradient, sun/moon and stars are drawn first into a cleared
     /// colour target (no depth). The world pass loads that colour, clears depth
-    /// and draws the chunk meshes. The outline is drawn in the same pass
-    /// immediately after the world geometry, with `LessEqual` depth testing and
-    /// depth writes disabled, so it is hidden by nearer terrain but never
-    /// occludes anything. The UI frame is drawn last with alpha blending and no
-    /// depth attachment.
+    /// and draws the chunk meshes. Dropped-item entities are drawn next in the
+    /// same pass, depth-tested against the world. The outline is drawn after
+    /// them, with `LessEqual` depth testing and depth writes disabled, so it is
+    /// hidden by nearer terrain but never occludes anything. The UI frame is
+    /// drawn last with alpha blending and no depth attachment.
     ///
-    /// The uploaded outline and the uniform are shared by the whole frame; the
-    /// statistics returned by [`Self::stats`] still count chunk draws only.
+    /// The uploaded outline, entity instances and the uniform are shared by the
+    /// whole frame; the statistics returned by [`Self::stats`] still count chunk
+    /// draws only.
     pub fn render_scene(&mut self, camera: &Camera, scene: &SceneParams<'_>) -> Result<(), RenderError> {
         let (width, height) = self.size();
         let aspect = width as f32 / height as f32;
@@ -640,6 +656,9 @@ impl Renderer {
                 stats.vertices += u64::from(mesh.vertex_count);
                 stats.sections += 1;
             }
+            // Dropped items sit in the world: depth-test them against the
+            // terrain, then draw the outline over both.
+            self.entities.draw(&mut pass, &self.bind_group);
             // Outline after the world geometry: the depth buffer now contains
             // the nearest opaque surface, so the outline is correctly hidden
             // behind terrain. Depth writes stay off; the UI pass follows.

@@ -232,6 +232,15 @@ Container kinds are registry data: slot count, layout order, accepted-slot predi
 
 An item entity is `{stack, position, velocity, age, pickup_delay, despawn_age, thrower}`. It despawns at 6,000 ct, cannot be picked up for 10 ct after spawn, and is destroyed by lava, fire, cactus and the void. Pickup checks each tick: player AABB expanded by 1.0 m, pickup delay expired, not a spectator, inventory has room for at least one item. A partial pickup leaves the remainder; at most 8 entities are picked up per player per tick to bound cost. Merging runs on spawn and every 20 ct: entities within 0.5 m with *exactly* equal item and canonical components merge up to `max_stack`; the survivor is the lower entity ID, keeps its position, takes the summed count, the minimum age, the maximum pickup delay and the minimum remaining despawn time. Different `custom_name`, enchantments or durability never merge, even when they look identical in the UI.
 
+**Interim v0.0.x implementation.** The host spawns one entity per break drop at
+the broken block's centre with a deterministic hash-derived impulse (no RNG
+state), a 10 ct pickup delay and a 6,000 ct despawn, matching the values above.
+The pickup volume is the player AABB expanded by 0.35 m on every axis (1.3 m
+wide, narrower than the 1.0 m above), and there is no per-tick pickup cap, no
+merging and no lava/fire/cactus destruction. Items sink in water rather than
+floating. Entities are server-authoritative and persist in `items.txt`
+([17](17-persistence.md)).
+
 ### 3.7 Crafting
 
 A recipe is content data: id, kind, ingredients (item ID or tag), pattern, result stack (components allowed), group, category, experience and time. The base pack ships the parity set; mods add more through the same schema.

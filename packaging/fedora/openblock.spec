@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           openblock
-Version:        0.0.7
+Version:        0.0.8
 Release:        1%{?dist}
 Summary:        Fast, deeply moddable, server-first voxel sandbox
 
@@ -127,6 +127,18 @@ update-desktop-database &>/dev/null || :
 %config(noreplace) %{_sysconfdir}/openblock-server/server.toml
 
 %changelog
+* Tue Nov 24 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.0.8-1
+- Crafting and tools: planks, cobblestone and crafting table blocks; sticks and
+  wooden/stone pickaxes, axes, shovels and swords; 11 recipes with table gating;
+  tool-dependent mining speed and drops; tool durability; procedural tool icons
+  and durability bars; C crafting screen plus RMB on a crafting table.
+- Dropped items now spawn as visible, physics-simulated item entities and are
+  picked up automatically (persisted in items.txt, covered by the state hash).
+- A full tabbed Settings screen opened with Esc (Game/Display/Controls/Textures,
+  keyboard + mouse, immediate persistence) replaces the old pause list.
+- New block textures in all four procedural styles and resource-pack mappings;
+  save format v4 with append-only migration from v1-v3.
+
 * Tue Nov 24 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.0.7-1
 - Survival foundations: health/hunger, fall damage, starvation/regeneration,
   block drops into a 9-slot item inventory, apples from leaves, eating, death

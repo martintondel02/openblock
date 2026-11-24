@@ -1,18 +1,16 @@
-//! Client UI model: F3 debug overlay, HUD layout and the pause/settings menu.
+//! Client UI model: F3 debug overlay, HUD layout and the tabbed settings screen.
 //!
 //! This module is deliberately GPU-free: it decides what to show and where,
 //! while `ob_render::ui` draws it. Keeping the model separate makes the layout
-//! and menu logic unit-testable without a window or a device.
+//! and settings navigation unit-testable without a window or a device.
 
 use std::collections::VecDeque;
 
 use ob_content::{BlockType, Registry};
-use ob_core::config::{
-    MAX_FOV_DEGREES, MAX_MOUSE_SENSITIVITY, MAX_RENDER_DISTANCE, MIN_FOV_DEGREES, MIN_MOUSE_SENSITIVITY,
-    MIN_RENDER_DISTANCE, Settings,
-};
+use ob_core::config::{GameMode, Settings, TextureStyle};
 use ob_render::UiFrame;
 
+use crate::crafting::CraftingState;
 use crate::inventory::{InventoryLayout, InventoryState, layout as inventory_layout};
 
 /// Number of hotbar slots.
@@ -33,10 +31,6 @@ pub const DEFAULT_HOTBAR: [&str; HOTBAR_SLOTS] = [
 pub const HOTBAR_SLOT_SIZE: f32 = 44.0;
 /// Gap between hotbar slots.
 pub const HOTBAR_GAP: f32 = 4.0;
-/// Height of the settings/pause menu rows.
-pub const MENU_ROW_HEIGHT: f32 = 34.0;
-/// Width of the central menu panel.
-pub const MENU_PANEL_WIDTH: f32 = 420.0;
 /// Seconds for which the selected block name stays visible after a change.
 pub const BLOCK_NAME_SECONDS: f32 = 2.5;
 /// Number of heart and hunger icons in the survival HUD.
@@ -64,19 +58,333 @@ pub const DEATH_BUTTON_GAP: f32 = 14.0;
 /// Death-screen note explaining that the inventory survives.
 pub const DEATH_NOTE: &str = "The world keeps your inventory";
 
+/// Width of the modal settings panel in UI pixels.
+pub const SETTINGS_PANEL_WIDTH: f32 = 560.0;
+/// Height of the modal settings panel in UI pixels.
+pub const SETTINGS_PANEL_HEIGHT: f32 = 460.0;
+/// Horizontal inner margin of the settings panel.
+pub const SETTINGS_MARGIN: f32 = 24.0;
+/// Height of the tab strip.
+pub const SETTINGS_TAB_HEIGHT: f32 = 32.0;
+/// Height of a focusable settings row.
+pub const SETTINGS_ROW_HEIGHT: f32 = 34.0;
+/// Vertical distance between settings rows.
+pub const SETTINGS_ROW_STEP: f32 = 38.0;
+/// Width of a footer button.
+pub const SETTINGS_BUTTON_WIDTH: f32 = 150.0;
+/// Height of a footer button.
+pub const SETTINGS_BUTTON_HEIGHT: f32 = 34.0;
+/// Gap between the two footer buttons.
+pub const SETTINGS_BUTTON_GAP: f32 = 16.0;
+/// Smallest render distance the settings screen offers, in chunks.
+pub const SETTINGS_MIN_RENDER_DISTANCE: i32 = 2;
+/// Largest render distance the settings screen offers, in chunks.
+pub const SETTINGS_MAX_RENDER_DISTANCE: i32 = 16;
+/// Smallest field of view the settings screen offers, in degrees.
+pub const SETTINGS_MIN_FOV_DEGREES: f32 = 50.0;
+/// Largest field of view the settings screen offers, in degrees.
+pub const SETTINGS_MAX_FOV_DEGREES: f32 = 110.0;
+/// Field-of-view step applied by Left/Right and Enter.
+pub const SETTINGS_FOV_STEP: f32 = 5.0;
+/// Smallest mouse sensitivity the settings screen offers.
+pub const SETTINGS_MIN_MOUSE_SENSITIVITY: f32 = 0.2;
+/// Largest mouse sensitivity the settings screen offers.
+pub const SETTINGS_MAX_MOUSE_SENSITIVITY: f32 = 3.0;
+/// Mouse-sensitivity step applied by Left/Right and Enter.
+pub const SETTINGS_SENSITIVITY_STEP: f32 = 0.1;
+/// Footer hint lines, split so they fit the panel at the 8x8 font.
+pub const SETTINGS_HINT_LINES: [&str; 2] = [
+    "Tab: switch   Up/Down: select   Left/Right: change",
+    "Enter: activate   Esc: back to game",
+];
+/// Note shown on the Controls tab.
+pub const SETTINGS_PERSISTENCE_NOTE: &str = "Settings save automatically";
+
 /// Which screen currently owns input.
+///
+/// Adding a modal screen (for example a crafting screen) means adding a variant
+/// here and extending the matches in the client input handler,
+/// `GameState::handle_escape` and `GameState::build_ui_frame_at`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     /// Normal gameplay with a captured pointer.
     Playing,
     /// Survival inventory / creative palette with a released pointer.
     Inventory,
-    /// Pause menu.
-    Pause,
-    /// Settings screen reached from the pause menu.
+    /// Full modal settings screen with a released pointer.
     Settings,
+    /// Modal crafting screen; gameplay input is blocked.
+    Crafting,
     /// Modal death screen; gameplay input is blocked.
     Death,
+}
+
+/// One tab of the settings screen, in display order.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTab {
+    /// Game mode, HUD and debug overlay.
+    #[default]
+    Game,
+    /// Render distance, FOV, sensitivity, fullscreen and mesh workers.
+    Display,
+    /// Read-only keyboard and mouse reference.
+    Controls,
+    /// Procedural texture style and external resource pack.
+    Textures,
+}
+
+impl SettingsTab {
+    /// All tabs, in display order.
+    pub const ALL: [SettingsTab; 4] = [
+        SettingsTab::Game,
+        SettingsTab::Display,
+        SettingsTab::Controls,
+        SettingsTab::Textures,
+    ];
+
+    /// Title drawn on the tab.
+    pub fn name(self) -> &'static str {
+        match self {
+            SettingsTab::Game => "Game",
+            SettingsTab::Display => "Display",
+            SettingsTab::Controls => "Controls",
+            SettingsTab::Textures => "Textures",
+        }
+    }
+
+    /// Next tab, wrapping from Textures to Game.
+    pub fn next(self) -> Self {
+        let index = SettingsTab::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        SettingsTab::ALL[(index + 1) % SettingsTab::ALL.len()]
+    }
+
+    /// Previous tab, wrapping from Game to Textures.
+    pub fn previous(self) -> Self {
+        let index = SettingsTab::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        SettingsTab::ALL[(index + SettingsTab::ALL.len() - 1) % SettingsTab::ALL.len()]
+    }
+}
+
+/// How a settings row is adjusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsRowKind {
+    /// Bounded numeric value changed in steps.
+    Range,
+    /// Cyclic choice such as game mode or texture style.
+    Choice,
+    /// On/off checkbox.
+    Toggle,
+    /// Row that asks the client to run a side effect (texture pack).
+    Action,
+    /// Informational row that cannot be changed.
+    ReadOnly,
+}
+
+/// One focusable row of a settings tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsRow {
+    /// Survival or creative gameplay.
+    GameMode,
+    /// Whether the HUD is visible.
+    ShowHud,
+    /// Whether the F3 debug overlay is visible.
+    DebugOverlay,
+    /// Streaming radius in chunks.
+    RenderDistance,
+    /// Vertical field of view.
+    Fov,
+    /// Mouse look multiplier.
+    MouseSensitivity,
+    /// Fullscreen window toggle.
+    Fullscreen,
+    /// Read-only worker-thread count.
+    MeshWorkers,
+    /// Procedural texture style.
+    TextureStyle,
+    /// External resource pack toggle.
+    TexturePack,
+}
+
+impl SettingsRow {
+    /// Label drawn on the left of the row.
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsRow::GameMode => "Game mode",
+            SettingsRow::ShowHud => "Show HUD",
+            SettingsRow::DebugOverlay => "Debug overlay (F3)",
+            SettingsRow::RenderDistance => "Render distance",
+            SettingsRow::Fov => "Field of view",
+            SettingsRow::MouseSensitivity => "Mouse sensitivity",
+            SettingsRow::Fullscreen => "Fullscreen",
+            SettingsRow::MeshWorkers => "Mesh workers",
+            SettingsRow::TextureStyle => "Texture style",
+            SettingsRow::TexturePack => "Texture pack",
+        }
+    }
+
+    /// How the row reacts to adjustment and drawing.
+    pub fn kind(self) -> SettingsRowKind {
+        match self {
+            SettingsRow::GameMode | SettingsRow::TextureStyle => SettingsRowKind::Choice,
+            SettingsRow::ShowHud | SettingsRow::DebugOverlay | SettingsRow::Fullscreen => SettingsRowKind::Toggle,
+            SettingsRow::RenderDistance | SettingsRow::Fov | SettingsRow::MouseSensitivity => SettingsRowKind::Range,
+            SettingsRow::TexturePack => SettingsRowKind::Action,
+            SettingsRow::MeshWorkers => SettingsRowKind::ReadOnly,
+        }
+    }
+}
+
+/// A footer button on the settings screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsButton {
+    /// Close settings and capture the pointer.
+    Resume,
+    /// Persist the world and settings, then exit.
+    SaveAndQuit,
+}
+
+impl SettingsButton {
+    /// Label drawn on the button.
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsButton::Resume => "Resume",
+            SettingsButton::SaveAndQuit => "Save & quit",
+        }
+    }
+}
+
+/// Footer buttons in display order.
+pub const SETTINGS_BUTTONS: [SettingsButton; 2] = [SettingsButton::Resume, SettingsButton::SaveAndQuit];
+
+/// Action selected on the settings screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsAction {
+    /// Close settings and return to gameplay.
+    Resume,
+    /// Save and exit the process.
+    SaveAndQuit,
+    /// A row changed; the client must apply its side effect and persist settings.
+    Adjust(SettingsRow),
+}
+
+/// One binding listed by the read-only Controls tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlBinding {
+    /// Key or mouse button.
+    pub keys: &'static str,
+    /// Action performed.
+    pub action: &'static str,
+}
+
+/// Every binding shown on the Controls tab, in display order.
+pub const CONTROLS_REFERENCE: [ControlBinding; 14] = [
+    ControlBinding {
+        keys: "WASD",
+        action: "Move",
+    },
+    ControlBinding {
+        keys: "Space",
+        action: "Jump",
+    },
+    ControlBinding {
+        keys: "Shift",
+        action: "Crouch / sneak",
+    },
+    ControlBinding {
+        keys: "Ctrl",
+        action: "Sprint",
+    },
+    ControlBinding {
+        keys: "F",
+        action: "Toggle fly",
+    },
+    ControlBinding {
+        keys: "LMB (hold)",
+        action: "Mine",
+    },
+    ControlBinding {
+        keys: "RMB",
+        action: "Place / eat / use",
+    },
+    ControlBinding {
+        keys: "1-9 / Wheel",
+        action: "Hotbar slot",
+    },
+    ControlBinding {
+        keys: "E",
+        action: "Inventory",
+    },
+    ControlBinding {
+        keys: "C",
+        action: "Crafting",
+    },
+    ControlBinding {
+        keys: "F3",
+        action: "Debug overlay",
+    },
+    ControlBinding {
+        keys: "F1",
+        action: "HUD",
+    },
+    ControlBinding {
+        keys: "F2",
+        action: "Screenshot",
+    },
+    ControlBinding {
+        keys: "Esc",
+        action: "Settings",
+    },
+];
+
+/// Splits [`CONTROLS_REFERENCE`] into two readable columns.
+pub fn controls_reference_columns() -> [Vec<ControlBinding>; 2] {
+    let split = CONTROLS_REFERENCE.len().div_ceil(2);
+    [
+        CONTROLS_REFERENCE[..split].to_vec(),
+        CONTROLS_REFERENCE[split..].to_vec(),
+    ]
+}
+
+/// Runtime values the settings screen shows but does not own.
+#[derive(Debug, Clone)]
+pub struct SettingsInfo {
+    /// Current health in half-hearts.
+    pub health: f32,
+    /// Current hunger points.
+    pub hunger: f32,
+    /// Active texture source label, e.g. `painterly` or a pack folder name.
+    pub texture_source: String,
+    /// Active texture resolution in pixels.
+    pub texture_resolution: u32,
+    /// Mesh worker-thread count.
+    pub mesh_workers: usize,
+}
+
+impl Default for SettingsInfo {
+    fn default() -> Self {
+        Self {
+            health: VITAL_ICON_COUNT as f32 * VITAL_POINTS_PER_ICON,
+            hunger: VITAL_ICON_COUNT as f32 * VITAL_POINTS_PER_ICON,
+            texture_source: "classic".to_string(),
+            texture_resolution: 16,
+            mesh_workers: 1,
+        }
+    }
+}
+
+/// One row ready to draw: stable metadata plus the current display value.
+#[derive(Debug, Clone)]
+pub struct SettingsRowInfo {
+    /// Row identity.
+    pub row: SettingsRow,
+    /// Label on the left.
+    pub label: &'static str,
+    /// Value on the right.
+    pub value: String,
+    /// Adjustment behaviour.
+    pub kind: SettingsRowKind,
+    /// Whether the row can be changed.
+    pub enabled: bool,
 }
 
 /// Fill level of a single heart icon.
@@ -118,7 +426,9 @@ pub const DEATH_ACTIONS: [DeathAction; 2] = [DeathAction::Respawn, DeathAction::
 pub enum ToastKind {
     /// Normal pickup/hint message.
     Info,
-    /// Warning such as a full inventory.
+    /// Successful action such as a completed craft.
+    Success,
+    /// Warning such as a full inventory or a broken tool.
     Warning,
 }
 
@@ -143,6 +453,11 @@ impl ToastQueue {
     /// Pushes an info toast, dropping the oldest when the queue is full.
     pub fn push(&mut self, text: impl Into<String>) {
         self.push_kind(ToastKind::Info, text);
+    }
+
+    /// Pushes a success toast, dropping the oldest when the queue is full.
+    pub fn push_success(&mut self, text: impl Into<String>) {
+        self.push_kind(ToastKind::Success, text);
     }
 
     /// Pushes a warning toast, dropping the oldest when the queue is full.
@@ -241,45 +556,6 @@ impl DamageFlash {
     }
 }
 
-/// An interactive row on the pause or settings screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MenuItem {
-    /// Return to gameplay.
-    Resume,
-    /// Open the settings screen.
-    OpenSettings,
-    /// Save the world and exit the process.
-    SaveAndQuit,
-    /// Return from settings to the pause menu.
-    Back,
-    /// Decrease render distance.
-    RenderDistanceDown,
-    /// Increase render distance.
-    RenderDistanceUp,
-    /// Decrease field of view.
-    FovDown,
-    /// Increase field of view.
-    FovUp,
-    /// Decrease mouse sensitivity.
-    SensitivityDown,
-    /// Increase mouse sensitivity.
-    SensitivityUp,
-    /// Toggle between survival and creative gameplay.
-    ToggleGameMode,
-    /// Toggle fullscreen.
-    ToggleFullscreen,
-    /// Toggle the F3 debug overlay.
-    ToggleDebugOverlay,
-    /// Toggle HUD visibility.
-    ToggleHud,
-    /// Select the previous texture style.
-    TextureStylePrevious,
-    /// Select the next texture style.
-    TextureStyleNext,
-    /// Toggle between the external resource pack and the built-in style.
-    ToggleTexturePack,
-}
-
 /// A rectangle in UI pixels, origin top-left.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UiRect {
@@ -373,6 +649,12 @@ pub struct DebugStats {
     pub hunger: f32,
     /// `walk`, `sneak`, `sprint` or `fly`.
     pub movement: &'static str,
+    /// Display name of the held item, or `empty`.
+    pub held: String,
+    /// Remaining and maximum durability of the held tool, if any.
+    pub held_durability: Option<(u16, u16)>,
+    /// Effective mining speed against the targeted block (1.0 for hand).
+    pub mining_speed: f32,
 }
 
 impl DebugStats {
@@ -413,6 +695,7 @@ impl DebugStats {
                     self.movement
                 }
             ),
+            self.held_line(),
             format!(
                 "FOV {:.0}   Render distance {} chunks",
                 self.fov_degrees, self.render_distance
@@ -453,6 +736,16 @@ impl DebugStats {
         lines
     }
 
+    /// `Held: Stone Pickaxe 129/131  speed 4.0` line shown in the left column.
+    pub fn held_line(&self) -> String {
+        let held = if self.held.is_empty() { "empty" } else { &self.held };
+        let durability = self
+            .held_durability
+            .map(|(remaining, max)| format!(" {remaining}/{max}"))
+            .unwrap_or_default();
+        format!("Held: {held}{durability}  speed {:.1}", self.mining_speed)
+    }
+
     /// Right column lines: hardware and window information.
     pub fn right_lines(&self) -> Vec<String> {
         vec![
@@ -462,21 +755,6 @@ impl DebugStats {
             "Mesh pipeline: greedy + AO".to_string(),
         ]
     }
-}
-
-/// Result of a click on the menu.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MenuAction {
-    /// Resume gameplay.
-    Resume,
-    /// Open settings.
-    OpenSettings,
-    /// Save and exit.
-    SaveAndQuit,
-    /// Back to the pause menu.
-    Back,
-    /// Apply one menu item adjustment.
-    Adjust(MenuItem),
 }
 
 /// UI state that survives across frames.
@@ -490,16 +768,25 @@ pub struct UiState {
     pub hud_visible: bool,
     /// Current persisted settings.
     pub settings: Settings,
-    /// Index of the keyboard-selected menu row.
-    pub selected_row: usize,
-    /// Index of the hovered menu row, if any.
-    pub hovered_row: Option<usize>,
+    /// Active tab of the settings screen.
+    pub settings_tab: SettingsTab,
+    /// Flat keyboard focus on the settings screen: tab rows first, then the
+    /// footer buttons in [`SETTINGS_BUTTONS`] order.
+    pub settings_selected_row: usize,
+    /// Hovered settings tab, if any.
+    pub settings_hovered_tab: Option<SettingsTab>,
+    /// Hovered settings row index within the active tab, if any.
+    pub settings_hovered_row: Option<usize>,
+    /// Hovered footer button index, if any.
+    pub settings_hovered_button: Option<usize>,
     /// Hotbar slot selected.
     pub hotbar_selected: usize,
     /// Resource ids of the blocks in each hotbar slot.
     pub hotbar: [&'static str; HOTBAR_SLOTS],
     /// Inventory selection, hover and scroll.
     pub inventory: InventoryState,
+    /// Crafting screen selection, hover and scroll.
+    pub crafting: CraftingState,
     /// Remaining seconds to show the selected block name.
     pub block_name_seconds: f32,
     /// Recently broken block name shown briefly near the crosshair.
@@ -527,11 +814,15 @@ impl Default for UiState {
             debug_overlay: false,
             hud_visible: true,
             settings: Settings::default(),
-            selected_row: 0,
-            hovered_row: None,
+            settings_tab: SettingsTab::Game,
+            settings_selected_row: 0,
+            settings_hovered_tab: None,
+            settings_hovered_row: None,
+            settings_hovered_button: None,
             hotbar_selected: 0,
             hotbar: DEFAULT_HOTBAR,
             inventory: InventoryState::default(),
+            crafting: CraftingState::default(),
             block_name_seconds: 0.0,
             break_flash: None,
             break_flash_seconds: 0.0,
@@ -616,8 +907,426 @@ impl UiState {
         match self.screen {
             Screen::Playing => self.open_inventory(),
             Screen::Inventory => self.close_inventory(),
-            Screen::Pause | Screen::Settings | Screen::Death => {}
+            Screen::Settings | Screen::Crafting | Screen::Death => {}
         }
+    }
+
+    /// Opens the crafting screen from gameplay.
+    pub fn open_crafting(&mut self) {
+        if self.screen != Screen::Playing {
+            return;
+        }
+        self.crafting.open();
+        self.screen = Screen::Crafting;
+        self.settings_clear_hover();
+    }
+
+    /// Closes the crafting screen and returns to gameplay.
+    pub fn close_crafting(&mut self) {
+        if self.screen == Screen::Crafting {
+            self.screen = Screen::Playing;
+        }
+    }
+
+    /// Toggles crafting from gameplay or closes it again.
+    pub fn toggle_crafting(&mut self) {
+        match self.screen {
+            Screen::Playing => self.open_crafting(),
+            Screen::Crafting => self.close_crafting(),
+            Screen::Inventory | Screen::Settings | Screen::Death => {}
+        }
+    }
+
+    /// Opens the full settings screen directly from gameplay.
+    ///
+    /// Esc reaches this from [`Screen::Playing`]; the death screen keeps
+    /// priority, so opening settings from any other screen is a no-op.
+    pub fn open_settings(&mut self) {
+        if self.screen != Screen::Playing {
+            return;
+        }
+        self.screen = Screen::Settings;
+        self.settings_tab = SettingsTab::Game;
+        self.settings_selected_row = 0;
+        self.settings_clear_hover();
+    }
+
+    /// Closes settings and returns to gameplay.
+    pub fn close_settings(&mut self) {
+        if self.screen == Screen::Settings {
+            self.screen = Screen::Playing;
+        }
+        self.settings_clear_hover();
+    }
+
+    /// Closes menus and returns to gameplay.
+    pub fn resume(&mut self) {
+        self.screen = Screen::Playing;
+        self.settings_clear_hover();
+    }
+
+    /// Switches to a settings tab and focuses its first row (or Resume on the
+    /// Controls tab, which has no rows).
+    pub fn settings_select_tab(&mut self, tab: SettingsTab) {
+        self.settings_tab = tab;
+        self.settings_selected_row = 0;
+        self.settings_clear_hover();
+    }
+
+    /// Advances to the next settings tab, wrapping around.
+    pub fn settings_tab_next(&mut self) {
+        self.settings_select_tab(self.settings_tab.next());
+    }
+
+    /// Moves to the previous settings tab, wrapping around.
+    pub fn settings_tab_prev(&mut self) {
+        self.settings_select_tab(self.settings_tab.previous());
+    }
+
+    /// Rows belonging to the active tab, in display order.
+    pub fn settings_rows(&self) -> Vec<SettingsRow> {
+        match self.settings_tab {
+            SettingsTab::Game => vec![SettingsRow::GameMode, SettingsRow::ShowHud, SettingsRow::DebugOverlay],
+            SettingsTab::Display => vec![
+                SettingsRow::RenderDistance,
+                SettingsRow::Fov,
+                SettingsRow::MouseSensitivity,
+                SettingsRow::Fullscreen,
+                SettingsRow::MeshWorkers,
+            ],
+            SettingsTab::Controls => Vec::new(),
+            SettingsTab::Textures => vec![SettingsRow::TextureStyle, SettingsRow::TexturePack],
+        }
+    }
+
+    /// Number of focusable entries on the active tab, including footer buttons.
+    pub fn settings_focus_count(&self) -> usize {
+        self.settings_rows().len() + SETTINGS_BUTTONS.len()
+    }
+
+    /// Row currently focused by the keyboard, if focus is not on a button.
+    pub fn settings_focused_row(&self) -> Option<SettingsRow> {
+        self.settings_rows().get(self.settings_selected_row).copied()
+    }
+
+    /// Footer button currently focused, if any.
+    pub fn settings_focused_button(&self) -> Option<SettingsButton> {
+        let row_count = self.settings_rows().len();
+        SETTINGS_BUTTONS
+            .get(self.settings_selected_row.checked_sub(row_count)?)
+            .copied()
+    }
+
+    /// Moves keyboard focus up by one entry, wrapping through rows and buttons.
+    pub fn settings_row_up(&mut self) {
+        self.settings_move_focus(-1);
+    }
+
+    /// Moves keyboard focus down by one entry, wrapping through rows and buttons.
+    pub fn settings_row_down(&mut self) {
+        self.settings_move_focus(1);
+    }
+
+    fn settings_move_focus(&mut self, delta: i32) {
+        let count = self.settings_focus_count();
+        if count == 0 {
+            return;
+        }
+        self.settings_selected_row = (self.settings_selected_row as i32 + delta).rem_euclid(count as i32) as usize;
+        self.settings_hovered_row = None;
+        self.settings_hovered_button = None;
+    }
+
+    fn settings_clear_hover(&mut self) {
+        self.settings_hovered_tab = None;
+        self.settings_hovered_row = None;
+        self.settings_hovered_button = None;
+    }
+
+    /// Whether a row can currently be changed.
+    pub fn settings_row_enabled(&self, row: SettingsRow) -> bool {
+        match row {
+            SettingsRow::MeshWorkers => false,
+            SettingsRow::TexturePack => {
+                self.active_texture_pack.is_some()
+                    || self
+                        .settings
+                        .texture_pack
+                        .as_deref()
+                        .is_some_and(|path| !path.is_empty())
+            }
+            _ => true,
+        }
+    }
+
+    /// Display value drawn on the right of a row.
+    pub fn settings_row_value(&self, row: SettingsRow, info: &SettingsInfo) -> String {
+        match row {
+            SettingsRow::GameMode => game_mode_label(self.settings.game_mode).to_string(),
+            SettingsRow::ShowHud => checkbox(self.hud_visible),
+            SettingsRow::DebugOverlay => checkbox(self.debug_overlay),
+            SettingsRow::RenderDistance => format!("{} chunks", self.settings.render_distance_chunks),
+            SettingsRow::Fov => format!("{:.0} deg", self.settings.fov_degrees),
+            SettingsRow::MouseSensitivity => format!("{:.2}x", self.settings.mouse_sensitivity),
+            SettingsRow::Fullscreen => checkbox(self.settings.fullscreen),
+            SettingsRow::MeshWorkers => format!("{} threads", info.mesh_workers.max(1)),
+            SettingsRow::TextureStyle => texture_style_label(self.settings.texture_style).to_string(),
+            SettingsRow::TexturePack => {
+                if let Some(name) = &self.active_texture_pack {
+                    shorten_row_value(name)
+                } else if self
+                    .settings
+                    .texture_pack
+                    .as_deref()
+                    .is_some_and(|path| !path.is_empty())
+                {
+                    "enable saved pack".to_string()
+                } else {
+                    "built-in only".to_string()
+                }
+            }
+        }
+    }
+
+    /// One row ready to draw with its current value.
+    pub fn settings_row_info(&self, row: SettingsRow, info: &SettingsInfo) -> SettingsRowInfo {
+        SettingsRowInfo {
+            row,
+            label: row.label(),
+            value: self.settings_row_value(row, info),
+            kind: row.kind(),
+            enabled: self.settings_row_enabled(row),
+        }
+    }
+
+    /// All rows of the active tab, ready to draw.
+    pub fn settings_row_infos(&self, info: &SettingsInfo) -> Vec<SettingsRowInfo> {
+        self.settings_rows()
+            .into_iter()
+            .map(|row| self.settings_row_info(row, info))
+            .collect()
+    }
+
+    /// Normalised fill for range rows, used by the slider-like display.
+    pub fn settings_row_fraction(&self, row: SettingsRow) -> Option<f32> {
+        match row {
+            SettingsRow::RenderDistance => Some(range_fraction(
+                self.settings.render_distance_chunks as f32,
+                SETTINGS_MIN_RENDER_DISTANCE as f32,
+                SETTINGS_MAX_RENDER_DISTANCE as f32,
+            )),
+            SettingsRow::Fov => Some(range_fraction(
+                self.settings.fov_degrees,
+                SETTINGS_MIN_FOV_DEGREES,
+                SETTINGS_MAX_FOV_DEGREES,
+            )),
+            SettingsRow::MouseSensitivity => Some(range_fraction(
+                self.settings.mouse_sensitivity,
+                SETTINGS_MIN_MOUSE_SENSITIVITY,
+                SETTINGS_MAX_MOUSE_SENSITIVITY,
+            )),
+            _ => None,
+        }
+    }
+
+    /// Changes the focused row by `delta` steps, clamping at range bounds.
+    ///
+    /// Returns the row when the caller must apply a side effect and persist the
+    /// settings. Toggle rows flip once regardless of the magnitude; choice rows
+    /// cycle in the direction of `delta`. The texture-pack row is an action: the
+    /// client owns the active renderer source and performs the actual toggle.
+    pub fn settings_adjust(&mut self, delta: i32) -> Option<SettingsRow> {
+        if delta == 0 {
+            return None;
+        }
+        let row = self.settings_focused_row()?;
+        let changed = match row {
+            SettingsRow::GameMode => {
+                let index = GameMode::ALL
+                    .iter()
+                    .position(|mode| *mode == self.settings.game_mode)
+                    .unwrap_or(0);
+                let next = GameMode::ALL[step_index(index, GameMode::ALL.len(), delta)];
+                if next == self.settings.game_mode {
+                    false
+                } else {
+                    self.settings.game_mode = next;
+                    true
+                }
+            }
+            SettingsRow::ShowHud => {
+                self.hud_visible = !self.hud_visible;
+                true
+            }
+            SettingsRow::DebugOverlay => {
+                self.toggle_debug_overlay();
+                true
+            }
+            SettingsRow::RenderDistance => {
+                let current = self
+                    .settings
+                    .render_distance_chunks
+                    .clamp(SETTINGS_MIN_RENDER_DISTANCE, SETTINGS_MAX_RENDER_DISTANCE);
+                let next = (current + delta.signum()).clamp(SETTINGS_MIN_RENDER_DISTANCE, SETTINGS_MAX_RENDER_DISTANCE);
+                if next == self.settings.render_distance_chunks {
+                    false
+                } else {
+                    self.settings.render_distance_chunks = next;
+                    true
+                }
+            }
+            SettingsRow::Fov => {
+                let current = if self.settings.fov_degrees.is_finite() {
+                    self.settings
+                        .fov_degrees
+                        .clamp(SETTINGS_MIN_FOV_DEGREES, SETTINGS_MAX_FOV_DEGREES)
+                } else {
+                    Settings::default().fov_degrees
+                };
+                let step = if delta > 0 {
+                    SETTINGS_FOV_STEP
+                } else {
+                    -SETTINGS_FOV_STEP
+                };
+                let next = (current + step).clamp(SETTINGS_MIN_FOV_DEGREES, SETTINGS_MAX_FOV_DEGREES);
+                if (next - self.settings.fov_degrees).abs() > f32::EPSILON {
+                    self.settings.fov_degrees = next;
+                    true
+                } else {
+                    false
+                }
+            }
+            SettingsRow::MouseSensitivity => {
+                let current = if self.settings.mouse_sensitivity.is_finite() {
+                    self.settings
+                        .mouse_sensitivity
+                        .clamp(SETTINGS_MIN_MOUSE_SENSITIVITY, SETTINGS_MAX_MOUSE_SENSITIVITY)
+                } else {
+                    Settings::default().mouse_sensitivity
+                };
+                let step = if delta > 0 {
+                    SETTINGS_SENSITIVITY_STEP
+                } else {
+                    -SETTINGS_SENSITIVITY_STEP
+                };
+                let next = (((current + step).clamp(SETTINGS_MIN_MOUSE_SENSITIVITY, SETTINGS_MAX_MOUSE_SENSITIVITY))
+                    * 100.0)
+                    .round()
+                    / 100.0;
+                if (next - self.settings.mouse_sensitivity).abs() > 0.0001 {
+                    self.settings.mouse_sensitivity = next;
+                    true
+                } else {
+                    false
+                }
+            }
+            SettingsRow::Fullscreen => {
+                self.settings.fullscreen = !self.settings.fullscreen;
+                true
+            }
+            SettingsRow::MeshWorkers => false,
+            SettingsRow::TextureStyle => {
+                let index = TextureStyle::ALL
+                    .iter()
+                    .position(|style| *style == self.settings.texture_style)
+                    .unwrap_or(0);
+                let next = TextureStyle::ALL[step_index(index, TextureStyle::ALL.len(), delta)];
+                if next == self.settings.texture_style {
+                    false
+                } else {
+                    self.settings.texture_style = next;
+                    true
+                }
+            }
+            SettingsRow::TexturePack => self.settings_row_enabled(SettingsRow::TexturePack),
+        };
+        changed.then_some(row)
+    }
+
+    /// Activates the focused entry: footer buttons return their action, while
+    /// rows behave like Right/Enter.
+    pub fn settings_activate(&mut self) -> Option<SettingsAction> {
+        if let Some(button) = self.settings_focused_button() {
+            return match button {
+                SettingsButton::Resume => {
+                    self.resume();
+                    Some(SettingsAction::Resume)
+                }
+                SettingsButton::SaveAndQuit => Some(SettingsAction::SaveAndQuit),
+            };
+        }
+        let row = self.settings_focused_row()?;
+        if !self.settings_row_enabled(row) || row.kind() == SettingsRowKind::ReadOnly {
+            return None;
+        }
+        self.settings_adjust(1).map(SettingsAction::Adjust)
+    }
+
+    /// Updates hover highlights and mouse row/button focus from [`Self::cursor`].
+    pub fn settings_hover(&mut self, screen: [f32; 2]) {
+        let panel = settings_panel_rect(screen);
+        if !panel.contains(self.cursor.0, self.cursor.1) {
+            self.settings_clear_hover();
+            return;
+        }
+        let tabs = settings_tab_rects(screen);
+        self.settings_hovered_tab = SettingsTab::ALL
+            .iter()
+            .zip(tabs.iter())
+            .find(|(_, rect)| rect.contains(self.cursor.0, self.cursor.1))
+            .map(|(tab, _)| *tab);
+        let rows = self.settings_row_rects(screen);
+        self.settings_hovered_row = rows.iter().position(|rect| rect.contains(self.cursor.0, self.cursor.1));
+        let buttons = settings_button_rects(screen);
+        self.settings_hovered_button = buttons
+            .iter()
+            .position(|rect| rect.contains(self.cursor.0, self.cursor.1));
+        let row_count = self.settings_rows().len();
+        if let Some(index) = self.settings_hovered_row {
+            self.settings_selected_row = index;
+        } else if let Some(index) = self.settings_hovered_button {
+            self.settings_selected_row = row_count + index;
+        }
+    }
+
+    /// Handles a click at [`Self::cursor`].
+    ///
+    /// Tab clicks switch tabs without closing the screen; row and button clicks
+    /// activate them. Clicks outside the panel are ignored.
+    pub fn settings_click(&mut self, screen: [f32; 2]) -> Option<SettingsAction> {
+        if self.screen != Screen::Settings {
+            return None;
+        }
+        self.settings_hover(screen);
+        if let Some(tab) = self.settings_hovered_tab {
+            self.settings_select_tab(tab);
+            return None;
+        }
+        let row_count = self.settings_rows().len();
+        let focus = self
+            .settings_hovered_button
+            .map(|index| row_count + index)
+            .or(self.settings_hovered_row)?;
+        self.settings_selected_row = focus;
+        self.settings_activate()
+    }
+
+    /// Row hit rectangles for the active tab and target size.
+    pub fn settings_row_rects(&self, screen: [f32; 2]) -> Vec<UiRect> {
+        let panel = settings_panel_rect(screen);
+        let start_y = panel.y + SETTINGS_CONTENT_TOP;
+        self.settings_rows()
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                UiRect::new(
+                    panel.x + SETTINGS_MARGIN,
+                    start_y + index as f32 * SETTINGS_ROW_STEP,
+                    panel.w - SETTINGS_MARGIN * 2.0,
+                    SETTINGS_ROW_HEIGHT,
+                )
+            })
+            .collect()
     }
 
     /// Opens the modal death screen and focuses the respawn button.
@@ -625,6 +1334,7 @@ impl UiState {
         self.screen = Screen::Death;
         self.death_selected = 0;
         self.death_hovered = None;
+        self.settings_clear_hover();
     }
 
     /// Leaves the death screen if it is open.
@@ -634,7 +1344,7 @@ impl UiState {
         }
     }
 
-    /// Keeps keyboard focus on the death buttons without opening the pause menu.
+    /// Keeps keyboard focus on the death buttons without opening settings.
     pub fn focus_death_buttons(&mut self) {
         self.death_selected = self.death_selected.min(DEATH_ACTIONS.len() - 1);
         self.death_hovered = None;
@@ -698,159 +1408,6 @@ impl UiState {
         self.inventory.scroll_by(screen, item_count, rows);
     }
 
-    /// Opens the pause screen.
-    pub fn open_pause(&mut self) {
-        self.screen = Screen::Pause;
-        self.selected_row = 0;
-        self.hovered_row = None;
-    }
-
-    /// Closes menus and returns to gameplay.
-    pub fn resume(&mut self) {
-        self.screen = Screen::Playing;
-    }
-
-    /// Menu rows for the current screen.
-    pub fn menu_items(&self) -> Vec<MenuItem> {
-        match self.screen {
-            Screen::Playing | Screen::Inventory | Screen::Death => Vec::new(),
-            Screen::Pause => vec![MenuItem::Resume, MenuItem::OpenSettings, MenuItem::SaveAndQuit],
-            Screen::Settings => vec![
-                MenuItem::RenderDistanceDown,
-                MenuItem::RenderDistanceUp,
-                MenuItem::FovDown,
-                MenuItem::FovUp,
-                MenuItem::SensitivityDown,
-                MenuItem::SensitivityUp,
-                MenuItem::ToggleGameMode,
-                MenuItem::TextureStylePrevious,
-                MenuItem::TextureStyleNext,
-                MenuItem::ToggleTexturePack,
-                MenuItem::ToggleFullscreen,
-                MenuItem::ToggleDebugOverlay,
-                MenuItem::ToggleHud,
-                MenuItem::Back,
-            ],
-        }
-    }
-
-    /// Label text for a settings/pause row, or `None` when it is a button whose
-    /// value is rendered separately.
-    pub fn row_label(&self, item: MenuItem) -> String {
-        match item {
-            MenuItem::Resume => "Resume".into(),
-            MenuItem::OpenSettings => "Settings".into(),
-            MenuItem::SaveAndQuit => "Save and quit".into(),
-            MenuItem::Back => "Back".into(),
-            MenuItem::RenderDistanceDown => format!("Render distance  {}  (-)", self.settings.render_distance_chunks),
-            MenuItem::RenderDistanceUp => "(+)".into(),
-            MenuItem::FovDown => format!("Field of view  {:.0} deg  (-)", self.settings.fov_degrees),
-            MenuItem::FovUp => "(+)".into(),
-            MenuItem::SensitivityDown => format!("Mouse sensitivity  {:.2}x  (-)", self.settings.mouse_sensitivity),
-            MenuItem::SensitivityUp => "(+)".into(),
-            MenuItem::ToggleGameMode => format!("Game mode  {}  (toggle)", self.settings.game_mode.name()),
-            MenuItem::TextureStylePrevious => {
-                format!("Texture style  {}  (<)", self.settings.texture_style.name())
-            }
-            MenuItem::TextureStyleNext => "(>)".into(),
-            MenuItem::ToggleTexturePack => {
-                if let Some(name) = &self.active_texture_pack {
-                    format!("Texture pack  {name}  (toggle)")
-                } else if self
-                    .settings
-                    .texture_pack
-                    .as_deref()
-                    .is_some_and(|path| !path.is_empty())
-                {
-                    "Texture pack  built-in  (toggle)".into()
-                } else {
-                    "Texture pack  built-in only".into()
-                }
-            }
-            MenuItem::ToggleFullscreen => {
-                format!("Fullscreen  {}", if self.settings.fullscreen { "on" } else { "off" })
-            }
-            MenuItem::ToggleDebugOverlay => format!(
-                "F3 debug overlay  {}",
-                if self.settings.show_debug_overlay { "on" } else { "off" }
-            ),
-            MenuItem::ToggleHud => format!("HUD  {}", if self.hud_visible { "on" } else { "off" }),
-        }
-    }
-
-    /// Applies an adjustment, returning whether a setting changed and must be persisted.
-    pub fn apply(&mut self, item: MenuItem) -> bool {
-        match item {
-            MenuItem::Resume => {
-                self.resume();
-                false
-            }
-            MenuItem::OpenSettings => {
-                self.screen = Screen::Settings;
-                self.selected_row = 0;
-                false
-            }
-            MenuItem::SaveAndQuit => false,
-            MenuItem::Back => {
-                self.screen = Screen::Pause;
-                self.selected_row = 0;
-                false
-            }
-            MenuItem::RenderDistanceDown => self.adjust(|s| {
-                s.render_distance_chunks = (s.render_distance_chunks - 1).max(MIN_RENDER_DISTANCE);
-            }),
-            MenuItem::RenderDistanceUp => self.adjust(|s| {
-                s.render_distance_chunks = (s.render_distance_chunks + 1).min(MAX_RENDER_DISTANCE);
-            }),
-            MenuItem::FovDown => self.adjust(|s| {
-                s.fov_degrees = (s.fov_degrees - 5.0).max(MIN_FOV_DEGREES);
-            }),
-            MenuItem::FovUp => self.adjust(|s| {
-                s.fov_degrees = (s.fov_degrees + 5.0).min(MAX_FOV_DEGREES);
-            }),
-            MenuItem::SensitivityDown => self.adjust(|s| {
-                s.mouse_sensitivity = (s.mouse_sensitivity - 0.1).max(MIN_MOUSE_SENSITIVITY);
-            }),
-            MenuItem::SensitivityUp => self.adjust(|s| {
-                s.mouse_sensitivity = (s.mouse_sensitivity + 0.1).min(MAX_MOUSE_SENSITIVITY);
-            }),
-            MenuItem::ToggleGameMode => {
-                self.settings.game_mode = self.settings.game_mode.next();
-                true
-            }
-            MenuItem::TextureStylePrevious => {
-                self.settings.texture_style = self.settings.texture_style.previous();
-                true
-            }
-            MenuItem::TextureStyleNext => {
-                self.settings.texture_style = self.settings.texture_style.next();
-                true
-            }
-            // The renderer switch and persistence are side effects handled by
-            // the client, which owns the active `TextureSource`.
-            MenuItem::ToggleTexturePack => false,
-            MenuItem::ToggleFullscreen => {
-                self.settings.fullscreen = !self.settings.fullscreen;
-                true
-            }
-            MenuItem::ToggleDebugOverlay => {
-                self.toggle_debug_overlay();
-                true
-            }
-            MenuItem::ToggleHud => {
-                self.hud_visible = !self.hud_visible;
-                true
-            }
-        }
-    }
-
-    fn adjust(&mut self, apply: impl FnOnce(&mut Settings)) -> bool {
-        let before = self.settings.clone();
-        apply(&mut self.settings);
-        self.settings.clamp();
-        before != self.settings
-    }
-
     /// Rects of the hotbar slots for a screen size.
     pub fn hotbar_rects(&self, screen: [f32; 2]) -> Vec<UiRect> {
         let total = HOTBAR_SLOTS as f32 * HOTBAR_SLOT_SIZE + (HOTBAR_SLOTS as f32 - 1.0) * HOTBAR_GAP;
@@ -863,67 +1420,393 @@ impl UiState {
             })
             .collect()
     }
+}
 
-    /// Menu row rects for the current screen and size.
-    pub fn menu_rects(&self, screen: [f32; 2]) -> Vec<UiRect> {
-        let items = self.menu_items();
-        if items.is_empty() {
-            return Vec::new();
+/// First y offset of settings content, relative to the panel top.
+const SETTINGS_CONTENT_TOP: f32 = 112.0;
+/// Footer button top, measured from the panel bottom.
+const SETTINGS_BUTTON_Y_FROM_BOTTOM: f32 = 102.0;
+/// Footer separator, measured from the panel bottom.
+const SETTINGS_FOOTER_Y_FROM_BOTTOM: f32 = 52.0;
+/// First footer hint line, measured from the panel bottom.
+const SETTINGS_HINT_Y_FROM_BOTTOM: f32 = 42.0;
+
+/// Steps a cyclic index by one in the direction of `delta`.
+fn step_index(index: usize, len: usize, delta: i32) -> usize {
+    (index as i32 + delta.signum()).rem_euclid(len as i32) as usize
+}
+
+/// Title-cased gameplay-mode name.
+pub fn game_mode_label(mode: GameMode) -> &'static str {
+    match mode {
+        GameMode::Survival => "Survival",
+        GameMode::Creative => "Creative",
+    }
+}
+
+/// Title-cased procedural texture-style name.
+pub fn texture_style_label(style: TextureStyle) -> &'static str {
+    match style {
+        TextureStyle::Classic => "Classic",
+        TextureStyle::Painterly => "Painterly",
+        TextureStyle::Lush => "Lush",
+        TextureStyle::Minimal => "Minimal",
+    }
+}
+
+fn checkbox(value: bool) -> String {
+    if value { "[x]" } else { "[ ]" }.to_string()
+}
+
+fn shorten(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut short: String = value.chars().take(max_chars.saturating_sub(2)).collect();
+    short.push_str("..");
+    short
+}
+
+fn shorten_row_value(value: &str) -> String {
+    shorten(value, 26)
+}
+
+fn range_fraction(value: f32, min: f32, max: f32) -> f32 {
+    if !value.is_finite() || max <= min {
+        return 0.0;
+    }
+    ((value - min) / (max - min)).clamp(0.0, 1.0)
+}
+
+fn vital_value(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, VITAL_ICON_COUNT as f32 * VITAL_POINTS_PER_ICON)
+    } else {
+        0.0
+    }
+}
+
+/// Full bounds of the modal settings panel for a target size.
+pub fn settings_panel_rect(screen: [f32; 2]) -> UiRect {
+    let width = SETTINGS_PANEL_WIDTH.min((screen[0] - 24.0).max(1.0));
+    let height = SETTINGS_PANEL_HEIGHT.min((screen[1] - 24.0).max(1.0));
+    UiRect::new((screen[0] - width) / 2.0, (screen[1] - height) / 2.0, width, height)
+}
+
+/// Bounds of the four tab buttons.
+pub fn settings_tab_rects(screen: [f32; 2]) -> [UiRect; 4] {
+    let panel = settings_panel_rect(screen);
+    let gap = 6.0;
+    let width = (panel.w - SETTINGS_MARGIN * 2.0 - gap * 3.0) / 4.0;
+    std::array::from_fn(|index| {
+        UiRect::new(
+            panel.x + SETTINGS_MARGIN + index as f32 * (width + gap),
+            panel.y + 62.0,
+            width,
+            SETTINGS_TAB_HEIGHT,
+        )
+    })
+}
+
+/// Bounds of the Resume and Save & quit buttons.
+pub fn settings_button_rects(screen: [f32; 2]) -> [UiRect; 2] {
+    let panel = settings_panel_rect(screen);
+    let total = SETTINGS_BUTTON_WIDTH * 2.0 + SETTINGS_BUTTON_GAP;
+    let x = panel.x + (panel.w - total) / 2.0;
+    let y = panel.y + panel.h - SETTINGS_BUTTON_Y_FROM_BOTTOM;
+    [
+        UiRect::new(x, y, SETTINGS_BUTTON_WIDTH, SETTINGS_BUTTON_HEIGHT),
+        UiRect::new(
+            x + SETTINGS_BUTTON_WIDTH + SETTINGS_BUTTON_GAP,
+            y,
+            SETTINGS_BUTTON_WIDTH,
+            SETTINGS_BUTTON_HEIGHT,
+        ),
+    ]
+}
+
+/// Draws the full modal settings screen over the dimmed world.
+///
+/// This is the public drawing entry point for the settings feature; later
+/// client screens should add their own `draw_*` function alongside it instead
+/// of growing this one.
+pub fn draw_settings_screen(frame: &mut UiFrame, ui: &UiState, info: &SettingsInfo, screen: [f32; 2]) {
+    let [width, height] = screen;
+    frame.rect(0.0, 0.0, width, height, [0.0, 0.0, 0.0, 0.55]);
+    frame.rect(0.0, 0.0, width, height, [0.02, 0.03, 0.06, 0.18]);
+    let panel = settings_panel_rect(screen);
+    draw_settings_panel(frame, panel);
+    draw_settings_header(frame, panel);
+    draw_settings_tabs(frame, ui, screen);
+    let rows = ui.settings_row_infos(info);
+    let row_rects = ui.settings_row_rects(screen);
+    match ui.settings_tab {
+        SettingsTab::Game => {
+            draw_settings_rows(frame, ui, &rows, &row_rects);
+            draw_game_summary(frame, ui, info, panel, rows.len());
         }
-        let panel_height = items.len() as f32 * MENU_ROW_HEIGHT + 64.0;
-        let x = (screen[0] - MENU_PANEL_WIDTH) / 2.0;
-        let y = (screen[1] - panel_height) / 2.0 + 48.0;
-        (0..items.len())
-            .map(|index| {
-                UiRect::new(
-                    x + 24.0,
-                    y + index as f32 * MENU_ROW_HEIGHT,
-                    MENU_PANEL_WIDTH - 48.0,
-                    MENU_ROW_HEIGHT - 4.0,
-                )
-            })
-            .collect()
-    }
-
-    /// Full panel bounds for the current screen.
-    pub fn panel_rect(&self, screen: [f32; 2]) -> Option<UiRect> {
-        let items = self.menu_items();
-        if items.is_empty() {
-            return None;
+        SettingsTab::Display => draw_settings_rows(frame, ui, &rows, &row_rects),
+        SettingsTab::Controls => draw_controls_reference(frame, panel),
+        SettingsTab::Textures => {
+            draw_settings_rows(frame, ui, &rows, &row_rects);
+            draw_texture_source(frame, info, panel, rows.len());
         }
-        let height = items.len() as f32 * MENU_ROW_HEIGHT + 64.0;
-        Some(UiRect::new(
-            (screen[0] - MENU_PANEL_WIDTH) / 2.0,
-            (screen[1] - height) / 2.0,
-            MENU_PANEL_WIDTH,
-            height,
-        ))
     }
+    draw_settings_buttons(frame, ui, screen);
+    draw_settings_footer(frame, panel);
+}
 
-    /// Updates the hovered row from the cursor.
-    pub fn update_hover(&mut self, screen: [f32; 2]) {
-        let rects = self.menu_rects(screen);
-        self.hovered_row = rects
-            .iter()
-            .position(|rect| rect.contains(self.cursor.0, self.cursor.1));
+fn draw_settings_panel(frame: &mut UiFrame, panel: UiRect) {
+    frame.rect(panel.x + 6.0, panel.y + 8.0, panel.w, panel.h, [0.0, 0.0, 0.0, 0.38]);
+    frame.rect(panel.x, panel.y, panel.w, panel.h, [0.055, 0.068, 0.092, 0.985]);
+    frame.outline(panel.x, panel.y, panel.w, panel.h, 2.0, [0.43, 0.49, 0.58, 1.0]);
+    frame.outline(
+        panel.x + 3.0,
+        panel.y + 3.0,
+        panel.w - 6.0,
+        panel.h - 6.0,
+        1.0,
+        [0.15, 0.18, 0.24, 1.0],
+    );
+}
+
+fn draw_settings_header(frame: &mut UiFrame, panel: UiRect) {
+    frame.text(
+        panel.x + SETTINGS_MARGIN,
+        panel.y + 14.0,
+        2.6,
+        [0.98, 0.99, 1.0, 1.0],
+        "Settings",
+    );
+    let version = format!("OpenBlock v{}", ob_core::VERSION);
+    let version_width = frame.text_width(1.2, &version);
+    frame.text(
+        panel.x + panel.w - SETTINGS_MARGIN - version_width,
+        panel.y + 22.0,
+        1.2,
+        [0.64, 0.70, 0.79, 1.0],
+        &version,
+    );
+    frame.rect(
+        panel.x + SETTINGS_MARGIN,
+        panel.y + 52.0,
+        panel.w - SETTINGS_MARGIN * 2.0,
+        1.0,
+        [0.24, 0.28, 0.35, 1.0],
+    );
+}
+
+fn draw_settings_tabs(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2]) {
+    let rects = settings_tab_rects(screen);
+    for (index, tab) in SettingsTab::ALL.iter().enumerate() {
+        let rect = rects[index];
+        let active = *tab == ui.settings_tab;
+        let hovered = ui.settings_hovered_tab == Some(*tab);
+        let background = if active {
+            [0.13, 0.18, 0.26, 1.0]
+        } else if hovered {
+            [0.10, 0.13, 0.18, 0.95]
+        } else {
+            [0.07, 0.09, 0.12, 0.65]
+        };
+        frame.rect(rect.x, rect.y, rect.w, rect.h, background);
+        if active {
+            frame.rect(rect.x, rect.y + rect.h - 3.0, rect.w, 3.0, [0.96, 0.76, 0.32, 1.0]);
+        } else if hovered {
+            frame.outline(rect.x, rect.y, rect.w, rect.h, 1.0, [0.40, 0.46, 0.55, 1.0]);
+        }
+        let color = if active {
+            [1.0, 0.98, 0.92, 1.0]
+        } else if hovered {
+            [0.85, 0.90, 0.96, 1.0]
+        } else {
+            [0.62, 0.68, 0.76, 1.0]
+        };
+        frame.text_centered(rect.center().0, rect.y + 10.0, 1.45, color, tab.name());
     }
+}
 
-    /// Handles a click at the cursor, returning the action to perform.
-    pub fn click(&mut self, screen: [f32; 2]) -> Option<MenuAction> {
-        self.update_hover(screen);
-        let row = self.hovered_row?;
-        self.selected_row = row;
-        let item = *self.menu_items().get(row)?;
-        match item {
-            MenuItem::Resume => Some(MenuAction::Resume),
-            MenuItem::OpenSettings => Some(MenuAction::OpenSettings),
-            MenuItem::SaveAndQuit => Some(MenuAction::SaveAndQuit),
-            MenuItem::Back => Some(MenuAction::Back),
-            other => {
-                self.apply(other);
-                Some(MenuAction::Adjust(other))
+fn draw_settings_rows(frame: &mut UiFrame, ui: &UiState, rows: &[SettingsRowInfo], rects: &[UiRect]) {
+    for (index, (info, rect)) in rows.iter().zip(rects.iter()).enumerate() {
+        if info.row == SettingsRow::MeshWorkers {
+            frame.rect(rect.x, rect.y - 6.0, rect.w, 1.0, [0.19, 0.23, 0.29, 0.9]);
+        }
+        if index == ui.settings_selected_row {
+            frame.rect(rect.x, rect.y, rect.w, rect.h, [0.16, 0.21, 0.29, 0.96]);
+            frame.outline(rect.x, rect.y, rect.w, rect.h, 1.0, [0.95, 0.79, 0.35, 0.95]);
+            frame.rect(rect.x, rect.y + 4.0, 3.0, rect.h - 8.0, [0.96, 0.76, 0.32, 1.0]);
+        }
+        let label_color = if info.enabled {
+            [0.92, 0.95, 0.99, 1.0]
+        } else {
+            [0.50, 0.55, 0.63, 1.0]
+        };
+        frame.text(rect.x + 14.0, rect.y + 10.0, 1.5, label_color, info.label);
+        let value_color = settings_value_color(info);
+        let value_width = frame.text_width(1.35, &info.value);
+        frame.text(
+            rect.x + rect.w - 12.0 - value_width,
+            rect.y + 10.0,
+            1.35,
+            value_color,
+            &info.value,
+        );
+        if let Some(fraction) = ui.settings_row_fraction(info.row) {
+            let track_x = rect.x + rect.w - 150.0;
+            let track_y = rect.y + rect.h - 8.0;
+            frame.rect(track_x, track_y, 130.0, 3.0, [0.10, 0.12, 0.16, 1.0]);
+            let filled = 130.0 * fraction;
+            if filled > 0.0 {
+                frame.rect(track_x, track_y, filled, 3.0, [0.88, 0.69, 0.28, 1.0]);
+            }
+            frame.rect(track_x + filled - 2.0, track_y - 2.0, 4.0, 7.0, [0.98, 0.83, 0.43, 1.0]);
+        }
+    }
+}
+
+fn settings_value_color(info: &SettingsRowInfo) -> [f32; 4] {
+    if !info.enabled {
+        return [0.48, 0.53, 0.61, 1.0];
+    }
+    match info.kind {
+        SettingsRowKind::Toggle => {
+            if info.value == "[x]" {
+                [0.72, 0.93, 0.55, 1.0]
+            } else {
+                [0.55, 0.60, 0.68, 1.0]
             }
         }
+        SettingsRowKind::Choice => [0.98, 0.83, 0.44, 1.0],
+        SettingsRowKind::Range | SettingsRowKind::Action => [0.86, 0.91, 1.0, 1.0],
+        SettingsRowKind::ReadOnly => [0.55, 0.60, 0.68, 1.0],
+    }
+}
+
+fn draw_game_summary(frame: &mut UiFrame, ui: &UiState, info: &SettingsInfo, panel: UiRect, row_count: usize) {
+    let x = panel.x + SETTINGS_MARGIN;
+    let y = panel.y + SETTINGS_CONTENT_TOP + row_count as f32 * SETTINGS_ROW_STEP + 14.0;
+    let width = panel.w - SETTINGS_MARGIN * 2.0;
+    frame.rect(x, y, width, 34.0, [0.09, 0.11, 0.15, 0.96]);
+    frame.outline(x, y, width, 34.0, 1.0, [0.20, 0.24, 0.31, 1.0]);
+    let mode = game_mode_label(ui.settings.game_mode);
+    let health = vital_value(info.health);
+    let hunger = vital_value(info.hunger);
+    let text = format!("{mode}   Health {health:.0} / 20   Hunger {hunger:.0} / 20");
+    frame.text(x + 12.0, y + 11.0, 1.2, [0.90, 0.94, 0.99, 1.0], &text);
+}
+
+fn draw_texture_source(frame: &mut UiFrame, info: &SettingsInfo, panel: UiRect, row_count: usize) {
+    let x = panel.x + SETTINGS_MARGIN;
+    let y = panel.y + SETTINGS_CONTENT_TOP + row_count as f32 * SETTINGS_ROW_STEP + 14.0;
+    let source = if info.texture_source.is_empty() {
+        "built-in"
+    } else {
+        &info.texture_source
+    };
+    let resolution = if info.texture_resolution == 0 {
+        "resolution unknown".to_string()
+    } else {
+        format!("{} px", info.texture_resolution)
+    };
+    let source = shorten(source, 20);
+    let text = format!("Active texture source: {source} ({resolution})");
+    frame.rect(
+        x,
+        y - 8.0,
+        panel.w - SETTINGS_MARGIN * 2.0,
+        1.0,
+        [0.19, 0.23, 0.29, 0.9],
+    );
+    frame.text(x, y, 1.2, [0.80, 0.86, 0.94, 1.0], &text);
+}
+
+fn draw_controls_reference(frame: &mut UiFrame, panel: UiRect) {
+    let columns = controls_reference_columns();
+    let top = panel.y + SETTINGS_CONTENT_TOP;
+    let column_x = [panel.x + SETTINGS_MARGIN + 8.0, panel.x + panel.w / 2.0 + 8.0];
+    for (column, bindings) in columns.iter().enumerate() {
+        for (index, binding) in bindings.iter().enumerate() {
+            let y = top + index as f32 * 20.0;
+            frame.text(column_x[column], y, 1.1, [0.96, 0.80, 0.42, 1.0], binding.keys);
+            frame.text(
+                column_x[column] + 104.0,
+                y,
+                1.1,
+                [0.83, 0.88, 0.95, 1.0],
+                binding.action,
+            );
+        }
+    }
+    let note_y = top + 7.0 * 20.0 + 14.0;
+    frame.rect(
+        panel.x + SETTINGS_MARGIN,
+        note_y - 10.0,
+        panel.w - SETTINGS_MARGIN * 2.0,
+        1.0,
+        [0.19, 0.23, 0.29, 0.9],
+    );
+    frame.text(
+        panel.x + SETTINGS_MARGIN,
+        note_y,
+        1.2,
+        [0.96, 0.80, 0.42, 1.0],
+        SETTINGS_PERSISTENCE_NOTE,
+    );
+}
+
+fn draw_settings_buttons(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2]) {
+    let rects = settings_button_rects(screen);
+    let row_count = ui.settings_rows().len();
+    for (index, button) in SETTINGS_BUTTONS.iter().enumerate() {
+        let rect = rects[index];
+        let focused = ui.settings_selected_row == row_count + index;
+        let hovered = ui.settings_hovered_button == Some(index);
+        let active = focused || hovered;
+        let (background, border) = match button {
+            SettingsButton::Resume => {
+                if active {
+                    ([0.17, 0.27, 0.20, 0.98], [0.72, 0.94, 0.46, 1.0])
+                } else {
+                    ([0.10, 0.15, 0.13, 0.98], [0.29, 0.41, 0.32, 1.0])
+                }
+            }
+            SettingsButton::SaveAndQuit => {
+                if active {
+                    ([0.30, 0.10, 0.10, 0.98], [0.98, 0.55, 0.45, 1.0])
+                } else {
+                    ([0.14, 0.08, 0.09, 0.98], [0.41, 0.21, 0.23, 1.0])
+                }
+            }
+        };
+        frame.rect(rect.x, rect.y, rect.w, rect.h, background);
+        frame.outline(rect.x, rect.y, rect.w, rect.h, if active { 2.0 } else { 1.0 }, border);
+        let label_color = if active {
+            [1.0, 1.0, 1.0, 1.0]
+        } else {
+            [0.84, 0.88, 0.93, 1.0]
+        };
+        frame.text_centered(rect.center().0, rect.y + 11.0, 1.5, label_color, button.label());
+    }
+}
+
+fn draw_settings_footer(frame: &mut UiFrame, panel: UiRect) {
+    let separator_y = panel.y + panel.h - SETTINGS_FOOTER_Y_FROM_BOTTOM;
+    frame.rect(
+        panel.x + SETTINGS_MARGIN,
+        separator_y,
+        panel.w - SETTINGS_MARGIN * 2.0,
+        1.0,
+        [0.24, 0.28, 0.35, 1.0],
+    );
+    let hint_y = panel.y + panel.h - SETTINGS_HINT_Y_FROM_BOTTOM;
+    for (index, line) in SETTINGS_HINT_LINES.iter().enumerate() {
+        frame.text_centered(
+            panel.x + panel.w / 2.0,
+            hint_y + index as f32 * 12.0,
+            1.0,
+            [0.62, 0.68, 0.76, 1.0],
+            line,
+        );
     }
 }
 
@@ -1124,6 +2007,7 @@ pub fn draw_toasts(frame: &mut UiFrame, toasts: &ToastQueue, screen: [f32; 2]) {
         );
         let color = match toast.kind {
             ToastKind::Info => [0.95, 0.97, 1.0, alpha],
+            ToastKind::Success => [0.62, 0.94, 0.56, alpha],
             ToastKind::Warning => [1.0, 0.62, 0.55, alpha],
         };
         frame.text(VITAL_MARGIN_X + 4.0, y, scale, color, &toast.text);
@@ -1209,7 +2093,9 @@ mod tests {
         assert_eq!(state.screen, Screen::Playing);
         assert!(state.hud_visible);
         assert!(!state.debug_overlay);
-        assert!(state.menu_items().is_empty());
+        assert_eq!(state.settings_tab, SettingsTab::Game);
+        assert_eq!(state.settings_selected_row, 0);
+        assert_eq!(state.settings_rows().len(), 3);
     }
 
     #[test]
@@ -1262,13 +2148,12 @@ mod tests {
     }
 
     #[test]
-    fn inventory_screen_toggles_without_opening_the_pause_menu() {
+    fn inventory_screen_toggles_without_opening_settings() {
         let mut state = UiState::default();
         state.toggle_inventory();
         assert_eq!(state.screen, Screen::Inventory);
-        assert!(state.menu_items().is_empty());
-        assert!(state.panel_rect([1280.0, 720.0]).is_none());
-        assert!(state.inventory_layout([1280.0, 720.0], 11).slots.len() == 11);
+        assert_ne!(state.screen, Screen::Settings);
+        assert!(state.inventory_layout([1280.0, 720.0], 14).slots.len() == 14);
         state.toggle_inventory();
         assert_eq!(state.screen, Screen::Playing);
 
@@ -1276,10 +2161,14 @@ mod tests {
         state.close_inventory();
         assert_eq!(state.screen, Screen::Playing);
 
-        // The pause menu remains reachable only from gameplay.
-        state.open_pause();
+        // Settings is reachable only from gameplay; the inventory is unaffected.
+        state.open_inventory();
+        state.open_settings();
+        assert_eq!(state.screen, Screen::Inventory);
+        state.close_inventory();
+        state.open_settings();
         state.toggle_inventory();
-        assert_eq!(state.screen, Screen::Pause);
+        assert_eq!(state.screen, Screen::Settings);
     }
 
     #[test]
@@ -1296,88 +2185,474 @@ mod tests {
     }
 
     #[test]
-    fn pause_and_settings_navigation() {
+    fn escape_flow_opens_settings_directly_and_returns_to_playing() {
         let mut state = UiState::default();
-        state.open_pause();
-        assert_eq!(state.screen, Screen::Pause);
-        assert_eq!(
-            state.menu_items(),
-            vec![MenuItem::Resume, MenuItem::OpenSettings, MenuItem::SaveAndQuit]
-        );
-        state.apply(MenuItem::OpenSettings);
+        state.open_settings();
         assert_eq!(state.screen, Screen::Settings);
-        assert!(state.menu_items().contains(&MenuItem::RenderDistanceUp));
-        state.apply(MenuItem::Back);
-        assert_eq!(state.screen, Screen::Pause);
-        state.apply(MenuItem::Resume);
+        assert_eq!(state.settings_tab, SettingsTab::Game);
+        assert_eq!(state.settings_selected_row, 0);
+        assert_eq!(state.settings_focused_row(), Some(SettingsRow::GameMode));
+
+        state.settings_select_tab(SettingsTab::Display);
+        state.settings_row_down();
+        state.close_settings();
+        assert_eq!(state.screen, Screen::Playing);
+
+        // Reopening always lands on the Game tab and its first row.
+        state.open_settings();
+        assert_eq!(state.settings_tab, SettingsTab::Game);
+        assert_eq!(state.settings_selected_row, 0);
+    }
+
+    #[test]
+    fn death_screen_keeps_priority_over_settings() {
+        let mut state = UiState::default();
+        state.open_settings();
+        state.open_death();
+        assert_eq!(state.screen, Screen::Death);
+        state.open_settings();
+        assert_eq!(state.screen, Screen::Death, "death must not yield to settings");
+        state.clear_death();
+        assert_eq!(state.screen, Screen::Playing);
+
+        state.open_inventory();
+        state.open_settings();
+        assert_eq!(state.screen, Screen::Inventory, "settings needs gameplay");
+        state.close_inventory();
+        state.open_settings();
+        state.open_death();
+        assert_eq!(state.screen, Screen::Death);
+        assert!(state.settings_rows().len() == 3, "tab state is retained");
+    }
+
+    #[test]
+    fn settings_tabs_cycle_with_tab_and_shift_tab() {
+        let mut state = UiState::default();
+        state.open_settings();
+        assert_eq!(state.settings_tab, SettingsTab::Game);
+        state.settings_selected_row = 2;
+        state.settings_tab_next();
+        assert_eq!(state.settings_tab, SettingsTab::Display);
+        assert_eq!(state.settings_selected_row, 0, "tab changes reset the row");
+        state.settings_tab_next();
+        assert_eq!(state.settings_tab, SettingsTab::Controls);
+        state.settings_tab_next();
+        assert_eq!(state.settings_tab, SettingsTab::Textures);
+        state.settings_tab_next();
+        assert_eq!(state.settings_tab, SettingsTab::Game);
+        state.settings_tab_prev();
+        assert_eq!(state.settings_tab, SettingsTab::Textures);
+        state.settings_tab_prev();
+        assert_eq!(state.settings_tab, SettingsTab::Controls);
+        assert_eq!(state.settings_tab, SettingsTab::ALL[2]);
+    }
+
+    #[test]
+    fn settings_row_navigation_wraps_through_buttons() {
+        let mut state = UiState::default();
+        state.open_settings();
+        assert_eq!(state.settings_focus_count(), 5);
+        assert_eq!(state.settings_focused_row(), Some(SettingsRow::GameMode));
+        state.settings_row_up();
+        assert_eq!(state.settings_selected_row, 4);
+        assert_eq!(state.settings_focused_row(), None);
+        assert_eq!(state.settings_focused_button(), Some(SettingsButton::SaveAndQuit));
+        state.settings_row_down();
+        assert_eq!(state.settings_selected_row, 0);
+        assert_eq!(state.settings_focused_button(), None);
+
+        state.settings_select_tab(SettingsTab::Display);
+        assert_eq!(state.settings_focus_count(), 7);
+        state.settings_selected_row = 6;
+        assert_eq!(state.settings_focused_button(), Some(SettingsButton::SaveAndQuit));
+        state.settings_row_down();
+        assert_eq!(state.settings_selected_row, 0);
+        assert_eq!(state.settings_focused_row(), Some(SettingsRow::RenderDistance));
+
+        state.settings_select_tab(SettingsTab::Controls);
+        assert!(state.settings_rows().is_empty());
+        assert_eq!(state.settings_focus_count(), 2);
+        assert_eq!(state.settings_focused_button(), Some(SettingsButton::Resume));
+        state.settings_row_up();
+        assert_eq!(state.settings_focused_button(), Some(SettingsButton::SaveAndQuit));
+        state.settings_row_down();
+        assert_eq!(state.settings_focused_button(), Some(SettingsButton::Resume));
+    }
+
+    #[test]
+    fn settings_adjust_clamps_render_distance() {
+        let mut state = UiState::default();
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Display);
+        assert_eq!(state.settings.render_distance_chunks, 6);
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::RenderDistance));
+        assert_eq!(state.settings.render_distance_chunks, 7);
+        assert_eq!(state.settings_adjust(-1), Some(SettingsRow::RenderDistance));
+        assert_eq!(state.settings.render_distance_chunks, 6);
+
+        state.settings.render_distance_chunks = SETTINGS_MAX_RENDER_DISTANCE;
+        assert_eq!(state.settings_adjust(1), None);
+        assert_eq!(state.settings.render_distance_chunks, SETTINGS_MAX_RENDER_DISTANCE);
+        state.settings.render_distance_chunks = SETTINGS_MIN_RENDER_DISTANCE;
+        assert_eq!(state.settings_adjust(-1), None);
+        assert_eq!(state.settings.render_distance_chunks, SETTINGS_MIN_RENDER_DISTANCE);
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::RenderDistance));
+        assert_eq!(state.settings.render_distance_chunks, 3);
+    }
+
+    #[test]
+    fn settings_adjust_clamps_fov() {
+        let mut state = UiState::default();
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Display);
+        state.settings_selected_row = 1;
+        assert_eq!(state.settings.fov_degrees, 70.0);
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::Fov));
+        assert_eq!(state.settings.fov_degrees, 75.0);
+        state.settings.fov_degrees = SETTINGS_MAX_FOV_DEGREES;
+        assert_eq!(state.settings_adjust(1), None);
+        state.settings.fov_degrees = SETTINGS_MIN_FOV_DEGREES;
+        assert_eq!(state.settings_adjust(-1), None);
+        state.settings.fov_degrees = 55.0;
+        assert_eq!(state.settings_adjust(-1), Some(SettingsRow::Fov));
+        assert_eq!(state.settings.fov_degrees, SETTINGS_MIN_FOV_DEGREES);
+        assert_eq!(state.settings_adjust(-1), None);
+    }
+
+    #[test]
+    fn settings_adjust_clamps_mouse_sensitivity() {
+        let mut state = UiState::default();
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Display);
+        state.settings_selected_row = 2;
+        assert_eq!(state.settings.mouse_sensitivity, 1.0);
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::MouseSensitivity));
+        assert!((state.settings.mouse_sensitivity - 1.1).abs() < 1e-6);
+        state.settings.mouse_sensitivity = SETTINGS_MAX_MOUSE_SENSITIVITY;
+        assert_eq!(state.settings_adjust(1), None);
+        state.settings.mouse_sensitivity = SETTINGS_MIN_MOUSE_SENSITIVITY;
+        assert_eq!(state.settings_adjust(-1), None);
+        state.settings.mouse_sensitivity = 0.5;
+        assert_eq!(state.settings_adjust(-1), Some(SettingsRow::MouseSensitivity));
+        assert!((state.settings.mouse_sensitivity - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn settings_adjust_cycles_game_mode_and_texture_style() {
+        let mut state = UiState::default();
+        state.open_settings();
+        assert_eq!(state.settings.game_mode, GameMode::Survival);
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::GameMode));
+        assert_eq!(state.settings.game_mode, GameMode::Creative);
+        assert_eq!(state.settings_adjust(-1), Some(SettingsRow::GameMode));
+        assert_eq!(state.settings.game_mode, GameMode::Survival);
+
+        state.settings_select_tab(SettingsTab::Textures);
+        assert_eq!(state.settings.texture_style, TextureStyle::Classic);
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::TextureStyle));
+        assert_eq!(state.settings.texture_style, TextureStyle::Painterly);
+        assert_eq!(state.settings_adjust(-1), Some(SettingsRow::TextureStyle));
+        assert_eq!(state.settings.texture_style, TextureStyle::Classic);
+        state.settings.texture_style = TextureStyle::Minimal;
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::TextureStyle));
+        assert_eq!(state.settings.texture_style, TextureStyle::Classic);
+        assert_eq!(state.settings_adjust(-1), Some(SettingsRow::TextureStyle));
+        assert_eq!(state.settings.texture_style, TextureStyle::Minimal);
+    }
+
+    #[test]
+    fn settings_adjust_toggles_checkboxes_and_skips_read_only_rows() {
+        let mut state = UiState::default();
+        state.open_settings();
+        assert!(state.hud_visible);
+        state.settings_selected_row = 1;
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::ShowHud));
+        assert!(!state.hud_visible);
+        assert_eq!(state.settings_adjust(-1), Some(SettingsRow::ShowHud));
+        assert!(state.hud_visible);
+
+        state.settings_selected_row = 2;
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::DebugOverlay));
+        assert!(state.settings.show_debug_overlay);
+        assert!(state.debug_overlay);
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::DebugOverlay));
+        assert!(!state.settings.show_debug_overlay);
+        assert!(!state.debug_overlay);
+
+        state.settings_select_tab(SettingsTab::Display);
+        state.settings_selected_row = 3;
+        assert!(!state.settings.fullscreen);
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::Fullscreen));
+        assert!(state.settings.fullscreen);
+        state.settings_selected_row = 4;
+        assert_eq!(state.settings_focused_row(), Some(SettingsRow::MeshWorkers));
+        assert_eq!(state.settings_adjust(1), None);
+        assert_eq!(state.settings_activate(), None);
+    }
+
+    #[test]
+    fn settings_activate_handles_rows_and_footer_buttons() {
+        let mut state = UiState::default();
+        state.open_settings();
+        assert_eq!(
+            state.settings_activate(),
+            Some(SettingsAction::Adjust(SettingsRow::GameMode))
+        );
+        assert_eq!(state.settings.game_mode, GameMode::Creative);
+
+        state.settings_select_tab(SettingsTab::Display);
+        state.settings_selected_row = 3;
+        assert_eq!(
+            state.settings_activate(),
+            Some(SettingsAction::Adjust(SettingsRow::Fullscreen))
+        );
+        assert!(state.settings.fullscreen);
+
+        state.settings_select_tab(SettingsTab::Textures);
+        state.settings_selected_row = 1;
+        assert_eq!(state.settings_activate(), None, "no pack is available");
+        state.active_texture_pack = Some("rotrBLOCKS V88".into());
+        assert_eq!(
+            state.settings_activate(),
+            Some(SettingsAction::Adjust(SettingsRow::TexturePack))
+        );
+        // The client owns the renderer switch; the UI only requests it.
+        assert_eq!(state.settings.texture_pack, None);
+
+        state.settings_selected_row = 3;
+        assert_eq!(state.settings_activate(), Some(SettingsAction::SaveAndQuit));
+        assert_eq!(state.screen, Screen::Settings);
+        state.settings_selected_row = 2;
+        assert_eq!(state.settings_activate(), Some(SettingsAction::Resume));
         assert_eq!(state.screen, Screen::Playing);
     }
 
     #[test]
-    fn settings_adjustments_are_clamped_and_reported() {
-        let mut state = UiState::from_settings(Settings::default());
-        assert!(state.apply(MenuItem::RenderDistanceUp));
-        assert_eq!(state.settings.render_distance_chunks, 7);
-        state.settings.render_distance_chunks = MAX_RENDER_DISTANCE;
-        assert!(!state.apply(MenuItem::RenderDistanceUp));
-        state.settings.fov_degrees = MIN_FOV_DEGREES;
-        assert!(!state.apply(MenuItem::FovDown));
-        state.settings.mouse_sensitivity = MIN_MOUSE_SENSITIVITY;
-        assert!(!state.apply(MenuItem::SensitivityDown));
-        assert!(state.apply(MenuItem::ToggleDebugOverlay));
-        assert!(state.settings.show_debug_overlay);
-        assert!(state.debug_overlay);
-        assert!(state.apply(MenuItem::ToggleHud));
-        assert!(!state.hud_visible);
-    }
-
-    #[test]
-    fn texture_style_rows_cycle_and_persist_signal() {
+    fn settings_click_switches_tabs_and_activates_rows_and_buttons() {
         let mut state = UiState::default();
-        assert_eq!(state.settings.texture_style, TextureStyle::Classic);
-        assert!(state.apply(MenuItem::TextureStyleNext));
-        assert_eq!(state.settings.texture_style, TextureStyle::Painterly);
-        assert!(state.apply(MenuItem::TextureStylePrevious));
-        assert_eq!(state.settings.texture_style, TextureStyle::Classic);
-        state.settings.texture_style = TextureStyle::Minimal;
-        assert!(state.apply(MenuItem::TextureStyleNext));
-        assert_eq!(state.settings.texture_style, TextureStyle::Classic);
-    }
+        state.open_settings();
+        let screen = [1280.0, 720.0];
+        let tabs = settings_tab_rects(screen);
+        state.cursor = tabs[1].center();
+        assert_eq!(state.settings_click(screen), None);
+        assert_eq!(state.settings_tab, SettingsTab::Display);
 
-    #[test]
-    fn settings_menu_contains_the_texture_style_rows() {
-        let mut state = UiState::default();
-        state.open_pause();
-        state.apply(MenuItem::OpenSettings);
-        let items = state.menu_items();
-        assert!(items.contains(&MenuItem::TextureStylePrevious));
-        assert!(items.contains(&MenuItem::TextureStyleNext));
-        assert!(items.contains(&MenuItem::ToggleTexturePack));
-        assert_eq!(items.last(), Some(&MenuItem::Back));
-    }
-
-    #[test]
-    fn texture_pack_row_label_reflects_the_active_source() {
-        let mut state = UiState::default();
+        let rows = state.settings_row_rects(screen);
+        assert_eq!(rows.len(), 5);
+        state.cursor = rows[3].center();
         assert_eq!(
-            state.row_label(MenuItem::ToggleTexturePack),
-            "Texture pack  built-in only"
+            state.settings_click(screen),
+            Some(SettingsAction::Adjust(SettingsRow::Fullscreen))
         );
+        assert!(state.settings.fullscreen);
+
+        let buttons = settings_button_rects(screen);
+        state.cursor = buttons[0].center();
+        assert_eq!(state.settings_click(screen), Some(SettingsAction::Resume));
+        assert_eq!(state.screen, Screen::Playing);
+
+        state.open_settings();
+        state.cursor = (5.0, 5.0);
+        assert_eq!(state.settings_click(screen), None);
+        assert_eq!(state.screen, Screen::Settings, "outside clicks do nothing");
+    }
+
+    #[test]
+    fn settings_hover_selects_rows_and_buttons() {
+        let mut state = UiState::default();
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Display);
+        let screen = [1280.0, 720.0];
+        let rows = state.settings_row_rects(screen);
+        state.cursor = rows[2].center();
+        state.settings_hover(screen);
+        assert_eq!(state.settings_hovered_row, Some(2));
+        assert_eq!(state.settings_selected_row, 2);
+
+        let tabs = settings_tab_rects(screen);
+        state.cursor = tabs[0].center();
+        state.settings_hover(screen);
+        assert_eq!(state.settings_hovered_tab, Some(SettingsTab::Game));
+        assert_eq!(state.settings_hovered_row, None);
+        assert_eq!(state.settings_selected_row, 2, "tab hover keeps row focus");
+
+        let buttons = settings_button_rects(screen);
+        state.cursor = buttons[1].center();
+        state.settings_hover(screen);
+        assert_eq!(state.settings_hovered_button, Some(1));
+        assert_eq!(state.settings_selected_row, rows.len() + 1);
+
+        state.cursor = (5.0, 5.0);
+        state.settings_hover(screen);
+        assert_eq!(state.settings_hovered_tab, None);
+        assert_eq!(state.settings_hovered_row, None);
+        assert_eq!(state.settings_hovered_button, None);
+    }
+
+    #[test]
+    fn settings_panel_tabs_rows_and_buttons_fit_inside() {
+        let mut state = UiState::default();
+        state.open_settings();
+        let screen = [1280.0, 720.0];
+        let panel = settings_panel_rect(screen);
+        assert!((panel.x + panel.w / 2.0 - 640.0).abs() < 0.01);
+        assert!((panel.y + panel.h / 2.0 - 360.0).abs() < 0.01);
+        assert!(panel.w <= screen[0] && panel.h <= screen[1]);
+        let tabs = settings_tab_rects(screen);
+        assert_eq!(tabs.len(), SettingsTab::ALL.len());
+        for tab in tabs {
+            assert!(tab.x >= panel.x && tab.x + tab.w <= panel.x + panel.w);
+            assert!(tab.y >= panel.y && tab.y + tab.h <= panel.y + panel.h);
+        }
+        let buttons = settings_button_rects(screen);
+        for button in buttons {
+            assert!(button.x >= panel.x && button.x + button.w <= panel.x + panel.w);
+            assert!(button.y + button.h <= panel.y + panel.h - SETTINGS_FOOTER_Y_FROM_BOTTOM);
+        }
+        for tab in SettingsTab::ALL {
+            state.settings_select_tab(tab);
+            let rows = state.settings_row_rects(screen);
+            assert_eq!(rows.len(), state.settings_rows().len());
+            for row in rows {
+                assert!(row.x >= panel.x && row.x + row.w <= panel.x + panel.w);
+                assert!(row.y + row.h <= buttons[0].y, "rows must clear the buttons");
+            }
+        }
+    }
+
+    #[test]
+    fn settings_texture_pack_row_reflects_source_and_enablement() {
+        let mut state = UiState::default();
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Textures);
+        state.settings_selected_row = 1;
+        let info = SettingsInfo::default();
+        assert_eq!(
+            state.settings_row_value(SettingsRow::TexturePack, &info),
+            "built-in only"
+        );
+        assert!(!state.settings_row_enabled(SettingsRow::TexturePack));
+        assert_eq!(state.settings_adjust(1), None);
 
         state.settings.texture_pack = Some("/packs/rotrBLOCKS".into());
+        assert!(state.settings_row_enabled(SettingsRow::TexturePack));
         assert_eq!(
-            state.row_label(MenuItem::ToggleTexturePack),
-            "Texture pack  built-in  (toggle)"
+            state.settings_row_value(SettingsRow::TexturePack, &info),
+            "enable saved pack"
+        );
+        assert_eq!(
+            state.settings_adjust(1),
+            Some(SettingsRow::TexturePack),
+            "the client performs the actual toggle"
         );
 
         state.active_texture_pack = Some("rotrBLOCKS V88".into());
         assert_eq!(
-            state.row_label(MenuItem::ToggleTexturePack),
-            "Texture pack  rotrBLOCKS V88  (toggle)"
+            state.settings_row_value(SettingsRow::TexturePack, &info),
+            "rotrBLOCKS V88"
         );
-        // Applying the row itself is a no-op in the UI model; the client owns
-        // the renderer switch.
-        assert!(!state.apply(MenuItem::ToggleTexturePack));
+    }
+
+    #[test]
+    fn settings_values_round_trip_through_the_config_file() {
+        let mut state = UiState::default();
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Display);
+        state.settings_selected_row = 0;
+        state.settings_adjust(1);
+        state.settings_selected_row = 1;
+        state.settings_adjust(1);
+        state.settings_selected_row = 2;
+        state.settings_adjust(1);
+        state.settings_selected_row = 3;
+        state.settings_adjust(1);
+        state.settings_select_tab(SettingsTab::Textures);
+        state.settings_selected_row = 0;
+        state.settings_adjust(1);
+        state.settings_select_tab(SettingsTab::Game);
+        state.settings_selected_row = 0;
+        state.settings_adjust(1);
+        state.settings_selected_row = 2;
+        state.settings_adjust(1);
+
+        let dir = std::env::temp_dir().join(format!(
+            "openblock-settings-roundtrip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        ob_core::config::save_settings(&dir, &state.settings).expect("save settings");
+        let loaded = ob_core::config::load_settings(&dir);
+        assert_eq!(loaded, state.settings);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn controls_reference_is_complete_and_laid_out_in_two_columns() {
+        assert_eq!(CONTROLS_REFERENCE.len(), 14);
+        let columns = controls_reference_columns();
+        assert_eq!(columns[0].len(), 7);
+        assert_eq!(columns[1].len(), 7);
+        let all: Vec<ControlBinding> = columns.into_iter().flatten().collect();
+        let keys: Vec<&str> = all.iter().map(|binding| binding.keys).collect();
+        let actions: Vec<&str> = all.iter().map(|binding| binding.action).collect();
+        for expected in [
+            "WASD",
+            "Space",
+            "Shift",
+            "Ctrl",
+            "F",
+            "LMB (hold)",
+            "RMB",
+            "1-9 / Wheel",
+            "E",
+            "C",
+            "F3",
+            "F1",
+            "F2",
+            "Esc",
+        ] {
+            assert!(keys.contains(&expected), "missing key binding {expected}");
+        }
+        for expected in [
+            "Move",
+            "Jump",
+            "Crouch / sneak",
+            "Sprint",
+            "Toggle fly",
+            "Mine",
+            "Place / eat / use",
+            "Hotbar slot",
+            "Inventory",
+            "Debug overlay",
+            "HUD",
+            "Screenshot",
+            "Settings",
+        ] {
+            assert!(actions.contains(&expected), "missing action {expected}");
+        }
+        assert!(SETTINGS_PERSISTENCE_NOTE.contains("save automatically"));
+        assert!(SETTINGS_HINT_LINES[0].contains("Tab"));
+        assert!(SETTINGS_HINT_LINES[0].contains("Up/Down"));
+        assert!(SETTINGS_HINT_LINES[0].contains("Left/Right"));
+        assert!(SETTINGS_HINT_LINES[1].contains("Esc"));
+    }
+
+    #[test]
+    fn settings_screen_draws_geometry_on_every_tab() {
+        let mut state = UiState::default();
+        state.open_settings();
+        let info = SettingsInfo::default();
+        for tab in SettingsTab::ALL {
+            state.settings_select_tab(tab);
+            let mut frame = UiFrame::new(1280.0, 720.0);
+            draw_settings_screen(&mut frame, &state, &info, [1280.0, 720.0]);
+            let (vertices, quads) = frame.measure();
+            assert!(vertices > 0, "{tab:?} tab must emit geometry");
+            assert!(quads > 40, "{tab:?} tab should draw a full panel, got {quads} quads");
+        }
     }
 
     #[test]
@@ -1392,44 +2667,6 @@ mod tests {
         assert!(centered < 0.01, "hotbar must be centred");
         assert!(first.contains(first.x + 1.0, first.y + 1.0));
         assert!(!first.contains(-10.0, -10.0));
-    }
-
-    #[test]
-    fn menu_hit_testing_finds_rows() {
-        let mut state = UiState::default();
-        state.open_pause();
-        let screen = [1280.0, 720.0];
-        let rects = state.menu_rects(screen);
-        assert_eq!(rects.len(), 3);
-        let rect = rects[1];
-        state.cursor = rect.center();
-        state.update_hover(screen);
-        assert_eq!(state.hovered_row, Some(1));
-        state.cursor = (1.0, 1.0);
-        state.update_hover(screen);
-        assert_eq!(state.hovered_row, None);
-    }
-
-    #[test]
-    fn clicking_settings_rows_applies_and_persists_signal() {
-        let mut state = UiState::default();
-        state.open_pause();
-        state.apply(MenuItem::OpenSettings);
-        let screen = [1280.0, 720.0];
-        let rects = state.menu_rects(screen);
-        // Row 0 is render-distance-down.
-        let rect = rects[0];
-        state.cursor = rect.center();
-        let action = state.click(screen);
-        assert_eq!(action, Some(MenuAction::Adjust(MenuItem::RenderDistanceDown)));
-        let rect = rects[1];
-        let before = state.settings.render_distance_chunks;
-        state.cursor = rect.center();
-        assert_eq!(
-            state.click(screen),
-            Some(MenuAction::Adjust(MenuItem::RenderDistanceUp))
-        );
-        assert_eq!(state.settings.render_distance_chunks, before + 1);
     }
 
     #[test]
@@ -1477,9 +2714,13 @@ mod tests {
             health: 14.0,
             hunger: 12.5,
             movement: "sprint",
+            held: "Stone Pickaxe".into(),
+            held_durability: Some((129, 131)),
+            mining_speed: 4.0,
         };
         let left = stats.left_lines();
-        assert_eq!(left.len(), 15);
+        assert_eq!(left.len(), 16);
+        assert!(left.iter().any(|line| line == "Held: Stone Pickaxe 129/131  speed 4.0"));
         let joined = left.join("\n");
         for needle in [
             "120 FPS",
@@ -1516,13 +2757,13 @@ mod tests {
     }
 
     #[test]
-    fn pause_panel_is_centred() {
-        let mut state = UiState::default();
-        state.open_pause();
-        let panel = state.panel_rect([1280.0, 720.0]).expect("panel");
+    fn settings_panel_is_560_by_460_and_centred() {
+        let panel = settings_panel_rect([1280.0, 720.0]);
         let centre = panel.center();
         assert!((centre.0 - 640.0).abs() < 0.01);
         assert!((centre.1 - 360.0).abs() < 0.01);
+        assert_eq!(panel.w, SETTINGS_PANEL_WIDTH);
+        assert_eq!(panel.h, SETTINGS_PANEL_HEIGHT);
     }
 
     #[test]
@@ -1631,12 +2872,12 @@ mod tests {
     }
 
     #[test]
-    fn death_screen_blocks_the_pause_menu_and_resolves_both_actions() {
+    fn death_screen_blocks_settings_and_resolves_both_actions() {
         let mut state = UiState::default();
         state.open_death();
         assert_eq!(state.screen, Screen::Death);
-        assert!(state.menu_items().is_empty());
-        assert!(state.panel_rect([1280.0, 720.0]).is_none());
+        state.open_settings();
+        assert_eq!(state.screen, Screen::Death);
         assert_eq!(state.selected_death_action(), Some(DeathAction::Respawn));
         assert_eq!(state.activate_death(), Some(DeathAction::Respawn));
         state.move_death_selection(1);
@@ -1670,22 +2911,64 @@ mod tests {
     }
 
     #[test]
-    fn game_mode_row_toggles_and_is_labelled() {
+    fn game_mode_row_shows_title_cased_labels() {
         let mut state = UiState::default();
-        state.open_pause();
-        state.apply(MenuItem::OpenSettings);
-        assert!(state.menu_items().contains(&MenuItem::ToggleGameMode));
+        state.open_settings();
+        let info = SettingsInfo::default();
+        assert_eq!(state.settings_row_value(SettingsRow::GameMode, &info), "Survival");
+        state.settings_adjust(1);
+        assert_eq!(state.settings.game_mode, GameMode::Creative);
+        assert_eq!(state.settings_row_value(SettingsRow::GameMode, &info), "Creative");
+        assert_eq!(SettingsRow::GameMode.label(), "Game mode");
+    }
+
+    #[test]
+    fn crafting_screen_opens_only_from_gameplay_and_other_modals_keep_priority() {
+        let mut state = UiState::default();
+        state.toggle_crafting();
+        assert_eq!(state.screen, Screen::Crafting);
+        state.toggle_crafting();
+        assert_eq!(state.screen, Screen::Playing);
+
+        state.open_settings();
+        state.toggle_crafting();
+        assert_eq!(state.screen, Screen::Settings);
+        state.close_settings();
+        state.open_death();
+        state.toggle_crafting();
+        assert_eq!(state.screen, Screen::Death);
+        state.clear_death();
+        state.open_crafting();
+        assert_eq!(state.screen, Screen::Crafting);
+        state.close_crafting();
+        assert_eq!(state.screen, Screen::Playing);
+        assert_eq!(state.crafting.selected, 0);
+    }
+
+    #[test]
+    fn success_toasts_use_their_own_kind_and_remain_bounded() {
+        let mut toasts = ToastQueue::default();
+        toasts.push_success("crafted 4 planks");
         assert_eq!(
-            state.row_label(MenuItem::ToggleGameMode),
-            "Game mode  survival  (toggle)"
+            toasts.iter().next_back().map(|toast| toast.kind),
+            Some(ToastKind::Success)
         );
-        assert!(state.apply(MenuItem::ToggleGameMode));
-        assert_eq!(state.settings.game_mode, ob_core::config::GameMode::Creative);
-        assert_eq!(
-            state.row_label(MenuItem::ToggleGameMode),
-            "Game mode  creative  (toggle)"
-        );
-        assert!(state.apply(MenuItem::ToggleGameMode));
-        assert_eq!(state.settings.game_mode, ob_core::config::GameMode::Survival);
+        for index in 0..5 {
+            toasts.push(format!("toast {index}"));
+        }
+        assert_eq!(toasts.len(), MAX_TOASTS);
+        let mut frame = UiFrame::new(1280.0, 720.0);
+        draw_toasts(&mut frame, &toasts, [1280.0, 720.0]);
+        let (_, quads) = frame.measure();
+        assert!(quads >= MAX_TOASTS * 2);
+    }
+
+    #[test]
+    fn controls_reference_documents_crafting_and_right_click_use() {
+        let actions: Vec<&str> = CONTROLS_REFERENCE.iter().map(|binding| binding.action).collect();
+        assert!(actions.contains(&"Crafting"));
+        assert!(actions.contains(&"Place / eat / use"));
+        assert_eq!(CONTROLS_REFERENCE.len(), 14);
+        assert_eq!(controls_reference_columns().iter().map(Vec::len).sum::<usize>(), 14);
     }
 }

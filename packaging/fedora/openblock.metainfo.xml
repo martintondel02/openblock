@@ -29,6 +29,13 @@
     <content_attribute id="social-chat">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.0.8" date="2026-11-24" type="development">
+      <description>
+        <p>Crafting and tools (planks, cobblestone, crafting table, sticks,
+        wooden/stone tools with durability), visible dropped-item entities with
+        automatic pickup, and a full tabbed Esc settings screen.</p>
+      </description>
+    </release>
     <release version="0.0.7" date="2026-11-24" type="development">
       <description>
         <p>Survival foundations (health, hunger, fall damage, block drops, an

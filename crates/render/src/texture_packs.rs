@@ -675,6 +675,139 @@ fn paint_gravel_pebble(
     }
 }
 
+/// Paints a recessed 3×3 crafting grid onto a wooden canvas.
+///
+/// A raised frame surrounds the nine cells; two dividers cross the surface in
+/// each direction, each with a single lit lip on its top and left. A tiny
+/// centre mark and four corner studs make the layer read as a crafting table
+/// rather than as a plain plank field.
+#[allow(clippy::too_many_arguments)]
+fn paint_crafting_grid(
+    canvas: &mut Canvas,
+    frame: [u8; 3],
+    divider: [u8; 3],
+    cell: [u8; 3],
+    highlight: [u8; 3],
+    stud: [u8; 3],
+    inset: i32,
+    thickness: i32,
+) {
+    let size = canvas.size as i32;
+    let inset = inset.clamp(1, size / 4);
+    let thickness = thickness.clamp(1, size / 8);
+    let first = size / 3;
+    let second = 2 * size / 3;
+
+    // Recess the nine fields a little while keeping the underlying wood grain.
+    for y in inset..size - inset {
+        for x in inset..size - inset {
+            canvas.blend(x, y, cell, 64);
+        }
+    }
+
+    // Raised outer frame.
+    for i in 0..size {
+        for t in 0..inset {
+            canvas.set(i, t, frame);
+            canvas.set(i, size - 1 - t, frame);
+            canvas.set(t, i, frame);
+            canvas.set(size - 1 - t, i, frame);
+        }
+    }
+
+    // The two dividers in each direction produce the 3×3 cell layout.
+    for i in inset..size - inset {
+        for t in 0..thickness {
+            canvas.set(first + t, i, divider);
+            canvas.set(second + t, i, divider);
+            canvas.set(i, first + t, divider);
+            canvas.set(i, second + t, divider);
+        }
+    }
+
+    // One lit lip on the top and left of every divider.
+    for i in inset..size - inset {
+        canvas.blend(first - 1, i, highlight, 150);
+        canvas.blend(second - 1, i, highlight, 150);
+        canvas.blend(i, first - 1, highlight, 150);
+        canvas.blend(i, second - 1, highlight, 150);
+    }
+
+    // Four corner studs and a small centre crafting mark.
+    for (x, y) in [
+        (inset, inset),
+        (size - 1 - inset, inset),
+        (inset, size - 1 - inset),
+        (size - 1 - inset, size - 1 - inset),
+    ] {
+        canvas.set(x, y, stud);
+    }
+    let centre = size / 2;
+    for (x, y) in [
+        (centre, centre),
+        (centre - 1, centre),
+        (centre + 1, centre),
+        (centre, centre - 1),
+        (centre, centre + 1),
+    ] {
+        canvas.blend(x, y, divider, 110);
+    }
+    canvas.set(centre, centre, highlight);
+}
+
+/// Paints a small hand tool (diagonal handle with a metal head) onto a table side.
+#[allow(clippy::too_many_arguments)]
+fn paint_table_tool(
+    canvas: &mut Canvas,
+    x: i32,
+    y: i32,
+    metal: [u8; 3],
+    metal_dark: [u8; 3],
+    handle: [u8; 3],
+    highlight: [u8; 3],
+    scale: i32,
+) {
+    let scale = scale.max(1);
+    // Two-texel-thick diagonal handle.
+    for step in 0..(3 * scale) {
+        canvas.set(x + step, y + step, handle);
+        canvas.set(x + step, y + step + 1, offset(handle, -18));
+    }
+    // Metal head across the top of the handle, with a darker back edge.
+    for dy in -scale..=scale {
+        canvas.set(x - scale, y + dy, metal);
+        canvas.set(x - scale - 1, y + dy, metal_dark);
+    }
+    canvas.set(x - scale - 1, y - scale, highlight);
+    // Binding where the head meets the handle.
+    canvas.set(x, y, metal_dark);
+}
+
+/// Paints a field of rounded cobbles separated by dark mortar.
+///
+/// The mortar stays visible wherever [`scatter_pebbles`] did not place a
+/// pebble, so the dark gaps are as irregular as the stone shapes themselves.
+#[allow(clippy::too_many_arguments)]
+fn paint_cobblestone(
+    size: u32,
+    seed: u32,
+    mortar: [u8; 3],
+    palette: &[[u8; 3]],
+    attempts: u32,
+    min_radius: i32,
+    max_radius: i32,
+    contrast: i32,
+    rim: i32,
+    dither_amount: i32,
+) -> Canvas {
+    let mut canvas = Canvas::new(size, mortar);
+    for pebble in scatter_pebbles(seed, size, attempts, min_radius, max_radius) {
+        let color = palette[(pebble.id >> 8) as usize % palette.len()];
+        paint_gravel_pebble(&mut canvas, &pebble, color, contrast, rim, dither_amount);
+    }
+    canvas
+}
+
 /// Punches clustered, irregular cut-out holes covering roughly `percent` of the tile.
 ///
 /// Scores come from a coarse noise field plus a little texel-scale jitter, so the
@@ -786,6 +919,26 @@ mod classic {
     const SNOW: [u8; 3] = [246, 249, 252];
     const SNOW_HIGHLIGHT: [u8; 3] = [255, 255, 255];
 
+    // v0.0.8 wood, cobblestone and crafting-table palettes.
+    const PLANK_SHADOW: [u8; 3] = [101, 69, 39];
+    const PLANK: [u8; 3] = [157, 112, 63];
+    const PLANK_LIGHT: [u8; 3] = [183, 138, 87];
+    const PLANK_GRAIN: [u8; 3] = [131, 91, 50];
+    const PLANK_HIGHLIGHT: [u8; 3] = [199, 158, 106];
+
+    const COBBLE_MORTAR: [u8; 3] = [88, 88, 94];
+    const COBBLE_DARK: [u8; 3] = [111, 112, 118];
+    const COBBLE: [u8; 3] = [142, 143, 148];
+    const COBBLE_LIGHT: [u8; 3] = [166, 167, 172];
+    const COBBLE_HIGHLIGHT: [u8; 3] = [181, 182, 186];
+
+    const TABLE_FRAME: [u8; 3] = [93, 62, 34];
+    const TABLE_DIVIDER: [u8; 3] = [82, 54, 29];
+    const TABLE_CELL: [u8; 3] = [146, 101, 56];
+    const TABLE_STUD: [u8; 3] = [209, 172, 120];
+    const TOOL_METAL: [u8; 3] = [126, 131, 140];
+    const TOOL_METAL_DARK: [u8; 3] = [93, 98, 107];
+
     /// Generates one classic layer.
     pub(super) fn layer(index: u32, name: &str, size: u32) -> Canvas {
         let seed = super::layer_seed(TexturePackStyle::Classic, index);
@@ -803,6 +956,10 @@ mod classic {
             "gravel" => gravel(size, seed),
             "clay" => clay(size, seed),
             "snow" => snow(size, seed),
+            "planks" => planks(size, seed),
+            "cobblestone" => cobblestone(size, seed),
+            "crafting_table_top" => crafting_table_top(size, seed),
+            "crafting_table_side" => crafting_table_side(size, seed),
             _ => debug(size),
         }
     }
@@ -1196,6 +1353,130 @@ mod classic {
         })
     }
 
+    fn planks(size: u32, seed: u32) -> Canvas {
+        let boards = 4u32;
+        let board_height = (size / boards).max(1);
+        let mut canvas = Canvas::from_fn(size, |x, y| {
+            let board = y / board_height;
+            let row = y % board_height;
+            let tone = (hash_noise(seed ^ 0x11, board, 0) % 5) as i32 - 2;
+            let grain = if hash_noise(seed ^ 0x33, x / 3, y).is_multiple_of(9) {
+                -13
+            } else if hash_noise(seed ^ 0x35, x / 4, y).is_multiple_of(11) {
+                9
+            } else {
+                (hash_noise(seed ^ 0x37, x, y) % 3) as i32 - 1
+            };
+            if row == 0 {
+                offset(PLANK_SHADOW, tone)
+            } else if row + 1 == board_height {
+                offset(PLANK_LIGHT, tone + grain / 2)
+            } else {
+                offset(PLANK, tone + grain)
+            }
+        });
+        // One offset butt joint per board, lit along its right edge.
+        for board in 0..boards {
+            let joint = 2 + (hash_noise(seed ^ 0x44, board, 1) % (size - 4).max(1)) as i32;
+            for y in board * board_height + 1..(board + 1) * board_height {
+                canvas.set(joint, y as i32, PLANK_GRAIN);
+                canvas.set(joint + 1, y as i32, PLANK_HIGHLIGHT);
+            }
+        }
+        canvas
+    }
+
+    fn cobblestone(size: u32, seed: u32) -> Canvas {
+        Canvas::from_fn(size, |x, y| {
+            let sample = cellular(seed, x, y, size, 4);
+            let edge = sample.second - sample.nearest;
+            let centre = isqrt(sample.nearest) as i32;
+            let grain = (hash_noise(seed ^ 0x31, x, y) % 5) as i32 - 2;
+            if edge < 2 {
+                offset(COBBLE_MORTAR, grain)
+            } else {
+                let base = if centre == 0 {
+                    COBBLE_HIGHLIGHT
+                } else if centre == 1 {
+                    COBBLE_LIGHT
+                } else if centre <= 3 {
+                    COBBLE
+                } else {
+                    COBBLE_DARK
+                };
+                offset(base, grain)
+            }
+        })
+    }
+
+    fn crafting_table_top(size: u32, seed: u32) -> Canvas {
+        let mut canvas = Canvas::from_fn(size, |x, y| {
+            let board = y / (size / 4).max(1);
+            let tone = (hash_noise(seed ^ 0x61, board, 0) % 5) as i32 - 2;
+            let grain = if hash_noise(seed ^ 0x63, x / 3, y).is_multiple_of(8) {
+                -11
+            } else {
+                (hash_noise(seed ^ 0x65, x, y) % 3) as i32 - 1
+            };
+            offset(PLANK_LIGHT, tone + grain)
+        });
+        paint_crafting_grid(
+            &mut canvas,
+            TABLE_FRAME,
+            TABLE_DIVIDER,
+            TABLE_CELL,
+            PLANK_HIGHLIGHT,
+            TABLE_STUD,
+            1,
+            1,
+        );
+        canvas
+    }
+
+    fn crafting_table_side(size: u32, seed: u32) -> Canvas {
+        let lip = (size / 5).max(3);
+        let board_width = (size / 4).max(1);
+        let mut canvas = Canvas::from_fn(size, |x, y| {
+            if y < lip {
+                let tone = (hash_noise(seed ^ 0x71, y, 0) % 3) as i32 - 1;
+                if y == 0 {
+                    PLANK_HIGHLIGHT
+                } else if y + 1 == lip {
+                    PLANK_SHADOW
+                } else {
+                    offset(PLANK_LIGHT, tone)
+                }
+            } else {
+                let board = x / board_width;
+                let tone = (hash_noise(seed ^ 0x73, board, 0) % 5) as i32 - 2;
+                let grain = if hash_noise(seed ^ 0x75, x, y / 3).is_multiple_of(11) {
+                    -10
+                } else {
+                    0
+                };
+                if x % board_width == 0 {
+                    offset(PLANK_SHADOW, tone)
+                } else {
+                    offset(PLANK, tone + grain)
+                }
+            }
+        });
+        paint_table_tool(
+            &mut canvas,
+            (size as i32 * 3) / 5,
+            (size as i32 * 7) / 10,
+            TOOL_METAL,
+            TOOL_METAL_DARK,
+            PLANK_GRAIN,
+            PLANK_HIGHLIGHT,
+            (size / 16).max(1) as i32,
+        );
+        // Two studs under the table lip hold the frame together.
+        canvas.set(2, lip as i32 + 1, TOOL_METAL);
+        canvas.set(size as i32 - 3, lip as i32 + 1, TOOL_METAL);
+        canvas
+    }
+
     fn debug(size: u32) -> Canvas {
         Canvas::from_fn(size, |x, y| {
             if (x / 4 + y / 4).is_multiple_of(2) {
@@ -1278,6 +1559,26 @@ mod painterly {
     const SNOW: [u8; 3] = [246, 247, 249];
     const SNOW_PINK: [u8; 3] = [248, 238, 241];
 
+    // v0.0.8 wood, cobblestone and crafting-table palettes.
+    const PLANK_SHADOW: [u8; 3] = [108, 78, 50];
+    const PLANK: [u8; 3] = [152, 114, 76];
+    const PLANK_LIGHT: [u8; 3] = [183, 146, 104];
+    const PLANK_GRAIN: [u8; 3] = [126, 90, 55];
+    const PLANK_HIGHLIGHT: [u8; 3] = [203, 168, 122];
+
+    const COBBLE_MORTAR: [u8; 3] = [81, 77, 69];
+    const COBBLE_DARK: [u8; 3] = [116, 112, 102];
+    const COBBLE: [u8; 3] = [147, 142, 131];
+    const COBBLE_LIGHT: [u8; 3] = [175, 169, 154];
+    const COBBLE_HIGHLIGHT: [u8; 3] = [196, 190, 173];
+
+    const TABLE_FRAME: [u8; 3] = [99, 71, 45];
+    const TABLE_DIVIDER: [u8; 3] = [88, 61, 37];
+    const TABLE_CELL: [u8; 3] = [141, 104, 67];
+    const TABLE_STUD: [u8; 3] = [201, 166, 116];
+    const TOOL_METAL: [u8; 3] = [124, 128, 132];
+    const TOOL_METAL_DARK: [u8; 3] = [94, 98, 103];
+
     /// Generates one painterly layer.
     pub(super) fn layer(index: u32, name: &str, size: u32) -> Canvas {
         let seed = super::layer_seed(TexturePackStyle::Painterly, index);
@@ -1295,6 +1596,10 @@ mod painterly {
             "gravel" => gravel(size, seed),
             "clay" => clay(size, seed),
             "snow" => snow(size, seed),
+            "planks" => planks(size, seed),
+            "cobblestone" => cobblestone(size, seed),
+            "crafting_table_top" => crafting_table_top(size, seed),
+            "crafting_table_side" => crafting_table_side(size, seed),
             _ => debug(size),
         }
     }
@@ -1620,6 +1925,136 @@ mod painterly {
         })
     }
 
+    fn planks(size: u32, seed: u32) -> Canvas {
+        let board_height = (size / 4).max(1);
+        let mut canvas = Canvas::from_fn(size, |x, y| {
+            let board = y / board_height;
+            let row = y % board_height;
+            let broad = u32::from(fbm(seed ^ 0x21, x, y, size, 4, 2));
+            let fine = u32::from(periodic_noise(seed ^ 0x33, x, y, size, 16));
+            let value = (broad * 3 + fine) / 4;
+            let base = ramp3(PLANK_SHADOW, PLANK, PLANK_LIGHT, value);
+            let grain = (periodic_noise(seed ^ 0x44, x / 2, y, size, 4) as i32 - 128) / 64;
+            let tone = (hash_noise(seed ^ 0x11, board, 0) % 5) as i32 - 2;
+            if row == 0 {
+                offset(PLANK_SHADOW, tone)
+            } else if row + 1 == board_height {
+                offset(PLANK_LIGHT, tone + grain)
+            } else {
+                offset(base, tone + grain + dither(x, y, 2))
+            }
+        });
+        // Soft knots and a dark butt joint with a lit edge on every board.
+        for board in 0..4u32 {
+            let joint = 3 + (hash_noise(seed ^ 0x55, board, 1) % (size - 6).max(1)) as i32;
+            for y in board * board_height..(board + 1) * board_height {
+                canvas.blend(joint, y as i32, PLANK_SHADOW, 190);
+            }
+        }
+        paint_ellipse(
+            &mut canvas,
+            (size * 3 / 4) as i32,
+            (size / 4) as i32 + 1,
+            2,
+            1,
+            PLANK_GRAIN,
+            1,
+        );
+        paint_ellipse(
+            &mut canvas,
+            (size / 5) as i32,
+            (size * 3 / 4) as i32,
+            2,
+            1,
+            PLANK_GRAIN,
+            1,
+        );
+        canvas
+    }
+
+    fn cobblestone(size: u32, seed: u32) -> Canvas {
+        Canvas::from_fn(size, |x, y| {
+            let sample = cellular(seed, x, y, size, 4);
+            let edge = sample.second - sample.nearest;
+            let centre = isqrt(sample.nearest) as i32;
+            let grain = (hash_noise(seed ^ 0x31, x, y) % 5) as i32 - 2 + dither(x, y, 2);
+            if edge < 8 {
+                offset(COBBLE_MORTAR, grain)
+            } else {
+                let base = if centre == 0 {
+                    COBBLE_HIGHLIGHT
+                } else if centre <= 1 {
+                    COBBLE_LIGHT
+                } else if centre <= 4 {
+                    COBBLE
+                } else {
+                    COBBLE_DARK
+                };
+                offset(base, grain)
+            }
+        })
+    }
+
+    fn crafting_table_top(size: u32, seed: u32) -> Canvas {
+        let mut canvas = planks(size, seed ^ 0x1a2b);
+        paint_crafting_grid(
+            &mut canvas,
+            TABLE_FRAME,
+            TABLE_DIVIDER,
+            TABLE_CELL,
+            PLANK_HIGHLIGHT,
+            TABLE_STUD,
+            2,
+            2,
+        );
+        canvas
+    }
+
+    fn crafting_table_side(size: u32, seed: u32) -> Canvas {
+        let lip = (size / 5).max(4);
+        let board_width = (size / 4).max(1);
+        let mut canvas = Canvas::from_fn(size, |x, y| {
+            if y < lip {
+                let value = u32::from(fbm(seed ^ 0x71, x, y, size, 4, 2));
+                let base = lerp_color(PLANK_LIGHT, PLANK, value);
+                if y == 0 {
+                    offset(PLANK_HIGHLIGHT, -2)
+                } else if y + 1 == lip {
+                    PLANK_SHADOW
+                } else {
+                    offset(base, dither(x, y, 1))
+                }
+            } else {
+                let board = x / board_width;
+                let tone = (hash_noise(seed ^ 0x73, board, 0) % 3) as i32 - 1;
+                let broad = u32::from(fbm(seed ^ 0x73, x, y, size, 4, 2));
+                let base = ramp3(PLANK_SHADOW, PLANK, PLANK_LIGHT, broad);
+                if x % board_width == 0 {
+                    offset(PLANK_SHADOW, 2)
+                } else {
+                    offset(base, tone + dither(x, y, 2))
+                }
+            }
+        });
+        paint_table_tool(
+            &mut canvas,
+            (size as i32 * 3) / 5,
+            (size as i32 * 7) / 10,
+            TOOL_METAL,
+            TOOL_METAL_DARK,
+            PLANK_GRAIN,
+            PLANK_HIGHLIGHT,
+            (size / 16).max(1) as i32,
+        );
+        // A shelf shadow under the lip and two warm studs.
+        for x in 0..size {
+            canvas.blend(x as i32, (lip + size / 5) as i32, PLANK_SHADOW, 70);
+        }
+        canvas.set(4, lip as i32 + 2, TABLE_STUD);
+        canvas.set(size as i32 - 5, lip as i32 + 2, TABLE_STUD);
+        canvas
+    }
+
     fn debug(size: u32) -> Canvas {
         Canvas::from_fn(size, |x, y| {
             let cell = (x / 8 + y / 8).is_multiple_of(2);
@@ -1703,6 +2138,26 @@ mod lush {
     const SNOW_SHADOW: [u8; 3] = [236, 244, 252];
     const SNOW: [u8; 3] = [244, 248, 252];
 
+    // v0.0.8 wood, cobblestone and crafting-table palettes.
+    const PLANK_SHADOW: [u8; 3] = [94, 58, 27];
+    const PLANK: [u8; 3] = [153, 101, 49];
+    const PLANK_LIGHT: [u8; 3] = [194, 139, 76];
+    const PLANK_GRAIN: [u8; 3] = [117, 72, 31];
+    const PLANK_HIGHLIGHT: [u8; 3] = [219, 170, 103];
+
+    const COBBLE_MORTAR: [u8; 3] = [59, 63, 58];
+    const COBBLE_DARK: [u8; 3] = [93, 103, 92];
+    const COBBLE: [u8; 3] = [127, 139, 126];
+    const COBBLE_LIGHT: [u8; 3] = [161, 173, 156];
+    const COBBLE_HIGHLIGHT: [u8; 3] = [187, 199, 181];
+
+    const TABLE_FRAME: [u8; 3] = [80, 49, 22];
+    const TABLE_DIVIDER: [u8; 3] = [70, 42, 19];
+    const TABLE_CELL: [u8; 3] = [129, 82, 38];
+    const TABLE_STUD: [u8; 3] = [222, 176, 105];
+    const TOOL_METAL: [u8; 3] = [126, 132, 136];
+    const TOOL_METAL_DARK: [u8; 3] = [91, 97, 102];
+
     /// Generates one lush layer.
     pub(super) fn layer(index: u32, name: &str, size: u32) -> Canvas {
         let seed = super::layer_seed(TexturePackStyle::Lush, index);
@@ -1720,6 +2175,10 @@ mod lush {
             "gravel" => gravel(size, seed),
             "clay" => clay(size, seed),
             "snow" => snow(size, seed),
+            "planks" => planks(size, seed),
+            "cobblestone" => cobblestone(size, seed),
+            "crafting_table_top" => crafting_table_top(size, seed),
+            "crafting_table_side" => crafting_table_side(size, seed),
             _ => debug(size),
         }
     }
@@ -2150,6 +2609,164 @@ mod lush {
         })
     }
 
+    fn planks(size: u32, seed: u32) -> Canvas {
+        let board_height = (size / 4).max(1);
+        let mut canvas = Canvas::from_fn(size, |x, y| {
+            let board = y / board_height;
+            let row = y % board_height;
+            let broad = u32::from(fbm(seed ^ 0x21, x, y, size, 2, 3));
+            let fine = u32::from(periodic_noise(seed ^ 0x33, x, y, size, 16));
+            let value = (broad * 4 + fine * 2) / 6;
+            let base = if value < 56 {
+                PLANK_SHADOW
+            } else if value < 128 {
+                PLANK
+            } else if value < 210 {
+                PLANK_LIGHT
+            } else {
+                PLANK_HIGHLIGHT
+            };
+            let grain = (periodic_noise(seed ^ 0x44, x / 2, y, size, 4) as i32 - 128) / 48;
+            let tone = (hash_noise(seed ^ 0x11, board, 0) % 5) as i32 - 2;
+            if row == 0 {
+                offset(PLANK_SHADOW, tone)
+            } else if row + 1 == board_height {
+                offset(PLANK_HIGHLIGHT, tone)
+            } else {
+                offset(base, tone + grain)
+            }
+        });
+        // Deep knots and short butt joints with a lit edge.
+        for board in 0..4u32 {
+            let joint = 3 + (hash_noise(seed ^ 0x55, board, 1) % (size - 6).max(1)) as i32;
+            for y in board * board_height..(board + 1) * board_height {
+                canvas.set(joint, y as i32, PLANK_SHADOW);
+                canvas.blend(joint + 1, y as i32, PLANK_HIGHLIGHT, 90);
+            }
+        }
+        paint_ellipse(
+            &mut canvas,
+            (size * 3 / 4) as i32,
+            (size / 5) as i32,
+            2,
+            1,
+            PLANK_GRAIN,
+            1,
+        );
+        paint_ellipse(
+            &mut canvas,
+            (size / 5) as i32,
+            (size * 4 / 5) as i32,
+            2,
+            1,
+            PLANK_GRAIN,
+            1,
+        );
+        canvas
+    }
+
+    fn cobblestone(size: u32, seed: u32) -> Canvas {
+        let mut canvas = Canvas::from_fn(size, |x, y| {
+            let sample = cellular(seed, x, y, size, 4);
+            let edge = sample.second - sample.nearest;
+            let centre = isqrt(sample.nearest) as i32;
+            let grain = (hash_noise(seed ^ 0x31, x, y) % 5) as i32 - 2;
+            let stone = if centre == 0 {
+                COBBLE_HIGHLIGHT
+            } else if centre <= 1 {
+                COBBLE_LIGHT
+            } else if centre <= 4 {
+                COBBLE
+            } else {
+                COBBLE_DARK
+            };
+            if edge < 8 {
+                offset(COBBLE_MORTAR, grain)
+            } else {
+                offset(stone, grain)
+            }
+        });
+        // Moss settles into the mortar band and along the stone rims.
+        for y in 0..size {
+            for x in 0..size {
+                let sample = cellular(seed, x, y, size, 4);
+                let edge = sample.second - sample.nearest;
+                let moss = u32::from(fbm(seed ^ 0x5a, x, y, size, 4, 2));
+                if edge < 10 && moss > 150 {
+                    canvas.blend(x as i32, y as i32, MOSS, 130);
+                } else if edge < 16 && moss > 208 {
+                    canvas.blend(x as i32, y as i32, MOSS_LIGHT, 70);
+                }
+            }
+        }
+        canvas
+    }
+
+    fn crafting_table_top(size: u32, seed: u32) -> Canvas {
+        let mut canvas = planks(size, seed ^ 0x1a2b);
+        paint_crafting_grid(
+            &mut canvas,
+            TABLE_FRAME,
+            TABLE_DIVIDER,
+            TABLE_CELL,
+            PLANK_HIGHLIGHT,
+            TABLE_STUD,
+            2,
+            2,
+        );
+        canvas
+    }
+
+    fn crafting_table_side(size: u32, seed: u32) -> Canvas {
+        let lip = (size / 5).max(4);
+        let board_width = (size / 4).max(1);
+        let mut canvas = Canvas::from_fn(size, |x, y| {
+            if y < lip {
+                let value = u32::from(fbm(seed ^ 0x71, x, y, size, 4, 3));
+                let base = lerp_color(PLANK_LIGHT, PLANK, value);
+                if y == 0 {
+                    PLANK_HIGHLIGHT
+                } else if y + 1 == lip {
+                    PLANK_SHADOW
+                } else {
+                    offset(base, dither(x, y, 1))
+                }
+            } else {
+                let board = x / board_width;
+                let tone = (hash_noise(seed ^ 0x73, board, 0) % 3) as i32 - 1;
+                let broad = u32::from(fbm(seed ^ 0x73, x, y, size, 2, 3));
+                let grain = (periodic_noise(seed ^ 0x77, x, y / 2, size, 8) as i32 - 128) / 40;
+                let base = ramp3(PLANK_SHADOW, PLANK, PLANK_LIGHT, broad);
+                if x % board_width == 0 {
+                    PLANK_SHADOW
+                } else {
+                    offset(base, tone + grain)
+                }
+            }
+        });
+        paint_table_tool(
+            &mut canvas,
+            (size as i32 * 3) / 5,
+            (size as i32 * 7) / 10,
+            TOOL_METAL,
+            TOOL_METAL_DARK,
+            PLANK_GRAIN,
+            PLANK_HIGHLIGHT,
+            (size / 16).max(1) as i32,
+        );
+        // Shelf shadow, two studs and a short hanging saw blade.
+        for x in 0..size {
+            canvas.blend(x as i32, (lip + size / 6) as i32, PLANK_SHADOW, 90);
+        }
+        for dx in 0..5 {
+            canvas.set((size as i32 / 5) + dx, lip as i32 + 3, TOOL_METAL);
+            canvas.set((size as i32 / 5) + dx, lip as i32 + 4, TOOL_METAL_DARK);
+        }
+        canvas.set(4, lip as i32 + 2, TABLE_STUD);
+        canvas.set(size as i32 - 5, lip as i32 + 2, TABLE_STUD);
+        canvas
+    }
+
     fn debug(size: u32) -> Canvas {
         Canvas::from_fn(size, |x, y| {
             let cell = (x / 4 + y / 4).is_multiple_of(2);
@@ -2219,6 +2836,15 @@ mod minimal {
     const SNOW_SHADOW: [u8; 3] = [240, 246, 252];
     const SNOW: [u8; 3] = [250, 251, 253];
 
+    // v0.0.8 wood, cobblestone and crafting-table accents.
+    const COBBLE_SEAM: [u8; 3] = [151, 153, 160];
+    const COBBLE: [u8; 3] = [184, 186, 193];
+    const COBBLE_LIGHT: [u8; 3] = [199, 201, 207];
+    const TABLE_FRAME: [u8; 3] = [169, 127, 76];
+    const TABLE_DIVIDER: [u8; 3] = [147, 107, 65];
+    const TABLE_CELL: [u8; 3] = [180, 139, 85];
+    const TOOL_METAL: [u8; 3] = [158, 160, 168];
+
     /// Generates one minimal layer.
     pub(super) fn layer(index: u32, name: &str, size: u32) -> Canvas {
         let seed = super::layer_seed(TexturePackStyle::Minimal, index);
@@ -2236,6 +2862,10 @@ mod minimal {
             "gravel" => gravel(size, seed),
             "clay" => clay(size),
             "snow" => snow(size, seed),
+            "planks" => planks(size, seed),
+            "cobblestone" => cobblestone(size, seed),
+            "crafting_table_top" => crafting_table_top(size, seed),
+            "crafting_table_side" => crafting_table_side(size, seed),
             _ => debug(size),
         }
     }
@@ -2521,6 +3151,94 @@ mod minimal {
         })
     }
 
+    fn planks(size: u32, seed: u32) -> Canvas {
+        let board_height = (size / 4).max(1);
+        let mut canvas = Canvas::from_fn(size, |_x, y| {
+            let board = y / board_height;
+            let row = y % board_height;
+            let tone = if hash_noise(seed ^ 0x11, board, 0) & 1 == 0 {
+                WOOD
+            } else {
+                WOOD_LIGHT
+            };
+            if row == 0 {
+                WOOD_DARK
+            } else if row == 1 {
+                offset(WOOD_LIGHT, 8)
+            } else {
+                tone
+            }
+        });
+        // One short butt joint per board and a whisper of grain.
+        for board in 0..4u32 {
+            let joint = 2 + (hash_noise(seed ^ 0x55, board, 1) % (size - 4).max(1)) as i32;
+            canvas.set(joint, (board * board_height + 1) as i32, WOOD_KNOT);
+            canvas.set(joint, (board * board_height + 2) as i32, WOOD_KNOT);
+        }
+        speckle(&mut canvas, seed ^ 0x9b, 1, 23);
+        canvas
+    }
+
+    fn cobblestone(size: u32, seed: u32) -> Canvas {
+        let mut canvas = paint_cobblestone(
+            size,
+            seed,
+            COBBLE_SEAM,
+            &[COBBLE, COBBLE_LIGHT, COBBLE],
+            80,
+            2,
+            3,
+            0,
+            -10,
+            0,
+        );
+        speckle(&mut canvas, seed ^ 0x9b, 1, 29);
+        canvas
+    }
+
+    fn crafting_table_top(size: u32, _seed: u32) -> Canvas {
+        let mut canvas = Canvas::new(size, WOOD);
+        paint_crafting_grid(
+            &mut canvas,
+            TABLE_FRAME,
+            TABLE_DIVIDER,
+            TABLE_CELL,
+            WOOD_LIGHT,
+            WOOD_LIGHT,
+            1,
+            1,
+        );
+        canvas
+    }
+
+    fn crafting_table_side(size: u32, _seed: u32) -> Canvas {
+        let lip = (size / 5).max(3);
+        let mut canvas = Canvas::new(size, WOOD);
+        for y in 0..lip {
+            for x in 0..size {
+                canvas.set(x as i32, y as i32, if y == 0 { WOOD_LIGHT } else { WOOD_DARK });
+            }
+        }
+        for x in [size / 4, size / 2, size * 3 / 4] {
+            for y in lip..size {
+                canvas.set(x as i32, y as i32, WOOD_DARK);
+            }
+        }
+        paint_table_tool(
+            &mut canvas,
+            (size as i32 * 3) / 5,
+            (size as i32 * 7) / 10,
+            TOOL_METAL,
+            STONE_SEAM,
+            WOOD_KNOT,
+            WOOD_LIGHT,
+            (size / 16).max(1) as i32,
+        );
+        canvas.set(2, lip as i32 + 1, WOOD_LIGHT);
+        canvas.set(size as i32 - 3, lip as i32 + 1, WOOD_LIGHT);
+        canvas
+    }
+
     fn debug(size: u32) -> Canvas {
         Canvas::from_fn(size, |x, y| {
             if (x / 4 + y / 4).is_multiple_of(2) {
@@ -2565,6 +3283,26 @@ mod tests {
         }
         let count = (bytes.len() / 4) as f64;
         [sums[0] as f64 / count, sums[1] as f64 / count, sums[2] as f64 / count]
+    }
+
+    /// Luma of an sRGB colour.
+    fn luma(colour: [f64; 3]) -> f64 {
+        0.2126 * colour[0] + 0.7152 * colour[1] + 0.0722 * colour[2]
+    }
+
+    /// Mean luma of one row (`vertical == false`) or column at mip 0.
+    fn line_luma(pack: &TexturePack, layer: usize, line: usize, vertical: bool) -> f64 {
+        let bytes = pack.layer(0, layer).expect("layer exists");
+        let edge = pack.resolution() as usize;
+        let mut sum = 0.0;
+        for i in 0..edge {
+            let (x, y) = if vertical { (line, i) } else { (i, line) };
+            let offset = (y * edge + x) * 4;
+            sum += 0.2126 * f64::from(bytes[offset])
+                + 0.7152 * f64::from(bytes[offset + 1])
+                + 0.0722 * f64::from(bytes[offset + 2]);
+        }
+        sum / edge as f64
     }
 
     #[test]
@@ -2722,6 +3460,126 @@ mod tests {
                 assert!(
                     distance > 10.0,
                     "stone means for {first_style:?} {first:?} and {second_style:?} {second:?} are too close ({distance:.2})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn new_block_layers_read_as_planks_cobblestone_and_crafting_tables() {
+        for style in TexturePackStyle::ALL {
+            let pack = generate_texture_pack(style);
+            let edge = pack.resolution() as usize;
+
+            // Planks: warm brown, four horizontal boards separated by dark seams.
+            // Planks: warm brown, four horizontal boards separated by dark seams.
+            let planks = catalogue::PLANKS.0 as usize;
+            let planks_mean = mean_color(&pack, planks);
+            assert!(
+                planks_mean[0] > planks_mean[1] && planks_mean[1] > planks_mean[2],
+                "{style:?} planks are not warm brown: {planks_mean:?}"
+            );
+            assert!(
+                planks_mean[0] - planks_mean[2] > 30.0,
+                "{style:?} planks are not warm enough: {planks_mean:?}"
+            );
+            let planks_luma = luma(planks_mean);
+            let rows: Vec<f64> = (0..edge).map(|y| line_luma(&pack, planks, y, false)).collect();
+            let seams = (1..edge - 1)
+                .filter(|&y| {
+                    rows[y] + 12.0 < rows[y - 1] && rows[y] + 12.0 < rows[y + 1] && rows[y] < planks_luma - 8.0
+                })
+                .count();
+            assert!(seams >= 2, "{style:?} planks have only {seams} dark horizontal seams");
+
+            // Cobblestone: grey stone with dark mortar and a rounded light/dark read.
+            let cobble = catalogue::COBBLESTONE.0 as usize;
+            let cobble_mean = mean_color(&pack, cobble);
+            assert!(
+                (cobble_mean[0] - cobble_mean[1]).abs() < 25.0 && (cobble_mean[1] - cobble_mean[2]).abs() < 30.0,
+                "{style:?} cobblestone is not grey: {cobble_mean:?}"
+            );
+            let cobble_bytes = pack.layer(0, cobble).expect("cobblestone layer");
+            let lumas: Vec<f64> = cobble_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|texel| 0.2126 * f64::from(texel[0]) + 0.7152 * f64::from(texel[1]) + 0.0722 * f64::from(texel[2]))
+                .collect();
+            let min_luma = lumas.iter().copied().fold(f64::INFINITY, f64::min);
+            let max_luma = lumas.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            assert!(
+                max_luma - min_luma > 40.0,
+                "{style:?} cobblestone has too little contrast ({min_luma:.1}..{max_luma:.1})"
+            );
+            // The mortar is the darkest part of the luminance range.
+            let threshold = min_luma + (max_luma - min_luma) * 0.22;
+            let dark = lumas.iter().filter(|luma| **luma < threshold).count();
+            let dark_fraction = dark as f64 / (edge * edge) as f64;
+            assert!(
+                (0.05..=0.65).contains(&dark_fraction),
+                "{style:?} cobblestone mortar covers {:.1}% of the tile",
+                dark_fraction * 100.0
+            );
+
+            // Crafting table top: darker grid lines cross the wooden surface.
+            let table_top = catalogue::CRAFTING_TABLE_TOP.0 as usize;
+            let top_luma = luma(mean_color(&pack, table_top));
+            let dark_rows = (0..edge)
+                .filter(|&y| line_luma(&pack, table_top, y, false) < top_luma - 12.0)
+                .count();
+            let dark_columns = (0..edge)
+                .filter(|&x| line_luma(&pack, table_top, x, true) < top_luma - 12.0)
+                .count();
+            assert!(
+                dark_rows >= 2 && dark_columns >= 2,
+                "{style:?} crafting table top has {dark_rows} dark rows and {dark_columns} dark columns"
+            );
+            assert_ne!(
+                pack.layer(0, table_top),
+                pack.layer(0, planks),
+                "{style:?} crafting table top must not be a plain plank field"
+            );
+
+            // Crafting table side: a lit table lip and a metal tool detail.
+            let table_side = catalogue::CRAFTING_TABLE_SIDE.0 as usize;
+            let lip = line_luma(&pack, table_side, 0, false);
+            let lower = line_luma(&pack, table_side, edge - 2, false);
+            assert!(
+                lip > lower + 5.0,
+                "{style:?} crafting table side lip is not lit ({lip:.1} vs {lower:.1})"
+            );
+            let side_bytes = pack.layer(0, table_side).expect("crafting table side");
+            let tool_pixels = side_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|texel| i32::from(texel[2]) > i32::from(texel[0]) + 4)
+                .count();
+            assert!(
+                tool_pixels >= 2,
+                "{style:?} crafting table side has no cool metal tool pixels"
+            );
+        }
+    }
+
+    #[test]
+    fn new_block_layers_do_not_use_the_debug_fallback() {
+        let new_layers = [
+            catalogue::PLANKS.0 as usize,
+            catalogue::COBBLESTONE.0 as usize,
+            catalogue::CRAFTING_TABLE_TOP.0 as usize,
+            catalogue::CRAFTING_TABLE_SIDE.0 as usize,
+        ];
+        for style in TexturePackStyle::ALL {
+            let pack = generate_texture_pack(style);
+            let debug = pack.layer(0, catalogue::DEBUG.0 as usize).expect("debug layer");
+            for layer in new_layers {
+                assert_ne!(
+                    pack.layer(0, layer).expect("new layer"),
+                    debug,
+                    "{style:?} layer {} fell back to the debug checkerboard",
+                    catalogue::NAMES[layer]
                 );
             }
         }
@@ -2918,17 +3776,23 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         };
         eprintln!("texture pack preview GPU: {summary}");
 
-        const SIZE: u32 = 544;
-        const GRID: u32 = 4;
-        const CELL: u32 = SIZE / GRID;
+        // Five columns by four rows: all eighteen layers fit on one sheet.
+        const WIDTH: u32 = 540;
+        const HEIGHT: u32 = 432;
+        const COLUMNS: u32 = 5;
+        const ROWS: u32 = 4;
+        const CELL: u32 = WIDTH / COLUMNS;
         const GAP: u32 = 8;
         const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+        debug_assert_eq!(CELL * ROWS, HEIGHT);
+        debug_assert!(COLUMNS * ROWS >= LAYER_COUNT as u32);
 
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("texture-pack-preview-target"),
             size: wgpu::Extent3d {
-                width: SIZE,
-                height: SIZE,
+                width: WIDTH,
+                height: HEIGHT,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -2940,25 +3804,24 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         });
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut vertices = Vec::with_capacity((GRID * GRID * 6) as usize);
-        for row in 0..GRID {
-            for column in 0..GRID {
-                let x0 = (column * CELL + GAP / 2) as f32 / SIZE as f32 * 2.0 - 1.0;
-                let x1 = (column * CELL + CELL - GAP / 2) as f32 / SIZE as f32 * 2.0 - 1.0;
-                let y0 = 1.0 - (row * CELL + GAP / 2) as f32 / SIZE as f32 * 2.0;
-                let y1 = 1.0 - (row * CELL + CELL - GAP / 2) as f32 / SIZE as f32 * 2.0;
-                let layer = (row * GRID + column) % LAYER_COUNT as u32;
-                let corners = [
-                    ([x0, y0], [0.0, 0.0]),
-                    ([x1, y0], [1.0, 0.0]),
-                    ([x1, y1], [1.0, 1.0]),
-                    ([x0, y0], [0.0, 0.0]),
-                    ([x1, y1], [1.0, 1.0]),
-                    ([x0, y1], [0.0, 1.0]),
-                ];
-                for (position, uv) in corners {
-                    vertices.push(GridVertex { position, uv, layer });
-                }
+        let mut vertices = Vec::with_capacity(LAYER_COUNT * 6);
+        for layer in 0..LAYER_COUNT as u32 {
+            let row = layer / COLUMNS;
+            let column = layer % COLUMNS;
+            let x0 = (column * CELL + GAP / 2) as f32 / WIDTH as f32 * 2.0 - 1.0;
+            let x1 = (column * CELL + CELL - GAP / 2) as f32 / WIDTH as f32 * 2.0 - 1.0;
+            let y0 = 1.0 - (row * CELL + GAP / 2) as f32 / HEIGHT as f32 * 2.0;
+            let y1 = 1.0 - (row * CELL + CELL - GAP / 2) as f32 / HEIGHT as f32 * 2.0;
+            let corners = [
+                ([x0, y0], [0.0, 0.0]),
+                ([x1, y0], [1.0, 0.0]),
+                ([x1, y1], [1.0, 1.0]),
+                ([x0, y0], [0.0, 0.0]),
+                ([x1, y1], [1.0, 1.0]),
+                ([x0, y1], [0.0, 1.0]),
+            ];
+            for (position, uv) in corners {
+                vertices.push(GridVertex { position, uv, layer });
             }
         }
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -3100,7 +3963,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             }
             queue.submit([encoder.finish()]);
 
-            let pixels = read_texture(&device, &queue, &target, SIZE, SIZE);
+            let pixels = read_texture(&device, &queue, &target, WIDTH, HEIGHT);
             let unique: HashSet<[u8; 4]> = pixels
                 .as_chunks::<4>()
                 .0
@@ -3112,13 +3975,15 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
                 "{style:?} preview is nearly uniform ({} colours)",
                 unique.len()
             );
-            for cell in 0..GRID * GRID {
+            for cell in 0..LAYER_COUNT as u32 {
+                let row = cell / COLUMNS;
+                let column = cell % COLUMNS;
                 let cell_colors: HashSet<[u8; 4]> = (0..CELL)
                     .flat_map(|local_y| (0..CELL).map(move |local_x| (local_x, local_y)))
                     .map(|(local_x, local_y)| {
-                        let x = (cell % GRID) * CELL + local_x;
-                        let y = (cell / GRID) * CELL + local_y;
-                        let offset = ((y * SIZE + x) * 4) as usize;
+                        let x = column * CELL + local_x;
+                        let y = row * CELL + local_y;
+                        let offset = ((y * WIDTH + x) * 4) as usize;
                         [
                             pixels[offset],
                             pixels[offset + 1],
@@ -3127,13 +3992,17 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
                         ]
                     })
                     .collect();
-                assert!(cell_colors.len() > 1, "{style:?} grid cell {cell} is a flat colour");
+                assert!(
+                    cell_colors.len() > 1,
+                    "{style:?} grid cell {cell} ({}) is a flat colour",
+                    catalogue::NAMES[cell as usize]
+                );
             }
 
             let path = format!("/tmp/ob-texture-{}.png", style.name());
-            write_png(Path::new(&path), SIZE, SIZE, &pixels);
+            write_png(Path::new(&path), WIDTH, HEIGHT, &pixels);
             let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-            eprintln!("wrote {path} ({SIZE}x{SIZE}, {bytes} bytes)");
+            eprintln!("wrote {path} ({WIDTH}x{HEIGHT}, {bytes} bytes)");
             previews.push((style, pixels));
         }
 
@@ -3151,7 +4020,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
                     .filter(|(left, right)| left != right)
                     .count();
                 assert!(
-                    differing > (SIZE * SIZE / 10) as usize,
+                    differing > (WIDTH * HEIGHT / 10) as usize,
                     "{first_style:?} and {second_style:?} previews look identical ({differing} pixels differ)"
                 );
             }
