@@ -28,6 +28,11 @@ panic = "abort"
 debug = "line-tables-only"
 strip = "split"
 
+# The dedicated server unwinds so job/WASM traps can be contained (DEC-042).
+[profile.server]
+inherits = "release"
+panic = "unwind"
+
 [profile.dist]
 inherits = "release"
 lto = "fat"

@@ -139,9 +139,10 @@ nameable by players and tools. See [research/06](research/06-modding-and-content
 ### DEC-007 — Deterministic simulation with a fixed tick
 **Status:** settled · **Reversal cost:** extreme · **Owner:** MS-02
 
-The authoritative simulation advances only in fixed ticks at
-**20 Hz default** (server-configurable to 30 Hz; 64 Hz is out of scope for the
-world simulation). Rendering and UI interpolate between ticks. Determinism rules
+The authoritative simulation advances only in fixed ticks at **20 Hz, fixed**
+for all gameplay. Servers may raise the *snapshot/replication rate* to 30 Hz,
+but the simulation tick never changes (amended by [DEC-038](#dec-038--simulation-tick-is-fixed-at-20-hz)).
+64 Hz simulation is out of scope. Rendering and UI interpolate between ticks. Determinism rules
 are normative in [spec/00 §6](spec/00-conventions.md#6-determinism-rules):
 seeded per-subsystem RNG, ordered iteration, pinned transcendental math, no
 wall-clock or thread-identity inputs to simulation state.
@@ -516,11 +517,14 @@ of the most expensive mistakes a game can make; both are cheap if designed in.
 **Status:** settled · **Reversal cost:** extreme · **Owner:** MS-03
 
 Worlds are saved as **32×32-chunk region files** containing a versioned header,
-checksummed chunk index, zstd-compressed section payloads and sidecar metadata
-(`level.json` equivalent, player data, `ids.json` resource-ID mapping, scheduled
-ticks). All writes are atomic (write-temp + fsync + rename) with a journal/
-double-buffer guard; the format has an explicit version with forward migrations
-from the first public build. Block/section data is stored palette-compressed;
+checksummed chunk index, zstd-compressed section payloads, and sidecar metadata
+(`level.json` equivalent, player data, `ids.json` resource-ID mapping,
+`mods.lock.json`). **Scheduled ticks live inside each chunk payload** (as
+remaining delays against the saved world tick), not in a sidecar. Chunk commits
+are published by swapping the **in-file double-buffered index/header**; whole
+files and sidecars use write-temp + fsync + rename. The format has an explicit
+version with forward migrations from the first public build. Detailed byte
+layout: [spec/17](spec/17-persistence.md). Block/section data is stored palette-compressed;
 entities and block entities use versioned structs keyed by resource IDs.
 
 *Why:* saves are the players' most valuable asset and the hardest thing to
@@ -573,7 +577,105 @@ required disclaimer.
 *Why:* code licensing never grants trademark rights, and renaming after 1.0 is
 far more expensive than before it.
 
-## 6. Open decisions (must close before their milestone)
+## 6. Amendments and clarifications (2026-11-24)
+
+The first full specification pass proposed many new decisions. They are
+registered here with canonical IDs; chapters that proposed provisional numbers
+(`DEC-038…DEC-046`, `DEC-060…DEC-065`) are reconciled to these IDs by the
+consistency pass. The register is authoritative.
+
+### DEC-038 — Simulation tick is fixed at 20 Hz; 30 Hz is a replication rate
+**Status:** settled · **Reversal cost:** high · **Owner:** MS-06 · **Amends:** DEC-007
+
+All gameplay durations are defined in 20 Hz ticks. A 30 Hz server setting raises
+only the *snapshot/replication* rate (smoother remote interpolation), never the
+simulation rate. Rejected: variable simulation rates, which would change
+game feel, break parity timings and make cross-server replays incomparable.
+
+### DEC-039 — Numeric type policy: integer/fixed-point for discrete state, f64 for space, f32 for presentation
+**Status:** settled · **Reversal cost:** medium · **Owner:** MS-02 · **Refines:** OPEN-002
+
+Discrete, gameplay-visible quantities (health, hunger, XP, durability, counts,
+progress) are integers or fixed-point with an explicit scale (for example
+1 HP = 1,024 units). Spatial simulation uses `f64` with pinned transcendentals
+(DEC-021). Rendering uses `f32`. OPEN-002 remains open only for the remaining
+question of *spatial* fixed-point, if the determinism harness shows drift.
+
+### DEC-040 — Content-ID dictionaries may cross the wire, never persist
+**Status:** settled · **Reversal cost:** medium · **Owner:** MS-06 · **Clarifies:** DEC-006
+
+Numeric content indices never appear in saves, logs or mod manifests. On the
+wire, a connection may negotiate a **hash-verified dictionary** of resource IDs
+during the content handshake and use compact indices for that connection's
+lifetime; the dictionary is derived from the content hash and cannot disagree
+with the peer. On disconnect, indices die with the connection.
+
+### DEC-041 — Item data is typed components, never free-form NBT
+**Status:** settled · **Reversal cost:** high · **Owner:** MS-05/MS-10
+
+Item stacks are `(resource ID, count, typed component map)`. Components are
+schema-defined (durability, enchantments, name/lore, custom data, container
+contents, modifiers, potion data, …) with canonical sorted encoding and a
+BLAKE3 hash used for transaction fingerprints. A mod that needs arbitrary data
+uses a registered `custom_data` component with a namespaced schema, not an
+unvalidated blob. Rejected: NBT-style free-form trees (unvalidatable, unbounded,
+save-bomb prone).
+
+### DEC-042 — Server builds unwind; client/dist builds abort
+**Status:** settled · **Reversal cost:** low · **Owner:** MS-00
+
+Job-pool and WASM traps must be containable on the host, so `openblock-server`
+is built with `panic = "unwind"` (a dedicated `server` cargo profile). Client and
+distribution builds use `panic = "abort"` for codegen and binary-size reasons;
+renderer/GPU failures terminate rather than continue in a corrupt state.
+
+### DEC-043 — Entity identity: session NetId plus persistent UUID
+**Status:** settled · **Reversal cost:** high · **Owner:** MS-02
+
+Every entity gets a monotonic `u64` NetId that is unique within a session and
+never reused; entities that must survive restarts (players, named/leashed mobs,
+item frames, persistent blocks) additionally carry a persistent UUID. NetIds are
+never persisted; UUIDs are. Entity replication uses NetIds; saves and
+cross-session references use UUIDs.
+
+### DEC-044 — Game rule and command IDs are snake_case, canonical
+**Status:** settled · **Reversal cost:** low · **Owner:** MS-10
+
+Game rules, command names and settings keys are snake_case ASCII
+(`random_tick_speed`, `keep_inventory`, `players_sleeping_percentage`,
+`do_daylight_cycle`), case-insensitive on input, canonical snake_case on output
+and in saves. Chapters must not introduce camelCase identifiers. The canonical
+list lives in [spec/08](spec/08-gameplay-survival.md).
+
+### DEC-045 — Shader packs are presentation-only and may not query world occupancy
+**Status:** settled · **Reversal cost:** low · **Owner:** MS-12
+
+Shader packs receive a read-only presentation snapshot (light volume, depth,
+scene colour, shadow matrices) through declared hooks. They never receive block
+or entity queries, an occupancy buffer, or any input that could reveal hidden
+world information to a multiplayer client. Any shadow/visual technique a pack
+wants must be derivable from engine-provided inputs. Rejected: Weft-style
+`solid_at` occupancy queries (cheat surface and anti-cheat conflict).
+
+### DEC-046 — World generation is integer-only and generator-fingerprinted
+**Status:** settled · **Reversal cost:** high · **Owner:** MS-08
+
+Terrain, biome, carver, feature and structure generation use integer-only noise
+and arithmetic (`Fx` fixed point) so output is bit-identical across platforms,
+worker counts and mods. Each generator configuration has a fingerprint; saved
+chunks record the fingerprint they were generated with, and a changed fingerprint
+**never silently regenerates** existing chunks — the server warns and requires an
+explicit `--regen-chunks` operator action (DEC-047).
+
+### DEC-047 — Generated chunks are never silently regenerated
+**Status:** settled · **Reversal cost:** medium · **Owner:** MS-08/MS-13
+
+If a world's generator fingerprint (seed, dimension, generator implementation
+version, content-defined worldgen data) differs from the one recorded with a
+chunk, the chunk is loaded as saved. Regeneration is an explicit operator command
+with a dry-run report. This protects player builds and modded worlds.
+
+## 7. Open decisions (must close before their milestone)
 
 | ID | Question | Owner | Deadline |
 | --- | --- | --- | --- |
@@ -586,7 +688,7 @@ far more expensive than before it.
 | OPEN-007 | Native plugin policy details (signing, separate process, crash containment) | MS-09 | post-1.0 |
 | OPEN-008 | Whether to support WebTransport/web client at all | MS-13 | post-1.0 |
 
-## 7. Rejected alternatives (recorded so we don't relitigate)
+## 8. Rejected alternatives (recorded so we don't relitigate)
 
 | Alternative | Why rejected |
 | --- | --- |
