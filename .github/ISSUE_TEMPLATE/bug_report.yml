@@ -1,0 +1,64 @@
+name: Bug report
+description: Something in the client, server, tools or docs is broken.
+labels: ["type: bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, search existing issues. For security problems use the
+        private advisory flow, not this form.
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Release tag or commit hash, plus `openblock --version` output.
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Client
+        - Dedicated server
+        - Redstone / simulation
+        - Rendering / shaders
+        - Networking / multiplayer
+        - Content packs / modding
+        - World generation
+        - Tools / packaging
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start a world with seed ...
+        2. Place ...
+        3. See ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour, logs, screenshots
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, GPU, driver version, RAM, CPU.
+  - type: textarea
+    id: save
+    attributes:
+      label: Reproduction world
+      description: A minimal save or seed + coordinates, if applicable.

@@ -49,13 +49,14 @@ synonyms; when a new term is needed, add it here first.
 | **World** | A saved universe: a set of dimensions, the players' persistent data, the world seed and global game rules. Identified by a stable world UUID. |
 | **Dimension** | An independently generated space with its own seed derivation, height limits, sky/ambience and generator. The vanilla-inspired set is `overworld`, `nether`, `end`, plus arbitrary content-defined dimensions. |
 | **Chunk** (or **chunk column**) | The horizontally aligned column of blocks at integer `(cx, cz)`, 16×16 blocks in XZ unless DEC-004 changes it. The unit of streaming, loading, saving and interest management. |
-| **Section** | The vertical subdivision of a chunk and the unit of storage, meshing, lighting and occlusion. Size is `SECTION_SIZE³`, default 32 (DEC-004). A chunk therefore contains `HEIGHT / SECTION_SIZE` sections. |
+| **Section** | The vertical subdivision of a chunk and the unit of storage, editing, lighting, meshing input and network deltas. Size is 16³ (DEC-004). A chunk therefore contains `HEIGHT / 16` sections. |
+| **Mesh cluster** | An optional 2×2×2 group of sections (32³ blocks) meshed as one render unit. Render-only: invisible to content, save format and protocol (DEC-004). |
 | **Block type** | A registry entry describing block behaviour and appearance (for example `openblock:stone`). Immutable during a session. |
 | **Block state** | A specific configuration of a block type: type ID plus a compact set of property values (facing, waterlogged, growth stage, …). The unit stored in the world. |
 | **Palette** | A per-section mapping from dense local indices to block state IDs, plus the bit-packed array of indices. |
 | **Block entity** | Extra per-position data that is too large to live in the block state (chest contents, sign text, furnace progress, mod-defined data). |
 | **Region** | A 32×32-chunk group, the unit of on-disk storage and (with `TICK_REGION` granularity) of scheduled ticking. |
-| **Tick** | One step of the authoritative simulation at a fixed `TICK_RATE` (default 20 Hz, DEC-040). Never tied to frame rate. |
+| **Tick** | One step of the authoritative simulation at a fixed `TICK_RATE` (default 20 Hz, configurable to 30 Hz on servers; DEC-007). Never tied to frame rate. |
 | **Frame** | One presentation step on a client, at whatever rate the display allows. Frames interpolate between ticks. |
 | **Snapshot** | An immutable, versioned view of simulation state handed from the simulation to rendering, networking or persistence. |
 
@@ -132,9 +133,13 @@ synonyms; when a new term is needed, add it here first.
   APIs that take multiple coordinate spaces.
 - **Chunk/local**: chunk coordinates are `i32` (`cx, cz`); in-chunk coordinates
   are `u8`; section coordinates are `i32` (`sx, sy, sz`).
-- **Height limits**: per dimension, `[MIN_Y, MAX_Y)` in blocks, MUST be
-  multiples of `SECTION_SIZE` and at most 1024 blocks tall for the base
-  dimensions (DEC-005).
+- **Dimensions**: a chunk column is 16×16 blocks; a section is 16×16×16 blocks;
+  an optional render-time *mesh cluster* is 2×2×2 sections. Height is
+  `[min_y, max_y)` in blocks, multiples of 16, at most 1024; the base dimensions
+  mirror Minecraft's overworld `-64..320`, nether and end `0..256` (DEC-004).
+- **Render distance** is always expressed in **blocks** in engineering
+  documents, with the chunk equivalent in parentheses (default 512 blocks =
+  32 chunks). Never write "32 chunks" without saying which chunk width is meant.
 - **Mass/velocity**: SI (kg, m/s, N), with block-collision AABBs defined in
   content data.
 
