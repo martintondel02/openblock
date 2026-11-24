@@ -86,7 +86,7 @@ register](decisions.md) holds the current state; ADRs hold the story.
 - [ADR-0001 — Record architecture decisions](adr/0001-record-architecture-decisions.md)
 - [ADR-0002 — Rust and a purpose-built engine](adr/0002-rust-and-purpose-built-engine.md)
 - [ADR-0003 — wgpu-first renderer](adr/0003-wgpu-first-renderer.md)
-- [ADR-0004 — 32³ sections with paletted storage](adr/0004-section-size-and-storage.md)
+- [ADR-0004 — 16³ sections with paletted storage](adr/0004-section-size-and-storage.md)
 - [ADR-0005 — Server-authoritative QUIC multiplayer](adr/0005-server-authoritative-quic.md)
 - [ADR-0006 — Three-tier modding: packs, WASM, native](adr/0006-three-tier-modding.md)
 - [ADR-0007 — Data-driven content with namespaced registries](adr/0007-data-driven-content.md)
