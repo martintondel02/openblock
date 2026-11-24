@@ -844,10 +844,12 @@ before content freeze and are a legal launch gate afterwards.
 OpenBlock is a **Linux-first game, and Fedora is the reference distribution**.
 Concretely:
 
-1. **Primary target:** Fedora Linux x86_64, versions 44 and 45 at launch, following
-   Fedora's own current-plus-previous support window (Fedora 44 is supported
-   until 2027-06; support rolls forward with each Fedora release). Fedora Server
-   is the reference dedicated-server OS.
+1. **Primary target:** Fedora Linux x86_64, always following Fedora's
+   current-plus-previous support window. At the time of this decision that is
+   Fedora 44/45 (Fedora 44 is supported until 2027-06); the supported versions in
+   the CI matrix, packaging and support policy roll forward with each Fedora
+   release, and the 1.0 launch supports the then-current and previous Fedora
+   releases. Fedora Server is the reference dedicated-server OS.
 2. **Desktop stack:** **Wayland-first** (Fedora's default session; winit Wayland
    backend) with X11/XWayland as a fallback, fractional scaling, IME and
    keyboard-layout correctness. Graphics are **Vulkan** through wgpu (Mesa RADV

@@ -36,6 +36,17 @@ makes **design contributions as valuable as code** right now.
 
 ## Development setup
 
+OpenBlock is Fedora-first ([DEC-054](docs/decisions.md)). On Fedora 44/45 the
+build dependencies are:
+
+```sh
+sudo dnf install gcc gcc-c++ pkgconf-pkg-config git alsa-lib-devel \
+  wayland-devel libxkbcommon-devel vulkan-loader-devel fontconfig-devel \
+  freetype-devel systemd-devel
+```
+
+Then install the pinned toolchain and build:
+
 ```sh
 # Toolchain is pinned by rust-toolchain.toml (stable, 2024 edition).
 rustup show

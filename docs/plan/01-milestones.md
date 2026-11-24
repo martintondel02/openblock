@@ -87,8 +87,8 @@ stranger following only the repository docs.
 
 **Exit criteria**
 
-- [ ] A fresh clone builds and runs the window and the headless server on **Fedora 44 and Fedora 45** (the primary platform, [DEC-054](../decisions.md)) and on Windows and macOS following only `CONTRIBUTING.md`.
-- [ ] The CI matrix contains required `fedora:44` and `fedora:45` container jobs that build and test every PR.
+- [ ] A fresh clone builds and runs the window and the headless server on **Fedora (44 and 45 at the time of writing; the matrix rolls with Fedora's support window)** — the primary platform ([DEC-054](../decisions.md)) — and on Windows and macOS following only `CONTRIBUTING.md`.
+- [ ] The CI matrix contains required `fedora:<current>` and `fedora:<previous>` container jobs that build and test every PR.
 - [ ] CI catches a deliberate `clippy` warning, a failing test, a forbidden
       dependency and a broken shader in a test PR.
 - [ ] `cargo xtask bench --scene empty` produces a report with frame-time

@@ -26,7 +26,7 @@ degrade to a playable previous state, not to a lost install.
 
 | ID | Requirement | Verification | Milestone |
 | --- | --- | --- | --- |
-| REQ-PLAT-001 | 1.0 client binaries MUST primarily target **Fedora Linux 44/45 x86_64 (Wayland-first)**, and MUST also ship Windows 10 22H2/11 x86_64 and macOS 12+ universal2 as supported secondary platforms; any other client target is post-1.0 ([DEC-054](../decisions.md)). | Release artifact inventory | MS-16 |
+| REQ-PLAT-001 | 1.0 client binaries MUST primarily target **Fedora Linux x86_64, current + previous release at ship time (44/45 while this plan was written), Wayland-first**, and MUST also ship Windows 10 22H2/11 x86_64 and macOS 12+ universal2 as supported secondary platforms; any other client target is post-1.0 ([DEC-054](../decisions.md)). | Release artifact inventory | MS-16 |
 | REQ-PLAT-002 | Dedicated servers MUST build for Linux, Windows and macOS on x86_64 and aarch64 (static musl on Linux), and MUST run with no GPU, display server or audio device. | Container/no-DRI CI ([REQ-ARCH-012](01-technical-architecture.md)) | MS-13 |
 | REQ-PLAT-003 | Graphics backends MUST be **Vulkan on Linux (the Fedora reference path)**, DX12 primary with Vulkan as an option on Windows, and Metal on macOS; the Linux matrix MUST cover Mesa RADV and ANV and the NVIDIA driver, and each shipped backend MUST pass the §7 smoke test. | Per-backend CI job + driver matrix | MS-13 |
 | REQ-PLAT-004 | The x86_64 baseline MUST be `x86-64-v2` (SSE4.2, POPCNT) with a runtime check that fails with an actionable message on older CPUs; `target-cpu=native` MUST NOT be shipped and aarch64 assumes mandatory NEON. | CPUID fixture + binary inspection | MS-13 |
@@ -86,7 +86,7 @@ degrade to a playable previous state, not to a lost install.
 
 | Priority | Platform | Artifacts | Graphics / audio | Minimum | Notes |
 | --- | --- | --- | --- | --- | --- |
-| **1 — primary** | **Fedora Linux 44/45, x86_64** (Workstation, KDE, Silverblue; Fedora Server for hosting) | Flathub Flatpak (default), COPR RPM, AppImage, `.tar.zst`, server RPM, container | **Vulkan** (Mesa RADV/ANV or NVIDIA from RPM Fusion), **PipeWire**, Wayland-first | x86-64-v2, 8 GiB, Wayland or X11 session | Reference platform for performance, CI, packaging and support ([DEC-054](../decisions.md)) |
+| **1 — primary** | **Fedora Linux x86_64, current + previous release at ship time** (44/45 at the time of writing; Workstation, KDE, Silverblue; Fedora Server for hosting) | Flathub Flatpak (default), COPR RPM, AppImage, `.tar.zst`, server RPM, container | **Vulkan** (Mesa RADV/ANV or NVIDIA from RPM Fusion), **PipeWire**, Wayland-first | x86-64-v2, 8 GiB, Wayland or X11 session | Reference platform for performance, CI, packaging and support ([DEC-054](../decisions.md)) |
 | 2 — supported secondary | Windows 10 22H2 / 11, x86_64 | MSI (per-user), portable zip | DX12 primary, Vulkan option; WASAPI | x86-64-v2, 8 GiB | Authenticode, SmartScreen reputation |
 | 2 — supported secondary | macOS 12+, universal2 | `.app` in DMG | Metal; CoreAudio | Apple Silicon or Intel, 8 GiB | Developer ID, notarised, stapled |
 | 3 — best effort | Other Linux x86_64 distros | Flatpak, AppImage, `.tar.zst` | Vulkan; PipeWire/PulseAudio/ALSA | Vulkan-capable driver, 8 GiB | No distro-specific packaging promise at 1.0 |
@@ -97,10 +97,12 @@ degrade to a playable previous state, not to a lost install.
 | Post-1.0 | Steam Deck (SteamOS/Flatpak) | Flatpak/AppImage on SteamOS | Vulkan; PipeWire | 16 GiB | Verification target (REQ-PLAT-013) |
 | Aspirational | WebGPU | — | WebGPU | — | [OPEN-008](../decisions.md) |
 
-Fedora 44 (released 2026-04-28, supported until 2027-06) and Fedora 45
-(released 2026-11-03) are the launch window; support rolls forward with Fedora's
-current-plus-previous window, and the CI matrix moves in the same release that a
-Fedora version reaches end of life. Windows 10 22H2 is the Windows floor because
+The supported window is Fedora's **current plus previous** release, whatever those
+are at a given ship date: Fedora 44 (released 2026-04-28, supported until 2027-06)
+and Fedora 45 (released 2026-11-03) at the time this specification was written,
+with the 1.0 launch supporting the then-current and previous releases. The CI
+matrix, RPM and Flatpak builds move in the same release that a Fedora version
+reaches end of life. Windows 10 22H2 is the Windows floor because
 older builds lack the DX12/WARP combinations wgpu 30 expects; the Linux baseline
 is the glibc shipped with Fedora 44 (build in a `fedora:44` container, never on
 the newest distro); macOS 12 is the Metal floor. CPU features are checked at

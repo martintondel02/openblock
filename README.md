@@ -28,10 +28,11 @@ promises:
   that runs on a GPU-less VPS, with self-signed identity, content-hash
   verification and progressive world streaming.
 
-**Linux is the primary platform, and Fedora is the reference distribution**
-(Fedora 44/45; Wayland + Vulkan + PipeWire; Flathub Flatpak first, COPR RPM for
-native installs, a hardened Fedora Server package for hosting). Windows and macOS
-ship as supported secondary platforms at 1.0.
+**Linux is the primary platform, and Fedora is the reference distribution** — the
+current + previous Fedora release at any ship date (44/45 at the time of writing),
+Wayland + Vulkan + PipeWire, Flathub Flatpak first, COPR RPM for native installs,
+and a hardened Fedora Server package for hosting. Windows and macOS ship as
+supported secondary platforms at 1.0.
 
 Minecraft Java Edition's feature set is the reference, delivered in stages: the
 **1.0 Early Access** release targets Tier-1 parity plus the platform (modding,
@@ -190,10 +191,10 @@ Budgets and their enforcement: [`spec/25-performance-budgets.md`](docs/spec/25-p
 
 | | Target |
 | --- | --- |
-| **Primary (launch)** | **Fedora Linux 44/45 x86_64** — Wayland session, Vulkan (Mesa RADV/ANV or NVIDIA), PipeWire; **Flathub Flatpak** first, COPR RPM, AppImage/tarball fallbacks |
+| **Primary (launch)** | **Fedora Linux x86_64**, current + previous at ship time (44/45 now) — Wayland session, Vulkan (Mesa RADV/ANV or NVIDIA), PipeWire; **Flathub Flatpak** first, COPR RPM, AppImage/tarball fallbacks |
 | **Supported secondary (launch)** | Windows 10/11 x86_64 (DX12), macOS 12+ universal2 (Metal) |
 | **Best effort** | Other Linux distributions via Flatpak/AppImage; Linux aarch64 |
-| **Dedicated server — primary** | **Fedora Server 44/45** — RPM + hardened systemd unit + firewalld service; container image |
+| **Dedicated server — primary** | **Fedora Server** (current + previous) — RPM + hardened systemd unit + firewalld service; container image |
 | **Post-1.0** | Android, Steam Deck verification, WebGPU feasibility |
 
 The reference machine, CI gates and packaging order all follow Fedora ([DEC-054](docs/decisions.md)).

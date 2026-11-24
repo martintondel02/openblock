@@ -1,6 +1,9 @@
 # Packaging
 
-OpenBlock is **Linux-first and Fedora-first** ([DEC-054](../docs/decisions.md)).
+OpenBlock is **Linux-first and Fedora-first** ([DEC-054](../docs/decisions.md)): the
+supported window is Fedora's current + previous release at any ship date
+(Fedora 44/45 while this packaging was written), so the RPM and Flatpak builds
+move forward with Fedora's cycle.
 This directory holds the packaging sources for the primary platform; the
 secondary platforms' packaging is described in
 [spec/22](../docs/spec/22-platforms-and-distribution.md).
