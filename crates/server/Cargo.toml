@@ -25,3 +25,4 @@ ob_worldgen.workspace = true
 ob_sim.workspace = true
 log.workspace = true
 ctrlc.workspace = true
+rayon.workspace = true

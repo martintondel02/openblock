@@ -18,16 +18,17 @@ fn main() {
         Err(message) => {
             eprintln!("openblock: {message}");
             eprintln!(
-                "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--fly] [--x11] [--screenshot PATH] [--seconds N] [--version]"
+                "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--mesh-workers N] [--fly] [--x11] [--screenshot PATH] [--seconds N] [--version]"
             );
             std::process::exit(2);
         }
     };
     if flags.iter().any(|(name, _)| name == "help") {
         println!(
-            "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--fly] [--x11] [--screenshot PATH] [--seconds N] [--version]"
+            "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--mesh-workers N] [--fly] [--x11] [--screenshot PATH] [--seconds N] [--version]"
         );
         println!("  --screenshot PATH  render one offscreen frame to a PNG and exit (no window)");
+        println!("  --mesh-workers N   section meshing worker threads (1-16, default cores - 1)");
         return;
     }
     log::info!("{}", ob_core::version_banner("openblock"));

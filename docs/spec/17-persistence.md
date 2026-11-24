@@ -62,6 +62,7 @@ In scope: `ob_world` storage, the `openblock-server` world manager, and the
 | REQ-SAVE-032 | Every write path MUST be idempotent: replaying the journal or re-running a commit MUST NOT duplicate or corrupt data. | Journal replay test |
 | REQ-SAVE-033 | Autosave interval MUST be configurable (10–3,600 s) and default to 60 s. | Config test |
 | REQ-SAVE-034 | A quarantined chunk MUST retain its bytes for forensics under `<world>/quarantine/`. | Quarantine test |
+| REQ-SAVE-035 | While the interim v0.x snapshot format stores dense block ids, it MUST record a content-registry fingerprint and MUST refuse to load when the current registry differs, naming both fingerprints; it MUST NOT silently reinterpret block ids. | Mismatch fixture + pack test |
 
 ## 3. Design
 
@@ -507,6 +508,17 @@ without `--dry-run` it takes the backup first. **Downgrade refusal:** if
 `format_version > CURRENT_FORMAT` or `data_version > CURRENT_DATA`, opening for
 write fails with the required version and the world left untouched; there is no
 read-only mode, because an older decoder cannot be trusted with a newer payload.
+
+**Interim snapshot format (v0.0.x).** Until the region store of §3.2 lands at
+MS-13, the reference implementation writes a whole-world snapshot: magic, a
+container version, seed, a content-registry fingerprint (REQ-SAVE-035), a
+compression flag (stored or zstd level 3), uncompressed/compressed payload
+lengths, the payload, and a CRC32C over everything before it. Snapshot v1
+(stored, dense light) and v2 (zstd, compact light) remain readable and are
+upgraded on the next save; v3 adds the registry fingerprint. Dense block ids in
+these snapshots are session-local indices, so a pack reorder is detected instead
+of silently corrupting a world. This format is explicitly not the frozen region
+format and makes no compatibility promise beyond the migration chain above.
 
 **Forward-compatibility promise.** A world written by any `1.x` build opens in any
 later `1.x` build through the migration chain. A newer world never opens in an

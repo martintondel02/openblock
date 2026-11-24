@@ -54,11 +54,13 @@ use crate::world::World;
 /// Snapshot magic at the start of every byte stream.
 const MAGIC: &[u8; 4] = b"OBSV";
 /// Snapshot format version written by this build.
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 /// Bytes before the first chunk in a v1 stream: magic, version, seed, count.
 const V1_HEADER_LEN: usize = 4 + 2 + 8 + 4;
 /// Bytes before the compressed payload in a v2 stream.
 const V2_HEADER_LEN: usize = 4 + 2 + 8 + 1 + 4 + 4;
+/// Bytes before the compressed payload in a v3 stream (adds a registry fingerprint).
+const V3_HEADER_LEN: usize = 4 + 2 + 8 + 8 + 1 + 4 + 4;
 /// Bytes in the trailing checksum.
 const CRC_LEN: usize = 4;
 /// Payload is stored verbatim.
@@ -130,6 +132,8 @@ pub enum SaveError {
     UnsupportedVersion(u16),
     /// The registry referenced by the save is missing a block type.
     UnknownBlock(u16),
+    /// The save was written with a different content pack (block order/content).
+    RegistryMismatch { saved: u64, current: u64 },
 }
 
 impl std::fmt::Display for SaveError {
@@ -138,6 +142,11 @@ impl std::fmt::Display for SaveError {
             SaveError::InvalidFormat(reason) => write!(f, "invalid world save: {reason}"),
             SaveError::UnsupportedVersion(v) => write!(f, "unsupported save version {v}"),
             SaveError::UnknownBlock(id) => write!(f, "save references unknown block id {id}"),
+            SaveError::RegistryMismatch { saved, current } => write!(
+                f,
+                "world was saved with a different content pack (registry fingerprint {saved:016x}, current {current:016x}); \
+                 reordering or changing block types invalidates existing saves"
+            ),
         }
     }
 }
@@ -151,7 +160,7 @@ impl std::error::Error for SaveError {}
 #[derive(Debug, Clone, Default)]
 pub struct WorldSave;
 
-/// Serializes a world to the compressed v2 snapshot format.
+/// Serializes a world to the compressed v3 snapshot format.
 ///
 /// Chunks are emitted in ascending `(cx, cz)` order so repeated saves of the
 /// same world produce identical bytes. The payload is compressed with zstd
@@ -163,10 +172,11 @@ pub fn to_bytes(world: &World) -> Vec<u8> {
     let (compression, body) = compress_payload(&payload);
     let body_len = u32::try_from(body.len()).expect("compressed world snapshot exceeds 4 GiB");
 
-    let mut out = Vec::with_capacity(V2_HEADER_LEN + body.len() + CRC_LEN);
+    let mut out = Vec::with_capacity(V3_HEADER_LEN + body.len() + CRC_LEN);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(&world.seed().to_le_bytes());
+    out.extend_from_slice(&registry_fingerprint(world.registry()).to_le_bytes());
     out.push(compression);
     out.extend_from_slice(&payload_len.to_le_bytes());
     out.extend_from_slice(&body_len.to_le_bytes());
@@ -177,7 +187,7 @@ pub fn to_bytes(world: &World) -> Vec<u8> {
     out
 }
 
-/// Loads a world from a v1 or v2 snapshot.
+/// Loads a world from a v1, v2 or v3 snapshot.
 ///
 /// The whole stream is validated before a [`World`] is returned: header,
 /// version, checksum, payload lengths, compression method, palette bounds
@@ -198,6 +208,7 @@ pub fn from_bytes(registry: Arc<Registry>, bytes: &[u8]) -> Result<World, SaveEr
     match version {
         1 => load_v1(registry, bytes),
         2 => load_v2(registry, bytes),
+        3 => load_v3(registry, bytes),
         _ => Err(SaveError::InvalidFormat("unknown format version")),
     }
 }
@@ -342,6 +353,76 @@ fn load_v2(registry: Arc<Registry>, bytes: &[u8]) -> Result<World, SaveError> {
 }
 
 /// Reads the chunk stream shared by both snapshot versions.
+/// Loads the compressed v3 snapshot layout, validating the content-pack fingerprint.
+fn load_v3(registry: Arc<Registry>, bytes: &[u8]) -> Result<World, SaveError> {
+    if bytes.len() < V3_HEADER_LEN + CRC_LEN {
+        return Err(SaveError::InvalidFormat("truncated header"));
+    }
+    let checksum_offset = bytes.len() - CRC_LEN;
+    let stored_crc = u32::from_le_bytes([
+        bytes[checksum_offset],
+        bytes[checksum_offset + 1],
+        bytes[checksum_offset + 2],
+        bytes[checksum_offset + 3],
+    ]);
+    if crc32c(&bytes[..checksum_offset]) != stored_crc {
+        return Err(SaveError::InvalidFormat("checksum mismatch"));
+    }
+    let seed = u64::from_le_bytes([
+        bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13],
+    ]);
+    let saved_registry = u64::from_le_bytes([
+        bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21],
+    ]);
+    let current_registry = registry_fingerprint(&registry);
+    if saved_registry != current_registry {
+        return Err(SaveError::RegistryMismatch {
+            saved: saved_registry,
+            current: current_registry,
+        });
+    }
+    let compression = bytes[22];
+    let uncompressed_len = u32::from_le_bytes([bytes[23], bytes[24], bytes[25], bytes[26]]);
+    let compressed_len = u32::from_le_bytes([bytes[27], bytes[28], bytes[29], bytes[30]]);
+    let compressed_len = usize::try_from(compressed_len).map_err(|_| SaveError::InvalidFormat("payload too large"))?;
+    let payload_end = V3_HEADER_LEN
+        .checked_add(compressed_len)
+        .ok_or(SaveError::InvalidFormat("payload length overflow"))?;
+    if payload_end > checksum_offset {
+        return Err(SaveError::InvalidFormat("truncated payload"));
+    }
+    if payload_end < checksum_offset {
+        return Err(SaveError::InvalidFormat("trailing bytes after payload"));
+    }
+    let body = &bytes[V3_HEADER_LEN..payload_end];
+    let payload = decode_payload(
+        compression,
+        usize::try_from(uncompressed_len).map_err(|_| SaveError::InvalidFormat("payload too large"))?,
+        body,
+    )?;
+    let mut reader = Reader::new(&payload);
+    read_payload(&mut reader, registry, seed, LightEncoding::V2)
+}
+
+/// Stable content-pack fingerprint: FNV-1a over the block count and ids in order.
+pub fn registry_fingerprint(registry: &Registry) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |byte: u8| {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for byte in (registry.len() as u32).to_le_bytes() {
+        mix(byte);
+    }
+    for (_, block) in registry.iter() {
+        for byte in block.id.as_bytes() {
+            mix(*byte);
+        }
+        mix(0xff);
+    }
+    hash
+}
+
 fn read_payload(
     reader: &mut Reader<'_>,
     registry: Arc<Registry>,
@@ -903,7 +984,7 @@ mod tests {
         let payload_len = u32::try_from(payload.len()).expect("test payload fits");
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
         out.extend_from_slice(&world.seed().to_le_bytes());
         out.push(COMPRESSION_NONE);
         out.extend_from_slice(&payload_len.to_le_bytes());
@@ -934,7 +1015,7 @@ mod tests {
         let (registry, world) = sample_world();
         let first = to_bytes(&world);
         assert_eq!(first, to_bytes(&world));
-        assert_eq!(first[14], COMPRESSION_ZSTD, "v2 snapshots are compressed by default");
+        assert_eq!(first[22], COMPRESSION_ZSTD, "v3 snapshots are compressed by default");
 
         let loaded = from_bytes(Arc::clone(&registry), &first).expect("snapshot is valid");
         assert_eq!(to_bytes(&loaded), first);
@@ -960,9 +1041,9 @@ mod tests {
             VERSION,
             "empty snapshot uses the current version"
         );
-        assert_eq!(bytes[14], COMPRESSION_ZSTD);
-        let compressed_len = u32::from_le_bytes([bytes[19], bytes[20], bytes[21], bytes[22]]) as usize;
-        assert_eq!(bytes.len(), V2_HEADER_LEN + compressed_len + CRC_LEN);
+        assert_eq!(bytes[22], COMPRESSION_ZSTD);
+        let compressed_len = u32::from_le_bytes([bytes[27], bytes[28], bytes[29], bytes[30]]) as usize;
+        assert_eq!(bytes.len(), V3_HEADER_LEN + compressed_len + CRC_LEN);
 
         let loaded = from_bytes(Arc::clone(&registry), &bytes).expect("empty snapshot is valid");
         assert_eq!(loaded.seed(), 42);
@@ -1123,12 +1204,12 @@ mod tests {
     }
 
     #[test]
-    fn v2_header_lengths_and_compression_are_validated() {
+    fn v3_header_lengths_and_compression_are_validated() {
         let (registry, world) = sample_world();
         let bytes = to_bytes(&world);
 
         let mut unknown_method = bytes.clone();
-        unknown_method[14] = 9;
+        unknown_method[22] = 9;
         resign(&mut unknown_method);
         assert!(matches!(
             from_bytes(Arc::clone(&registry), &unknown_method),
@@ -1136,16 +1217,16 @@ mod tests {
         ));
 
         let mut huge_payload = bytes.clone();
-        huge_payload[15..19].copy_from_slice(&u32::MAX.to_le_bytes());
+        huge_payload[23..27].copy_from_slice(&u32::MAX.to_le_bytes());
         resign(&mut huge_payload);
         assert!(matches!(
             from_bytes(Arc::clone(&registry), &huge_payload),
             Err(SaveError::InvalidFormat("uncompressed payload too large"))
         ));
 
-        let compressed_len = u32::from_le_bytes([bytes[19], bytes[20], bytes[21], bytes[22]]);
+        let compressed_len = u32::from_le_bytes([bytes[27], bytes[28], bytes[29], bytes[30]]);
         let mut trailing = bytes.clone();
-        trailing[19..23].copy_from_slice(&(compressed_len + 1).to_le_bytes());
+        trailing[27..31].copy_from_slice(&(compressed_len + 1).to_le_bytes());
         resign(&mut trailing);
         assert!(matches!(
             from_bytes(Arc::clone(&registry), &trailing),
@@ -1153,7 +1234,7 @@ mod tests {
         ));
 
         let mut truncated = bytes.clone();
-        truncated[19..23].copy_from_slice(&compressed_len.saturating_sub(1).to_le_bytes());
+        truncated[27..31].copy_from_slice(&compressed_len.saturating_sub(1).to_le_bytes());
         resign(&mut truncated);
         assert!(matches!(
             from_bytes(Arc::clone(&registry), &truncated),
@@ -1213,10 +1294,10 @@ mod tests {
     fn newer_version_is_unsupported() {
         let (registry, world) = sample_world();
         let mut bytes = to_bytes(&world);
-        bytes[4..6].copy_from_slice(&3u16.to_le_bytes());
+        bytes[4..6].copy_from_slice(&99u16.to_le_bytes());
         match from_bytes(registry, &bytes) {
-            Err(SaveError::UnsupportedVersion(3)) => {}
-            other => panic!("expected UnsupportedVersion(3), got {other:?}"),
+            Err(SaveError::UnsupportedVersion(99)) => {}
+            other => panic!("expected UnsupportedVersion(99), got {other:?}"),
         }
     }
 
@@ -1296,5 +1377,47 @@ mod tests {
                 let _ = from_bytes(Arc::clone(&registry), &data);
             }
         }
+    }
+
+    #[test]
+    fn v2_snapshots_still_load_and_upgrade_to_v3() {
+        let (registry, world) = sample_world();
+        let v2 = to_v2_uncompressed_bytes(&world);
+        assert_eq!(u16::from_le_bytes([v2[4], v2[5]]), 2);
+        let loaded = from_bytes(Arc::clone(&registry), &v2).expect("v2 snapshot still loads");
+        assert_same_world(&world, &loaded);
+        let upgraded = to_bytes(&loaded);
+        assert_eq!(u16::from_le_bytes([upgraded[4], upgraded[5]]), VERSION);
+        assert_eq!(load_checked(Arc::clone(&registry), &upgraded).seed(), world.seed());
+    }
+
+    fn load_checked(registry: Arc<Registry>, bytes: &[u8]) -> World {
+        from_bytes(registry, bytes).expect("snapshot is valid")
+    }
+
+    #[test]
+    fn v3_rejects_a_different_registry_fingerprint() {
+        let (registry, world) = sample_world();
+        let bytes = to_bytes(&world);
+
+        // Same block ordering but changed content (a renamed block id) must be detected.
+        let mut blocks: Vec<_> = registry.iter().map(|(_, block)| block.clone()).collect();
+        blocks[1].id = "openblock:stone_variant";
+        let changed = Arc::new(Registry::from_blocks(blocks).expect("variant registry is valid"));
+        match from_bytes(changed, &bytes) {
+            Err(SaveError::RegistryMismatch { saved, current }) => assert_ne!(saved, current),
+            other => panic!("expected RegistryMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn base_pack_and_code_registry_share_a_fingerprint() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/base/blocks.json");
+        let packed = ob_content::registry_from_pack(&path).expect("base pack loads");
+        assert_eq!(
+            registry_fingerprint(&Registry::base()),
+            registry_fingerprint(&packed),
+            "packs/base/blocks.json must stay in sync with Registry::base()"
+        );
     }
 }

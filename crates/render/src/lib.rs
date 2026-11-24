@@ -23,7 +23,7 @@ use ob_math::{Mat4, SectionPos, WorldVec};
 use winit::window::Window;
 
 pub use frustum::{FRUSTUM_PLANE_COUNT, aabb_visible, section_bounds, section_visible};
-pub use mesh::{MesherStats, mesh_section, mesh_section_with_stats};
+pub use mesh::{MesherStats, SNAPSHOT_SIZE, SectionSnapshot, mesh_section, mesh_section_with_stats};
 pub use offscreen::OffscreenRenderer;
 
 use pipeline::CameraUniform;
@@ -89,7 +89,7 @@ impl Camera {
 ///
 /// The layout is 28 bytes: `position` 12, `uv` 8, `layer` 4, `light` 4.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub struct Vertex {
     /// World-space position.
     pub position: [f32; 3],

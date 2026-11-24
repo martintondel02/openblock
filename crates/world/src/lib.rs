@@ -13,6 +13,6 @@ pub mod world;
 
 pub use chunk::ChunkColumn;
 pub use light::Light;
-pub use save::{SaveError, from_bytes, to_bytes};
+pub use save::{SaveError, from_bytes, registry_fingerprint, to_bytes};
 pub use section::{Section, SectionStorage};
 pub use world::{RayHit, World};

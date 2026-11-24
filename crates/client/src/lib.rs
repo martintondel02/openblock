@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use ob_content::{BlockId, Registry};
 use ob_math::{ChunkPos, SEA_LEVEL, SectionPos, WorldVec};
-use ob_render::{Camera, OffscreenRenderer, Renderer, mesh_section};
+use ob_render::{Camera, OffscreenRenderer, Renderer};
 use ob_server::{Host, HostConfig};
 use ob_sim::{BlockAction, PlayerInput};
 use winit::application::ApplicationHandler;
@@ -23,10 +23,21 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
+pub mod mesh_scheduler;
+pub mod ui_state;
+
+use mesh_scheduler::MeshScheduler;
+
 /// One fixed simulation tick (20 Hz, DEC-038).
 const TICK: Duration = Duration::from_millis(50);
-/// Meshing budget per frame, in microseconds.
-const MESH_BUDGET_US: u128 = 8_000;
+/// Maximum dirty sections handed to the mesh scheduler per frame. The rest are
+/// re-marked dirty so they are retried on the next frame.
+const MAX_MESH_SUBMISSIONS_PER_FRAME: usize = 32;
+/// Upload budget per frame, in microseconds: GPU buffer creation and upload
+/// are kept short so a burst of completed meshes cannot stall a frame.
+const MESH_UPLOAD_BUDGET_US: u128 = 4_000;
+/// Interval between mesh scheduler debug summaries.
+const MESH_STATS_INTERVAL: Duration = Duration::from_secs(5);
 /// Chunks generated per frame while streaming.
 const GENERATE_BUDGET: usize = 2;
 /// Autosave interval.
@@ -60,6 +71,8 @@ pub struct ClientOptions {
     pub screenshot: Option<std::path::PathBuf>,
     /// Automatically close the window after this many seconds and log frame stats.
     pub seconds: Option<f32>,
+    /// Number of dedicated section-meshing worker threads (1..=16).
+    pub mesh_workers: usize,
 }
 
 impl Default for ClientOptions {
@@ -73,8 +86,17 @@ impl Default for ClientOptions {
             force_x11: false,
             screenshot: None,
             seconds: None,
+            mesh_workers: default_mesh_workers(),
         }
     }
+}
+
+/// Default mesh worker count: all but one core, capped at [`mesh_scheduler::MAX_MESH_WORKERS`].
+fn default_mesh_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get().saturating_sub(1).max(1))
+        .unwrap_or(1)
+        .min(mesh_scheduler::MAX_MESH_WORKERS)
 }
 
 /// Runs the client until the window closes, or writes a single screenshot and exits.
@@ -181,6 +203,8 @@ struct GameState {
     renderer: Renderer,
     host: Host,
     registry: Arc<Registry>,
+    mesh_scheduler: MeshScheduler,
+    mesh_stats_timer: Instant,
     keys: [bool; 8],
     input_yaw: f32,
     input_pitch: f32,
@@ -279,32 +303,85 @@ impl GameState {
         for chunk in self.host.take_unloaded_chunks() {
             self.unload_chunk_meshes(chunk);
         }
+
+        // Snapshot and queue dirty sections. At most 32 snapshots are captured
+        // on the main thread per frame; the rest go back into the world's dirty
+        // set so no edit is lost. A section that is already in flight is also
+        // deferred: submit() invalidates its old epoch so the completion is
+        // dropped, and the retry picks up the latest world state.
         let dirty = self.host.take_dirty_sections();
-        let start = Instant::now();
-        let mut processed = 0usize;
-        let mut deferred: Vec<SectionPos> = Vec::new();
+        let mut deferred = Vec::new();
+        let mut submitted = 0usize;
         for pos in dirty {
-            if start.elapsed().as_micros() >= MESH_BUDGET_US && processed > 0 {
+            if self.host.world().section(pos).is_none() {
+                self.drop_section_mesh(pos);
+                self.mesh_scheduler.forget_section(pos);
+                continue;
+            }
+            if submitted >= MAX_MESH_SUBMISSIONS_PER_FRAME {
+                self.mesh_scheduler.invalidate(pos);
                 deferred.push(pos);
                 continue;
             }
-            if self.host.world().section(pos).is_none() {
-                continue;
-            }
-            let mesh = mesh_section(self.host.world(), pos);
-            if mesh.vertices.is_empty() {
-                self.renderer.remove_mesh(pos);
-                self.meshes.remove(&pos);
+            if self.mesh_scheduler.submit(self.host.world(), pos) {
+                submitted += 1;
             } else {
-                let vertex_count = mesh.vertices.len();
-                self.renderer.upload_mesh(pos, mesh);
-                self.meshes.insert(pos, vertex_count);
+                deferred.push(pos);
             }
-            processed += 1;
         }
         for pos in deferred {
             self.host.world_mut().mark_section_dirty(pos);
         }
+
+        self.drain_mesh_results();
+
+        if self.mesh_stats_timer.elapsed() >= MESH_STATS_INTERVAL {
+            log::debug!(
+                "mesh scheduler: submitted {} completed {} dropped {} in-flight {} backlog {}",
+                self.mesh_scheduler.submitted_count(),
+                self.mesh_scheduler.completed_count(),
+                self.mesh_scheduler.dropped_count(),
+                self.mesh_scheduler.in_flight_count(),
+                self.host.dirty_sections(),
+            );
+            self.mesh_stats_timer = Instant::now();
+        }
+    }
+
+    /// Uploads completed meshes until the per-frame budget is spent.
+    ///
+    /// Results that do not fit stay in the channel (and therefore keep their
+    /// section in flight) and are picked up on the next frame.
+    fn drain_mesh_results(&mut self) {
+        let start = Instant::now();
+        let mut uploaded = 0usize;
+        loop {
+            if uploaded > 0 && start.elapsed().as_micros() >= MESH_UPLOAD_BUDGET_US {
+                break;
+            }
+            // try_recv drops stale epochs internally.
+            let Some(result) = self.mesh_scheduler.try_recv() else {
+                break;
+            };
+            if self.host.world().section(result.pos).is_none() {
+                self.drop_section_mesh(result.pos);
+                continue;
+            }
+            if result.mesh.vertices.is_empty() {
+                self.drop_section_mesh(result.pos);
+            } else {
+                let vertex_count = result.mesh.vertices.len();
+                self.renderer.upload_mesh(result.pos, result.mesh);
+                self.meshes.insert(result.pos, vertex_count);
+            }
+            uploaded += 1;
+        }
+    }
+
+    /// Removes a section mesh from the renderer and the client-side table.
+    fn drop_section_mesh(&mut self, pos: SectionPos) {
+        self.renderer.remove_mesh(pos);
+        self.meshes.remove(&pos);
     }
 
     fn unload_chunk_meshes(&mut self, chunk: ChunkPos) {
@@ -315,9 +392,11 @@ impl GameState {
             .copied()
             .collect();
         for pos in positions {
-            self.renderer.remove_mesh(pos);
-            self.meshes.remove(&pos);
+            self.drop_section_mesh(pos);
         }
+        // In-flight results for the unloaded column are discarded when they
+        // complete because their epoch is no longer tracked.
+        self.mesh_scheduler.forget_chunk(chunk);
     }
 
     fn tick(&mut self) {
@@ -437,6 +516,8 @@ impl ApplicationHandler for App {
         };
         log::info!("GPU: {}", renderer.adapter_summary());
         let registry = Arc::new(Registry::base());
+        let mesh_scheduler = MeshScheduler::new(self.options.mesh_workers, Arc::clone(&registry));
+        log::info!("mesh scheduler: {} worker threads", mesh_scheduler.workers());
         let config = HostConfig {
             seed: self.options.seed,
             world_name: self.options.world.clone(),
@@ -462,6 +543,8 @@ impl ApplicationHandler for App {
             renderer,
             host,
             registry,
+            mesh_scheduler,
+            mesh_stats_timer: Instant::now(),
             keys: [false; 8],
             input_yaw: yaw,
             input_pitch: pitch,
@@ -634,6 +717,17 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
             }
             "fly" => options.fly = true,
             "x11" => options.force_x11 = true,
+            "mesh-workers" => {
+                options.mesh_workers = value
+                    .parse()
+                    .map_err(|_| format!("invalid --mesh-workers value '{value}'"))?;
+                if !(1..=mesh_scheduler::MAX_MESH_WORKERS).contains(&options.mesh_workers) {
+                    return Err(format!(
+                        "--mesh-workers must be between 1 and {}",
+                        mesh_scheduler::MAX_MESH_WORKERS
+                    ));
+                }
+            }
             "seconds" => {
                 options.seconds = Some(
                     value

@@ -3,8 +3,16 @@
 //! This is the v0.0.1 in-code registry. The data-driven content-pack pipeline
 //! described in `docs/spec/15-content-system.md` replaces the hard-coded
 //! `Registry::base()` at milestone MS-05 without changing this public API.
+//!
+//! The first slice of that pipeline lives in [`pack`]: [`registry_from_pack`]
+//! loads the versioned JSON block schema and builds a [`Registry`] through the
+//! same [`Registry::from_blocks`] path used by [`Registry::base`].
 
 use rustc_hash::FxHashMap;
+
+pub mod pack;
+
+pub use pack::{MAX_BLOCKS, MAX_PACK_BYTES, PackError, load_blocks_json, registry_from_pack};
 
 /// A dense, session-local block type index. Never persisted or networked.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -244,20 +252,56 @@ impl Registry {
                 BlockTextures::all(tex::SNOW),
             ),
         ];
-        let mut blocks = Vec::with_capacity(defs.len());
-        let mut by_id = FxHashMap::default();
-        for (index, (id, color, solid, opaque, fluid, textures)) in defs.into_iter().enumerate() {
-            by_id.insert(id, BlockId(index as u16));
-            blocks.push(BlockType {
+        let blocks = defs
+            .into_iter()
+            .map(|(id, color, solid, opaque, fluid, textures)| BlockType {
                 id,
                 color,
                 solid,
                 opaque,
                 fluid,
                 textures,
+            })
+            .collect();
+        Self::from_blocks(blocks).expect("the built-in base block set is valid")
+    }
+
+    /// Builds a frozen registry from an ordered list of block types.
+    ///
+    /// This is the single construction path for registries: [`Registry::base`]
+    /// and [`registry_from_pack`] both call it. The first block must be
+    /// `openblock:air`, ids must be unique, and the list must be non-empty and
+    /// no larger than [`MAX_BLOCKS`].
+    pub fn from_blocks(blocks: Vec<BlockType>) -> Result<Self, PackError> {
+        if blocks.is_empty() {
+            return Err(PackError::MissingAir { path: None });
+        }
+        if blocks.len() > MAX_BLOCKS {
+            return Err(PackError::TooManyBlocks {
+                path: None,
+                count: blocks.len(),
+                limit: MAX_BLOCKS,
             });
         }
-        Self { blocks, by_id }
+        if blocks[0].id != pack::AIR_ID {
+            return Err(PackError::InvalidOrder {
+                path: None,
+                id: blocks[0].id.to_owned(),
+            });
+        }
+
+        let mut by_id = FxHashMap::default();
+        for (index, block) in blocks.iter().enumerate() {
+            if let Some(first) = by_id.insert(block.id, BlockId(index as u16)) {
+                return Err(PackError::DuplicateId {
+                    path: None,
+                    id: block.id.to_owned(),
+                    first: first.0 as usize,
+                    second: index,
+                });
+            }
+        }
+        Ok(Self { blocks, by_id })
     }
 
     /// Looks up a block type by dense id.

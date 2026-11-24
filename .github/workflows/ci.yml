@@ -49,7 +49,16 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq mesa-vulkan-drivers libvulkan1
-          cargo run --release --locked -p ob_tools --bin openblock-tools -- bench --frames 30 --width 640 --height 360 --seed 42 --render-distance 6 --data-dir target/bench-data --max-frame-ms 2000
+          cargo run --release --locked -p ob_tools --bin openblock-tools -- bench --frames 30 --width 640 --height 360 --seed 42 --render-distance 6 --data-dir target/bench-data --json target/bench.json --max-frame-ms 2000
+      - name: Save size guard
+        # The 169-chunk reference world is ~49 KiB compressed (v0.0.2). Fail loudly
+        # if compression or light storage regresses by an order of magnitude.
+        run: |
+          save=$(find target/smoke -name world.obs | head -1)
+          test -n "$save"
+          bytes=$(stat -c %s "$save")
+          echo "save size: $bytes bytes ($save)"
+          test "$bytes" -lt 5000000
       - name: Docs
         if: matrix.os == 'ubuntu-latest'
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps

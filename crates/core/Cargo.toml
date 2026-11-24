@@ -14,3 +14,5 @@ path = "src/lib.rs"
 
 [dependencies]
 log.workspace = true
+serde.workspace = true
+serde_json.workspace = true

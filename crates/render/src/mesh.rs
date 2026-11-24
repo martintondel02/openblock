@@ -10,7 +10,7 @@
 
 #![allow(missing_docs)] // TODO(MS-04): re-enable once the v0.0.1 API surface settles
 
-use ob_content::{BlockId, BlockType};
+use ob_content::{BlockId, BlockType, Registry};
 use ob_math::{BlockPos, SECTION_SIZE, SectionPos};
 use ob_world::World;
 
@@ -18,6 +18,83 @@ use crate::{MeshData, Vertex};
 
 /// Number of blocks along one section axis.
 const SECTION_EDGE: usize = SECTION_SIZE;
+
+/// Edge length of an immutable section snapshot: the 16³ section plus one
+/// block of border on every side.
+pub const SNAPSHOT_SIZE: usize = 18;
+
+// The literal above is part of the snapshot contract; keep it tied to the
+// section size if the 16³ storage unit ever changes.
+const _: () = assert!(SNAPSHOT_SIZE == SECTION_EDGE + 2);
+
+/// Offset from a section-local coordinate to an index inside a snapshot.
+const SNAPSHOT_BORDER: i32 = 1;
+
+/// Highest section-local coordinate stored in a snapshot (the +1 border).
+const SNAPSHOT_MAX_LOCAL: i32 = SECTION_EDGE as i32;
+
+/// An immutable copy of a section plus its one-block border.
+///
+/// Worker threads can mesh a snapshot without touching the live [`World`],
+/// which keeps meshing independent of edits and streaming on the main thread.
+/// The box is indexed `(y * 18 + z) * 18 + x` with a `+1` border offset on every
+/// axis, so section-local coordinates `-1..=16` are addressable.
+#[derive(Clone, Debug)]
+pub struct SectionSnapshot {
+    /// Position of the captured section.
+    pub pos: SectionPos,
+    /// `SNAPSHOT_SIZE³` block ids in `(y, z, x)` order.
+    blocks: Box<[BlockId]>,
+}
+
+impl SectionSnapshot {
+    /// Captures a section and its border from the world.
+    ///
+    /// Positions outside a loaded column or outside the world height read as
+    /// air, matching [`World::get_block`].
+    pub fn capture(world: &World, pos: SectionPos) -> Self {
+        let mut blocks = vec![BlockId::AIR; SNAPSHOT_SIZE * SNAPSHOT_SIZE * SNAPSHOT_SIZE].into_boxed_slice();
+        let origin = pos.origin();
+        let mut index = 0;
+        for y in -SNAPSHOT_BORDER..=SNAPSHOT_MAX_LOCAL {
+            for z in -SNAPSHOT_BORDER..=SNAPSHOT_MAX_LOCAL {
+                for x in -SNAPSHOT_BORDER..=SNAPSHOT_MAX_LOCAL {
+                    blocks[index] = world.get_block(origin.offset(x, y, z));
+                    index += 1;
+                }
+            }
+        }
+        Self { pos, blocks }
+    }
+
+    /// Reads a block at section-local coordinates in `-1..=16`.
+    ///
+    /// Coordinates outside the stored border read as air.
+    pub fn block(&self, x: i32, y: i32, z: i32) -> BlockId {
+        let inside = |value: i32| (-SNAPSHOT_BORDER..=SNAPSHOT_MAX_LOCAL).contains(&value);
+        if !inside(x) || !inside(y) || !inside(z) {
+            return BlockId::AIR;
+        }
+        let x = (x + SNAPSHOT_BORDER) as usize;
+        let y = (y + SNAPSHOT_BORDER) as usize;
+        let z = (z + SNAPSHOT_BORDER) as usize;
+        self.blocks[(y * SNAPSHOT_SIZE + z) * SNAPSHOT_SIZE + x]
+    }
+
+    /// Builds the greedy mesh for this snapshot using registry block data.
+    pub fn mesh(&self, registry: &Registry) -> MeshData {
+        let mut mesh = MeshData::default();
+        for face in FACES {
+            mesh_face(&mut mesh.vertices, self, registry, face);
+        }
+        mesh
+    }
+
+    /// Whether the block at section-local coordinates is opaque.
+    fn is_opaque(&self, registry: &Registry, x: i32, y: i32, z: i32) -> bool {
+        registry.block(self.block(x, y, z)).opaque
+    }
+}
 
 /// Ambient-occlusion brightness indexed by the number of occluding neighbours
 /// around a vertex corner (0..=3).
@@ -155,11 +232,8 @@ pub fn mesh_section(world: &World, pos: SectionPos) -> MeshData {
 
 /// Returns the greedy mesh and its statistics in one pass.
 pub fn mesh_section_with_stats(world: &World, pos: SectionPos) -> (MeshData, MesherStats) {
-    let mut mesh = MeshData::default();
-    let origin = pos.origin();
-    for face in FACES {
-        mesh_face(&mut mesh.vertices, world, origin, face);
-    }
+    let snapshot = SectionSnapshot::capture(world, pos);
+    let mesh = snapshot.mesh(world.registry());
     let vertices = mesh.vertices.len() as u32;
     let stats = MesherStats {
         faces: vertices / 6,
@@ -169,7 +243,7 @@ pub fn mesh_section_with_stats(world: &World, pos: SectionPos) -> (MeshData, Mes
 }
 
 /// Meshes every slice of one face direction into merged quads.
-fn mesh_face(out: &mut Vec<Vertex>, world: &World, origin: BlockPos, face: Face) {
+fn mesh_face(out: &mut Vec<Vertex>, snapshot: &SectionSnapshot, registry: &Registry, face: Face) {
     let axes = face.axes();
     for slice in 0..SECTION_EDGE {
         let mut mask: [[Option<MergeKey>; SECTION_EDGE]; SECTION_EDGE] = [[None; SECTION_EDGE]; SECTION_EDGE];
@@ -181,17 +255,20 @@ fn mesh_face(out: &mut Vec<Vertex>, world: &World, origin: BlockPos, face: Face)
                 local[axes.normal_axis] = slice as i32;
                 local[axes.u_axis] = u as i32;
                 local[axes.v_axis] = v as i32;
-                let block_pos = origin.offset(local[0], local[1], local[2]);
-                let block_id = world.get_block(block_pos);
+                let block_id = snapshot.block(local[0], local[1], local[2]);
                 if block_id == BlockId::AIR {
                     continue;
                 }
-                let block = world.block_type(block_id);
-                let neighbour_pos = block_pos.offset(face.normal[0], face.normal[1], face.normal[2]);
-                if !face_visible(block, world.block_type(world.get_block(neighbour_pos))) {
+                let block = registry.block(block_id);
+                let neighbour = snapshot.block(
+                    local[0] + face.normal[0],
+                    local[1] + face.normal[1],
+                    local[2] + face.normal[2],
+                );
+                if !face_visible(block, registry.block(neighbour)) {
                     continue;
                 }
-                let ao = face_ambient_occlusion(world, block_pos, &face);
+                let ao = face_ambient_occlusion(snapshot, registry, local, &face);
                 *cell = Some(MergeKey {
                     layer: u32::from(block.textures.for_face(axes.texture_face).0),
                     brightness: face.brightness,
@@ -199,7 +276,7 @@ fn mesh_face(out: &mut Vec<Vertex>, world: &World, origin: BlockPos, face: Face)
                 });
             }
         }
-        emit_greedy(out, origin, &axes, slice, &mask);
+        emit_greedy(out, snapshot.pos.origin(), &axes, slice, &mask);
     }
 }
 
@@ -322,33 +399,36 @@ fn face_visible(current: &BlockType, neighbour: &BlockType) -> bool {
 ///
 /// Corner order is `(u0,v0), (u1,v0), (u1,v1), (u0,v1)`. The three blocks
 /// sharing a corner in the layer in front of the face (two sides and the
-/// diagonal) are counted with [`World::is_opaque`].
-fn face_ambient_occlusion(world: &World, block_pos: BlockPos, face: &Face) -> [f32; 4] {
+/// diagonal) are counted with [`SectionSnapshot::is_opaque`].
+fn face_ambient_occlusion(snapshot: &SectionSnapshot, registry: &Registry, local: [i32; 3], face: &Face) -> [f32; 4] {
     const CORNERS: [(i32, i32); 4] = [(0, 0), (1, 0), (1, 1), (0, 1)];
     CORNERS.map(|(su, sv)| {
         let side_u = if su == 0 { -1 } else { 1 };
         let side_v = if sv == 0 { -1 } else { 1 };
         let layer = face.normal;
         let mut occluders = 0u8;
-        if world.is_opaque(block_pos.offset(
-            layer[0] + side_u * face.u[0],
-            layer[1] + side_u * face.u[1],
-            layer[2] + side_u * face.u[2],
-        )) {
+        if snapshot.is_opaque(
+            registry,
+            local[0] + layer[0] + side_u * face.u[0],
+            local[1] + layer[1] + side_u * face.u[1],
+            local[2] + layer[2] + side_u * face.u[2],
+        ) {
             occluders += 1;
         }
-        if world.is_opaque(block_pos.offset(
-            layer[0] + side_v * face.v[0],
-            layer[1] + side_v * face.v[1],
-            layer[2] + side_v * face.v[2],
-        )) {
+        if snapshot.is_opaque(
+            registry,
+            local[0] + layer[0] + side_v * face.v[0],
+            local[1] + layer[1] + side_v * face.v[1],
+            local[2] + layer[2] + side_v * face.v[2],
+        ) {
             occluders += 1;
         }
-        if world.is_opaque(block_pos.offset(
-            layer[0] + side_u * face.u[0] + side_v * face.v[0],
-            layer[1] + side_u * face.u[1] + side_v * face.v[1],
-            layer[2] + side_u * face.u[2] + side_v * face.v[2],
-        )) {
+        if snapshot.is_opaque(
+            registry,
+            local[0] + layer[0] + side_u * face.u[0] + side_v * face.v[0],
+            local[1] + layer[1] + side_u * face.u[1] + side_v * face.v[1],
+            local[2] + layer[2] + side_u * face.u[2] + side_v * face.v[2],
+        ) {
             occluders += 1;
         }
         AO_FACTORS[occluders as usize]
@@ -371,7 +451,7 @@ mod tests {
     use std::sync::Arc;
 
     use ob_content::{BlockId, Registry, textures};
-    use ob_math::{BlockPos, ChunkPos};
+    use ob_math::{BlockPos, ChunkPos, WORLD_MAX_Y, WORLD_MIN_Y};
     use ob_world::ChunkColumn;
 
     use super::*;
@@ -755,5 +835,141 @@ mod tests {
         // The neighbour section culls its own -X face the same way.
         let (_, neighbour_stats) = mesh_section_with_stats(&world, SectionPos::new(1, 0, 0));
         assert_eq!(neighbour_stats.faces, 5);
+    }
+
+    #[test]
+    fn snapshot_mesh_matches_world_mesh_vertex_for_vertex() {
+        let mut world = world_with_chunk(ChunkPos::new(0, 0));
+        let stone = block(&world, "openblock:stone");
+        let dirt = block(&world, "openblock:dirt");
+        let water = block(&world, "openblock:water");
+        let leaves = block(&world, "openblock:leaves");
+        for y in 0..6 {
+            for z in 0..8 {
+                for x in 0..8 {
+                    let id = match (x + 2 * y + 3 * z) % 5 {
+                        0 => stone,
+                        1 => dirt,
+                        2 => water,
+                        3 => leaves,
+                        _ => BlockId::AIR,
+                    };
+                    assert!(world.set_block(BlockPos::new(x, y, z), id));
+                }
+            }
+        }
+
+        let registry = registry();
+        let snapshot = SectionSnapshot::capture(&world, section());
+        let from_snapshot = snapshot.mesh(&registry);
+        let from_world = mesh_section(&world, section());
+        assert!(!from_snapshot.vertices.is_empty());
+        assert_eq!(
+            from_snapshot.vertices, from_world.vertices,
+            "snapshot meshing must reproduce the world mesher exactly",
+        );
+    }
+
+    #[test]
+    fn snapshot_captures_chunk_border_and_culls_the_shared_face() {
+        let mut world = world_with_chunk(ChunkPos::new(0, 0));
+        world.insert_chunk(ChunkColumn::new(ChunkPos::new(1, 0)));
+        let stone = block(&world, "openblock:stone");
+        assert!(world.set_block(BlockPos::new(15, 0, 0), stone));
+        assert!(world.set_block(BlockPos::new(16, 0, 0), stone));
+
+        let snapshot = SectionSnapshot::capture(&world, section());
+        assert_eq!(snapshot.block(15, 0, 0), stone);
+        assert_eq!(
+            snapshot.block(16, 0, 0),
+            stone,
+            "the +1 border must include the next chunk"
+        );
+        assert_eq!(snapshot.block(-1, 0, 0), BlockId::AIR);
+
+        let mesh = snapshot.mesh(&registry());
+        assert_eq!(
+            SectionSnapshot::capture(&world, section())
+                .mesh(&registry())
+                .vertices
+                .len(),
+            30
+        );
+        assert_eq!(mesh.vertices.len(), 30);
+        assert!(
+            !mesh
+                .vertices
+                .as_chunks::<6>()
+                .0
+                .iter()
+                .any(|quad| quad.iter().all(|vertex| (vertex.position[0] - 16.0).abs() < 1e-5)),
+            "the face shared with the next chunk must be culled",
+        );
+    }
+
+    #[test]
+    fn snapshot_captures_vertical_section_border_and_culls_the_shared_face() {
+        // Both blocks live in the same chunk column: this is a section border
+        // that is not a chunk border.
+        let mut world = world_with_chunk(ChunkPos::new(0, 0));
+        let stone = block(&world, "openblock:stone");
+        assert!(world.set_block(BlockPos::new(0, 15, 0), stone));
+        assert!(world.set_block(BlockPos::new(0, 16, 0), stone));
+
+        let lower = SectionSnapshot::capture(&world, section());
+        assert_eq!(lower.block(0, 15, 0), stone);
+        assert_eq!(
+            lower.block(0, 16, 0),
+            stone,
+            "the +Y border must reach the next section"
+        );
+        let lower_mesh = lower.mesh(&registry());
+        assert_eq!(lower_mesh.vertices.len(), 30, "the shared top face must be culled");
+        assert!(
+            !lower_mesh
+                .vertices
+                .as_chunks::<6>()
+                .0
+                .iter()
+                .any(|quad| quad.iter().all(|vertex| (vertex.position[1] - 16.0).abs() < 1e-5)),
+        );
+
+        let upper = SectionSnapshot::capture(&world, SectionPos::new(0, 1, 0));
+        assert_eq!(
+            upper.block(0, -1, 0),
+            stone,
+            "the -Y border must reach the previous section"
+        );
+        assert_eq!(upper.mesh(&registry()).vertices.len(), 30);
+    }
+
+    #[test]
+    fn snapshot_reads_out_of_world_y_as_air() {
+        let mut world = World::new(registry(), 0);
+        world.insert_chunk(ChunkColumn::new(ChunkPos::new(0, 0)));
+        let stone = block(&world, "openblock:stone");
+
+        let bottom_section_y = WORLD_MIN_Y / SECTION_SIZE as i32;
+        assert!(world.set_block(BlockPos::new(0, WORLD_MIN_Y, 0), stone));
+        let bottom = SectionSnapshot::capture(&world, SectionPos::new(0, bottom_section_y, 0));
+        assert_eq!(bottom.block(0, 0, 0), stone);
+        assert_eq!(bottom.block(0, -1, 0), BlockId::AIR);
+
+        let top_section_y = WORLD_MAX_Y / SECTION_SIZE as i32 - 1;
+        assert!(world.set_block(BlockPos::new(1, WORLD_MAX_Y - 1, 0), stone));
+        let top = SectionSnapshot::capture(&world, SectionPos::new(0, top_section_y, 0));
+        assert_eq!(top.block(1, SECTION_SIZE as i32 - 1, 0), stone);
+        assert_eq!(top.block(1, SNAPSHOT_MAX_LOCAL, 0), BlockId::AIR);
+        assert_eq!(top.block(1, SNAPSHOT_MAX_LOCAL + 1, 0), BlockId::AIR);
+    }
+
+    #[test]
+    fn empty_snapshot_produces_an_empty_mesh() {
+        let world = world_with_chunk(ChunkPos::new(0, 0));
+        let snapshot = SectionSnapshot::capture(&world, section());
+        assert_eq!(snapshot.block(0, 0, 0), BlockId::AIR);
+        let mesh = snapshot.mesh(&registry());
+        assert!(mesh.is_empty());
+        assert_eq!(mesh.triangle_count(), 0);
     }
 }

@@ -5,7 +5,7 @@ version = 1
 [[annotations]]
 path = [
   "README.md", "CONTRIBUTING.md", "SECURITY.md", "CODE_OF_CONDUCT.md",
-  "MAINTAINERS.md", "docs/**", "crates/**", "xtask/**", "perf/**", "justfile",
+  "MAINTAINERS.md", "docs/**", "crates/**", "xtask/**", "perf/**", "packs/**", "justfile",
   "Cargo.toml", "rust-toolchain.toml", "rustfmt.toml", "deny.toml",
   "architecture.toml", "REUSE.toml", "perf/**",
   ".github/**", ".editorconfig", ".markdownlint.jsonc", ".gitignore",

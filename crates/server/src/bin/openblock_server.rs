@@ -41,8 +41,10 @@ fn main() {
     }
     if has("help") || !free.is_empty() {
         println!("usage: openblock-server [--world NAME] [--seed N] [--data-dir DIR]");
-        println!("                         [--render-distance N] [--smoke] [--ticks N]");
+        println!("                         [--render-distance N] [--pack PATH] [--smoke] [--ticks N]");
         println!("                         [--version] [--help]");
+        println!();
+        println!("  --pack PATH  load a data-driven content pack (JSON); defaults to the built-in base blocks");
         return;
     }
 
@@ -66,7 +68,17 @@ fn main() {
         render_distance_chunks: value("render-distance").and_then(|v| v.parse().ok()).unwrap_or(6),
         generate_budget: 4,
     };
-    let registry = Arc::new(Registry::base());
+    let registry = match value("pack") {
+        Some(path) => match ob_content::registry_from_pack(std::path::Path::new(&path)) {
+            Ok(registry) => Arc::new(registry),
+            Err(err) => {
+                eprintln!("openblock-server: failed to load content pack '{path}': {err}");
+                std::process::exit(2);
+            }
+        },
+        None => Arc::new(Registry::base()),
+    };
+    log::info!("content: {} block types", registry.len());
     log::info!("{}", ob_core::version_banner("openblock-server"));
     let mut host = match Host::open(Arc::clone(&registry), config.clone()) {
         Ok(host) => host,
@@ -100,7 +112,7 @@ fn main() {
         };
         for _ in 0..ticks {
             host.tick(&PlayerInput::default());
-            host.ensure_streaming(2);
+            host.ensure_streaming(16);
         }
         if let Err(err) = host.save() {
             log::error!("save failed: {err}");
@@ -203,7 +215,7 @@ fn run_dedicated(host: &mut Host) {
         if now.duration_since(last_tick) >= TICK {
             last_tick += TICK;
             host.tick(&PlayerInput::default());
-            host.ensure_streaming(4);
+            host.ensure_streaming(16);
             ticks_in_window += 1;
             if now.duration_since(last_status) >= Duration::from_secs(5) {
                 tps = ticks_in_window as f32 / now.duration_since(last_status).as_secs_f32();

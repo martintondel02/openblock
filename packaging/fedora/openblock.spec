@@ -127,5 +127,12 @@ update-desktop-database &>/dev/null || :
 %config(noreplace) %{_sysconfdir}/openblock-server/server.toml
 
 %changelog
-* Tue Nov 24 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.0.0-1
-- Initial packaging skeleton (specification stage; not yet a playable build).
+* Tue Nov 24 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.0.2-1
+- Textured greedy-meshed rendering, frustum culling and procedural texture array.
+- zstd-compressed save format v2 with compact light storage and v1 read support.
+- World generation quality pass (mountains, snow peaks, shores, trees, boulders).
+- Benchmark harness and CI render/bench/save-size gates.
+
+* Tue Nov 24 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.0.1-1
+- First tech preview: windowed client, headless host, terrain, physics,
+  block break/place, save/load, determinism smoke test.
