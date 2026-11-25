@@ -41,7 +41,7 @@ chunk columns, never a 512-block diameter.
 | REQ-RENDER-012 | Voxel quads are exactly 16 B in the §4.1 layout; position, normal, UV, AO and corner light are derived, with no vertex attributes. | `size_of` test plus golden image |
 | REQ-RENDER-013 | Three buckets (opaque, cutout, translucent); opaque and cutout are never sorted per frame, translucent is sorted per cluster back to front. | Image test plus sort unit test |
 | REQ-RENDER-014 | Meshes are cached under (dimension, cluster position, content epoch, mesher version) and invalidated on edit, border change, content reload and eviction; a stale mesh is never drawn. | Cache test plus edit-latency test |
-| REQ-RENDER-015 | At a 512-block radius: ≤ 12 geometry draws and ≤ 32 draws including shadow, post and UI per frame. | Frame statistics gate |
+| REQ-RENDER-015 | At a 512-block radius the v1.1 interim path stays under 1,000 geometry draws at 1280×720 using the §3.10 surface-shell LOD; the MS-04 GPU-driven target remains ≤ 12 geometry draws and ≤ 32 including shadow, post and UI. | Frame statistics gate |
 | REQ-RENDER-016 | No per-frame main-thread loop iterates over individual sections; visibility cost scales with region and 32³-cluster counts only. | 512-vs-1024-block-radius scaling benchmark |
 | REQ-RENDER-017 | CPU region+cluster frustum culling is the MVP path; the Hi-Z compute culling with GPU compaction is **(provisional)** until MS-04; the zero-instance portable path selects the same visible set as the counted path. | A/B image diff across paths |
 | REQ-RENDER-018 | 2×2×2 sections (32³) is the default mesh cluster from MS-04 (DEC-048); `mesh.cluster_sections = 1` remains a debug/fallback option. Both paths agree on face visibility and differ only in merge factor. | A/B diff plus quad-count report |
@@ -52,7 +52,7 @@ chunk columns, never a 512-block diameter.
 | REQ-RENDER-023 | Entities, items and particles are instanced or vertex-pulled from shared buffers; no per-entity uniform, bind group or pipeline switch in the frame loop. | Draw counter with 500 entities |
 | REQ-RENDER-024 | The UI pass is last, in the swapchain format, `LoadOp::Load`, without world depth, and never influences culling. | Graph inspection |
 | REQ-RENDER-025 | Shadow and post passes are declared in §3.9 and implemented by [chapter 04](04-shaders-and-visuals.md); adding or removing one updates both chapters' budgets. | Pass inventory diff |
-| REQ-RENDER-026 | No LOD inside the render distance at 1.0; beyond-view terrain is visual-only (DEC-018). | Config inspection plus parity test |
+| REQ-RENDER-026 | At a 512-block radius, full 16³ section detail inside a 10-chunk radius; farther columns use the §3.10 surface-shell batch LOD (top 48 blocks, 2×2-chunk groups, at most one geometry draw per group). No impostor or generated terrain exists beyond the render distance. | LOD policy unit tests, renderer distance tests and the 512-block benchmark |
 | REQ-RENDER-027 | Present mode, limiter and vsync map to the §3.10 settings; default `Mailbox` else `Fifo`, vsync off. | Settings schema plus frame trace |
 | REQ-RENDER-028 | Upload bytes, mesh jobs, defrag copies and sorts have hard per-frame caps; exceeding one defers work rather than extending the frame. | p99 gate during streaming |
 | REQ-RENDER-029 | Presets are data (potato, low, medium, high, performance, ultra) mapping to §3.11 settings; `performance` is the 144 FPS mode, not a quality tier above `high`; no automatic preset changes state unreported in the UI. | Settings schema test |
@@ -432,12 +432,38 @@ and the graph re-derives barriers and aliasing.
 
 ### 3.10 LOD, frame pacing and latency
 
-No LOD inside the render distance at 1.0: every cluster within the 512-block radius draws at
-full detail (DEC-018). Beyond it the world ends in atmospheric fog and sky — no impostor tiles,
-no heightfield rings, no GPU-generated far terrain. LOD becomes necessary at 128+ chunks, not
-32, and client-side generation is an information leak. Post-1.0 (MS-20) adds visual-only tiles
-allocated as whole pages and excluded from the shadow pass; they can never feed collision,
-spawning, drops, ore knowledge or anti-cheat.
+**v1.1 interim distance LOD.** The clustered GPU path in §3.5 is still the target design, but
+the shipping v1.1 renderer keeps the 16³ greedy mesher and adds a pragmatic distance tier so
+the 512-block radius is playable now:
+
+* Inside 10 chunks (160 blocks) every non-empty 16³ section draws as a full detail mesh.
+* Beyond 10 chunks a 2×2-chunk group (32×32 blocks) is meshed once into one merged buffer.
+  Each far column keeps only the top 48 blocks of its surface shell, derived from the
+  column heightmap, so caves and underground geometry are never submitted while the terrain
+  silhouette, cliffs, trees and water surfaces remain.
+* Tier choice is per group and hysteretic: a group is full or shell as a whole, which avoids
+  holes at the boundary, and a group is built only once all four columns are resident.
+* Far groups are built on the same worker pool as section meshes from a small cloned
+  neighbourhood (group plus one chunk of border), so a batch is independent of the live
+  world and can be cancelled by its epoch. At most four batches are queued at once and one
+  batch is uploaded per frame to bound buffer-creation hitches.
+* `render_distance_chunks` is clamped to 2..=32; the settings row shows both the chunk count
+  and the block radius (`32 chunks / 512 blocks`). The camera far plane is
+  `chunks × 16 + 48` (560 blocks at the ceiling). Standard `Depth32Float` is kept — no
+  reverse-Z — because the 0.31 m depth quantum at 512 m is below the sub-pixel size of far
+  terrain.
+
+Measured at 1280×720 on the RADV integrated reference: 4,225 columns, 716 draws (433 full
+sections + 283 far batches), 6.35 M submitted vertices, p50 5.21 ms (191 FPS) with GPU
+readback. The pre-LOD scene at the same radius needed 8,917 draws and p50 13.87 ms. See
+[plan/08](../plan/08-measurements.md) for the full methodology and the 1,216 MiB vertex-data
+estimate (RSS 455 MiB).
+
+Beyond the render distance the world still ends in atmospheric fog and sky — no impostor
+tiles, heightfield rings or GPU-generated far terrain, and client-side generation would be an
+information leak. Post-1.0 (MS-20) adds visual-only tiles allocated as whole pages and
+excluded from the shadow pass; they can never feed collision, spawning, drops, ore knowledge
+or anti-cheat.
 
 | Setting | Values | Mapping |
 | --- | --- | --- |

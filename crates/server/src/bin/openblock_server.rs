@@ -300,7 +300,7 @@ fn print_help() {
     println!("  --config PATH            flat server.toml configuration (CLI overrides it)");
     println!("  --max-players N          player cap, 1..=500 (default: 8)");
     println!("  --motd TEXT              message of the day, at most 128 bytes");
-    println!("  --interest-radius N      per-client chunk radius, 1..=16 (default: 6)");
+    println!("  --interest-radius N      per-client chunk radius, 1..=32 (default: 6)");
     println!("  --save-interval SECONDS  autosave interval, 0 disables (default: 60)");
     println!("  --metrics-json PATH      write periodic JSON metrics snapshots (listener mode)");
     println!("  --metrics-interval SEC   seconds between metrics snapshots (default: 5)");
@@ -781,11 +781,23 @@ fn run_dedicated(host: &mut Host) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
             log::info!("shutdown signal received");
-            if let Err(err) = host.save() {
+            if let Err(err) = host.shutdown_save(Duration::from_secs(60)) {
                 log::error!("save on shutdown failed: {err}");
             }
             log::info!("saved; ran {} ticks", host.tick_count());
             return;
+        }
+        // Reap a finished background autosave without blocking the tick loop.
+        if let Some(result) = host.poll_save() {
+            match result {
+                Ok(report) => log::info!(
+                    "autosaved {} columns in {:.1} ms ({} bytes on disk)",
+                    report.chunks,
+                    report.elapsed_ms,
+                    report.total_bytes
+                ),
+                Err(err) => log::error!("autosave failed; previous save kept, will retry: {err}"),
+            }
         }
         let now = Instant::now();
         if now.duration_since(last_tick) >= TICK {
@@ -804,18 +816,22 @@ fn run_dedicated(host: &mut Host) {
                     host.tick_count()
                 );
             }
-            if now.duration_since(last_save) >= Duration::from_secs(30) {
-                if let Err(err) = host.save() {
-                    log::error!("autosave failed: {err}");
+            if now.duration_since(last_save) >= Duration::from_secs(30) && !host.save_in_flight() {
+                match host.save_async() {
+                    Ok(true) => last_save = now,
+                    Ok(false) => {}
+                    Err(err) => {
+                        last_save = now;
+                        log::error!("could not start autosave: {err}");
+                    }
                 }
-                last_save = now;
             }
         }
         while let Ok(command) = rx.try_recv() {
             match command.as_str() {
                 "stop" | "quit" | "exit" => {
                     log::info!("stopping");
-                    if let Err(err) = host.save() {
+                    if let Err(err) = host.shutdown_save(Duration::from_secs(60)) {
                         log::error!("save on stop failed: {err}");
                     }
                     log::info!(
@@ -825,7 +841,7 @@ fn run_dedicated(host: &mut Host) {
                     );
                     return;
                 }
-                "save" => match host.save() {
+                "save" => match host.save_and_wait() {
                     Ok(()) => log::info!("saved"),
                     Err(err) => log::error!("save failed: {err}"),
                 },

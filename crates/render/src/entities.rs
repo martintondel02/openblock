@@ -199,6 +199,8 @@ const CUBE_VERTICES: [CubeVertex; CUBE_VERTEX_COUNT as usize] = [
 /// The entity pipeline and its persistent vertex/instance buffers.
 pub struct EntitiesRenderer {
     pipeline: wgpu::RenderPipeline,
+    /// Depth-only variant used by the sun shadow cascades.
+    shadow_pipeline: wgpu::RenderPipeline,
     cube_buffer: wgpu::Buffer,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
@@ -214,6 +216,7 @@ impl EntitiesRenderer {
         queue: &wgpu::Queue,
         target_format: wgpu::TextureFormat,
         bind_group_layout: &wgpu::BindGroupLayout,
+        shadow_bind_group_layout: &wgpu::BindGroupLayout,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("entity-shader"),
@@ -233,6 +236,11 @@ impl EntitiesRenderer {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("entity-pipeline-layout"),
             bind_group_layouts: &[Some(bind_group_layout)],
+            immediate_size: 0,
+        });
+        let shadow_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("entity-shadow-pipeline-layout"),
+            bind_group_layouts: &[Some(shadow_bind_group_layout)],
             immediate_size: 0,
         });
         // Keep these offsets in sync with `CubeVertex`, `EntityRaw` and entity.wgsl.
@@ -338,8 +346,53 @@ impl EntitiesRenderer {
             cache: None,
         });
 
+        let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("entity-shadow-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("entity_shadow.wgsl").into()),
+        });
+        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("entity-shadow-pipeline"),
+            layout: Some(&shadow_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shadow_shader,
+                entry_point: Some("vs_entity_shadow"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &vertex_buffers,
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: crate::pipeline::SHADOW_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: 2,
+                    slope_scale: 2.5,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shadow_shader,
+                entry_point: Some("fs_entity_shadow"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             pipeline,
+            shadow_pipeline,
             cube_buffer,
             instance_buffer,
             instance_capacity: INITIAL_INSTANCE_CAPACITY,
@@ -383,6 +436,23 @@ impl EntitiesRenderer {
             return;
         }
         pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.set_vertex_buffer(0, self.cube_buffer.slice(..));
+        pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+        pass.draw(0..CUBE_VERTEX_COUNT, 0..instance_count);
+    }
+
+    /// Draws every instance into a shadow-cascade depth pass.
+    ///
+    /// The shadow pipeline shares the unit-cube and instance buffers; textured
+    /// items discard transparent texels so dropped leaves do not cast a solid
+    /// cube shadow. An empty list issues no draw call.
+    pub(crate) fn draw_shadow(&self, pass: &mut wgpu::RenderPass<'_>, bind_group: &wgpu::BindGroup) {
+        let instance_count = self.gpu_instances.len() as u32;
+        if instance_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.shadow_pipeline);
         pass.set_bind_group(0, bind_group, &[]);
         pass.set_vertex_buffer(0, self.cube_buffer.slice(..));
         pass.set_vertex_buffer(1, self.instance_buffer.slice(..));

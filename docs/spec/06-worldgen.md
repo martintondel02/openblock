@@ -326,6 +326,23 @@ while a player is inside the bounding box ([09](09-entities-ai.md)).
 | `beard_box` | as thin over the whole box, plus clearing air above | dungeons, strongholds |
 | `bury` | fill solid from the piece's range to the surface | buried treasure, ancient cities |
 
+
+**Interim 1.1 structure layer.** Until the data-driven `structure_set` pipeline
+lands, the generator MAY place engine-defined, chunk-local structures. One
+candidate is derived per 8×8-chunk region from a region hash; the hash selects
+the candidate chunk, weighted kind and local anchor, and the whole footprint
+remains inside that chunk. A candidate MUST be rejected on wet ground (surface
+below sea + 3), on a footprint with more than four blocks of relief, inside the
+spawn-protection square, or in a chunk touched by a ravine candidate. Structures
+run after carvers and before features and ores, MUST use only existing block
+ids, MUST NOT replace water or bedrock, and MUST be supported by terrain or
+their own connected foundation. The interim API is
+`Generator::structure_in_chunk(ChunkPos) -> Option<StructureInstance>`; starts
+are not persisted. Loot chests/furnaces and template/jigsaw structure sets
+remain part of the full §3.8 target (MS-08 and later). The 1.1 palette is cobble,
+planks, crafting table, coal/iron/copper ore, sand, gravel and snow; types are
+ruined tower, abandoned camp, stone circle and mineshaft adit.
+
 ### 3.9 Dimensions and portals
 
 | Dimension | Y range | Sea | Generator | Notes |

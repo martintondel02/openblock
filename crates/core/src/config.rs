@@ -65,6 +65,217 @@ impl TextureStyle {
     }
 }
 
+/// Built-in 1.1 graphics preset.
+///
+/// Individual quality rows may override a preset; doing so stores
+/// [`GraphicsPreset::Custom`] so the settings screen never claims a preset it is
+/// not actually using.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GraphicsPreset {
+    /// No shadows or clouds, cheap water, no bloom or FXAA.
+    Low,
+    /// Low shadows and clouds, cheap water, bloom and FXAA.
+    Medium,
+    /// Three 2048² cascades, full clouds, transparent water, bloom, FXAA.
+    #[default]
+    High,
+    /// High shadows with 5×5 PCF.
+    Ultra,
+    /// Individual overrides.
+    Custom,
+}
+
+impl GraphicsPreset {
+    /// Menu-order presets, excluding [`Self::Custom`].
+    pub const ALL: [GraphicsPreset; 4] = [
+        GraphicsPreset::Low,
+        GraphicsPreset::Medium,
+        GraphicsPreset::High,
+        GraphicsPreset::Ultra,
+    ];
+
+    /// Stable lowercase settings/CLI name.
+    pub fn name(self) -> &'static str {
+        match self {
+            GraphicsPreset::Low => "low",
+            GraphicsPreset::Medium => "medium",
+            GraphicsPreset::High => "high",
+            GraphicsPreset::Ultra => "ultra",
+            GraphicsPreset::Custom => "custom",
+        }
+    }
+
+    /// Display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            GraphicsPreset::Low => "Low",
+            GraphicsPreset::Medium => "Medium",
+            GraphicsPreset::High => "High",
+            GraphicsPreset::Ultra => "Ultra",
+            GraphicsPreset::Custom => "Custom",
+        }
+    }
+
+    /// Parses a preset name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .chain([Self::Custom])
+            .find(|preset| preset.name().eq_ignore_ascii_case(name))
+    }
+
+    /// Next preset in the menu cycle (Low → Medium → High → Ultra → Low).
+    pub fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|preset| *preset == self).unwrap_or(2);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    /// Previous preset in the menu cycle.
+    pub fn previous(self) -> Self {
+        let index = Self::ALL.iter().position(|preset| *preset == self).unwrap_or(2);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
+/// Sun-shadow quality persisted in settings.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShadowQuality {
+    /// No shadows.
+    Off,
+    /// Two 1024² cascades, 3×3 PCF.
+    Low,
+    /// Three 2048² cascades, 3×3 PCF.
+    #[default]
+    High,
+    /// Three 2048² cascades, 5×5 PCF.
+    Ultra,
+}
+
+impl ShadowQuality {
+    /// All choices in menu order.
+    pub const ALL: [ShadowQuality; 4] = [
+        ShadowQuality::Off,
+        ShadowQuality::Low,
+        ShadowQuality::High,
+        ShadowQuality::Ultra,
+    ];
+
+    /// Stable lowercase name.
+    pub fn name(self) -> &'static str {
+        match self {
+            ShadowQuality::Off => "off",
+            ShadowQuality::Low => "low",
+            ShadowQuality::High => "high",
+            ShadowQuality::Ultra => "ultra",
+        }
+    }
+
+    /// Display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            ShadowQuality::Off => "Off",
+            ShadowQuality::Low => "Low",
+            ShadowQuality::High => "High",
+            ShadowQuality::Ultra => "Ultra",
+        }
+    }
+
+    /// Parses a quality name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|quality| quality.name().eq_ignore_ascii_case(name))
+    }
+}
+
+/// Procedural cloud quality persisted in settings.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CloudQuality {
+    /// No cloud layer.
+    Off,
+    /// Two-octave clouds.
+    Low,
+    /// Four-octave clouds with sun-lit edges.
+    #[default]
+    High,
+}
+
+impl CloudQuality {
+    /// All choices in menu order.
+    pub const ALL: [CloudQuality; 3] = [CloudQuality::Off, CloudQuality::Low, CloudQuality::High];
+
+    /// Stable lowercase name.
+    pub fn name(self) -> &'static str {
+        match self {
+            CloudQuality::Off => "off",
+            CloudQuality::Low => "low",
+            CloudQuality::High => "high",
+        }
+    }
+
+    /// Display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            CloudQuality::Off => "Off",
+            CloudQuality::Low => "Low",
+            CloudQuality::High => "High",
+        }
+    }
+
+    /// Parses a quality name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|quality| quality.name().eq_ignore_ascii_case(name))
+    }
+}
+
+/// Transparent-water quality persisted in settings.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WaterQuality {
+    /// Opaque, still water.
+    Off,
+    /// Translucent water with gentle waves.
+    Low,
+    /// Translucent water with stronger waves and sun glints.
+    #[default]
+    High,
+}
+
+impl WaterQuality {
+    /// All choices in menu order.
+    pub const ALL: [WaterQuality; 3] = [WaterQuality::Off, WaterQuality::Low, WaterQuality::High];
+
+    /// Stable lowercase name.
+    pub fn name(self) -> &'static str {
+        match self {
+            WaterQuality::Off => "off",
+            WaterQuality::Low => "low",
+            WaterQuality::High => "high",
+        }
+    }
+
+    /// Display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            WaterQuality::Off => "Off",
+            WaterQuality::Low => "Low",
+            WaterQuality::High => "High",
+        }
+    }
+
+    /// Parses a quality name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|quality| quality.name().eq_ignore_ascii_case(name))
+    }
+}
+
 /// Gameplay mode selected by the player.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1005,8 +1216,11 @@ pub fn remember_recent_server(list: &mut Vec<RecentServer>, address: &str, name:
 
 /// Smallest supported render distance in chunks.
 pub const MIN_RENDER_DISTANCE: i32 = 2;
-/// Largest render distance offered by the settings screen in v0.0.x.
-pub const MAX_RENDER_DISTANCE: i32 = 24;
+/// Largest render distance offered by the settings screen.
+///
+/// 32 chunks is a 512-block radius, the v1.1 playable target. The vertical
+/// streaming radius is unchanged; only the horizontal column count grows.
+pub const MAX_RENDER_DISTANCE: i32 = 32;
 /// Smallest supported vertical field of view in degrees.
 pub const MIN_FOV_DEGREES: f32 = 30.0;
 /// Largest supported vertical field of view in degrees.
@@ -1104,6 +1318,21 @@ pub struct Settings {
     /// Removes camera shake and the sprint FOV pump for motion-sensitive
     /// players. Gameplay is otherwise unchanged.
     pub reduced_motion: bool,
+    /// Visual-quality preset. Individual rows may override it, in which case
+    /// this becomes [`GraphicsPreset::Custom`].
+    pub graphics_preset: GraphicsPreset,
+    /// Sun-shadow quality.
+    pub shadow_quality: ShadowQuality,
+    /// Procedural cloud quality.
+    pub clouds: CloudQuality,
+    /// Transparent-water quality.
+    pub water_quality: WaterQuality,
+    /// Whether HDR bloom is enabled.
+    pub bloom: bool,
+    /// Whether the post-pass FXAA-lite edge filter is enabled.
+    pub fxaa: bool,
+    /// Cloud coverage in `0.0..=1.0` (0 clear, 1 overcast).
+    pub cloud_coverage: f32,
     /// World name opened by the title screen's Continue button.
     pub last_world: Option<String>,
     /// Remembered multiplayer servers, newest first (at most
@@ -1132,6 +1361,13 @@ impl Default for Settings {
             music_volume: 0.55,
             keybinds: Keybinds::default(),
             reduced_motion: false,
+            graphics_preset: GraphicsPreset::High,
+            shadow_quality: ShadowQuality::High,
+            clouds: CloudQuality::High,
+            water_quality: WaterQuality::High,
+            bloom: true,
+            fxaa: true,
+            cloud_coverage: 0.45,
             last_world: None,
             recent_servers: Vec::new(),
         }
@@ -1162,6 +1398,10 @@ impl Settings {
         self.master_volume = clamp_volume(self.master_volume, Settings::default().master_volume);
         self.sfx_volume = clamp_volume(self.sfx_volume, Settings::default().sfx_volume);
         self.music_volume = clamp_volume(self.music_volume, Settings::default().music_volume);
+        if !self.cloud_coverage.is_finite() {
+            self.cloud_coverage = Settings::default().cloud_coverage;
+        }
+        self.cloud_coverage = self.cloud_coverage.clamp(0.0, 1.0);
         self.keybinds.sanitise();
         if let Some(world) = self.last_world.take() {
             let world = world.trim();
@@ -1178,6 +1418,45 @@ impl Settings {
         }
         self.recent_servers = sanitise_recent_servers(std::mem::take(&mut self.recent_servers));
         before != *self
+    }
+
+    /// Applies the selected preset to every individual quality field.
+    ///
+    /// [`GraphicsPreset::Custom`] is ignored: it describes overrides rather than
+    /// a coherent set of defaults. Returns whether anything changed.
+    pub fn apply_graphics_preset(&mut self) -> bool {
+        let defaults = match self.graphics_preset {
+            GraphicsPreset::Low => (ShadowQuality::Off, CloudQuality::Off, WaterQuality::Low, false, false),
+            GraphicsPreset::Medium => (ShadowQuality::Low, CloudQuality::Low, WaterQuality::Low, true, true),
+            GraphicsPreset::High => (ShadowQuality::High, CloudQuality::High, WaterQuality::High, true, true),
+            GraphicsPreset::Ultra => (ShadowQuality::Ultra, CloudQuality::High, WaterQuality::High, true, true),
+            GraphicsPreset::Custom => return false,
+        };
+        let before = (
+            self.shadow_quality,
+            self.clouds,
+            self.water_quality,
+            self.bloom,
+            self.fxaa,
+        );
+        self.shadow_quality = defaults.0;
+        self.clouds = defaults.1;
+        self.water_quality = defaults.2;
+        self.bloom = defaults.3;
+        self.fxaa = defaults.4;
+        before
+            != (
+                self.shadow_quality,
+                self.clouds,
+                self.water_quality,
+                self.bloom,
+                self.fxaa,
+            )
+    }
+
+    /// Marks the preset as custom after an individual quality row changed.
+    pub fn mark_graphics_custom(&mut self) {
+        self.graphics_preset = GraphicsPreset::Custom;
     }
 
     /// Why the persisted resource-pack path cannot be used, if it cannot.
@@ -1539,6 +1818,132 @@ mod tests {
         fs::write(settings_path(&dir), b"{ not json").expect("write");
         assert_eq!(load_settings(&dir), Settings::default());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn graphics_settings_have_high_defaults_and_apply_presets() {
+        let settings = Settings::default();
+        assert_eq!(settings.graphics_preset, GraphicsPreset::High);
+        assert_eq!(settings.shadow_quality, ShadowQuality::High);
+        assert_eq!(settings.clouds, CloudQuality::High);
+        assert_eq!(settings.water_quality, WaterQuality::High);
+        assert!(settings.bloom && settings.fxaa);
+        assert!((settings.cloud_coverage - 0.45).abs() < 1e-6);
+
+        let mut preset = Settings {
+            graphics_preset: GraphicsPreset::Low,
+            ..Settings::default()
+        };
+        assert!(preset.apply_graphics_preset());
+        assert_eq!(preset.shadow_quality, ShadowQuality::Off);
+        assert_eq!(preset.clouds, CloudQuality::Off);
+        assert_eq!(preset.water_quality, WaterQuality::Low);
+        assert!(!preset.bloom && !preset.fxaa);
+        // Applying the same preset again is a no-op.
+        assert!(!preset.apply_graphics_preset());
+
+        preset.graphics_preset = GraphicsPreset::Ultra;
+        assert!(preset.apply_graphics_preset());
+        assert_eq!(preset.shadow_quality, ShadowQuality::Ultra);
+        assert_eq!(preset.clouds, CloudQuality::High);
+        assert!(preset.bloom && preset.fxaa);
+
+        // Custom means overrides; it never overwrites them.
+        preset.shadow_quality = ShadowQuality::Low;
+        preset.graphics_preset = GraphicsPreset::Custom;
+        assert!(!preset.apply_graphics_preset());
+        assert_eq!(preset.shadow_quality, ShadowQuality::Low);
+        preset.mark_graphics_custom();
+        assert_eq!(preset.graphics_preset, GraphicsPreset::Custom);
+    }
+
+    #[test]
+    fn graphics_settings_persist_round_trip_and_clamp() {
+        let mut settings = Settings {
+            graphics_preset: GraphicsPreset::Ultra,
+            shadow_quality: ShadowQuality::Low,
+            clouds: CloudQuality::Off,
+            water_quality: WaterQuality::Low,
+            bloom: false,
+            fxaa: false,
+            cloud_coverage: 0.9,
+            ..Settings::default()
+        };
+        assert!(!settings.clamp());
+        let json = serde_json::to_string(&settings).expect("serialise settings");
+        let loaded: Settings = serde_json::from_str(&json).expect("deserialise settings");
+        assert_eq!(loaded.graphics_preset, GraphicsPreset::Ultra);
+        assert_eq!(loaded.shadow_quality, ShadowQuality::Low);
+        assert_eq!(loaded.clouds, CloudQuality::Off);
+        assert_eq!(loaded.water_quality, WaterQuality::Low);
+        assert!(!loaded.bloom);
+        assert!(!loaded.fxaa);
+        assert!((loaded.cloud_coverage - 0.9).abs() < 1e-6);
+
+        settings.cloud_coverage = 9.0;
+        assert!(settings.clamp());
+        assert_eq!(settings.cloud_coverage, 1.0);
+        settings.cloud_coverage = f32::NAN;
+        assert!(settings.clamp());
+        assert_eq!(settings.cloud_coverage, Settings::default().cloud_coverage);
+
+        // Older documents without the fields keep the High defaults.
+        let loaded: Settings = serde_json::from_str("{\"render_distance_chunks\": 8}").expect("old document");
+        assert_eq!(loaded.graphics_preset, GraphicsPreset::High);
+        assert_eq!(loaded.shadow_quality, ShadowQuality::High);
+        assert!(loaded.bloom);
+    }
+
+    #[test]
+    fn graphics_quality_names_round_trip_and_cycle() {
+        for preset in GraphicsPreset::ALL {
+            assert_eq!(GraphicsPreset::from_name(preset.name()), Some(preset));
+        }
+        for quality in ShadowQuality::ALL {
+            assert_eq!(ShadowQuality::from_name(quality.name()), Some(quality));
+        }
+        for quality in CloudQuality::ALL {
+            assert_eq!(CloudQuality::from_name(quality.name()), Some(quality));
+        }
+        for quality in WaterQuality::ALL {
+            assert_eq!(WaterQuality::from_name(quality.name()), Some(quality));
+        }
+        assert_eq!(GraphicsPreset::High.next(), GraphicsPreset::Ultra);
+        assert_eq!(GraphicsPreset::Ultra.next(), GraphicsPreset::Low);
+        assert_eq!(GraphicsPreset::Custom.name(), "custom");
+    }
+
+    #[test]
+    fn render_distance_offers_the_512_block_target() {
+        assert_eq!(MAX_RENDER_DISTANCE, 32);
+        let mut settings = Settings {
+            render_distance_chunks: 32,
+            ..Settings::default()
+        };
+        assert!(!settings.clamp());
+        assert_eq!(settings.render_distance_chunks, 32);
+        settings.render_distance_chunks = 0;
+        assert!(settings.clamp());
+        assert_eq!(settings.render_distance_chunks, MIN_RENDER_DISTANCE);
+        settings.render_distance_chunks = 999;
+        assert!(settings.clamp());
+        assert_eq!(settings.render_distance_chunks, MAX_RENDER_DISTANCE);
+    }
+
+    #[test]
+    fn non_finite_settings_recover_to_safe_defaults() {
+        let mut settings = Settings {
+            fov_degrees: f32::NAN,
+            mouse_sensitivity: f32::INFINITY,
+            master_volume: f32::NEG_INFINITY,
+            ..Settings::default()
+        };
+        assert!(settings.clamp());
+        assert!(settings.fov_degrees.is_finite());
+        assert!(settings.mouse_sensitivity.is_finite());
+        assert!(settings.master_volume.is_finite());
+        assert!((MIN_FOV_DEGREES..=MAX_FOV_DEGREES).contains(&settings.fov_degrees));
+        assert!((MIN_AUDIO_VOLUME..=MAX_AUDIO_VOLUME).contains(&settings.master_volume));
     }
 
     #[test]

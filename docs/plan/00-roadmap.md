@@ -436,16 +436,21 @@ wait for it and do not require full parity.
 | Release | Milestone | Theme | Highlights | Effort |
 | --- | --- | --- | --- | --- |
 | `2.0` | `MS-17` | **Full Tier-2 parity** | Remaining blocks/items/mobs/biomes/structures, full redstone, bosses and terminus progression, raids, potions, advancements/statistics, commands and game rules, full server properties; Modern Delta re-baseline (OPEN-020); full-parity art/audio | **500–800 dev-weeks**, 6–10 people for 2–3 years |
-| `1.1` | `MS-24` | Flagship content I | First-party differentiators built on the mod API: programmable logic blocks (an in-world computer), first-class energy/fluid networks, one showcase tech pack | 10–14 |
-| `1.2` | `MS-18` | Worlds and dungeons | Procedural dungeon/structure API, showcase adventure pack, map sharing | 8–12 |
-| `1.3` | `MS-19` | Mobile | Android port, touch UI, mobile perf tiers, Play Store release | 8–12 |
-| `1.4` | `MS-20` | Far terrain | Visual-only LOD/far-terrain renderer out to 128+ chunks and 1024-block render distance | 4–6 |
-| `1.5` | `MS-21` | Native plugins + server mesh | Signed native plugin tier in a supervised process, multi-server network (proxy/lobby) | 6–10 |
-| `1.6` | `MS-22` | Web and reach | WebTransport/web client feasibility, better Steam Deck and accessibility passes | 8–12 |
+| `1.1` | `MS-20` | **Reach** | **Shipped:** 512-block render distance with visual-only surface-shell LOD, adaptive streaming, HDR shader pipeline (sun-shadow cascades, translucent water, procedural clouds, bloom/ACES/FXAA) and graphics presets; deterministic worldgen structures; async saves and append-only save compatibility | 10–14 |
+| `1.2` | `MS-25` | **Light & Home** | Real sky/block lighting + torches, beds/sleep/personal respawn, wheat farming/bread, 36-slot inventory and protocol v3; async-save follow-through | 30–38 |
+| `1.3` | `MS-26` | **Weather & Danger** | Rain/snow/thunder/lightning/fire, skeleton/creeper/spider, breeding, charged combat, direct XP, deterministic structure loot; protocol v4 | 30–36 |
+| `1.4` | `MS-27` | **Company & Trust** | Villager professions/trading, enchanting, TLS 1.3/argon2 auth, server movement validation; protocol v5 | 30–34 |
+| `1.5` | `MS-24` | Flagship content I | First-party differentiators built on the mod API: programmable logic blocks (an in-world computer), first-class energy/fluid networks, one showcase tech pack | 10–14 |
+| `1.6` | `MS-18` | Worlds and dungeons | Procedural dungeon/structure API, dimensions/portals, showcase adventure pack, map sharing | 8–12 |
+| `1.7` | `MS-19` | Mobile | Android port, touch UI, mobile perf tiers, Play Store release | 8–12 |
+| `1.8` | `MS-21` | Native plugins + server mesh | Signed native plugin tier in a supervised process, multi-server network (proxy/lobby) | 6–10 |
+| `1.9` | `MS-22` | Web and reach | WebTransport/web client feasibility, better Steam Deck and accessibility passes | 8–12 |
 | TBD | `MS-23` | Compatibility gateway | Optional Minecraft-client gateway as an isolated, best-effort bridge (not core) | 10–16 |
 
 Milestone IDs are stable identifiers, not release order (`MS-09` already follows
-`MS-13` in the 1.0 plan). `MS-17` was assigned to the 2.0 track when it became the
+`MS-13` in the 1.0 plan; `MS-25`–`MS-27` are reserved for the 1.2–1.4 gameplay
+waves). The player-first 1.2–1.4 track supersedes the earlier post-1.0 ordering
+while keeping the old tracks after it. `MS-17` was assigned to the 2.0 track when it became the
 first post-1.0 commitment; flagship content moved to the next free id, `MS-24`.
 Community mods and content packs still fill most of the long-tail content
 surface, but the engineering roadmap **grows** after 1.0: 1.0 is Early Access, and

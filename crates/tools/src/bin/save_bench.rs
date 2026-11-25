@@ -22,7 +22,7 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ob_content::{BlockId, MobKind, Registry};
 use ob_math::{BlockPos, WorldVec};
@@ -59,6 +59,7 @@ usage: save_bench [options]
   --saves N            measured save repetitions (default 5, quick 3)
   --loads N            measured reload repetitions (default 3, quick 2)
   --phases             add a Host::save phase breakdown (encode/compress/write/fsync)
+  --no-async           skip the asynchronous save series (sync only)
   --no-migration       skip the synthesized v1/v2/v3 migration smoke
   --data-dir DIR       benchmark data root instead of a temporary directory
   --clean              remove an existing <DIR>/worlds/save-bench before opening
@@ -79,6 +80,7 @@ struct Options {
     saves: usize,
     loads: usize,
     phases: bool,
+    async_saves: bool,
     migration: bool,
     data_dir: Option<PathBuf>,
     clean: bool,
@@ -99,6 +101,7 @@ impl Default for Options {
             saves: 5,
             loads: 3,
             phases: false,
+            async_saves: true,
             migration: true,
             data_dir: None,
             clean: false,
@@ -142,6 +145,28 @@ struct SaveResult {
     world_bytes: u64,
     uncompressed_payload: Option<u64>,
     phases: Option<SavePhases>,
+    /// Peak process RSS observed during a synchronous save, when VmHWM could be
+    /// reset for the sample.
+    peak_rss_kib: Option<u64>,
+}
+
+/// Asynchronous save summary.
+struct AsyncSaveResult {
+    /// Host-side snapshot + sidecar capture, i.e. the tick pause.
+    start: Stats,
+    /// Full worker wall time (encode + compress + staged write + fsync + rename).
+    wall: Stats,
+    encode: Stats,
+    write: Stats,
+    /// Highest per-run VmHWM after resetting the high-water mark.
+    peak_rss_kib: Option<u64>,
+    /// RSS immediately before the measured async saves.
+    baseline_rss_kib: Option<u64>,
+    total_bytes: u64,
+    world_bytes: u64,
+    uncompressed_payload: Option<u64>,
+    /// Every measured run produced byte-identical `world.obs`.
+    bytes_stable: bool,
 }
 
 /// Phase breakdown of the synchronous `Host::save()` path.
@@ -233,6 +258,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Options, String> 
                 explicit[6] = true;
             }
             "phases" => options.phases = true,
+            "no-async" => options.async_saves = false,
             "no-migration" => options.migration = false,
             "data-dir" => {
                 if value.is_empty() {
@@ -359,9 +385,17 @@ fn run(options: &Options) -> Result<bool, String> {
         initial_open_ms, stream.0, stream.1, items, mobs, containers.0, containers.1
     );
 
-    // Warm-up save: prunes stale block entities and writes the first full snapshot.
-    host.save().map_err(|error| format!("warm-up save failed: {error}"))?;
     let rss_after_setup = measure::rss_kib();
+    // Measure the async path first, while no previous full-payload allocation
+    // is resident, so the per-run peak-RSS reset reflects this save rather than
+    // allocator reuse from an earlier synchronous encode.
+    let async_save = if options.async_saves {
+        Some(measure_async_saves(&mut host, options.saves)?)
+    } else {
+        None
+    };
+    // Warm-up sync save: prunes stale block entities and writes the first full snapshot.
+    host.save().map_err(|error| format!("warm-up save failed: {error}"))?;
     let save = measure_saves(&mut host, options.saves, options.phases)?;
     let rss_after_save = measure::rss_kib();
     let hash_before = host.state_hash();
@@ -391,6 +425,53 @@ fn run(options: &Options) -> Result<bool, String> {
         Vec::new()
     };
 
+    if let Some(async_save) = &async_save {
+        println!();
+        println!("## Async save");
+        println!();
+        println!("| Metric | Value |");
+        println!("| --- | ---: |");
+        println!(
+            "| async start (tick pause) mean / p95 / max | {:.3} / {:.3} / {:.3} ms |",
+            async_save.start.mean_ms, async_save.start.p95_ms, async_save.start.max_ms
+        );
+        println!(
+            "| async worker wall mean / p50 / p95 / max | {:.3} / {:.3} / {:.3} / {:.3} ms |",
+            async_save.wall.mean_ms, async_save.wall.p50_ms, async_save.wall.p95_ms, async_save.wall.max_ms
+        );
+        println!(
+            "| worker encode / write (means) | {:.3} / {:.3} ms |",
+            async_save.encode.mean_ms, async_save.write.mean_ms
+        );
+        if let Some(peak) = async_save.peak_rss_kib {
+            let baseline = async_save.baseline_rss_kib.unwrap_or(0);
+            println!(
+                "| peak RSS during async save | {} (baseline {}, delta {}) |",
+                measure::mib(peak),
+                measure::mib(baseline),
+                measure::mib(peak.saturating_sub(baseline))
+            );
+        } else {
+            println!("| peak RSS during async save | n/a (VmHWM reset unsupported) |");
+        }
+        println!(
+            "| async total world directory | {} |",
+            measure::bytes_label(async_save.total_bytes)
+        );
+        println!(
+            "| async world.obs | {} (uncompressed payload {}) |",
+            measure::bytes_label(async_save.world_bytes),
+            async_save
+                .uncompressed_payload
+                .map(measure::bytes_label)
+                .unwrap_or_else(|| "n/a".to_string())
+        );
+        println!(
+            "| repeated async saves byte-identical | {} |",
+            if async_save.bytes_stable { "PASS" } else { "FAIL" }
+        );
+        println!();
+    }
     println!();
     println!("## Save");
     println!();
@@ -408,6 +489,15 @@ fn run(options: &Options) -> Result<bool, String> {
         "| save mean / p50 / p95 / p99 / max | {:.3} / {:.3} / {:.3} / {:.3} / {:.3} ms |",
         save.stats.mean_ms, save.stats.p50_ms, save.stats.p95_ms, save.stats.p99_ms, save.stats.max_ms
     );
+    if let Some(peak) = save.peak_rss_kib {
+        let baseline = rss_after_setup.unwrap_or(0);
+        println!(
+            "| peak RSS during sync save | {} (baseline {}, delta {}) |",
+            measure::mib(peak),
+            measure::mib(baseline),
+            measure::mib(peak.saturating_sub(baseline))
+        );
+    }
     println!(
         "| save throughput (mean, world dir) | {:.1} MiB/s |",
         mib_per_second(save.total_bytes, save.stats.mean_ms)
@@ -516,6 +606,7 @@ fn run(options: &Options) -> Result<bool, String> {
     let report = build_report(
         options,
         &save,
+        async_save.as_ref(),
         &load,
         &migration,
         hash_before,
@@ -794,6 +885,80 @@ fn grid_offset(center: WorldVec, offset: &mut i32) -> (i32, i32) {
     }
 }
 
+/// Measures the asynchronous save path: host-side start pause, full worker
+/// wall time and per-run peak RSS.
+///
+/// `Host::save_async` captures the snapshot and serializes sidecars on this
+/// thread (the tick pause); encoding, compression, staged writes and fsyncs run
+/// on the worker. The peak is sampled from `VmHWM` after resetting the kernel's
+/// high-water mark for each run, so transient encode buffers are included.
+fn measure_async_saves(host: &mut Host, runs: usize) -> Result<AsyncSaveResult, String> {
+    let baseline_rss_kib = measure::rss_kib();
+    let dir = world_dir_from_host(host);
+    let mut starts = Vec::with_capacity(runs);
+    let mut walls = Vec::with_capacity(runs);
+    let mut encodes = Vec::with_capacity(runs);
+    let mut writes = Vec::with_capacity(runs);
+    let mut peaks = Vec::with_capacity(runs);
+    let mut world_hashes = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let reset = measure::reset_peak_rss();
+        let started = Instant::now();
+        let is_new = host
+            .save_async()
+            .map_err(|error| format!("async save failed to start: {error}"))?;
+        if !is_new {
+            return Err("async save was already in flight between samples".to_string());
+        }
+        starts.push(started.elapsed().as_secs_f64() * 1000.0);
+
+        let wall_started = Instant::now();
+        let report = host
+            .wait_for_save(Duration::from_secs(300))
+            .map_err(|error| format!("async save wait failed: {error}"))?
+            .ok_or_else(|| "async save reported no completion".to_string())?;
+        walls.push(wall_started.elapsed().as_secs_f64() * 1000.0);
+        encodes.push(report.encode_ms);
+        writes.push(report.write_ms);
+        world_hashes.push(file_fnv(&dir.join("world.obs"))?);
+        if reset {
+            peaks.extend(measure::peak_rss_kib());
+        }
+    }
+    let bytes_stable = world_hashes.windows(2).all(|pair| pair[0] == pair[1]);
+    let (total_bytes, sidecars) = directory_files(&dir)?;
+    let world_bytes = sidecars
+        .iter()
+        .find(|(name, _)| name == "world.obs")
+        .map_or(0, |(_, bytes)| *bytes);
+    let uncompressed_payload = std::fs::read(dir.join("world.obs"))
+        .ok()
+        .and_then(|bytes| v4_uncompressed_len(&bytes));
+    Ok(AsyncSaveResult {
+        start: Stats::from_samples(&starts),
+        wall: Stats::from_samples(&walls),
+        encode: Stats::from_samples(&encodes),
+        write: Stats::from_samples(&writes),
+        peak_rss_kib: peaks.into_iter().max(),
+        baseline_rss_kib,
+        total_bytes,
+        world_bytes,
+        uncompressed_payload,
+        bytes_stable,
+    })
+}
+
+/// FNV-1a hash of a file's bytes, used to prove repeated async saves are stable.
+fn file_fnv(path: &Path) -> Result<u64, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Ok(hash)
+}
+
 /// Measures repeated saves and sums the on-disk footprint.
 ///
 /// With `phases`, each timed save is followed by an encode/compress/write/fsync
@@ -813,11 +978,16 @@ fn measure_saves(host: &mut Host, runs: usize, phases: bool) -> Result<SaveResul
     let mut fsync_world_samples = Vec::with_capacity(runs);
     let mut fsync_dir_samples = Vec::with_capacity(runs);
     let mut residual_samples = Vec::with_capacity(runs);
+    let mut peak_rss_kib = None;
     for _ in 0..runs {
+        let reset = measure::reset_peak_rss();
         let started = Instant::now();
         host.save().map_err(|error| format!("save failed: {error}"))?;
         let total_ms = started.elapsed().as_secs_f64() * 1000.0;
         samples.push(total_ms);
+        if reset && let Some(peak) = measure::peak_rss_kib() {
+            peak_rss_kib = Some(peak_rss_kib.map_or(peak, |current: u64| current.max(peak)));
+        }
         if phases {
             let encode_started = Instant::now();
             let bytes = to_bytes(host.world());
@@ -897,6 +1067,7 @@ fn measure_saves(host: &mut Host, runs: usize, phases: bool) -> Result<SaveResul
         world_bytes,
         uncompressed_payload,
         phases: if phases { Some(phase_series) } else { None },
+        peak_rss_kib,
     })
 }
 
@@ -1416,6 +1587,7 @@ struct Report {
 fn build_report(
     options: &Options,
     save: &SaveResult,
+    async_save: Option<&AsyncSaveResult>,
     load: &LoadResult,
     migration: &[MigrationRow],
     hash_before: u64,
@@ -1434,6 +1606,33 @@ fn build_report(
     csv.push_str(&format!("save_p99_ms,{:.4}\n", save.stats.p99_ms));
     csv.push_str(&format!("save_max_ms,{:.4}\n", save.stats.max_ms));
     csv.push_str(&format!("save_total_bytes,{}\n", save.total_bytes));
+    if let Some(peak) = save.peak_rss_kib {
+        csv.push_str(&format!("sync_save_peak_rss_kib,{peak}\n"));
+    }
+    if let Some(async_save) = async_save {
+        csv.push_str(&format!("async_save_runs,{}\n", async_save.start.count));
+        csv.push_str(&format!("async_start_mean_ms,{:.4}\n", async_save.start.mean_ms));
+        csv.push_str(&format!("async_start_p95_ms,{:.4}\n", async_save.start.p95_ms));
+        csv.push_str(&format!("async_start_max_ms,{:.4}\n", async_save.start.max_ms));
+        csv.push_str(&format!("async_wall_mean_ms,{:.4}\n", async_save.wall.mean_ms));
+        csv.push_str(&format!("async_wall_p95_ms,{:.4}\n", async_save.wall.p95_ms));
+        csv.push_str(&format!("async_wall_max_ms,{:.4}\n", async_save.wall.max_ms));
+        csv.push_str(&format!("async_encode_mean_ms,{:.4}\n", async_save.encode.mean_ms));
+        csv.push_str(&format!("async_write_mean_ms,{:.4}\n", async_save.write.mean_ms));
+        if let Some(peak) = async_save.peak_rss_kib {
+            csv.push_str(&format!("async_save_peak_rss_kib,{peak}\n"));
+            if let Some(baseline) = async_save.baseline_rss_kib {
+                csv.push_str(&format!("async_save_baseline_rss_kib,{baseline}\n"));
+                csv.push_str(&format!(
+                    "async_save_peak_delta_kib,{}\n",
+                    peak.saturating_sub(baseline)
+                ));
+            }
+        }
+        csv.push_str(&format!("async_world_bytes,{}\n", async_save.world_bytes));
+        csv.push_str(&format!("async_total_bytes,{}\n", async_save.total_bytes));
+        csv.push_str(&format!("async_bytes_stable,{}\n", async_save.bytes_stable));
+    }
     if let Some(phases) = &save.phases {
         for (name, stats) in [
             ("encode", &phases.encode),
@@ -1496,6 +1695,23 @@ fn build_report(
         "| World directory | {} |\n",
         measure::bytes_label(save.total_bytes)
     ));
+    if let Some(async_save) = async_save {
+        markdown.push_str(&format!(
+            "| Async start (tick pause) mean / p95 / max | {:.3} / {:.3} / {:.3} ms |\n",
+            async_save.start.mean_ms, async_save.start.p95_ms, async_save.start.max_ms
+        ));
+        markdown.push_str(&format!(
+            "| Async worker wall mean / p95 / max | {:.3} / {:.3} / {:.3} ms |\n",
+            async_save.wall.mean_ms, async_save.wall.p95_ms, async_save.wall.max_ms
+        ));
+        if let Some(peak) = async_save.peak_rss_kib {
+            markdown.push_str(&format!(
+                "| Async peak RSS (baseline) | {} ({}) |\n",
+                measure::mib(peak),
+                measure::mib(async_save.baseline_rss_kib.unwrap_or(0))
+            ));
+        }
+    }
     markdown.push_str(&format!(
         "| Reload mean / p50 / p95 / max | {:.3} / {:.3} / {:.3} / {:.3} ms |\n",
         load.stats.mean_ms, load.stats.p50_ms, load.stats.p95_ms, load.stats.max_ms

@@ -1478,8 +1478,8 @@ def parse_args(argv):
         parser.error("--clients must be at most 500")
     if args.seconds < 1:
         parser.error("--seconds must be at least 1")
-    if not 1 <= args.interest_radius <= 16:
-        parser.error("--interest-radius must be in 1..=16")
+    if not 1 <= args.interest_radius <= 32:
+        parser.error("--interest-radius must be in 1..=32")
     if not 0 <= args.save_interval <= 86_400:
         parser.error("--save-interval must be in 0..=86400")
     if not 1 <= args.metrics_interval <= 3600:

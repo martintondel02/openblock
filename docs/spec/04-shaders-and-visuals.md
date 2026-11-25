@@ -62,6 +62,12 @@ are stated at 1080p on the reference machine of [vision §9](../vision.md#9-plat
 | REQ-VIS-029 | A failing or hanging shader pack is disabled with a precise error and leaves the previous visuals running; it can never crash or stall the frame. | Fault-injection test on packs |
 | REQ-VIS-030 | Golden images, per-effect cost measurements and shader-compile budgets are enforced in CI. | CI job |
 
+> **1.1 implementation status.** The v1.1 branch implements the HDR, shadow, cloud,
+> transparent-water and post-processing slice described below with a deliberately smaller
+> resource envelope than this chapter's long-term target. The shipped pipeline, settings
+> and deviations are recorded in [§3.13](#313-11-implementation-status-v11-dev-2026-11-25);
+> where this chapter names a feature that is not in §3.13, the feature is future work.
+
 ## 3. Design
 
 ### 3.1 The voxel lighting model
@@ -162,7 +168,8 @@ overworld): a 512² tiling noise texture scrolled by wind, sampled at the layer
 intersection, shaded by sun visibility and fogged at distance. It casts no shadow and
 occludes nothing. The `ultra` preset and MS-12 add a half-resolution volumetric mode
 (32-step raymarch, temporal reprojection, 0.35 ms) with the same wind field; a pack may
-select either but not add a third.
+select either but not add a third. **1.1 status:** the 2.5D world-space layer is shipped
+(procedural, no tiling texture); the volumetric mode is future work — see §3.13.4.
 
 #### 3.2.4 Fog
 
@@ -176,7 +183,23 @@ let amount = 1.0 - exp(-fog_density * h * d * d);
 color = mix(color, sky_color(dir) , amount);
 ```
 
-`fog_end` is the render distance, and the curve is tuned so opacity is ≥ 0.9 there
+`fog_end` is the render distance, and the curve is tuned so opacity is ≥ 0.9 there.
+For the v1.1 512-block radius the CPU supplies `(fog_start, fog_end)` as
+`max(far − 160, 0.55 × far)` and `0.95 × far`: 400–532 blocks at a 32-chunk radius.
+Smoothstep reaches 0.93 opacity at the 512-block world edge while 200 blocks stays
+perfectly clear, so the horizon reads as terrain fading into sky rather than a grey wall.
+At short render distances the historical 55% start is preserved so the last streamed ring
+still dissolves. Shader modules and packs must read `Camera.fog` and must not hardcode
+distances; the same uniform drives opaque, cutout and entity fog.
+
+**Shader work implied by the v1.1 LOD.** Shadow cascades are unchanged in count and
+distance (§3.3.1): far surface-shell batches are opaque geometry and must be included in
+the same cascades as near sections, so cascade 3 remains useful to 96 blocks. Water stays in
+the surface shell and keeps its normal material; a future translucent pass must keep far
+water sorted separately rather than folding it into the opaque batch. Distance fog is the
+only blend between near and far tiers — there is deliberately no LOD cross-fade, because the
+shell preserves the silhouette; a shader that adds dithering or TAA must not treat the tier
+seam as a depth discontinuity.
 (REQ-VIS-008). Underwater and lava override the parameters per fluid, with a Beer-Lambert
 absorption on the water colour; blindness and darkness effects scale the exponent and are
 driven by gameplay effect state, never by the shader.
@@ -197,7 +220,10 @@ practical-split formula: with a first-person near plane of 0.1 m, the formula co
 the near cascade into a few centimetres, which is useless for block-scale geometry.
 Depth is `Depth16Unorm`; each cascade fits its orthographic projection tightly to the
 slice's bounding sphere, so 96 m over 16 bits is ~1.5 mm of quantisation — an order of
-magnitude finer than the texel footprint.
+magnitude finer than the texel footprint. **1.1 status:** two cascades (splits 32 m and
+160 m) at `Depth32Float`, 2048² each on High/Ultra, 1024² on Low/Medium; the near cascade
+keeps the full PCF kernel and the far cascade uses one hardware-bilinear comparison tap —
+see §3.13.3.
 
 #### 3.3.2 Stabilisation
 
@@ -253,6 +279,11 @@ are complete:
    by distance.
 6. **Underwater**, when the camera is submerged, a full-screen volume tint, increased fog
    density, reduced sun, and procedural caustics projected on surfaces below the surface.
+
+**1.1 status:** water is split out of the opaque mesh and drawn after it in a sorted,
+alpha-blended pass with animated normals, Fresnel sky reflection, a sun highlight and
+cascade shadows. SSR, refraction, foam and the underwater volume are future work — see
+§3.13.5.
 
 #### 3.4.2 Translucency policy
 
@@ -315,6 +346,12 @@ Render scale is applied before TAA, which doubles as the upscaler: at 0.85 the i
 buffer is 1632×918 and the resolve is a Catmull-Rom filter to 1920×1080. Vendor upscalers
 are not bundled (DEC-016); the hook for an externally installed one is the same
 jitter/velocity/depth/exposure contract, documented in the API reference.
+
+**1.1 status:** the shipped chain is HDR scene → bloom threshold + 3 mip downsample →
+one final pass with ACES-fit tonemap, two bloom mip samples, conditional FXAA-lite,
+saturation and a 6% vignette. Exposure is fixed, not histogram-adapted, and there is no TAA,
+GTAO, volumetric fog or colour LUT yet. UI is drawn after post. See §3.13.6. Two post
+pipelines (full and bloom/FXAA-free) are compiled at start-up.
 
 ### 3.7 Materials, WGSL modules and pipeline variants
 
@@ -535,6 +572,179 @@ reports Tier-2 coverage (DEC-051).
 - **Motion.** Reduced-motion mode disables camera bob, screen shake, view-roll effects and
   motion blur; FOV is adjustable from 30° to 110° with a warning above 90° about distortion
   and motion sickness.
+
+### 3.13 1.1 implementation status (v1.1-dev, 2026-11-25)
+
+This section is the authoritative description of what the 1.1 shader wave ships. The
+long-term design in §3.1–3.12 remains the target; the deviations below are deliberate
+budget decisions for a 512-block radius on integrated Vulkan hardware, and every one is
+covered by a test or a measured number in
+[08-measurements](../plan/08-measurements.md#2026-11-25--v11-high-quality-built-in-shaders-hdr-sun-shadows-water-clouds-post).
+
+#### 3.13.1 Passes, targets and ownership
+
+| # | Pass | Target | Notes |
+| ---: | --- | --- | --- |
+| 1 | sun shadow, once per active cascade | `Depth32Float` 2D array, 2048² (`low`/`medium` 1024²) | depth only, alpha-cut-out foliage, entities included |
+| 2 | opaque world (sections, far batches, entities) | `Rgba16Float` HDR + `Depth32Float` | HDR cleared to the horizon, depth cleared to 1.0 |
+| 3 | sky background fill | HDR + depth, no depth write | `LessEqual` at z = 1.0, so only background pixels run clouds/stars |
+| 4 | water + block outline | HDR + depth, no depth write | water alpha blend, back-to-front; outline after water |
+| 5 | bloom threshold + 2 downsamples | `Rgba16Float` mips at ½, ¼, ⅛ | threshold 1.0, soft knee, 4-tap box |
+| 6 | post | LDR surface / offscreen `Rgba8UnormSrgb` | ACES fit, bloom, FXAA-lite, saturation, vignette |
+| 7 | UI | same LDR target, after post | text and HUD stay crisp and are never tonemapped |
+
+The windowed `Renderer` and the windowless `OffscreenRenderer` both delegate to one
+private `frame::SceneRenderer`; the only difference is the final output view and the
+readback. All pipelines are created in `SceneRenderer::new`. A graphics-preset change
+reallocates the shadow map and updates uniforms, a resize reallocates the HDR/depth/bloom
+targets and their bind groups, and no frame triggers shader compilation.
+
+#### 3.13.2 Uniforms and bindings
+
+- **`CameraUniform`** (512 B, group 0 binding 0): the existing 224 B camera/fog/sun/palette
+  block, then three shadow matrices (192 B), the cascade splits, per-cascade world texel
+  sizes, shadow parameters, cloud/time parameters, water parameters and per-cascade UV
+  scales. The field order is asserted at compile time and mirrored exactly in
+  `shader.wgsl`.
+- **Group 0** binding 1/2 are the block texture array and sampler; binding 3/4 are the
+  shadow depth array and comparison sampler. The shadow pass uses a reduced layout with a
+  64-byte per-cascade matrix at binding 3 and no shadow texture, because binding the depth
+  array while rendering it is both a feedback loop and a wgpu usage conflict.
+- **`PostUniform`** (32 B): exposure, bloom strength, saturation, FXAA strength, target
+  texel size, bloom threshold and scene time. Post and bloom passes have their own layouts;
+  post samples the HDR scene and the first two bloom mips.
+- Mesh vertices remain 28 B (position, UV, layer, baked light). Fragment normals are
+  reconstructed with `cross(dpdx(world_position), dpdy(world_position))` and flipped
+  towards the eye, so adding shadows did not widen the vertex format or change the mesher's
+  merge keys.
+
+#### 3.13.3 Shadows
+
+- **Cascades:** two cascades fitted to the camera frustum, splits 32 m and 160 m. Low and
+  Medium use 2 × 1024²; High and Ultra use 2 × 2048². Shadows can be Off. The far cascade
+  covers 32–160 m at full layer resolution; the shader scales UVs by a per-cascade factor
+  that is 1.0 in every shipped preset and 0.5 for a custom three-cascade configuration
+  (the fitting code supports 3, the presets use 2).
+- **Stability:** each slice is fitted with a light-space bounding sphere, the radius is
+  rounded up to 1/16 m, the light-space centre is snapped to whole shadow texels, and the
+  light matrix is rebuilt from the snapped centre. A point in the slice projects to a
+  valid clip-space position; a fixed camera produces bit-identical matrices.
+- **Bias and filtering:** slope-scaled depth bias in the shadow pipeline, plus a 2.5-texel
+  normal offset in the receiver. The near cascade uses a manual 3×3 PCF kernel (High) or
+  5×5 within 16 m (Ultra); 16–32 m and the whole far cascade use one
+  `textureSampleCompareLevel` tap, which already filters a hardware 2×2 footprint. The
+  shader cross-fades into the next cascade over the last 15% of a cascade.
+- **Casters:** opaque near sections, opaque far-batch geometry, and dropped-item entities.
+  Water is excluded from casting but receives shadows. The near cascade draws full section
+  meshes. The far cascade draws full meshes up to 64 m and then one instanced AABB per
+  section/far batch for 64–160 m; one draw call replaces hundreds, while 64 m and beyond is
+  where PCF and distance make box silhouettes acceptable.
+- **Uniform lighting:** the shadow term attenuates only the direct-sun share, gated by
+  `max(N·sun, 0)` and the daylight factor; baked face light and AO are untouched on faces
+  turned away from the sun. Night has no sun shadows (the sun is below the horizon); the
+  moon does not cast.
+
+Measured: the near/far split keeps 160 m coverage while replacing the third pass that a
+three-cascade set would need; see the feature-cost table in 08-measurements. The p50 target
+of 60 FPS at 1080p/512 is met at Ultra on the integrated RADV test machine; p95 is ~58 FPS.
+
+#### 3.13.4 Sky, clouds and atmosphere
+
+- The sky keeps the CPU `Environment` palette (`horizon`, `zenith`, sun colour/intensity,
+  star rotation, daylight) and the screen-space gradient; there is no atmosphere LUT or
+  raymarch. A subtle horizon band and a wider sun glow were added.
+- **Clouds:** a procedural 2.5D layer at y = 190 m, intersected in world space. World-space
+  UVs scroll with a fixed wind and the scene clock; a one-sample domain warp breaks the
+  noise grid; 2–3 octaves of value noise depend on the cloud quality. Coverage is a
+  persisted `0.0..=1.0` value; the shader shapes the density with a coverage-dependent
+  threshold, tints the layer by daylight, shades thicker density, adds a sun-facing rim and
+  fades it out towards the horizon and at 12–26 km. `Off`, `Low` and `High` are persisted.
+- The sky pass runs **after** the opaque world as a depth-`LessEqual` background fill, so
+  covered pixels never evaluate the cloud/star shader. Sun and moon discs, halos and the
+  deterministic hashed star field are unchanged in spirit from 1.0 but now write linear HDR
+  values.
+- Clouds do not cast shadows. Weather particles and rain/snow volumes are unchanged.
+
+#### 3.13.5 Water
+
+The mesher routes every `BlockType::fluid` face into `MeshData::water_vertices`; greedy
+merging, AO, per-corner light and the per-quad tint remain identical. Sections, far LOD
+batches and the cached benchmark scene upload a second vertex buffer for water. A water-only
+section is preserved (the opaque buffer is a one-vertex placeholder and the opaque draw is
+skipped), so an ocean surface does not disappear.
+
+The water pass runs after the opaque and sky passes with alpha blending, `LessEqual` depth
+testing and depth writes disabled. Draws are sorted far-to-near by AABB centre with a
+deterministic key tie-break; sections and far batches share the order. The fragment shader
+samples the fluid texture, perturbs the derivative normal with two travelling waves driven
+by the scene clock, mixes a deep-water tint with the sky horizon/zenith by a Schlick
+Fresnel term, adds a Blinn-Phong sun highlight multiplied by the cascade shadow and sun
+elevation, attenuates the surface by the shadow (45% darkening in shade), and applies the
+same distance fog as opaque terrain. Water `Off` still draws (fully opaque, no waves);
+`Low`/`High` vary wave and specular strength and surface alpha.
+
+Not shipped: SSR/planar reflection, refraction, shoreline foam, water volume/underwater
+tint or caustics. Far water is drawn in the same translucent pass, which avoids LOD-seam
+holes; both sides are kept, with the same alpha as the top.
+
+#### 3.13.6 Post-processing
+
+The scene is linear `Rgba16Float`, resolved by one full-screen pass:
+
+1. sample the scene plus a weighted sum of the first two bloom mips (`0.55` / `0.45`);
+2. multiply by exposure (default `0.80`), apply the Narkowicz ACES rational fit and clamp;
+3. optional FXAA-lite: one neighbour probe decides whether a pixel is on an edge, then up
+   to four tonemapped neighbours are luma-range tested and blended; flat skies and terrain
+   interiors skip the remaining fetches;
+4. saturation (1.0 by default), a 6% radial vignette, clamp to LDR and write.
+
+Bloom is a threshold pass at half resolution plus two half-size downsamples; the third mip
+is rendered but not sampled by default. Two post pipelines are compiled at init: the full
+pipeline and a simple pipeline with no bloom/FXAA fetches, selected when both are off. A CPU
+mirror of the ACES/vignette math lives in `tonemap.rs` and is used by tests to predict pixel
+values exactly.
+
+Not shipped: TAA, render scale, histogram exposure, GTAO, volumetric fog, colour LUT and
+sharpening. MSAA stays at 1; FXAA-lite is the shipped antialiasing.
+
+#### 3.13.7 Settings, presets and F3
+
+`ob_core::config::Settings` persists `graphics_preset`, `shadow_quality`, `clouds`,
+`water_quality`, `bloom`, `fxaa` and `cloud_coverage` (clamped `0..=1`, non-finite values
+reset). Presets map as follows:
+
+| Preset | Shadows | Clouds | Water | Bloom | FXAA |
+| --- | --- | --- | --- | --- | --- |
+| Low | off | off | low | off | off |
+| Medium | low 2×1024² | low | low | on | on |
+| **High (default)** | **high 2×2048²** | **high** | **high** | **on** | **on** |
+| Ultra | ultra 2×2048², 5×5 near | high | high | on | on |
+
+The settings screen has a Graphics tab with rows for the preset, shadows, clouds, water,
+cloud coverage, bloom and FXAA. Adjusting an individual row marks the preset Custom. F3
+reports the preset, shadow mode, resolution, cascade count and PCF mode, plus the pass,
+water, shadow, bloom and memory counters. The offscreen tools accept the same settings
+(`--graphics`, `--shadows`, `--clouds`, `--water`, `--bloom/--no-bloom`,
+`--fxaa/--no-fxaa`), so screenshots and benchmarks use the exact playable configuration.
+
+#### 3.13.8 Verification and known limitations
+
+Unit tests cover the settings round-trip/clamps, preset mapping, the shadow sphere fit,
+texel snapping, split scaling, AABB culling, the 512-byte uniform layout, the 32-byte post
+layout, opaque/water mesh split parity, far-batch water, and the CPU tonemap. GPU tests
+(run on RADV and skippable with `OPENBLOCK_NO_GPU_TESTS`) cover the shadow pass writing
+casters, shadows darkening terrain, water drawing in its own pass, water-only sections,
+water receiving shadows, far-batch water, cloud determinism and motion, every preset
+rendering with sane colours, post-target resize (including 1×1), and a wgpu validation
+error scope that must stay clean across shadow + water + post frames. The ignored water
+screenshot test writes `/tmp/openblock-shaders-water.png`; the benchmark provides day,
+dusk, night and sky captures.
+
+Remaining limitations are listed with their measured cost in
+[08-measurements](../plan/08-measurements.md): far-cascade PCF reduction, AABB shadow
+proxies beyond 64 m, no water reflection/refraction/foam/underwater volume, fixed exposure,
+FXAA-lite instead of TAA, and offscreen readback inflating the benchmark tail. The High
+1080p/90 FPS aspirational target is not met; Ultra 1080p/60 FPS is met at p50 but not p95.
 
 ## 4. Data structures and formats
 

@@ -1473,3 +1473,86 @@ fn network_name_tag_screenshot_probe() {
     }
     ob_client::screenshot_name_tags_demo(&path, 42).expect("name tag screenshot");
 }
+
+/// Measures a full 512-block-radius loopback join: 4,225 columns over TCP,
+/// including server generation, protocol encoding and client request pacing.
+///
+/// Ignored because it takes roughly half a minute and allocates a full 322 MiB
+/// world. Run in release:
+/// `./dev-cargo test -p ob_client --release --test net_loopback -- --ignored --nocapture join_512_blocks`
+#[test]
+#[ignore = "full 512-block transfer; run explicitly in release"]
+fn join_512_blocks_loopback_transfer() {
+    let registry = Arc::new(Registry::base());
+    let dir = TempDir::new("join512");
+    let mut host = Host::open(
+        Arc::clone(&registry),
+        HostConfig {
+            seed: 42,
+            world_name: "join512".to_string(),
+            data_dir: Some(dir.path().to_path_buf()),
+            render_distance_chunks: 32,
+            generate_budget: 64,
+        },
+    )
+    .expect("open 512-block world");
+    let center = host.player().pos;
+    let mut generated = 0usize;
+    loop {
+        let count = host.ensure_streaming_around(center, 32, 512);
+        generated += count;
+        if count == 0 {
+            break;
+        }
+    }
+    assert_eq!(host.world().chunk_count(), 65 * 65);
+    let server = DedicatedServer::start(
+        host,
+        NetConfig {
+            listen: "127.0.0.1:0".parse::<SocketAddr>().expect("ephemeral loopback"),
+            max_players: 4,
+            motd: "join512".to_string(),
+            interest_radius_chunks: 32,
+            chunks_per_tick: 16,
+            save_interval_seconds: 0,
+            whitelist: Vec::new(),
+            game_mode: GameMode::Creative,
+        },
+    )
+    .expect("start 512-block loopback server");
+    let options = ConnectOptions::new(server.local_addr().to_string(), "join512", 32, Arc::clone(&registry));
+    let started = Instant::now();
+    let mut client = NetworkClient::connect(options).expect("connect");
+    let mut polls = 0u64;
+    let deadline = started + Duration::from_secs(180);
+    let (loaded, target) = loop {
+        let _ = client.poll();
+        client.maintain_chunks(16);
+        let progress = client.loading_progress();
+        if progress.0 >= progress.1 && client.state().is_playing() {
+            break progress;
+        }
+        assert!(Instant::now() < deadline, "join stalled at {progress:?}");
+        polls += 1;
+        thread::sleep(Duration::from_millis(10));
+    };
+    let elapsed = started.elapsed();
+    let metrics = server.metrics();
+    let bytes = metrics.bytes_out;
+    let columns = loaded.max(1) as f64;
+    println!(
+        "512-block loopback join: {loaded}/{target} columns in {:.2} s ({} polls, {} generated), \
+         out {} MiB ({:.1} KiB/column, {:.2} Mbit/s), tick p95 {:.2} ms p99 {:.2} ms max {:.2} ms",
+        elapsed.as_secs_f64(),
+        polls,
+        generated,
+        bytes as f64 / (1024.0 * 1024.0),
+        bytes as f64 / 1024.0 / columns,
+        bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1_000_000.0,
+        metrics.tick_p95_ms,
+        metrics.tick_p99_ms,
+        metrics.tick_max_ms,
+    );
+    client.shutdown();
+    server.stop().expect("stop server");
+}

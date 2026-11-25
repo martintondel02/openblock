@@ -77,9 +77,13 @@ pub const DEFAULT_MOTD: &str = "A self-hosted OpenBlock world";
 /// Default horizontal interest radius in chunks.
 pub const DEFAULT_INTEREST_RADIUS_CHUNKS: i32 = 6;
 /// Hard upper bound on a client's requested/streamed interest radius.
-pub const MAX_INTEREST_RADIUS_CHUNKS: i32 = 16;
+///
+/// 32 chunks is a 512-block radius (4,225 columns), matching the client
+/// ceiling. Interest sets larger than this are refused rather than clamped
+/// silently by the network layer.
+pub const MAX_INTEREST_RADIUS_CHUNKS: i32 = 32;
 /// Default number of chunk columns generated/sent per player per tick.
-pub const DEFAULT_CHUNKS_PER_TICK: usize = 4;
+pub const DEFAULT_CHUNKS_PER_TICK: usize = 16;
 /// Default autosave interval in seconds (`0` disables periodic autosave).
 pub const DEFAULT_SAVE_INTERVAL_SECONDS: u64 = 60;
 /// Maximum frames buffered for one client before it is considered too slow.
@@ -91,6 +95,8 @@ pub const DEFAULT_NETWORK_GAME_MODE: GameMode = GameMode::Survival;
 
 /// One simulation tick (20 Hz).
 const TICK_INTERVAL: Duration = Duration::from_millis(50);
+/// How long shutdown waits for an in-flight autosave before reporting failure.
+const SHUTDOWN_SAVE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Timeout for the Hello exchange.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for a single socket write.
@@ -172,7 +178,7 @@ pub struct NetConfig {
     pub max_players: u16,
     /// MOTD sent in the handshake (sanitised and truncated to 128 bytes).
     pub motd: String,
-    /// Per-client interest radius in chunks (`1..=16`).
+    /// Per-client interest radius in chunks (`1..=32`).
     pub interest_radius_chunks: i32,
     /// Chunk columns generated and sent per client per tick (`1..=64`).
     pub chunks_per_tick: usize,
@@ -893,8 +899,13 @@ impl DedicatedServer {
     /// disconnect frames and saves the world.
     ///
     /// The save is performed once, by this method, so a successful return
-    /// means the world is on disk. Client reader/writer threads are detached
-    /// but have their sockets shut down by the tick thread and exit promptly.
+    /// means the world is on disk. An autosave worker that is still in flight is
+    /// awaited with a bounded timeout and its result reaped; if the worker
+    /// failed or stopped, the synchronous fallback writes the final state. A
+    /// worker that is merely slow past the timeout yields an error rather than
+    /// starting a second writer over the same files. Client reader/writer
+    /// threads are detached but have their sockets shut down by the tick thread
+    /// and exit promptly.
     pub fn stop(mut self) -> Result<(), HostError> {
         self.request_shutdown();
         if let Some(join) = self.accept_join.take() {
@@ -906,7 +917,7 @@ impl DedicatedServer {
         // Give writers a moment to flush their queued Disconnect frames before
         // the world save returns and the caller may close the process.
         thread::sleep(Duration::from_millis(100));
-        lock(&self.shared.core).host.save()
+        lock(&self.shared.core).host.shutdown_save(SHUTDOWN_SAVE_TIMEOUT)
     }
 }
 
@@ -2455,13 +2466,30 @@ impl Core {
     }
 
     /// Generates and sends missing columns inside each player's interest area.
+    ///
+    /// TODO(1.2, spec 17 §3.5 / plan 08): the server deliberately never evicts
+    /// a column, so it retains the union of every player's explored area
+    /// (~322 MiB at the 512-block radius). A save-safe unload needs a
+    /// per-column saved revision, eviction only outside the union of interest
+    /// plus margin, and save-before-unload batching with a hash-verified
+    /// unload/reload test. Do not add plain radius unload here: it can drop
+    /// edits made between the last commit and the unload.
     fn stream_chunks(&mut self) {
         let ids: Vec<u64> = self.players.keys().copied().collect();
         let radius = self.config.interest_radius_chunks;
-        let budget = self.config.chunks_per_tick;
         for id in ids {
             let Some(pos) = self.players.get(&id).map(|player| player.pos) else {
                 continue;
+            };
+            // While a 512-block interest set is still filling, spend a larger
+            // generation budget so a join does not take minutes. The send budget
+            // is bounded by `chunks_per_tick` (default 16); the client's request
+            // limiter controls the actual drain rate and therefore bandwidth.
+            let missing = missing_columns_around(&self.host, pos, radius);
+            let budget = if missing > 256 {
+                self.config.chunks_per_tick.clamp(1, 32).max(16)
+            } else {
+                self.config.chunks_per_tick
             };
             self.host.ensure_streaming_around(pos, radius, budget);
             let messages = self
@@ -2519,24 +2547,47 @@ impl Core {
         }
     }
 
-    /// Saves when dirty and the configured interval has elapsed.
+    /// Starts an asynchronous save when dirty and the interval has elapsed.
+    ///
+    /// Completion is reaped on every tick. At most one worker writes at a time:
+    /// while a save is in flight the interval is coalesced (no queue), so a slow
+    /// disk can never build a backlog of snapshots or stall the tick thread.
     fn maybe_autosave(&mut self, now: Instant) {
+        if let Some(result) = self.host.poll_save() {
+            match result {
+                Ok(report) => {
+                    self.dirty = false;
+                    log::info!(
+                        "autosaved world '{}' at tick {} ({} columns, {:.1} ms worker, {} on disk)",
+                        self.world_name,
+                        self.tick_count,
+                        report.chunks,
+                        report.elapsed_ms,
+                        report.total_bytes
+                    );
+                }
+                Err(error) => {
+                    // Keep the dirty flag set: the next interval retries and the
+                    // previous committed snapshot stays intact.
+                    self.dirty = true;
+                    log::error!("autosave failed; previous save kept, will retry: {error}");
+                }
+            }
+        }
         let interval = self.config.save_interval_seconds;
-        if interval == 0 || !self.dirty {
+        if interval == 0 || !self.dirty || self.host.save_in_flight() {
             return;
         }
         if now.duration_since(self.last_save) < Duration::from_secs(interval) {
             return;
         }
-        match self.host.save() {
-            Ok(()) => {
-                self.dirty = false;
-                self.last_save = now;
-                log::info!("autosaved world '{}' at tick {}", self.world_name, self.tick_count);
-            }
+        match self.host.save_async() {
+            Ok(true) => self.last_save = now,
+            Ok(false) => {}
             Err(error) => {
+                self.dirty = true;
                 self.last_save = now;
-                log::error!("autosave failed; previous save kept: {error}");
+                log::error!("could not start autosave: {error}");
             }
         }
     }
@@ -2697,6 +2748,30 @@ fn entity_spawn_message(entity: EntitySnapshot) -> ServerMessage {
 /// Converts a host slot snapshot to wire DTOs.
 fn window_slot_dtos(host: &Host, slots: &[Option<ItemStack>]) -> Vec<Option<ItemStackDto>> {
     slots.iter().map(|stack| stack_dto(host.registry(), stack)).collect()
+}
+
+/// Counts missing columns inside a player's interest square.
+///
+/// Used only to choose an adaptive generation budget during the join burst; it
+/// is O((2r+1)²) hash lookups at 20 Hz (4,225 at the 512-block ceiling), which is
+/// negligible next to generating a column.
+fn missing_columns_around(host: &Host, center: WorldVec, radius: i32) -> usize {
+    let radius = radius.clamp(0, MAX_INTEREST_RADIUS_CHUNKS);
+    let center = BlockPos::new(
+        center.x.floor() as i32,
+        center.y.floor() as i32,
+        center.z.floor() as i32,
+    )
+    .chunk();
+    let mut missing = 0;
+    for dz in -radius..=radius {
+        for dx in -radius..=radius {
+            if host.chunk_column(ChunkPos::new(center.x + dx, center.z + dz)).is_none() {
+                missing += 1;
+            }
+        }
+    }
+    missing
 }
 
 /// Collects chunk snapshots a player has not received yet, in square-ring order.
@@ -3141,6 +3216,9 @@ mod tests {
         config.max_players = 0;
         assert!(config.validate().is_err());
         config = NetConfig::default();
+        config.interest_radius_chunks = MAX_INTEREST_RADIUS_CHUNKS;
+        assert_eq!(MAX_INTEREST_RADIUS_CHUNKS, 32, "512-block servers must be expressible");
+        assert!(config.validate().is_ok(), "a 32-chunk interest radius is supported");
         config.interest_radius_chunks = MAX_INTEREST_RADIUS_CHUNKS + 1;
         assert!(config.validate().is_err());
         config = NetConfig::default();

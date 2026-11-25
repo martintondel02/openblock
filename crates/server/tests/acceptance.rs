@@ -478,6 +478,19 @@ fn spawn_is_safe_and_stable_across_reopen_for_far_candidates() {
             Some(sy - 1),
             "seed {seed}: a feature sits above the spawn column"
         );
+        // Wave-1 worldgen structures are chunk-local; the spawn resolver must
+        // not place a player inside one. Four blocks is worldgen's maximum
+        // structure half-extent (the mineshaft adit).
+        let generator = ob_worldgen::Generator::new(seed);
+        if let Some(structure) = generator.structure_in_chunk(BlockPos::new(sx, sy, sz).chunk()) {
+            assert!(
+                (sx - structure.x).abs() > 4 || (sz - structure.z).abs() > 4,
+                "seed {seed}: spawn ({sx},{sz}) is inside {:?} at ({},{})",
+                structure.kind,
+                structure.x,
+                structure.z
+            );
+        }
         for _ in 0..40 {
             host.tick(&PlayerInput::default());
         }

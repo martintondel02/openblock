@@ -1,28 +1,37 @@
 //! The GPU renderer built on wgpu: voxel meshing, mesh upload and shading.
 //!
-//! v0.0.1 scope: a screen-space sky gradient pass followed by one forward pass,
-//! textured greedy-meshed chunk geometry with baked face shading and ambient
-//! occlusion, a 16×16 block texture array, distance fog that fades chunk edges
-//! into the sky horizon, a depth buffer and section frustum culling. The render
-//! graph, GPU-driven submission and post chain in `docs/spec/03-rendering.md`
-//! arrive with the rest of MS-04.
+//! v1.1 scope: an HDR forward scene with sun-shadow cascades, animated
+//! procedural clouds, a transparent water pass with Fresnel and sun glints,
+//! HDR bloom, ACES-fit tonemapping and FXAA-lite. The windowed renderer and the
+//! windowless [`OffscreenRenderer`] share one private scene renderer, so a
+//! graphics preset looks identical in both, and every GPU
+//! pipeline is created once at start-up: quality changes only reallocate the
+//! shadow map and update uniforms.
+//!
+//! The public model is still simple: a [`Camera`], an [`Environment`] clock and
+//! a [`SceneParams`] bundle. Dropped items are cubes, sections are uploaded as
+//! opaque and water vertex buffers, and far terrain is merged into LOD batches.
 
 #![allow(missing_docs)] // TODO(MS-04): re-enable once the v0.0.1 API surface settles
 #![forbid(unsafe_code)]
 
 pub mod entities;
 pub mod environment;
+mod frame;
 pub mod frustum;
+pub mod graphics;
+pub mod lod;
 pub mod mesh;
 pub mod offscreen;
 pub mod outline;
 mod pipeline;
 pub mod resource_pack;
+pub mod shadow;
 pub mod textures;
+pub mod tonemap;
 pub mod ui;
 pub mod ui_font;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
@@ -31,19 +40,26 @@ use winit::window::Window;
 
 pub use entities::{EntityInstance, entity_layer, entity_layers};
 pub use environment::{DAY_LENGTH_TICKS, Environment, EnvironmentVisual};
-pub use frustum::{FRUSTUM_PLANE_COUNT, aabb_visible, section_bounds, section_visible};
+pub use frustum::{FRUSTUM_PLANE_COUNT, aabb_visible, aabb_within_distance, section_bounds, section_visible};
+pub use graphics::{
+    BLOOM_STRENGTH, BLOOM_THRESHOLD, CloudQuality, DEFAULT_EXPOSURE, GraphicsPreset, GraphicsSettings, MAX_EXPOSURE,
+    MIN_EXPOSURE, ShadowConfig, ShadowQuality, WaterQuality,
+};
+pub use lod::{
+    DEFAULT_FULL_DETAIL_RADIUS_CHUNKS, DEFAULT_LOD_GROUP_CHUNKS, DEFAULT_SHELL_DEPTH_BLOCKS, LodBatchKey, LodBatchMesh,
+    LodCacheStats, LodConfig, LodTier, mesh_lod_batch, shell_section_range, skipped_sections_for_column,
+    tier_for_group,
+};
 pub use mesh::{MesherStats, SNAPSHOT_SIZE, SectionSnapshot, mesh_section, mesh_section_with_stats};
 pub use offscreen::OffscreenRenderer;
 pub use outline::{BlockOutline, DEFAULT_EDGE_COLOR, DEFAULT_INFLATION, OUTLINE_VERTEX_COUNT, OutlineVertex};
 pub use resource_pack::{ResourcePackLayers, TextureLoadError, TextureSource, load_resource_pack};
+pub use shadow::{MAX_SHADOW_CASCADES, ShadowCascade, ShadowCascades};
 pub use textures::{TexturePack, TexturePackStyle};
 pub use ui::{GLYPH_SIZE, LINE_HEIGHT, UiFrame, UiRenderer, UiStats, UiTexture, UiVertex, glyph_advance, line_height};
 pub use ui_font::{
     UI_GLYPH_SIZE, UI_LINE_HEIGHT, UiFontAtlas, UiFontError, default_ui_font, default_ui_font_name, rasterize_ui_font,
 };
-
-use pipeline::CameraUniform;
-use textures::BlockTextureArray;
 
 /// Camera used to render the world.
 #[derive(Debug, Clone, Copy)]
@@ -121,20 +137,33 @@ impl Camera {
 
     /// Distance-fog `(start, end)` bounds derived from the far plane.
     ///
-    /// Fog begins at 55% and reaches full strength at 95% of the far plane, so
-    /// terrain fades into the sky before the far plane culls it. The end is
-    /// clamped to at least `start + 1` so a tiny far plane cannot invert the
-    /// range. Both the windowed and offscreen renderers use this method, which
-    /// keeps their fog identical for the same camera.
+    /// Small render distances keep the historical 55%-of-far start so the
+    /// last streamed ring always dissolves into the sky. At long distances the
+    /// fog instead starts 160 blocks before the far plane (never earlier than
+    /// 55%), so a 512-block world has a crisp horizon while 200 blocks away is
+    /// still clear. The end is clamped to at least `start + 1` so a tiny far
+    /// plane cannot invert the range. Both the windowed and offscreen renderers
+    /// use this method, which keeps their fog identical for the same camera.
     pub fn fog_range(&self) -> (f32, f32) {
-        let start = self.far * 0.55;
+        let start = (self.far - 160.0).max(self.far * 0.55);
         let end = (self.far * 0.95).max(start + 1.0);
         (start, end)
     }
 }
 
+/// Far plane used for a horizontal streaming radius in chunks.
+///
+/// The margin keeps the last streamed ring inside the frustum even when the
+/// camera is close to a column boundary; 512 blocks (32 chunks) therefore maps
+/// to a 560-block far plane. The client and the offscreen benchmark share this
+/// helper so their fog and culling agree.
+pub fn far_plane_for_render_distance(chunks: i32) -> f32 {
+    (chunks.max(1) as f32 * 16.0 + 48.0).max(128.0)
+}
+
 /// Everything a frame needs besides the camera: the time of day, an optional
-/// immediate-mode UI frame and an optional targeted-block outline.
+/// immediate-mode UI frame, an optional targeted-block outline and the scene
+/// animation clock.
 ///
 /// The default environment is noon, so `SceneParams::default()` and
 /// [`Environment::default()`] keep the pre-v0.0.5 daylight look. Existing
@@ -143,10 +172,16 @@ impl Camera {
 pub struct SceneParams<'a> {
     /// Time-of-day environment driving the sky and world light.
     pub environment: Environment,
-    /// Optional HUD/menu frame drawn after the world and the outline.
+    /// Optional HUD/menu frame drawn after post-processing.
     pub ui: Option<&'a UiFrame>,
-    /// Optional targeted-block outline drawn after the world, before the UI.
+    /// Optional targeted-block outline drawn after the water pass.
     pub outline: Option<BlockOutline>,
+    /// Monotonic scene time in seconds, used for cloud and water animation.
+    ///
+    /// Zero is deterministic and matches the 1.0 still-frame behaviour; the
+    /// windowed client passes its elapsed time, screenshots and benchmarks pass
+    /// a fixed value so captures are reproducible.
+    pub time_seconds: f32,
 }
 
 impl<'a> SceneParams<'a> {
@@ -156,6 +191,7 @@ impl<'a> SceneParams<'a> {
             environment,
             ui: None,
             outline: None,
+            time_seconds: 0.0,
         }
     }
 
@@ -170,12 +206,20 @@ impl<'a> SceneParams<'a> {
         self.outline = Some(outline);
         self
     }
+
+    /// Sets the animation clock.
+    pub fn with_time_seconds(mut self, seconds: f32) -> Self {
+        self.time_seconds = seconds;
+        self
+    }
 }
 
 /// One renderable vertex: world position, tile UV, texture-array layer and
 /// baked light factor.
 ///
-/// The layout is 28 bytes: `position` 12, `uv` 8, `layer` 4, `light` 4.
+/// The layout is 28 bytes: `position` 12, `uv` 8, `layer` 4, `light` 4. Normals
+/// are reconstructed from screen-space derivatives in the fragment shader, so
+/// the vertex format stays unchanged from 1.0.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub struct Vertex {
@@ -193,33 +237,83 @@ pub struct Vertex {
 const _: () = assert!(std::mem::size_of::<Vertex>() == 28);
 
 /// A CPU-side mesh for one section.
+///
+/// Opaque geometry lives in `vertices`, fluid/water geometry in
+/// `water_vertices`. The renderer uploads both into separate buffers: the
+/// opaque pass draws only `vertices`, the translucent water pass only
+/// `water_vertices`, and the shadow pass only opaque geometry.
 #[derive(Debug, Default, Clone)]
 pub struct MeshData {
-    /// Triangle vertices (six per merged quad).
+    /// Opaque triangle vertices (six per merged quad).
     pub vertices: Vec<Vertex>,
+    /// Water/fluid triangle vertices (six per merged quad).
+    pub water_vertices: Vec<Vertex>,
 }
 
 impl MeshData {
-    /// Number of triangles.
+    /// Number of triangles in both lists.
     pub fn triangle_count(&self) -> usize {
+        self.vertex_count() / 3
+    }
+
+    /// Number of opaque triangles.
+    pub fn opaque_triangle_count(&self) -> usize {
         self.vertices.len() / 3
     }
 
-    /// Whether the mesh has no geometry.
+    /// Number of water triangles.
+    pub fn water_triangle_count(&self) -> usize {
+        self.water_vertices.len() / 3
+    }
+
+    /// Total number of vertices in both lists.
+    pub fn vertex_count(&self) -> usize {
+        self.vertices.len() + self.water_vertices.len()
+    }
+
+    /// Number of water vertices.
+    pub fn water_vertex_count(&self) -> usize {
+        self.water_vertices.len()
+    }
+
+    /// Whether the mesh has no geometry in either list.
     pub fn is_empty(&self) -> bool {
-        self.vertices.is_empty()
+        self.vertices.is_empty() && self.water_vertices.is_empty()
     }
 }
 
 /// Per-frame renderer counters.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RenderStats {
-    /// Draw calls issued for chunk geometry.
+    /// Draw calls issued for opaque chunk geometry (sections plus far batches).
     pub draw_calls: u32,
-    /// Vertices drawn.
+    /// Opaque vertices drawn from all world geometry.
     pub vertices: u64,
-    /// Section meshes drawn after frustum culling.
+    /// Full-detail section meshes drawn after frustum and distance culling.
     pub sections: u32,
+    /// Merged far-LOD batches drawn.
+    pub lod_batches: u32,
+    /// Vertices drawn from far-LOD batches (opaque only).
+    pub lod_vertices: u64,
+    /// Section meshes rejected by the frustum or distance checks.
+    pub culled_sections: u32,
+    /// Far-LOD batches rejected by the frustum or distance checks.
+    pub culled_lod_batches: u32,
+    /// Draw calls issued in the transparent water pass.
+    pub water_draw_calls: u32,
+    /// Vertices drawn in the transparent water pass.
+    pub water_vertices: u64,
+    /// Draw calls issued across all sun-shadow cascades.
+    pub shadow_draw_calls: u32,
+    /// Active shadow cascades this frame.
+    pub shadow_cascades: u32,
+    /// Shadow-map edge length in texels (0 when shadows are off).
+    pub shadow_resolution: u32,
+    /// Render passes recorded this frame (shadow, sky, world, water, bloom,
+    /// post).
+    pub passes: u32,
+    /// Bloom threshold/downsample passes recorded this frame.
+    pub bloom_passes: u32,
 }
 
 /// Errors from renderer initialisation or presentation.
@@ -260,16 +354,7 @@ impl From<TextureLoadError> for RenderError {
     }
 }
 
-/// GPU resources for one section mesh.
-#[derive(Debug)]
-pub struct GpuMesh {
-    /// Vertex buffer.
-    pub buffer: wgpu::Buffer,
-    /// Number of vertices in the buffer.
-    pub vertex_count: u32,
-}
-
-/// The wgpu renderer.
+/// The wgpu renderer for a window surface.
 pub struct Renderer {
     /// wgpu instance.
     ///
@@ -285,34 +370,12 @@ pub struct Renderer {
     pub(crate) queue: wgpu::Queue,
     /// Surface configuration.
     pub(crate) config: wgpu::SurfaceConfiguration,
-    /// World render pipeline.
-    pub(crate) pipeline: wgpu::RenderPipeline,
-    /// Full-screen sky gradient pipeline.
-    pub(crate) sky_pipeline: wgpu::RenderPipeline,
-    /// Targeted-block outline line-list pipeline.
-    pub(crate) outline_pipeline: wgpu::RenderPipeline,
-    /// Dropped-item cube pipeline and instance buffers.
-    pub(crate) entities: entities::EntitiesRenderer,
-    /// Depth texture view.
-    pub(crate) depth_view: wgpu::TextureView,
-    /// Camera, fog and environment uniform buffer.
-    pub(crate) uniform_buffer: wgpu::Buffer,
-    /// Small per-frame outline vertex buffer (24 line-list vertices).
-    pub(crate) outline_buffer: wgpu::Buffer,
-    /// Block texture array and sampler (procedural or user resource pack).
-    ///
-    /// Kept alive here even though the bind group also retains its view.
-    _textures: BlockTextureArray,
+    /// Shared scene renderer: pipelines, targets, meshes and entities.
+    scene: frame::SceneRenderer,
     /// Immediate-mode UI renderer (HUD, F3 overlay, menus).
     pub(crate) ui: ui::UiRenderer,
-    /// Camera and texture bind group.
-    pub(crate) bind_group: wgpu::BindGroup,
-    /// Uploaded section meshes.
-    pub(crate) meshes: HashMap<SectionPos, GpuMesh>,
     /// Adapter description.
     pub(crate) adapter_summary: String,
-    /// Statistics from the last frame.
-    pub(crate) stats: RenderStats,
     /// Window handle keeping the surface alive.
     ///
     /// The surface owns a clone of the `Arc` as well, so this field is
@@ -338,6 +401,18 @@ impl Renderer {
     /// pack. Resource-pack load failures become [`RenderError::Texture`] and
     /// leave no partially initialised renderer behind.
     pub fn new_with_source(window: Arc<Window>, source: TextureSource) -> Result<Self, RenderError> {
+        Self::new_with_source_and_graphics(window, source, GraphicsSettings::default())
+    }
+
+    /// Creates a renderer with an explicit graphics preset.
+    ///
+    /// Used by the client so the persisted graphics settings are applied before
+    /// the first frame (and therefore before any shadow map is allocated).
+    pub fn new_with_source_and_graphics(
+        window: Arc<Window>,
+        source: TextureSource,
+        graphics: GraphicsSettings,
+    ) -> Result<Self, RenderError> {
         // wgpu 30's `InstanceDescriptor` has no `Default` impl; this constructor
         // is its `default()` equivalent and needs no display handle. On native
         // platforms `Arc<Window>` satisfies raw-window-handle's blanket
@@ -401,18 +476,10 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
-        let depth_view = pipeline::create_depth_view(&device, width, height);
 
-        let uniform_buffer = pipeline::create_camera_buffer(&device);
-        let outline_buffer = pipeline::create_outline_buffer(&device);
-        let textures = BlockTextureArray::new_with_source(&device, &queue, &source)?;
-        let ui = ui::UiRenderer::new(&device, &queue, &textures, format);
-        let bind_group_layout = pipeline::create_bind_group_layout(&device);
-        let bind_group = pipeline::create_bind_group(&device, &bind_group_layout, &uniform_buffer, &textures);
-        let pipeline = pipeline::create_pipeline(&device, format, &bind_group_layout);
-        let sky_pipeline = pipeline::create_sky_pipeline(&device, format, &bind_group_layout);
-        let outline_pipeline = pipeline::create_outline_pipeline(&device, format, &bind_group_layout);
-        let entity_renderer = entities::EntitiesRenderer::new(&device, &queue, format, &bind_group_layout);
+        let scene = frame::SceneRenderer::new(&device, &queue, width, height, format, &source, graphics)?;
+        let ui = ui::UiRenderer::new(&device, &queue, &scene.textures, format);
+        log::info!("graphics: {}", scene.graphics.summary());
 
         Ok(Self {
             instance,
@@ -420,19 +487,9 @@ impl Renderer {
             device,
             queue,
             config,
-            pipeline,
-            sky_pipeline,
-            outline_pipeline,
-            entities: entity_renderer,
-            depth_view,
-            uniform_buffer,
-            outline_buffer,
-            _textures: textures,
+            scene,
             ui,
-            bind_group,
-            meshes: HashMap::new(),
             adapter_summary,
-            stats: RenderStats::default(),
             window,
         })
     }
@@ -442,7 +499,8 @@ impl Renderer {
         (self.config.width, self.config.height)
     }
 
-    /// Reconfigures the surface after a resize. Zero-sized sizes are ignored.
+    /// Reconfigures the surface after a resize and reallocates the HDR targets.
+    /// Zero-sized sizes are ignored.
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -450,7 +508,23 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
-        self.depth_view = pipeline::create_depth_view(&self.device, width, height);
+        self.scene.resize(&self.device, width, height);
+    }
+
+    /// Applies a new visual quality without recompiling any shader.
+    pub fn set_graphics(&mut self, graphics: GraphicsSettings) {
+        self.scene.set_graphics(&self.device, graphics);
+        log::info!("graphics: {}", self.scene.graphics.summary());
+    }
+
+    /// Current visual quality.
+    pub fn graphics(&self) -> GraphicsSettings {
+        self.scene.graphics
+    }
+
+    /// Short shadow-mode description for F3 (`off`, `high 2048² ×3 3×3 PCF`).
+    pub fn shadow_summary(&self) -> String {
+        self.scene.shadow_summary()
     }
 
     /// Rebuilds the block texture array and every bind group that references it.
@@ -460,17 +534,15 @@ impl Renderer {
     /// failure returns [`RenderError::Texture`] and leaves the current textures,
     /// bind group and UI untouched.
     pub fn set_texture_source(&mut self, source: TextureSource) -> Result<(), RenderError> {
-        if self._textures.source() == &source {
+        if self.scene.textures.source() == &source {
             return Ok(());
         }
-        let textures = BlockTextureArray::new_with_source(&self.device, &self.queue, &source)?;
-        let layout = pipeline::create_bind_group_layout(&self.device);
-        self.bind_group = pipeline::create_bind_group(&self.device, &layout, &self.uniform_buffer, &textures);
+        self.scene
+            .set_texture_source(&self.device, &self.queue, source.clone())?;
         // The UI renderer owns its font atlases and pipeline; only its block
         // bind group refers to the replaced textures, so keep the active UI
         // font instead of rebuilding the whole renderer.
-        self.ui.set_block_textures(&textures);
-        self._textures = textures;
+        self.ui.set_block_textures(&self.scene.textures);
         log::info!("texture source set to {}", source.label());
         Ok(())
     }
@@ -490,89 +562,87 @@ impl Renderer {
     /// For a resource-pack source this is the style used for missing layers
     /// (Classic by default); use [`Self::texture_source`] for the exact source.
     pub fn texture_style(&self) -> TexturePackStyle {
-        self._textures.style()
+        self.scene.textures.style()
+    }
+
+    /// Base-level texture edge length in texels (procedural or resource pack).
+    pub fn texture_resolution(&self) -> u32 {
+        self.scene.textures.resolution()
     }
 
     /// Currently active block texture source.
-    /// Base-level texture edge length in texels (procedural or resource pack).
-    pub fn texture_resolution(&self) -> u32 {
-        self._textures.resolution()
-    }
-
     pub fn texture_source(&self) -> &TextureSource {
-        self._textures.source()
+        self.scene.textures.source()
     }
 
     /// Uploads (or replaces) the mesh for a section.
     pub fn upload_mesh(&mut self, pos: SectionPos, mesh: MeshData) {
-        if mesh.vertices.is_empty() {
-            self.meshes.remove(&pos);
-            return;
-        }
-        let vertex_count = mesh.vertices.len() as u32;
-        let size = (mesh.vertices.len() * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
-        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("section-mesh"),
-            size,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue
-            .write_buffer(&buffer, 0, bytemuck::cast_slice(&mesh.vertices));
-        self.meshes.insert(pos, GpuMesh { buffer, vertex_count });
+        self.scene.upload_mesh(&self.device, &self.queue, pos, mesh);
     }
 
     /// Removes a section mesh (streaming unload).
     pub fn remove_mesh(&mut self, pos: SectionPos) {
-        self.meshes.remove(&pos);
+        self.scene.remove_mesh(pos);
     }
 
     /// Removes all section meshes.
     pub fn clear_meshes(&mut self) {
-        self.meshes.clear();
+        self.scene.clear_meshes();
+    }
+
+    /// Uploads (or replaces) one merged far-LOD batch.
+    ///
+    /// `min`/`max` are the world-space bounds of the emitted vertices; the
+    /// renderer uses them for frustum and distance culling. An empty mesh
+    /// removes the batch instead of allocating a zero-length buffer.
+    pub fn upload_lod_batch(&mut self, key: LodBatchKey, min: [f32; 3], max: [f32; 3], mesh: MeshData) {
+        self.scene
+            .upload_lod_batch(&self.device, &self.queue, key, min, max, mesh);
+    }
+
+    /// Removes one merged far-LOD batch.
+    pub fn remove_lod_batch(&mut self, key: LodBatchKey) {
+        self.scene.remove_lod_batch(key);
+    }
+
+    /// Removes every merged far-LOD batch.
+    pub fn clear_lod_batches(&mut self) {
+        self.scene.clear_lod_batches();
+    }
+
+    /// Number of uploaded far-LOD batches.
+    pub fn lod_batch_count(&self) -> usize {
+        self.scene.lod_batch_count()
+    }
+
+    /// Total vertices held by uploaded far-LOD batches.
+    pub fn lod_vertex_count(&self) -> u64 {
+        self.scene.lod_vertex_count()
     }
 
     /// Replaces the dropped-item entities drawn with the world.
     ///
     /// The slice is copied into the renderer and kept until the next call; an
     /// empty slice disables the entity draw (no draw call is issued). Entities
-    /// are drawn after the world geometry and before the outline and UI passes.
+    /// are drawn after the opaque world geometry and before the outline and UI
+    /// passes, and they cast into the sun-shadow cascades.
     pub fn set_entities(&mut self, entities: &[EntityInstance]) {
-        self.entities.set(&self.device, &self.queue, entities);
+        self.scene.set_entities(&self.device, &self.queue, entities);
     }
 
     /// Renders one frame with a day/night environment, an optional UI overlay
     /// and an optional targeted-block outline.
     ///
-    /// The sky gradient, sun/moon and stars are drawn first into a cleared
-    /// colour target (no depth). The world pass loads that colour, clears depth
-    /// and draws the chunk meshes. Dropped-item entities are drawn next in the
-    /// same pass, depth-tested against the world. The outline is drawn after
-    /// them, with `LessEqual` depth testing and depth writes disabled, so it is
-    /// hidden by nearer terrain but never occludes anything. The UI frame is
-    /// drawn last with alpha blending and no depth attachment.
+    /// Shadow cascades are rendered first. The sky (gradient, clouds, sun/moon,
+    /// stars) is then drawn into the HDR target, followed by the opaque world,
+    /// dropped items and the translucent water pass. The outline is drawn after
+    /// water with `LessEqual` depth testing and no depth writes. Bloom and the
+    /// ACES-fit post pass write the surface, and the UI is drawn last directly
+    /// onto the LDR surface so text stays crisp.
     ///
-    /// The uploaded outline, entity instances and the uniform are shared by the
-    /// whole frame; the statistics returned by [`Self::stats`] still count chunk
-    /// draws only.
+    /// The statistics returned by [`Self::stats`] count shadow, opaque, water
+    /// and post passes separately.
     pub fn render_scene(&mut self, camera: &Camera, scene: &SceneParams<'_>) -> Result<(), RenderError> {
-        let (width, height) = self.size();
-        let aspect = width as f32 / height as f32;
-        let uniform = CameraUniform::new(camera, aspect, scene.environment);
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
-        let frustum = camera.frustum_planes(aspect);
-
-        // A non-finite outline is skipped rather than uploaded as NaNs.
-        let outline_vertices = scene
-            .outline
-            .filter(BlockOutline::is_finite)
-            .map(|outline| outline.vertices());
-        if let Some(vertices) = &outline_vertices {
-            self.queue
-                .write_buffer(&self.outline_buffer, 0, bytemuck::cast_slice(vertices));
-        }
-
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -584,99 +654,11 @@ impl Renderer {
             wgpu::CurrentSurfaceTexture::Validation => return Err(RenderError::SurfaceLost),
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        // Sort the draws so the submitted command stream is deterministic even
-        // though meshes live in a hash map; depth testing makes the result
-        // independent of draw order either way. Culled sections are skipped
-        // and never counted in the frame statistics.
-        let mut order: Vec<SectionPos> = self.meshes.keys().copied().collect();
-        order.sort_unstable();
-
-        let mut stats = RenderStats::default();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
-        {
-            // Sky first, with no depth attachment: one full-screen triangle.
-            // The clear colour follows the current horizon as a fallback.
-            let mut sky = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("sky"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(uniform.sky_clear()),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            sky.set_pipeline(&self.sky_pipeline);
-            sky.set_bind_group(0, &self.bind_group, &[]);
-            sky.draw(0..3, 0..1);
-        }
-        {
-            // The world loads the sky already written above and clears depth
-            // independently.
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("main"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            for pos in order {
-                if !section_visible(&frustum, pos) {
-                    continue;
-                }
-                let Some(mesh) = self.meshes.get(&pos) else {
-                    continue;
-                };
-                if mesh.vertex_count == 0 {
-                    continue;
-                }
-                pass.set_vertex_buffer(0, mesh.buffer.slice(..));
-                pass.draw(0..mesh.vertex_count, 0..1);
-                stats.draw_calls += 1;
-                stats.vertices += u64::from(mesh.vertex_count);
-                stats.sections += 1;
-            }
-            // Dropped items sit in the world: depth-test them against the
-            // terrain, then draw the outline over both.
-            self.entities.draw(&mut pass, &self.bind_group);
-            // Outline after the world geometry: the depth buffer now contains
-            // the nearest opaque surface, so the outline is correctly hidden
-            // behind terrain. Depth writes stay off; the UI pass follows.
-            if outline_vertices.is_some() {
-                pass.set_pipeline(&self.outline_pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.set_vertex_buffer(0, self.outline_buffer.slice(..));
-                pass.draw(0..OUTLINE_VERTEX_COUNT as u32, 0..1);
-            }
-        }
-        self.stats = stats;
+        self.scene
+            .record(&self.device, &self.queue, &mut encoder, &view, camera, scene);
         if let Some(ui_frame) = scene.ui {
             self.ui.render(&mut encoder, &view, ui_frame);
         }
@@ -695,6 +677,7 @@ impl Renderer {
                 environment: Environment::default(),
                 ui,
                 outline: None,
+                time_seconds: 0.0,
             },
         )
     }
@@ -731,7 +714,7 @@ impl Renderer {
 
     /// Statistics from the last rendered frame.
     pub fn stats(&self) -> RenderStats {
-        self.stats
+        self.scene.stats()
     }
 }
 
@@ -776,18 +759,53 @@ mod tests {
     }
 
     #[test]
+    fn mesh_data_separates_water_without_losing_totals() {
+        let vertex = Vertex {
+            position: [0.0; 3],
+            uv: [0.0; 2],
+            layer: 0,
+            light: 1.0,
+        };
+        let mesh = MeshData {
+            vertices: vec![vertex; 36],
+            water_vertices: vec![vertex; 6],
+        };
+        assert_eq!(mesh.vertex_count(), 42);
+        assert_eq!(mesh.water_vertex_count(), 6);
+        assert_eq!(mesh.triangle_count(), 14);
+        assert_eq!(mesh.opaque_triangle_count(), 12);
+        assert_eq!(mesh.water_triangle_count(), 2);
+        assert!(!mesh.is_empty());
+        assert!(MeshData::default().is_empty());
+    }
+
+    #[test]
     fn scene_params_default_to_noon_and_are_composable() {
         let scene = SceneParams::default();
         assert_eq!(scene.environment, Environment::default());
         assert_eq!(scene.environment.time_of_day, 0.5);
         assert!(scene.ui.is_none());
         assert!(scene.outline.is_none());
+        assert_eq!(scene.time_seconds, 0.0);
 
         let outline = BlockOutline::for_block([1, 2, 3]);
-        let scene = SceneParams::new(Environment::new(0.0)).with_outline(outline);
+        let scene = SceneParams::new(Environment::new(0.0))
+            .with_outline(outline)
+            .with_time_seconds(12.5);
         assert_eq!(scene.environment, Environment::new(0.0));
         assert_eq!(scene.outline, Some(outline));
+        assert_eq!(scene.time_seconds, 12.5);
         assert!(scene.ui.is_none());
+    }
+
+    #[test]
+    fn render_stats_defaults_are_zero_and_named() {
+        let stats = RenderStats::default();
+        assert_eq!(stats.draw_calls, 0);
+        assert_eq!(stats.water_draw_calls, 0);
+        assert_eq!(stats.shadow_draw_calls, 0);
+        assert_eq!(stats.passes, 0);
+        assert_eq!(stats.shadow_resolution, 0);
     }
 
     #[test]
@@ -798,10 +816,26 @@ mod tests {
         assert!((start - 110.0).abs() < 1e-4, "fog start is {start}");
         assert!((end - 190.0).abs() < 1e-4, "fog end is {end}");
 
+        // At the 512-block radius the fog starts well beyond 300 blocks, so
+        // the horizon stays readable instead of dissolving into grey.
+        camera.far = far_plane_for_render_distance(32);
+        let (start, end) = camera.fog_range();
+        assert!((camera.far - 560.0).abs() < 1e-4);
+        assert!((399.0..440.0).contains(&start), "fog start is {start}");
+        assert!(end >= 530.0, "fog end is {end}");
+
         // A very short far plane keeps a usable, non-inverted range.
         camera.far = 1.0;
         let (start, end) = camera.fog_range();
         assert!(start >= 0.0);
         assert!(end >= start + 1.0, "fog range is {start}..{end}");
+    }
+
+    #[test]
+    fn graphics_is_exported_from_the_crate_root() {
+        assert_eq!(GraphicsSettings::default().preset, GraphicsPreset::High);
+        assert!(GraphicsSettings::default().shadow_config().cascades as usize <= MAX_SHADOW_CASCADES);
+        let exposure = GraphicsSettings::default().normalised().exposure;
+        assert!((MIN_EXPOSURE..=MAX_EXPOSURE).contains(&exposure));
     }
 }

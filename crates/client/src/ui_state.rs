@@ -7,7 +7,10 @@
 use std::collections::VecDeque;
 
 use ob_content::{BlockType, Registry};
-use ob_core::config::{Action, BindKey, GameMode, KeybindError, Settings, TextureStyle};
+use ob_core::config::{
+    Action, BindKey, CloudQuality, GameMode, GraphicsPreset, KeybindError, Settings, ShadowQuality, TextureStyle,
+    WaterQuality,
+};
 use ob_render::UiFrame;
 
 use crate::crafting::CraftingState;
@@ -124,7 +127,10 @@ pub const SETTINGS_HINT_STEP: f32 = 14.0;
 /// Smallest render distance the settings screen offers, in chunks.
 pub const SETTINGS_MIN_RENDER_DISTANCE: i32 = 2;
 /// Largest render distance the settings screen offers, in chunks.
-pub const SETTINGS_MAX_RENDER_DISTANCE: i32 = 16;
+///
+/// 32 chunks is 512 blocks. The settings row shows both values because the
+/// existing `--render-distance` flag and F3 line are chunk-based.
+pub const SETTINGS_MAX_RENDER_DISTANCE: i32 = 32;
 /// Smallest field of view the settings screen offers, in degrees.
 pub const SETTINGS_MIN_FOV_DEGREES: f32 = 50.0;
 /// Largest field of view the settings screen offers, in degrees.
@@ -229,16 +235,19 @@ pub enum SettingsTab {
     Controls,
     /// Procedural texture style and external resource pack.
     Textures,
+    /// 1.1 visual quality: preset, shadows, clouds, water, bloom and FXAA.
+    Graphics,
 }
 
 impl SettingsTab {
     /// All tabs, in display order.
-    pub const ALL: [SettingsTab; 5] = [
+    pub const ALL: [SettingsTab; 6] = [
         SettingsTab::Game,
         SettingsTab::Display,
         SettingsTab::Audio,
         SettingsTab::Controls,
         SettingsTab::Textures,
+        SettingsTab::Graphics,
     ];
 
     /// Title drawn on the tab.
@@ -249,6 +258,7 @@ impl SettingsTab {
             SettingsTab::Audio => "Audio",
             SettingsTab::Controls => "Controls",
             SettingsTab::Textures => "Textures",
+            SettingsTab::Graphics => "Graphics",
         }
     }
 
@@ -330,6 +340,20 @@ pub enum SettingsRow {
     ResetKeybinds,
     /// Remove camera shake and the sprint FOV pump.
     ReducedMotion,
+    /// Coherent visual-quality preset.
+    GraphicsPreset,
+    /// Sun-shadow quality.
+    ShadowQuality,
+    /// Procedural cloud quality.
+    Clouds,
+    /// Transparent-water quality.
+    WaterQuality,
+    /// Cloud coverage percentage.
+    CloudCoverage,
+    /// HDR bloom toggle.
+    Bloom,
+    /// FXAA-lite toggle.
+    Fxaa,
 }
 
 impl SettingsRow {
@@ -357,24 +381,40 @@ impl SettingsRow {
             SettingsRow::Keybind(action) => action.label(),
             SettingsRow::ResetKeybinds => "Reset controls",
             SettingsRow::ReducedMotion => "Reduced motion",
+            SettingsRow::GraphicsPreset => "Graphics preset",
+            SettingsRow::ShadowQuality => "Shadows",
+            SettingsRow::Clouds => "Clouds",
+            SettingsRow::WaterQuality => "Water",
+            SettingsRow::CloudCoverage => "Cloud coverage",
+            SettingsRow::Bloom => "Bloom",
+            SettingsRow::Fxaa => "FXAA",
         }
     }
 
     /// How the row reacts to adjustment and drawing.
     pub fn kind(self) -> SettingsRowKind {
         match self {
-            SettingsRow::GameMode | SettingsRow::TextureStyle | SettingsRow::UiScale => SettingsRowKind::Choice,
+            SettingsRow::GameMode
+            | SettingsRow::TextureStyle
+            | SettingsRow::UiScale
+            | SettingsRow::GraphicsPreset
+            | SettingsRow::ShadowQuality
+            | SettingsRow::Clouds
+            | SettingsRow::WaterQuality => SettingsRowKind::Choice,
             SettingsRow::ShowHud
             | SettingsRow::DebugOverlay
             | SettingsRow::Fullscreen
             | SettingsRow::AudioEnabled
-            | SettingsRow::ReducedMotion => SettingsRowKind::Toggle,
+            | SettingsRow::ReducedMotion
+            | SettingsRow::Bloom
+            | SettingsRow::Fxaa => SettingsRowKind::Toggle,
             SettingsRow::RenderDistance
             | SettingsRow::Fov
             | SettingsRow::MouseSensitivity
             | SettingsRow::MasterVolume
             | SettingsRow::SfxVolume
-            | SettingsRow::MusicVolume => SettingsRowKind::Range,
+            | SettingsRow::MusicVolume
+            | SettingsRow::CloudCoverage => SettingsRowKind::Range,
             SettingsRow::TexturePack | SettingsRow::ResetUiFont | SettingsRow::ReloadUiFont => SettingsRowKind::Action,
             SettingsRow::MeshWorkers | SettingsRow::UiFont => SettingsRowKind::ReadOnly,
             SettingsRow::Keybind(_) | SettingsRow::ResetKeybinds => SettingsRowKind::Action,
@@ -792,8 +832,16 @@ pub struct DebugStats {
     pub loaded_chunks: usize,
     /// Sections drawn after frustum culling.
     pub drawn_sections: usize,
-    /// Sections with a cached GPU mesh.
+    /// Full-detail sections with a cached GPU mesh.
     pub cached_sections: usize,
+    /// Merged far-LOD batches with a cached GPU mesh.
+    pub lod_batches: usize,
+    /// Shell sections represented by the far batches.
+    pub lod_sections: usize,
+    /// Sections omitted from far columns by the surface shell.
+    pub lod_skipped_sections: usize,
+    /// Estimated CPU+GPU bytes held by section and far-batch vertex data.
+    pub mesh_bytes: usize,
     /// Triangles drawn.
     pub triangles: u64,
     /// Draw calls issued for the world.
@@ -854,6 +902,10 @@ pub struct DebugStats {
     pub day: bool,
     /// Armor defence points (0 in creative).
     pub defense: u8,
+    /// One-line graphics configuration (`High preset | clouds high | ...`).
+    pub graphics_summary: String,
+    /// Shadow mode, resolution and cascade count (`high 2048² ×3 3×3 PCF`).
+    pub shadow_summary: String,
 }
 
 impl DebugStats {
@@ -899,8 +951,10 @@ impl DebugStats {
             ),
             self.held_line(),
             format!(
-                "FOV {:.0}   Render distance {} chunks",
-                self.fov_degrees, self.render_distance
+                "FOV {:.0}   Render distance {} chunks / {} blocks",
+                self.fov_degrees,
+                self.render_distance,
+                self.render_distance * 16
             ),
             format!(
                 "Textures: {}",
@@ -920,10 +974,16 @@ impl DebugStats {
                 }
             ),
             format!(
-                "Chunks {}   Sections drawn {}/{}   Draws {}",
-                self.loaded_chunks, self.drawn_sections, self.cached_sections, self.draw_calls
+                "Chunks {}  Drawn {}/{}  Draws {}  LOD {}",
+                self.loaded_chunks, self.drawn_sections, self.cached_sections, self.draw_calls, self.lod_batches
             ),
-            format!("Triangles {}", self.triangles),
+            format!(
+                "Tri {}  Verts {}  Far {}s/{}skip",
+                self.triangles,
+                self.triangles.saturating_mul(3),
+                self.lod_sections,
+                self.lod_skipped_sections
+            ),
             match &self.target {
                 Some((id, pos)) => {
                     format!("Target {} at {} {} {}", id, pos[0], pos[1], pos[2])
@@ -935,14 +995,11 @@ impl DebugStats {
                 self.mesh_workers, self.mesh_in_flight, self.mesh_backlog, self.mesh_completed
             ),
             format!(
-                "Heap {:.1} MiB  Ticks {}  Mobs {} ({}P/{}H)  {} {}t",
+                "Heap {:.1} MiB  Mesh {:.1} MiB  Ticks {}  Mobs {}",
                 self.heap_bytes as f64 / (1024.0 * 1024.0),
+                self.mesh_bytes as f64 / (1024.0 * 1024.0),
                 self.ticks,
                 self.mobs_total,
-                self.mobs_passive,
-                self.mobs_hostile,
-                if self.day { "Day" } else { "Night" },
-                self.day_phase,
             ),
         ];
         if lines.len() < 15 {
@@ -983,6 +1040,22 @@ impl DebugStats {
                     ob_render::default_ui_font_name()
                 } else {
                     &self.ui_font
+                }
+            ),
+            format!(
+                "Graphics {}",
+                if self.graphics_summary.is_empty() {
+                    "preset ?"
+                } else {
+                    &self.graphics_summary
+                }
+            ),
+            format!(
+                "Shadows {}",
+                if self.shadow_summary.is_empty() {
+                    "off"
+                } else {
+                    &self.shadow_summary
                 }
             ),
         ] {
@@ -1037,8 +1110,11 @@ impl DebugStats {
                 self.health, self.hunger, self.defense
             ),
             format!(
-                "FOV {:.0}   Render distance {} chunks   Facing {}",
-                self.fov_degrees, self.render_distance, self.facing
+                "FOV {:.0}   Render distance {} chunks / {} blocks   Facing {}",
+                self.fov_degrees,
+                self.render_distance,
+                self.render_distance * 16,
+                self.facing
             ),
             format!(
                 "Seed {}   {}",
@@ -1050,16 +1126,22 @@ impl DebugStats {
                 }
             ),
             format!(
-                "Chunks {}  Sec {}/{}  Draws {}  Tri {}",
-                self.loaded_chunks, self.drawn_sections, self.cached_sections, self.draw_calls, self.triangles
+                "Chunks {}  Sec {}/{}  Draws {}  LOD {}  Tri {}",
+                self.loaded_chunks,
+                self.drawn_sections,
+                self.cached_sections,
+                self.draw_calls,
+                self.lod_batches,
+                self.triangles
             ),
             format!(
-                "Mesh {}w {}in {}done   Mobs {}   Heap {:.1} MiB",
+                "Mesh {}w {}in {}done   Mobs {}   Heap {:.1} MiB   Mesh {:.1} MiB",
                 self.mesh_workers,
                 self.mesh_in_flight,
                 self.mesh_completed,
                 self.mobs_total,
-                self.heap_bytes as f64 / (1024.0 * 1024.0)
+                self.heap_bytes as f64 / (1024.0 * 1024.0),
+                self.mesh_bytes as f64 / (1024.0 * 1024.0)
             ),
             match &self.target {
                 Some((id, pos)) => format!(
@@ -1822,6 +1904,15 @@ impl UiState {
                 rows
             }
             SettingsTab::Textures => vec![SettingsRow::TextureStyle, SettingsRow::TexturePack],
+            SettingsTab::Graphics => vec![
+                SettingsRow::GraphicsPreset,
+                SettingsRow::ShadowQuality,
+                SettingsRow::Clouds,
+                SettingsRow::WaterQuality,
+                SettingsRow::CloudCoverage,
+                SettingsRow::Bloom,
+                SettingsRow::Fxaa,
+            ],
         }
     }
 
@@ -1937,7 +2028,23 @@ impl UiState {
             SettingsRow::MusicVolume => {
                 volume_can_adjust(self.settings.music_volume, delta, Settings::default().music_volume)
             }
-            SettingsRow::GameMode | SettingsRow::TextureStyle | SettingsRow::UiScale => true,
+            SettingsRow::CloudCoverage => {
+                let value = if self.settings.cloud_coverage.is_finite() {
+                    self.settings.cloud_coverage.clamp(0.0, 1.0)
+                } else {
+                    Settings::default().cloud_coverage
+                };
+                if delta < 0 { value > 0.0 } else { value < 1.0 }
+            }
+            SettingsRow::GameMode
+            | SettingsRow::TextureStyle
+            | SettingsRow::UiScale
+            | SettingsRow::GraphicsPreset
+            | SettingsRow::ShadowQuality
+            | SettingsRow::Clouds
+            | SettingsRow::WaterQuality
+            | SettingsRow::Bloom
+            | SettingsRow::Fxaa => true,
             SettingsRow::ShowHud
             | SettingsRow::DebugOverlay
             | SettingsRow::Fullscreen
@@ -1990,7 +2097,11 @@ impl UiState {
             SettingsRow::GameMode => game_mode_label(self.settings.game_mode).to_string(),
             SettingsRow::ShowHud => checkbox(self.hud_visible),
             SettingsRow::DebugOverlay => checkbox(self.debug_overlay),
-            SettingsRow::RenderDistance => format!("{} chunks", self.settings.render_distance_chunks),
+            SettingsRow::RenderDistance => format!(
+                "{} chunks / {} blocks",
+                self.settings.render_distance_chunks,
+                self.settings.render_distance_chunks * 16
+            ),
             SettingsRow::Fov => format!("{:.0} deg", self.settings.fov_degrees),
             SettingsRow::MouseSensitivity => format!("{:.2}x", self.settings.mouse_sensitivity),
             SettingsRow::Fullscreen => checkbox(self.settings.fullscreen),
@@ -2039,6 +2150,15 @@ impl UiState {
                 .map_or_else(|| "unbound".to_string(), |key| key.label().to_string()),
             SettingsRow::ResetKeybinds => "Defaults".to_string(),
             SettingsRow::ReducedMotion => checkbox(self.settings.reduced_motion),
+            SettingsRow::GraphicsPreset => graphics_preset_label(self.settings.graphics_preset).to_string(),
+            SettingsRow::ShadowQuality => shadow_quality_label(self.settings.shadow_quality).to_string(),
+            SettingsRow::Clouds => cloud_quality_label(self.settings.clouds).to_string(),
+            SettingsRow::WaterQuality => water_quality_label(self.settings.water_quality).to_string(),
+            SettingsRow::CloudCoverage => {
+                format!("{:.0}%", settings_fraction(self.settings.cloud_coverage) * 100.0)
+            }
+            SettingsRow::Bloom => checkbox(self.settings.bloom),
+            SettingsRow::Fxaa => checkbox(self.settings.fxaa),
         }
     }
 
@@ -2094,6 +2214,7 @@ impl UiState {
                 0.0,
                 1.0,
             )),
+            SettingsRow::CloudCoverage => Some(settings_fraction(self.settings.cloud_coverage)),
             _ => None,
         }
     }
@@ -2220,6 +2341,71 @@ impl UiState {
             }
             SettingsRow::ReducedMotion => {
                 self.settings.reduced_motion = !self.settings.reduced_motion;
+                true
+            }
+            SettingsRow::GraphicsPreset => {
+                let current = GraphicsPreset::ALL
+                    .iter()
+                    .position(|preset| *preset == self.settings.graphics_preset)
+                    .unwrap_or(2);
+                let next = GraphicsPreset::ALL[step_index(current, GraphicsPreset::ALL.len(), delta)];
+                if next == self.settings.graphics_preset {
+                    false
+                } else {
+                    self.settings.graphics_preset = next;
+                    self.settings.apply_graphics_preset();
+                    true
+                }
+            }
+            SettingsRow::ShadowQuality => {
+                let next = cycle_quality(&ShadowQuality::ALL, self.settings.shadow_quality, delta);
+                if next == self.settings.shadow_quality {
+                    false
+                } else {
+                    self.settings.shadow_quality = next;
+                    self.settings.mark_graphics_custom();
+                    true
+                }
+            }
+            SettingsRow::Clouds => {
+                let next = cycle_quality(&CloudQuality::ALL, self.settings.clouds, delta);
+                if next == self.settings.clouds {
+                    false
+                } else {
+                    self.settings.clouds = next;
+                    self.settings.mark_graphics_custom();
+                    true
+                }
+            }
+            SettingsRow::WaterQuality => {
+                let next = cycle_quality(&WaterQuality::ALL, self.settings.water_quality, delta);
+                if next == self.settings.water_quality {
+                    false
+                } else {
+                    self.settings.water_quality = next;
+                    self.settings.mark_graphics_custom();
+                    true
+                }
+            }
+            SettingsRow::CloudCoverage => {
+                let current = settings_fraction(self.settings.cloud_coverage);
+                let next = ((current + 0.05 * delta.signum() as f32).clamp(0.0, 1.0) * 100.0).round() / 100.0;
+                if (next - current).abs() < 1e-4 {
+                    false
+                } else {
+                    self.settings.cloud_coverage = next;
+                    self.settings.mark_graphics_custom();
+                    true
+                }
+            }
+            SettingsRow::Bloom => {
+                self.settings.bloom = !self.settings.bloom;
+                self.settings.mark_graphics_custom();
+                true
+            }
+            SettingsRow::Fxaa => {
+                self.settings.fxaa = !self.settings.fxaa;
+                self.settings.mark_graphics_custom();
                 true
             }
             SettingsRow::MeshWorkers
@@ -2613,6 +2799,42 @@ pub fn texture_style_label(style: TextureStyle) -> &'static str {
     }
 }
 
+/// Title-cased graphics-preset name.
+pub fn graphics_preset_label(preset: GraphicsPreset) -> &'static str {
+    preset.label()
+}
+
+/// Title-cased shadow-quality name.
+pub fn shadow_quality_label(quality: ShadowQuality) -> &'static str {
+    quality.label()
+}
+
+/// Title-cased cloud-quality name.
+pub fn cloud_quality_label(quality: CloudQuality) -> &'static str {
+    quality.label()
+}
+
+/// Title-cased water-quality name.
+pub fn water_quality_label(quality: WaterQuality) -> &'static str {
+    quality.label()
+}
+
+/// Clamps cloud coverage to its supported range, substituting the default for
+/// non-finite persisted values.
+fn settings_fraction(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        Settings::default().cloud_coverage
+    }
+}
+
+/// Cycles a small `Copy` enum-like list in the direction of `delta`.
+fn cycle_quality<T: Copy + PartialEq>(all: &[T], current: T, delta: i32) -> T {
+    let index = all.iter().position(|value| *value == current).unwrap_or(0);
+    all[step_index(index, all.len(), delta)]
+}
+
 fn checkbox(value: bool) -> String {
     // The 8x8 bitmap font renders `[ ]` as two thin bars, which reads like
     // "| |" at UI scales. Words are unambiguous for screenshots and screen
@@ -2843,7 +3065,7 @@ pub fn settings_panel_rect(screen: [f32; 2]) -> UiRect {
 }
 
 /// Bounds of the settings tab buttons.
-pub fn settings_tab_rects(screen: [f32; 2]) -> [UiRect; 5] {
+pub fn settings_tab_rects(screen: [f32; 2]) -> [UiRect; 6] {
     let panel = settings_panel_rect(screen);
     let metrics = settings_metrics(screen);
     let count = SettingsTab::ALL.len() as f32;
@@ -2940,6 +3162,7 @@ pub fn draw_settings_screen(frame: &mut UiFrame, ui: &UiState, info: &SettingsIn
             draw_settings_rows(frame, ui, &rows, &row_rects, screen);
             draw_texture_source(frame, info, panel, content_bottom, metrics);
         }
+        SettingsTab::Graphics => draw_settings_rows(frame, ui, &rows, &row_rects, screen),
     }
     draw_settings_buttons(frame, ui, screen, metrics);
     draw_settings_footer(frame, panel, ui, metrics);
@@ -2985,11 +3208,23 @@ fn draw_settings_header(frame: &mut UiFrame, panel: UiRect, metrics: SettingsMet
     );
 }
 
+/// Scale that fits a settings tab label inside its tab.
+///
+/// Six tabs (the Graphics tab was added in v1.1) make the 620 px panel's tab
+/// strip only ~84 px wide, while an 8-character label at the base 1.45 scale is
+/// ~93 px. The scale is reduced per label instead of shrinking the whole strip,
+/// and the 8 px inset keeps a visible margin between neighbours.
+pub fn settings_tab_label_scale(rect: UiRect, label: &str, base_scale: f32) -> f32 {
+    let glyphs = label.chars().count().max(1) as f32 * ob_render::GLYPH_SIZE;
+    base_scale.min(((rect.w - 8.0) / glyphs).max(0.75))
+}
+
 fn draw_settings_tabs(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2], metrics: SettingsMetrics) {
     let rects = settings_tab_rects(screen);
-    let label_y = |rect: UiRect| rect.y + (rect.h - ob_render::line_height(metrics.tab_scale)) / 2.0;
     for (index, tab) in SettingsTab::ALL.iter().enumerate() {
         let rect = rects[index];
+        let scale = settings_tab_label_scale(rect, tab.name(), metrics.tab_scale);
+        let label_y = rect.y + (rect.h - ob_render::line_height(scale)) / 2.0;
         let active = *tab == ui.settings_tab;
         let hovered = ui.settings_hovered_tab == Some(*tab);
         let background = if active {
@@ -3012,7 +3247,7 @@ fn draw_settings_tabs(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2], metri
         } else {
             [0.62, 0.68, 0.76, 1.0]
         };
-        frame.text_centered(rect.center().0, label_y(rect), metrics.tab_scale, color, tab.name());
+        frame.text_centered(rect.center().0, label_y, scale, color, tab.name());
     }
 }
 
@@ -3846,6 +4081,10 @@ mod tests {
             loaded_chunks: 217,
             drawn_sections: 244,
             cached_sections: 1133,
+            lod_batches: 37,
+            lod_sections: 812,
+            lod_skipped_sections: 4100,
+            mesh_bytes: 3 * 1024 * 1024,
             triangles: 106398,
             draw_calls: 244,
             mesh_workers: 7,
@@ -3876,6 +4115,9 @@ mod tests {
             day_phase: 6000,
             day: true,
             defense: 5,
+            graphics_summary: "High preset | shadows high 2048² ×3 | clouds high | water high | bloom on | FXAA on"
+                .into(),
+            shadow_summary: "high 2048² ×3 3×3 PCF".into(),
         }
     }
 
@@ -4052,7 +4294,11 @@ mod tests {
         state.settings_tab_next();
         assert_eq!(state.settings_tab, SettingsTab::Textures);
         state.settings_tab_next();
+        assert_eq!(state.settings_tab, SettingsTab::Graphics);
+        state.settings_tab_next();
         assert_eq!(state.settings_tab, SettingsTab::Game);
+        state.settings_tab_prev();
+        assert_eq!(state.settings_tab, SettingsTab::Graphics);
         state.settings_tab_prev();
         assert_eq!(state.settings_tab, SettingsTab::Textures);
         state.settings_tab_prev();
@@ -4108,6 +4354,29 @@ mod tests {
             state.settings_focused_row(),
             Some(SettingsRow::Keybind(Action::MoveForward))
         );
+    }
+
+    #[test]
+    fn render_distance_row_shows_chunks_and_blocks() {
+        let mut state = UiState::default();
+        let info = SettingsInfo::default();
+        state.settings.render_distance_chunks = 32;
+        assert_eq!(
+            state.settings_row_value(SettingsRow::RenderDistance, &info),
+            "32 chunks / 512 blocks"
+        );
+        state.settings.render_distance_chunks = 2;
+        assert_eq!(
+            state.settings_row_value(SettingsRow::RenderDistance, &info),
+            "2 chunks / 32 blocks"
+        );
+        // The row clamps at the 512-block ceiling.
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Display);
+        state.settings_selected_row = 0;
+        state.settings.render_distance_chunks = SETTINGS_MAX_RENDER_DISTANCE;
+        assert_eq!(state.settings_adjust(1), None);
+        assert_eq!(state.settings.render_distance_chunks, SETTINGS_MAX_RENDER_DISTANCE);
     }
 
     #[test]
@@ -4402,6 +4671,17 @@ mod tests {
         for tab in tabs {
             assert!(tab.x >= panel.x && tab.x + tab.w <= panel.x + panel.w);
             assert!(tab.y >= panel.y && tab.y + tab.h <= panel.y + panel.h);
+        }
+        // Every tab label fits inside its own tab at the resolved scale.
+        for (tab_rect, tab) in tabs.iter().zip(SettingsTab::ALL.iter()) {
+            let scale = settings_tab_label_scale(*tab_rect, tab.name(), SETTINGS_METRICS_BASE.tab_scale);
+            let width = tab.name().chars().count() as f32 * ob_render::GLYPH_SIZE * scale;
+            assert!(
+                width <= tab_rect.w + 0.01,
+                "{} label is {width:.1} px wide in a {:.1} px tab",
+                tab.name(),
+                tab_rect.w
+            );
         }
         let buttons = settings_button_rects(screen);
         for button in buttons {
@@ -4972,6 +5252,10 @@ mod tests {
             loaded_chunks: 217,
             drawn_sections: 244,
             cached_sections: 1133,
+            lod_batches: 37,
+            lod_sections: 812,
+            lod_skipped_sections: 4100,
+            mesh_bytes: 3 * 1024 * 1024,
             triangles: 106398,
             draw_calls: 244,
             mesh_workers: 7,
@@ -5002,6 +5286,8 @@ mod tests {
             day_phase: 18000,
             day: false,
             defense: 0,
+            graphics_summary: "High preset | shadows high | clouds high | water high | bloom on | FXAA on".into(),
+            shadow_summary: "high 2048² ×3 3×3 PCF".into(),
         };
         let left = stats.left_lines();
         assert_eq!(left.len(), 16);

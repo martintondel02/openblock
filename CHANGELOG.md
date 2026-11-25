@@ -6,6 +6,80 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [1.1.0] — 2026-11-25 (Reach: 512-block view distance and shaders)
+
+The "reach" release: the world is now visible 512 blocks away and the renderer
+has a real shader/lifecycle pipeline, plus the first exploration content and a
+save system that no longer hitches. Save format 4 and protocol 2 are unchanged.
+
+### Added — 512-block render distance
+- Render distance now goes up to **32 chunks / 512 blocks** (core, settings,
+  network interest radius, CLI/server config), with a Settings row showing both
+  units and a one-time memory/GPU warning when crossing 16 chunks.
+- Distance LOD: full 16³ section meshes within 10 chunks, merged 2×2-chunk
+  surface-shell batches beyond (top 48 blocks per column), frustum + distance
+  culling, deterministic batched draw order. Far villages/trees/water/cliffs
+  stay visible; far caves/deep geometry are intentionally omitted.
+- Adaptive streaming: full 4,225-column world in ~0.5 s single-player; loading
+  overlay with column/section progress; movement released once the near ring is
+  meshed (45 s fallback); far chunks stream in the background.
+- Multiplayer streaming: server interest radius 32 with adaptive chunks/tick;
+  client request pacing (128/s burst 64), eviction outside radius+2, release of
+  section meshes and LOD batches. Loopback 512 join: 12.6 s, 13.2 MiB,
+  server tick p99 1.46 ms.
+- Camera far plane 560 m, fog/horizon retuned (400–532 m at 512), F3 counters
+  for chunks/sections/LOD batches/draws/vertices/streaming/memory.
+- New `render_distance_bench` tool with preset/full-detail/time/camera options.
+
+### Added — shaders, lighting and graphics
+- New HDR render graph shared by window and offscreen paths: 2 sun-shadow
+  cascades → opaque world → sky/clouds → water/outline → bloom → ACES post → UI.
+- **Shadows**: 32/160 m cascades, stable sphere/texel-snapped fitting, PCF,
+  cascade blending, AABB proxies for distant casters; receives on terrain,
+  entities and water.
+- **Water**: split opaque/water meshes, translucent sorted pass, animated wave
+  normals, Fresnel sky tint, sun glints, shadows and fog.
+- **Sky/clouds**: procedural world-space cloud layer with coverage/wind/day-night
+  tint, horizon haze; sun/moon/stars retained.
+- **Post**: HDR bloom, ACES-fit tonemapping, saturation, vignette, FXAA-lite.
+- **Graphics settings tab**: preset (Low/Medium/High/Ultra/Custom), shadows,
+  clouds, water, cloud coverage, bloom, FXAA; new F3 Graphics/Shadows lines.
+- Measured at 512 blocks (seed 42, readback benchmark): Low 147 FPS @720p /
+  100 @1080p; High 91/62; Ultra 86/62. RSS ~455 MiB at 4,225 columns.
+
+### Added — exploration, saves and performance
+- **Worldgen structures** (deterministic, chunk-local, existing blocks only):
+  ruined tower, abandoned camp, stone circle, mineshaft adit; one candidate per
+  8×8-chunk region with dry/flat/ravine-free site rules, spawn exclusion and
+  order-independent placement; +<=0.02 ms/chunk generation cost.
+- **Async saves**: copy-on-write world snapshots + a single save worker that
+  serializes/compresses/stages/fsyncs off the tick thread; tick pause is
+  **0.41 ms at 4,225 columns** (was 318 ms), peak RSS +36 MiB, previous save
+  kept on failure, autosave coalescing, bounded shutdown wait with sync fallback.
+- **Append-only save compatibility**: v4 loader accepts saves whose registry
+  fingerprint is a strict prefix of the current registry (blocks added at the
+  end), so future content keeps 1.0.x worlds open; removals/reorders still
+  rejected with a clear error.
+- Spawn search is structure-aware; seed-42 spawn unchanged; new smoke hash
+  `eba0c42219691190`.
+- Save caps raised for 512-radius worlds (512 MiB payload / 1 GiB file).
+
+### Verification
+- Workspace tests, clippy `-D warnings`, fmt, rustdoc, architecture/docs checks,
+  smoke, quick load gate, backup/restore and the 512-block benchmark all green;
+  CI covers Fedora 44/45, Ubuntu, Windows and macOS.
+- New v1.1.0 classic-texture screenshots: 512 vistas day/dusk/night, water,
+  clouds, Graphics tab, F3 and title/survival UI.
+
+### Known limitations
+- Far-cascade PCF is 2×2 hardware taps; AABB shadow proxies lose tree silhouettes
+  beyond 64 m; shadows reach 160 m, not 512; no water SSR/refraction/foam or
+  underwater volume; fixed exposure; FXAA-lite (no TAA/MSAA); far LOD hides deep
+  caves and can show a tier seam at extreme grazing angles.
+- Server chunk memory still grows with exploration (save-safe unload is next);
+  client single-player autosave uses the async path, some tools still call the
+  synchronous API.
+
 ## [1.0.2] — 2026-11-25 (Minecraft-style UI font)
 
 ### Added
@@ -81,7 +155,7 @@ Strict post-release polish update; no save-format or protocol change.
   `network_players.txt` tokens, heightmap no-op/air fixes.
 - **State hash completeness**: persisted yaw/pitch/flying (canonical angles) are
   now hashed and round-trip exactly; seed-42 smoke hash is
-  `7a4532e2ee387d5f` (deterministic across fresh runs and save/reload).
+  `eba0c42219691190` (deterministic across fresh runs and save/reload).
 - Landed attacks push an immediate inventory/vitals/selection sync (tool-wear
   latency removed).
 

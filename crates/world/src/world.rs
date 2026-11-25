@@ -8,6 +8,7 @@ use ob_math::{BlockPos, ChunkPos, SectionPos, WORLD_MAX_Y, WORLD_MIN_Y};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::chunk::ChunkColumn;
+use crate::save::WorldSnapshot;
 use crate::section::Section;
 
 /// Result of a block raycast.
@@ -24,9 +25,15 @@ pub struct RayHit {
 }
 
 /// A sparse voxel world.
+///
+/// Columns are stored behind `Arc` so [`World::snapshot`] can freeze the loaded
+/// set for a background save in O(number of columns) pointer copies. Mutating a
+/// chunk after a snapshot has been taken pays one copy of that single column
+/// (copy-on-write in [`World::chunk_mut`]); the snapshot itself never sees the
+/// change.
 #[derive(Debug)]
 pub struct World {
-    chunks: FxHashMap<ChunkPos, ChunkColumn>,
+    chunks: FxHashMap<ChunkPos, Arc<ChunkColumn>>,
     dirty: FxHashSet<SectionPos>,
     registry: Arc<Registry>,
     seed: u64,
@@ -43,6 +50,20 @@ impl World {
             seed,
             revision: 0,
         }
+    }
+
+    /// Builds a world from existing columns without marking them dirty.
+    ///
+    /// Used to hand a small neighbourhood to a background LOD mesher: the
+    /// caller clones the target group plus one chunk of border, and the worker
+    /// meshes against the same block data (and registry) as the live world
+    /// without producing spurious dirty sections in the main world.
+    pub fn from_columns(registry: Arc<Registry>, seed: u64, columns: impl IntoIterator<Item = ChunkColumn>) -> Self {
+        let mut world = Self::new(registry, seed);
+        for column in columns {
+            world.chunks.insert(column.pos(), Arc::new(column));
+        }
+        world
     }
 
     /// The content registry used for block lookups.
@@ -72,23 +93,39 @@ impl World {
 
     /// Immutable access to a chunk column.
     pub fn chunk(&self, pos: ChunkPos) -> Option<&ChunkColumn> {
-        self.chunks.get(&pos)
+        self.chunks.get(&pos).map(Arc::as_ref)
     }
 
     /// Mutable access to a chunk column.
+    ///
+    /// Copies the column if a background save still holds a snapshot of it.
     pub fn chunk_mut(&mut self, pos: ChunkPos) -> Option<&mut ChunkColumn> {
-        self.chunks.get_mut(&pos)
+        self.chunks.get_mut(&pos).map(Arc::make_mut)
     }
 
     /// Iterates over all loaded chunk columns.
     pub fn chunks(&self) -> impl Iterator<Item = (&ChunkPos, &ChunkColumn)> + '_ {
-        self.chunks.iter()
+        self.chunks.iter().map(|(pos, chunk)| (pos, chunk.as_ref()))
+    }
+
+    /// Captures an immutable, cheaply shareable view of every loaded column.
+    ///
+    /// The snapshot holds one `Arc` per column and the seed and registry
+    /// fingerprint at capture time. Encoding it on a worker thread therefore
+    /// does not block the simulation or copy the world; later edits
+    /// copy-on-write only the columns they touch. Chunks are sorted by
+    /// `(cx, cz)` at capture so the encoded stream is deterministic regardless
+    /// of hash-map iteration order.
+    pub fn snapshot(&self) -> WorldSnapshot {
+        let mut chunks: Vec<Arc<ChunkColumn>> = self.chunks.values().cloned().collect();
+        chunks.sort_by_key(|chunk| (chunk.pos().x, chunk.pos().z));
+        WorldSnapshot::new(self.seed, self.registry(), chunks)
     }
 
     /// Inserts or replaces a chunk column.
     pub fn insert_chunk(&mut self, chunk: ChunkColumn) {
         let pos = chunk.pos();
-        self.chunks.insert(pos, chunk);
+        self.chunks.insert(pos, Arc::new(chunk));
         for section in 0..ob_math::N_SECTIONS {
             self.dirty.insert(SectionPos::new(
                 pos.x,
@@ -99,8 +136,14 @@ impl World {
     }
 
     /// Removes a chunk column (streaming unload).
+    ///
+    /// Returns an owned copy because a background save may still reference the
+    /// removed column through its snapshot.
+    #[allow(clippy::map_unwrap_or)]
     pub fn remove_chunk(&mut self, pos: ChunkPos) -> Option<ChunkColumn> {
-        self.chunks.remove(&pos)
+        self.chunks
+            .remove(&pos)
+            .map(|column| Arc::try_unwrap(column).unwrap_or_else(|shared| (*shared).clone()))
     }
 
     /// Reads a block; unloaded chunks and out-of-range Y read as air.
@@ -127,7 +170,7 @@ impl World {
         let Some(chunk) = self.chunks.get_mut(&chunk_pos) else {
             return false;
         };
-        chunk.set_block(pos, value);
+        Arc::make_mut(chunk).set_block(pos, value);
         self.revision += 1;
         self.mark_dirty_with_neighbours(pos);
         true

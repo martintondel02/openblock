@@ -699,6 +699,16 @@ impl MenuRuntime {
                 self.sync_audio_settings();
             }
             SettingsRow::UiScale => self.refresh_ui_scale(),
+            SettingsRow::GraphicsPreset
+            | SettingsRow::ShadowQuality
+            | SettingsRow::Clouds
+            | SettingsRow::WaterQuality
+            | SettingsRow::CloudCoverage
+            | SettingsRow::Bloom
+            | SettingsRow::Fxaa => {
+                self.renderer
+                    .set_graphics(crate::graphics_settings_from_settings(&self.ui.settings));
+            }
             SettingsRow::RenderDistance
             | SettingsRow::Fov
             | SettingsRow::MouseSensitivity
@@ -924,6 +934,7 @@ impl MenuRuntime {
             environment,
             ui: Some(&frame),
             outline: None,
+            time_seconds: 0.0,
         };
         if let Err(error) = self.renderer.render_scene(&camera, &scene) {
             log::error!("menu render error: {error}");
@@ -1038,6 +1049,7 @@ fn screenshot_menu_inner(
             environment,
             ui: Some(&frame),
             outline: None,
+            time_seconds: 0.0,
         },
     )?;
     let rgba = renderer.read_rgba();

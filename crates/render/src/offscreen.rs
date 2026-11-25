@@ -1,24 +1,20 @@
 //! Offscreen rendering: draw the world into a fixed-size colour texture and read
 //! the pixels back as RGBA8.
 //!
-//! This path needs no window or display. It reuses the same sky pass, shader,
-//! vertex layout, texture array, camera uniform, fog, frustum culling and sky
-//! palette as the windowed renderer, so it verifies the GPU pipeline as well as
-//! producing screenshots.
+//! This path needs no window or display. It reuses the same scene renderer,
+//! shader, vertex layout, texture array, camera uniform, shadow cascades, water
+//! pass, bloom chain and ACES post pass as the windowed renderer, so it verifies
+//! the full GPU pipeline as well as producing screenshots and benchmark frames.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use ob_math::{N_SECTIONS, SECTION_SIZE, SectionPos, WORLD_MIN_Y};
 use ob_world::World;
 
-use crate::entities::EntitiesRenderer;
-use crate::textures::BlockTextureArray;
+use crate::frame;
+use crate::graphics::GraphicsSettings;
 use crate::ui::{UiFrame, UiRenderer};
-use crate::{
-    BlockOutline, Camera, EntityInstance, Environment, OUTLINE_VERTEX_COUNT, RenderError, RenderStats, SceneParams,
-    Vertex, mesh, pipeline, section_visible,
-};
+use crate::{Camera, EntityInstance, Environment, LodBatchKey, RenderError, RenderStats, SceneParams, lod, mesh};
 
 /// Offscreen colour target format (sRGB, readable through `copy_texture_to_buffer`).
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -29,30 +25,14 @@ pub struct OffscreenRenderer {
     device: wgpu::Device,
     /// Submission queue.
     queue: wgpu::Queue,
-    /// Chunk render pipeline.
-    pipeline: wgpu::RenderPipeline,
-    /// Full-screen sky gradient pipeline.
-    sky_pipeline: wgpu::RenderPipeline,
-    /// Targeted-block outline line-list pipeline.
-    outline_pipeline: wgpu::RenderPipeline,
-    /// Dropped-item cube pipeline and instance buffers.
-    entities: EntitiesRenderer,
-    /// Camera, fog and environment uniform buffer.
-    uniform_buffer: wgpu::Buffer,
-    /// Small per-frame outline vertex buffer.
-    outline_buffer: wgpu::Buffer,
-    /// Block texture array and sampler (procedural or user resource pack).
-    ///
-    /// Kept alive here even though the bind group also retains its view.
-    _textures: BlockTextureArray,
-    /// Camera and texture bind group.
-    bind_group: wgpu::BindGroup,
+    /// Shared scene renderer (pipelines, targets, shadows, water, post).
+    scene: frame::SceneRenderer,
+    /// Immediate-mode UI renderer for screenshots with HUD/menus.
+    ui: UiRenderer,
     /// Offscreen colour texture.
     color_texture: wgpu::Texture,
-    /// View of the colour texture used as the render target.
+    /// View of the colour texture used as the post-processing output target.
     color_view: wgpu::TextureView,
-    /// Depth texture view.
-    depth_view: wgpu::TextureView,
     /// Target width in pixels.
     width: u32,
     /// Target height in pixels.
@@ -61,18 +41,6 @@ pub struct OffscreenRenderer {
     adapter_summary: String,
     /// RGBA8 pixels of the last rendered frame.
     pixels: Vec<u8>,
-    /// Statistics from the last rendered frame.
-    stats: RenderStats,
-    /// Immediate-mode UI renderer for screenshots with HUD/menus.
-    ui: UiRenderer,
-    /// Cached section meshes (rebuilt on demand; used by the benchmark path).
-    meshes: HashMap<SectionPos, CachedMesh>,
-}
-
-/// A cached vertex buffer for one section.
-struct CachedMesh {
-    buffer: wgpu::Buffer,
-    vertex_count: u32,
 }
 
 impl OffscreenRenderer {
@@ -91,6 +59,16 @@ impl OffscreenRenderer {
     /// A resource-pack load failure returns [`RenderError::Texture`] before any
     /// render target or pipeline is created.
     pub fn new_with_source(width: u32, height: u32, source: crate::TextureSource) -> Result<Self, RenderError> {
+        Self::new_with_source_and_graphics(width, height, source, GraphicsSettings::default())
+    }
+
+    /// Creates an offscreen renderer with an explicit graphics preset.
+    pub fn new_with_source_and_graphics(
+        width: u32,
+        height: u32,
+        source: crate::TextureSource,
+        graphics: GraphicsSettings,
+    ) -> Result<Self, RenderError> {
         let width = width.max(1);
         let height = height.max(1);
 
@@ -127,40 +105,22 @@ impl OffscreenRenderer {
             label: Some("offscreen-color-view"),
             ..Default::default()
         });
-        let depth_view = pipeline::create_depth_view(&device, width, height);
 
-        let uniform_buffer = pipeline::create_camera_buffer(&device);
-        let outline_buffer = pipeline::create_outline_buffer(&device);
-        let textures = BlockTextureArray::new_with_source(&device, &queue, &source)?;
-        let ui = UiRenderer::new(&device, &queue, &textures, COLOR_FORMAT);
-        let bind_group_layout = pipeline::create_bind_group_layout(&device);
-        let bind_group = pipeline::create_bind_group(&device, &bind_group_layout, &uniform_buffer, &textures);
-        let pipeline = pipeline::create_pipeline(&device, COLOR_FORMAT, &bind_group_layout);
-        let sky_pipeline = pipeline::create_sky_pipeline(&device, COLOR_FORMAT, &bind_group_layout);
-        let outline_pipeline = pipeline::create_outline_pipeline(&device, COLOR_FORMAT, &bind_group_layout);
-        let entities = EntitiesRenderer::new(&device, &queue, COLOR_FORMAT, &bind_group_layout);
+        let scene = frame::SceneRenderer::new(&device, &queue, width, height, COLOR_FORMAT, &source, graphics)?;
+        let ui = UiRenderer::new(&device, &queue, &scene.textures, COLOR_FORMAT);
+        log::info!("graphics: {}", scene.graphics.summary());
 
         Ok(Self {
             device,
             queue,
-            pipeline,
-            sky_pipeline,
-            outline_pipeline,
-            entities,
-            uniform_buffer,
-            outline_buffer,
-            _textures: textures,
-            bind_group,
+            scene,
+            ui,
             color_texture,
             color_view,
-            depth_view,
             width,
             height,
             adapter_summary,
             pixels: Vec::new(),
-            stats: RenderStats::default(),
-            ui,
-            meshes: HashMap::new(),
         })
     }
 
@@ -171,23 +131,96 @@ impl OffscreenRenderer {
 
     /// Statistics from the last rendered frame.
     pub fn stats(&self) -> RenderStats {
-        self.stats
+        self.scene.stats()
+    }
+
+    /// Applies a new visual quality without recompiling any shader.
+    pub fn set_graphics(&mut self, graphics: GraphicsSettings) {
+        self.scene.set_graphics(&self.device, graphics);
+        log::info!("graphics: {}", self.scene.graphics.summary());
+    }
+
+    /// Current visual quality.
+    pub fn graphics(&self) -> GraphicsSettings {
+        self.scene.graphics
+    }
+
+    /// Short shadow-mode description for F3 and benchmark reports.
+    pub fn shadow_summary(&self) -> String {
+        self.scene.shadow_summary()
+    }
+
+    /// Current offscreen target size.
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Reallocates the offscreen colour target and every size-dependent scene
+    /// target (HDR colour, depth, bloom mips and their bind groups).
+    ///
+    /// Zero-sized requests are ignored. Used by tools that capture several sizes
+    /// and by the resize regression test; the next rendered frame has the new
+    /// size and [`Self::read_rgba`] returns exactly `width * height * 4` bytes.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        self.width = width;
+        self.height = height;
+        self.color_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen-color"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: COLOR_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        self.color_view = self.color_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("offscreen-color-view"),
+            ..Default::default()
+        });
+        self.scene.resize(&self.device, width, height);
+        self.pixels.clear();
+    }
+
+    /// Debug helper: first-cascade shadow depth statistics.
+    #[cfg(test)]
+    pub(crate) fn debug_shadow_depth(&self) -> Option<(f32, f32, usize)> {
+        self.scene.debug_shadow_depth(&self.device, &self.queue)
+    }
+
+    /// Pushes a wgpu validation error scope (tests and diagnostics).
+    #[cfg(test)]
+    pub(crate) fn push_validation_scope(&self) -> wgpu::ErrorScopeGuard {
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation)
+    }
+
+    /// Pops a validation scope returned by [`Self::push_validation_scope`].
+    #[cfg(test)]
+    pub(crate) fn pop_validation_scope(scope: wgpu::ErrorScopeGuard) -> Option<wgpu::Error> {
+        pollster::block_on(scope.pop())
     }
 
     /// Rebuilds the block texture array and its bind groups for a new source.
     ///
     /// The current textures survive a failed resource-pack load unchanged.
     pub fn set_texture_source(&mut self, source: crate::TextureSource) -> Result<(), RenderError> {
-        if self._textures.source() == &source {
+        if self.scene.textures.source() == &source {
             return Ok(());
         }
-        let textures = BlockTextureArray::new_with_source(&self.device, &self.queue, &source)?;
-        let layout = pipeline::create_bind_group_layout(&self.device);
-        self.bind_group = pipeline::create_bind_group(&self.device, &layout, &self.uniform_buffer, &textures);
+        self.scene
+            .set_texture_source(&self.device, &self.queue, source.clone())?;
         // Keep the UI renderer (and any custom UI font) alive; only its block
         // bind group references the replaced textures.
-        self.ui.set_block_textures(&textures);
-        self._textures = textures;
+        self.ui.set_block_textures(&self.scene.textures);
         log::info!("offscreen texture source set to {}", source.label());
         Ok(())
     }
@@ -221,25 +254,57 @@ impl OffscreenRenderer {
     /// For a resource-pack source this is the style used for missing layers;
     /// use [`Self::texture_source`] for the exact source.
     pub fn texture_style(&self) -> crate::TexturePackStyle {
-        self._textures.style()
+        self.scene.textures.style()
+    }
+
+    /// Base-level texture edge length in texels (procedural or resource pack).
+    pub fn texture_resolution(&self) -> u32 {
+        self.scene.textures.resolution()
     }
 
     /// Currently active block texture source.
-    /// Base-level texture edge length in texels (procedural or resource pack).
-    pub fn texture_resolution(&self) -> u32 {
-        self._textures.resolution()
-    }
-
     pub fn texture_source(&self) -> &crate::TextureSource {
-        self._textures.source()
+        self.scene.textures.source()
     }
 
     /// Replaces the dropped-item entities drawn with the world.
     ///
     /// The slice is copied and kept until the next call; an empty slice skips
-    /// the entity draw entirely. The next rendered frame includes them.
+    /// the entity draw entirely. The next rendered frame includes them and they
+    /// cast into the sun-shadow cascades.
     pub fn set_entities(&mut self, entities: &[EntityInstance]) {
-        self.entities.set(&self.device, &self.queue, entities);
+        self.scene.set_entities(&self.device, &self.queue, entities);
+    }
+
+    /// Uploads (or replaces) one section mesh in the cached benchmark scene.
+    pub fn upload_mesh(&mut self, pos: SectionPos, section_mesh: crate::MeshData) {
+        self.scene.upload_mesh(&self.device, &self.queue, pos, section_mesh);
+    }
+
+    /// Uploads (or replaces) one merged far-LOD batch in the cached scene.
+    pub fn upload_lod_batch(&mut self, key: LodBatchKey, min: [f32; 3], max: [f32; 3], batch: crate::MeshData) {
+        self.scene
+            .upload_lod_batch(&self.device, &self.queue, key, min, max, batch);
+    }
+
+    /// Removes one far-LOD batch.
+    pub fn remove_lod_batch(&mut self, key: LodBatchKey) {
+        self.scene.remove_lod_batch(key);
+    }
+
+    /// Removes every far-LOD batch.
+    pub fn clear_lod_batches(&mut self) {
+        self.scene.clear_lod_batches();
+    }
+
+    /// Number of cached far-LOD batches.
+    pub fn lod_batch_count(&self) -> usize {
+        self.scene.lod_batch_count()
+    }
+
+    /// Total vertices held by cached far-LOD batches (opaque and water).
+    pub fn lod_vertex_count(&self) -> u64 {
+        self.scene.lod_vertex_count()
     }
 
     /// Rebuilds the cached GPU meshes for every non-empty loaded section.
@@ -248,7 +313,8 @@ impl OffscreenRenderer {
     /// calls this once, then times cached frames so meshing and upload do not
     /// dominate the measurement.
     pub fn rebuild_mesh_cache(&mut self, world: &World) -> (u32, u64) {
-        self.meshes.clear();
+        self.scene.clear_meshes();
+        self.scene.clear_lod_batches();
         let mut sections = 0u32;
         let mut vertices = 0u64;
         let base_y = WORLD_MIN_Y / SECTION_SIZE as i32;
@@ -270,21 +336,77 @@ impl OffscreenRenderer {
             if section_mesh.is_empty() {
                 continue;
             }
-            let vertex_count = section_mesh.vertices.len() as u32;
-            let size = (section_mesh.vertices.len() * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
-            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("offscreen-cached-section"),
-                size,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.queue
-                .write_buffer(&buffer, 0, bytemuck::cast_slice(&section_mesh.vertices));
-            self.meshes.insert(pos, CachedMesh { buffer, vertex_count });
+            vertices += section_mesh.vertex_count() as u64;
             sections += 1;
-            vertices += u64::from(vertex_count);
+            self.upload_mesh(pos, section_mesh);
         }
         (sections, vertices)
+    }
+
+    /// Rebuilds the cached benchmark scene with the distance-LOD policy.
+    ///
+    /// Near columns are meshed per section; far 2×2-chunk groups are meshed
+    /// once as a surface-shell batch. Returns a summary for the benchmark
+    /// report. This is the exact policy the client applies through its
+    /// scheduler, implemented here without a scheduler so the offscreen tool
+    /// stays dependency-free and deterministic.
+    pub fn rebuild_lod_scene(
+        &mut self,
+        world: &World,
+        camera: &Camera,
+        config: &lod::LodConfig,
+    ) -> crate::LodCacheStats {
+        self.scene.clear_meshes();
+        self.scene.clear_lod_batches();
+        let config = config.normalised();
+        let camera_chunk = ob_math::BlockPos::new(
+            camera.position.x.floor() as i32,
+            camera.position.y.floor() as i32,
+            camera.position.z.floor() as i32,
+        )
+        .chunk();
+        let mut stats = crate::LodCacheStats::default();
+        let base_y = WORLD_MIN_Y / SECTION_SIZE as i32;
+        // Deterministic iteration order: chunk order is not stable in a hash
+        // map, and the benchmark's counts must be reproducible.
+        let mut columns: Vec<(ob_math::ChunkPos, &ob_world::ChunkColumn)> =
+            world.chunks().map(|(pos, c)| (*pos, c)).collect();
+        columns.sort_by_key(|(pos, _)| (pos.x, pos.z));
+        let mut far_groups = std::collections::BTreeSet::new();
+        for (chunk_pos, _) in &columns {
+            if config.chunk_tier(camera_chunk, *chunk_pos) == crate::LodTier::Shell {
+                far_groups.insert(LodBatchKey::containing(*chunk_pos, config.group_chunks));
+                continue;
+            }
+            for index in 0..ob_math::N_SECTIONS {
+                let pos = SectionPos::new(chunk_pos.x, base_y + index as i32, chunk_pos.z);
+                let Some(section) = world.section(pos) else {
+                    continue;
+                };
+                if section.is_empty() {
+                    continue;
+                }
+                let section_mesh = mesh::mesh_section(world, pos);
+                if section_mesh.is_empty() {
+                    continue;
+                }
+                stats.sections += 1;
+                stats.section_vertices += section_mesh.vertex_count() as u64;
+                self.upload_mesh(pos, section_mesh);
+            }
+        }
+        for key in far_groups {
+            let batch = lod::mesh_lod_batch(world, key, &config);
+            if batch.is_empty() {
+                continue;
+            }
+            stats.batches += 1;
+            stats.batch_sections += batch.shell_sections as u64;
+            stats.skipped_sections += batch.skipped_sections as u64;
+            stats.batch_vertices += batch.mesh.vertex_count() as u64;
+            self.upload_lod_batch(key, batch.min, batch.max, batch.mesh);
+        }
+        stats
     }
 
     /// Renders the cached meshes inside the frustum and reads the frame back.
@@ -303,129 +425,64 @@ impl OffscreenRenderer {
                 environment: Environment::default(),
                 ui,
                 outline: None,
+                time_seconds: 0.0,
             },
         )
     }
 
     /// Renders the cached meshes for a full scene and reads the frame back.
     ///
-    /// This is the offscreen counterpart of [`crate::Renderer::render_scene`]:
-    /// the sky pass uses the scene environment, the world loads that colour and
-    /// draws the chunk meshes, dropped-item entities follow in the same pass,
-    /// the outline (when present) is drawn next with `LessEqual` depth testing
-    /// and no depth writes, and the UI frame is drawn last. The GPU-to-CPU
-    /// readback is included in the returned timing, like
+    /// This is the offscreen counterpart of [`crate::Renderer::render_scene`].
+    /// The GPU-to-CPU readback is included in the returned timing, like
     /// [`Self::render_cached_with_ui`].
     pub fn render_cached_scene(
         &mut self,
         camera: &Camera,
         scene: &SceneParams<'_>,
     ) -> Result<RenderStats, RenderError> {
-        let aspect = self.width as f32 / self.height as f32;
-        let uniform = pipeline::CameraUniform::new(camera, aspect, scene.environment);
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
-        let frustum = camera.frustum_planes(aspect);
-
-        // A non-finite outline is skipped rather than uploaded as NaNs.
-        let outline_vertices = scene
-            .outline
-            .filter(BlockOutline::is_finite)
-            .map(|outline| outline.vertices());
-        if let Some(vertices) = &outline_vertices {
-            self.queue
-                .write_buffer(&self.outline_buffer, 0, bytemuck::cast_slice(vertices));
-        }
-
-        let mut stats = RenderStats::default();
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("offscreen-cached-frame"),
         });
-        {
-            // Sky first, with no depth attachment: one full-screen triangle.
-            let mut sky = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("offscreen-sky"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.color_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(uniform.sky_clear()),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            sky.set_pipeline(&self.sky_pipeline);
-            sky.set_bind_group(0, &self.bind_group, &[]);
-            sky.draw(0..3, 0..1);
-        }
-        {
-            // The world loads the sky already written above and clears depth
-            // independently.
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("offscreen-main"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.color_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            for (pos, cached) in &self.meshes {
-                if !section_visible(&frustum, *pos) {
-                    continue;
-                }
-                pass.set_vertex_buffer(0, cached.buffer.slice(..));
-                pass.draw(0..cached.vertex_count, 0..1);
-                stats.draw_calls += 1;
-                stats.vertices += u64::from(cached.vertex_count);
-                stats.sections += 1;
-            }
-            // Dropped items are depth-tested against the world geometry and
-            // drawn before the selection outline.
-            self.entities.draw(&mut pass, &self.bind_group);
-            // Outline after the world geometry, before the UI pass. The depth
-            // buffer already holds the nearest opaque surface, so terrain in
-            // front of the selection hides it.
-            if outline_vertices.is_some() {
-                pass.set_pipeline(&self.outline_pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.set_vertex_buffer(0, self.outline_buffer.slice(..));
-                pass.draw(0..OUTLINE_VERTEX_COUNT as u32, 0..1);
-            }
-        }
+        let stats = self
+            .scene
+            .record(&self.device, &self.queue, &mut encoder, &self.color_view, camera, scene);
         if let Some(ui_frame) = scene.ui {
             self.ui.render(&mut encoder, &self.color_view, ui_frame);
         }
         self.queue.submit([encoder.finish()]);
         self.read_back()?;
-        self.stats = stats;
         Ok(stats)
     }
 
     /// Number of cached section meshes (0 before `rebuild_mesh_cache`).
     pub fn cached_mesh_count(&self) -> usize {
-        self.meshes.len()
+        self.scene.mesh_count()
+    }
+
+    /// Renders a world using the distance-LOD policy.
+    ///
+    /// Screenshots and F2 captures use this path so a 512-block capture does not
+    /// build tens of thousands of full section meshes or exhaust GPU memory.
+    /// Render distances within the full-detail radius produce exactly the same
+    /// geometry as [`Self::render_world_scene`].
+    pub fn render_world_scene_lod(
+        &mut self,
+        world: &World,
+        camera: &Camera,
+        scene: &SceneParams<'_>,
+        config: &lod::LodConfig,
+    ) -> Result<(), RenderError> {
+        let stats = self.rebuild_lod_scene(world, camera, config);
+        log::info!(
+            "offscreen LOD frame: {} near sections + {} far batches, {} cached vertices, {} shell sections, {} skipped",
+            stats.sections,
+            stats.batches,
+            stats.section_vertices + stats.batch_vertices,
+            stats.batch_sections,
+            stats.skipped_sections
+        );
+        let _ = self.render_cached_scene(camera, scene)?;
+        Ok(())
     }
 
     /// Renders every non-empty loaded section inside the frustum into the
@@ -451,6 +508,7 @@ impl OffscreenRenderer {
                 environment: Environment::default(),
                 ui,
                 outline: None,
+                time_seconds: 0.0,
             },
         )
     }
@@ -468,12 +526,14 @@ impl OffscreenRenderer {
         scene: &SceneParams<'_>,
     ) -> Result<(), RenderError> {
         self.rebuild_mesh_cache(world);
-        let _ = self.render_cached_scene(camera, scene)?;
+        let stats = self.render_cached_scene(camera, scene)?;
         log::info!(
-            "offscreen frame: {} visible sections drawn, {} vertices, {} draws",
-            self.stats.sections,
-            self.stats.vertices,
-            self.stats.draw_calls
+            "offscreen frame: {} visible sections drawn, {} vertices, {} draws, {} water draws, {} shadow draws",
+            stats.sections,
+            stats.vertices,
+            stats.draw_calls,
+            stats.water_draw_calls,
+            stats.shadow_draw_calls
         );
         Ok(())
     }
@@ -603,6 +663,7 @@ mod tests {
     use ob_world::ChunkColumn;
 
     use super::*;
+    use crate::BlockOutline;
 
     /// Builds one chunk column with a flat stone platform, a grass surface and
     /// two small pillars so the image contains several distinct shades.
@@ -717,6 +778,14 @@ mod tests {
         };
         eprintln!("offscreen test GPU: {}", renderer.adapter_summary());
 
+        // Keep the sky deterministic for the culled-frame comparison: no
+        // world-space clouds, bloom or FXAA; only the HDR tonemap remains.
+        renderer.set_graphics(crate::GraphicsSettings {
+            clouds: crate::CloudQuality::Off,
+            bloom: false,
+            fxaa: false,
+            ..crate::GraphicsSettings::default()
+        });
         let mut camera = Camera::new(WorldVec::new(8.0, 76.0, 8.0), 0.6, -1.0);
         camera.far = 128.0;
 
@@ -790,16 +859,20 @@ mod tests {
         let mut high_camera = Camera::new(WorldVec::new(8.0, 220.0, 8.0), 0.0, 0.0);
         high_camera.far = 64.0;
         renderer
+            .render_world(&empty, &high_camera)
+            .expect("render high empty world");
+        let high_background = renderer.read_rgba();
+        renderer
             .render_world(&world, &high_camera)
             .expect("render culled world");
         assert_eq!(renderer.stats().sections, 0);
         assert_eq!(renderer.stats().draw_calls, 0);
         let culled = renderer.read_rgba();
-        assert_eq!(culled.len(), background.len());
+        assert_eq!(culled.len(), high_background.len());
         assert!(
             culled
                 .iter()
-                .zip(background.iter())
+                .zip(high_background.iter())
                 .all(|(actual, expected)| actual.abs_diff(*expected) <= 1),
             "a fully culled frame must show the same sky gradient as an empty world",
         );
@@ -822,6 +895,12 @@ mod tests {
             Err(err) => panic!("failed to create the offscreen renderer: {err}"),
         };
 
+        renderer.set_graphics(crate::GraphicsSettings {
+            clouds: crate::CloudQuality::Off,
+            bloom: false,
+            fxaa: false,
+            ..crate::GraphicsSettings::default()
+        });
         let camera = Camera::new(WorldVec::new(0.0, 128.0, 0.0), 0.0, 0.0);
         renderer.render_world(&empty, &camera).expect("render sky only");
         assert_eq!(renderer.stats().sections, 0);
@@ -829,7 +908,7 @@ mod tests {
         assert_eq!(pixels.len(), 320 * 180 * 4);
 
         // The gradient is a function of screen Y only.
-        assert_rows_uniform(&pixels, 320, 180, 1);
+        assert_rows_uniform(&pixels, 320, 180, 8);
 
         let top = row_rgb(&pixels, 320, 1);
         let middle = row_rgb(&pixels, 320, 90);
@@ -1142,7 +1221,17 @@ mod tests {
             return None;
         }
         match OffscreenRenderer::new(width, height) {
-            Ok(renderer) => {
+            Ok(mut renderer) => {
+                // Sky/fog/outline GPU tests compare exact pixels. Clouds are
+                // world-space and animate, bloom adds a highlight glow and FXAA
+                // changes edge pixels, so the deterministic tests turn them off
+                // and keep only the ACES/exposure/vignette post chain.
+                renderer.set_graphics(crate::GraphicsSettings {
+                    clouds: crate::CloudQuality::Off,
+                    bloom: false,
+                    fxaa: false,
+                    ..crate::GraphicsSettings::default()
+                });
                 eprintln!("{test} GPU: {}", renderer.adapter_summary());
                 Some(renderer)
             }
@@ -1182,18 +1271,31 @@ mod tests {
         ])
     }
 
-    /// sRGB byte value of a linear RGB channel, matching the sRGB render target.
-    fn linear_to_srgb_byte(value: f32) -> f32 {
-        let srgb = if value <= 0.003_130_8 {
-            value * 12.92
-        } else {
-            1.055 * value.powf(1.0 / 2.4) - 0.055
-        };
-        (srgb.clamp(0.0, 1.0) * 255.0).round()
+    /// Expected sRGB byte of a uniform linear colour after the post chain.
+    ///
+    /// The sky/fog horizon is compared against the CPU environment; the render
+    /// target now stores HDR and the post pass applies exposure, ACES and the
+    /// vignette. `row` is the framebuffer row whose average is compared, so the
+    /// vignette is averaged over the same columns the test averages.
+    fn post_byte_for_uniform(channel: f32, exposure: f32, row: u32, width: u32, height: u32) -> f32 {
+        let toned = crate::tonemap::aces_tonemap_channel(channel * exposure);
+        let v = (row as f32 + 0.5) / height as f32;
+        let mut vignette_sum = 0.0f32;
+        for x in 0..width {
+            let u = (x as f32 + 0.5) / width as f32;
+            vignette_sum += crate::tonemap::vignette_factor(u, v);
+        }
+        let vignette = vignette_sum / width as f32;
+        crate::tonemap::srgb_encode_channel(toned * vignette) * 255.0
     }
 
     fn is_outline_pixel(pixel: &[u8]) -> bool {
-        pixel[0] >= 240 && pixel[1] >= 240 && pixel[2] >= 240
+        // The outline is authored as linear white, so the ACES post pass writes
+        // about 224 in sRGB rather than 255. Treat any near-neutral bright pixel
+        // as outline; the world has no such flat white in these scenes.
+        let max = pixel[0].max(pixel[1]).max(pixel[2]);
+        let min = pixel[0].min(pixel[1]).min(pixel[2]);
+        min >= 190 && max - min <= 24
     }
 
     fn count_outline_pixels(pixels: &[u8]) -> usize {
@@ -1463,15 +1565,16 @@ mod tests {
             let background = renderer.read_rgba();
             let horizon = row_rgb(&background, 320, 90);
             let expected = env.visual().horizon;
+            let exposure = renderer.graphics().exposure;
             let expected = [
-                linear_to_srgb_byte(expected[0]),
-                linear_to_srgb_byte(expected[1]),
-                linear_to_srgb_byte(expected[2]),
+                post_byte_for_uniform(expected[0], exposure, 90, 320, 180),
+                post_byte_for_uniform(expected[1], exposure, 90, 320, 180),
+                post_byte_for_uniform(expected[2], exposure, 90, 320, 180),
             ];
             for channel in 0..3 {
                 assert!(
-                    (horizon[channel] - expected[channel]).abs() <= 2.0,
-                    "time {}: horizon row {horizon:?} does not match the CPU horizon {expected:?}",
+                    (horizon[channel] - expected[channel]).abs() <= 4.0,
+                    "time {}: horizon row {horizon:?} does not match the post-processed CPU horizon {expected:?}",
                     env.time_of_day
                 );
             }
@@ -1701,6 +1804,178 @@ mod tests {
                 outline.is_some()
             );
         }
+    }
+
+    /// A small lake with a sandy shore, stone terraces and two pillars, used for
+    /// the transparent-water screenshot. Deterministic and one chunk only.
+    fn screenshot_water_world(registry: &Arc<Registry>) -> World {
+        let stone = registry.id_or_air("openblock:stone");
+        let sand = registry.id_or_air("openblock:sand");
+        let grass = registry.id_or_air("openblock:grass");
+        let water = registry.id_or_air("openblock:water");
+        let mut column = ChunkColumn::new(ChunkPos::new(0, 0));
+        for z in 0..SECTION_SIZE as i32 {
+            for x in 0..SECTION_SIZE as i32 {
+                column.set_block(BlockPos::new(x, 60, z), stone);
+                // A shallow bowl: water in the middle, a sand/grass shore, then a
+                // low stone rim that catches the late-morning shadows.
+                let dx = (x as f32 - 7.5).abs();
+                let dz = (z as f32 - 7.5).abs();
+                let centre = dx.max(dz);
+                if centre <= 4.5 {
+                    // Water top surface at y = 65, one block below the rim.
+                    for y in 61..=64 {
+                        column.set_block(BlockPos::new(x, y, z), water);
+                    }
+                } else if centre <= 6.5 {
+                    for y in 61..=65 {
+                        column.set_block(BlockPos::new(x, y, z), if y == 65 { sand } else { stone });
+                    }
+                } else {
+                    for y in 61..=65 {
+                        column.set_block(BlockPos::new(x, y, z), if y == 65 { grass } else { stone });
+                    }
+                }
+            }
+        }
+        // One pillar rises out of the water and casts a shadow across the
+        // surface; the other stands on the shore for depth.
+        for y in 65..73 {
+            column.set_block(BlockPos::new(8, y, 8), stone);
+        }
+        for y in 63..69 {
+            column.set_block(BlockPos::new(13, y, 12), stone);
+        }
+        column.recompute_heightmap();
+        let mut world = World::new(Arc::clone(registry), 11);
+        world.insert_chunk(column);
+        world
+    }
+
+    #[test]
+    fn water_receives_sun_shadows() {
+        let Some(mut renderer) = open_renderer(640, 360, "water_receives_sun_shadows") else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let world = screenshot_water_world(&registry);
+        let mut camera = Camera::new(WorldVec::new(8.0, 70.5, 22.0), 0.0, -0.34);
+        camera.far = 96.0;
+        let scene = SceneParams {
+            environment: Environment::new(0.40),
+            ui: None,
+            outline: None,
+            time_seconds: 8.0,
+        };
+        let mut graphics = renderer.graphics();
+        graphics.shadow_quality = crate::ShadowQuality::High;
+        renderer.set_graphics(graphics);
+        renderer
+            .render_world_scene(&world, &camera, &scene)
+            .expect("render shadowed water");
+        let shadowed = renderer.read_rgba();
+        assert!(renderer.stats().water_draw_calls > 0);
+        let mut graphics = renderer.graphics();
+        graphics.shadow_quality = crate::ShadowQuality::Off;
+        renderer.set_graphics(graphics);
+        renderer
+            .render_cached_scene(&camera, &scene)
+            .expect("render unshadowed water");
+        let plain = renderer.read_rgba();
+
+        // Count only pixels that are visibly blue in the shadowed frame, i.e.
+        // water (or its tinted rim), so opaque terrain shadows cannot satisfy the
+        // test on their own.
+        let mut water_pixels = 0usize;
+        let mut changed = 0usize;
+        for (shadowed, plain) in shadowed.as_chunks::<4>().0.iter().zip(plain.as_chunks::<4>().0) {
+            let blue = i32::from(shadowed[2]) - i32::from(shadowed[0]);
+            let water = blue > 25 && shadowed[2] > shadowed[1];
+            if !water {
+                continue;
+            }
+            water_pixels += 1;
+            if shadowed[0].abs_diff(plain[0]) > 2
+                || shadowed[1].abs_diff(plain[1]) > 2
+                || shadowed[2].abs_diff(plain[2]) > 2
+            {
+                changed += 1;
+            }
+        }
+        assert!(water_pixels > 500, "only {water_pixels} water pixels were found");
+        assert!(
+            changed > 100,
+            "only {changed} of {water_pixels} water pixels changed when shadows were disabled"
+        );
+    }
+
+    #[test]
+    #[ignore = "GPU screenshot verification; writes /tmp/openblock-shaders-water.png"]
+    fn write_shader_water_screenshot() {
+        if std::env::var_os("OPENBLOCK_NO_GPU_TESTS").is_some() {
+            eprintln!("skipping water screenshot: OPENBLOCK_NO_GPU_TESTS is set");
+            return;
+        }
+        let registry = Arc::new(Registry::base());
+        let world = screenshot_water_world(&registry);
+        let mut renderer = match OffscreenRenderer::new_with_source_and_graphics(
+            1280,
+            720,
+            crate::TextureSource::Style(crate::TexturePackStyle::Classic),
+            crate::GraphicsSettings::from_preset(crate::GraphicsPreset::High),
+        ) {
+            Ok(renderer) => renderer,
+            Err(RenderError::NoAdapter(reason)) => {
+                eprintln!("skipping water screenshot: no GPU adapter ({reason})");
+                return;
+            }
+            Err(error) => panic!("failed to create the offscreen renderer: {error}"),
+        };
+        let mut camera = Camera::new(WorldVec::new(8.0, 70.5, 22.0), 0.0, -0.34);
+        camera.far = 96.0;
+        let scene = SceneParams {
+            environment: Environment::new(0.40),
+            ui: None,
+            outline: None,
+            time_seconds: 8.0,
+        };
+        renderer
+            .render_world_scene(&world, &camera, &scene)
+            .expect("render water screenshot");
+        assert!(renderer.stats().water_draw_calls > 0);
+        let rgba = renderer.read_rgba();
+        let mut graphics = renderer.graphics();
+        graphics.shadow_quality = crate::ShadowQuality::Off;
+        renderer.set_graphics(graphics);
+        renderer
+            .render_cached_scene(&camera, &scene)
+            .expect("render water without shadows");
+        let no_shadow = renderer.read_rgba();
+        let differing = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(no_shadow.as_chunks::<4>().0)
+            .filter(|(a, b)| a[0].abs_diff(b[0]) > 2 || a[1].abs_diff(b[1]) > 2 || a[2].abs_diff(b[2]) > 2)
+            .count();
+        eprintln!("water screenshot shadow difference: {differing} pixels");
+        let mut graphics = renderer.graphics();
+        graphics.shadow_quality = crate::ShadowQuality::High;
+        renderer.set_graphics(graphics);
+        renderer
+            .render_cached_scene(&camera, &scene)
+            .expect("render water with shadows again");
+        write_test_png(
+            std::path::Path::new("/tmp/openblock-shaders-water.png"),
+            1280,
+            720,
+            &rgba,
+        );
+        eprintln!(
+            "water screenshot: {:?}, {} water draws",
+            renderer.stats(),
+            renderer.stats().water_draw_calls
+        );
     }
 
     /// Scratch directory for a synthetic resource pack, removed on drop.
@@ -1988,5 +2263,459 @@ mod tests {
         );
         renderer.set_texture_style(crate::TexturePackStyle::Minimal);
         assert_eq!(renderer.texture_style(), crate::TexturePackStyle::Minimal);
+    }
+
+    #[test]
+    fn cached_mesh_beyond_the_far_plane_is_culled() {
+        if std::env::var_os("OPENBLOCK_NO_GPU_TESTS").is_some() {
+            eprintln!("skipping offscreen GPU tests: OPENBLOCK_NO_GPU_TESTS is set");
+            return;
+        }
+        let registry = Arc::new(Registry::base());
+        let world = test_world(&registry);
+        let mut renderer = match OffscreenRenderer::new(96, 54) {
+            Ok(renderer) => renderer,
+            Err(RenderError::NoAdapter(reason)) => {
+                eprintln!("skipping cached_mesh_beyond_the_far_plane_is_culled: {reason}");
+                return;
+            }
+            Err(error) => panic!("failed to create the offscreen renderer: {error}"),
+        };
+        let mesh = mesh::mesh_section(&world, SectionPos::new(0, 4, 0));
+        assert!(!mesh.is_empty(), "the test platform must produce geometry");
+        // Upload under a key far outside the 128-block far plane while the
+        // camera looks along -Z. The vertices themselves are at the origin, so
+        // any draw would be visible if distance culling failed.
+        renderer.upload_mesh(SectionPos::new(0, 4, -30), mesh);
+        let mut camera = Camera::new(WorldVec::new(8.0, 76.0, 8.0), 0.0, 0.0);
+        camera.far = 128.0;
+        let stats = renderer.render_cached(&camera).expect("cached frame");
+        assert_eq!(stats.sections, 0, "a section beyond the far plane must not draw");
+        assert_eq!(stats.draw_calls, 0);
+        assert!(stats.culled_sections >= 1);
+    }
+
+    #[test]
+    fn far_lod_batches_carry_and_draw_water() {
+        let Some(mut renderer) = open_renderer(320, 180, "far_lod_batches_carry_and_draw_water") else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let world = water_world(&registry);
+        let camera = Camera::new(WorldVec::new(8.0, 72.0, 20.0), 0.0, -0.55);
+        let config = crate::LodConfig {
+            full_detail_radius_chunks: 0,
+            group_chunks: 2,
+            shell_depth_blocks: 48,
+        };
+        let cache = renderer.rebuild_lod_scene(&world, &camera, &config);
+        assert_eq!(cache.sections, 0, "full radius 0 must not mesh sections");
+        assert!(cache.batches > 0, "the water column must become a far batch");
+        assert!(cache.batch_vertices > 0);
+        let stats = renderer.render_cached(&camera).expect("far water frame");
+        assert_eq!(stats.sections, 0);
+        assert!(stats.lod_batches > 0);
+        assert!(stats.water_draw_calls > 0, "the far batch water buffer was not drawn");
+        assert!(stats.water_vertices > 0);
+        let pixels = renderer.read_rgba();
+        assert!(pixels.iter().any(|value| *value != 0));
+    }
+
+    #[test]
+    fn lod_scene_meshes_far_groups_and_draws_them() {
+        if std::env::var_os("OPENBLOCK_NO_GPU_TESTS").is_some() {
+            eprintln!("skipping offscreen GPU tests: OPENBLOCK_NO_GPU_TESTS is set");
+            return;
+        }
+        let registry = Arc::new(Registry::base());
+        let world = test_world(&registry);
+        let mut renderer = match OffscreenRenderer::new(96, 54) {
+            Ok(renderer) => renderer,
+            Err(RenderError::NoAdapter(reason)) => {
+                eprintln!("skipping lod_scene_meshes_far_groups_and_draws_them: {reason}");
+                return;
+            }
+            Err(error) => panic!("failed to create the offscreen renderer: {error}"),
+        };
+        let mut camera = Camera::new(WorldVec::new(8.0, 76.0, 8.0), 0.0, 0.0);
+        camera.far = 128.0;
+        let config = crate::LodConfig {
+            full_detail_radius_chunks: 0,
+            group_chunks: 2,
+            shell_depth_blocks: 48,
+        };
+        let cache = renderer.rebuild_lod_scene(&world, &camera, &config);
+        assert_eq!(cache.sections, 0, "full radius 0 must not mesh sections");
+        assert!(cache.batches > 0, "the test group must become a far batch");
+        assert!(cache.batch_vertices > 0);
+        assert!(cache.batch_sections > 0);
+        let stats = renderer.render_cached(&camera).expect("cached LOD frame");
+        assert!(stats.lod_batches > 0, "the far batch must be inside the frustum");
+        assert_eq!(stats.sections, 0);
+        assert_eq!(stats.vertices, stats.lod_vertices);
+        assert!(renderer.read_rgba().iter().any(|value| *value != 0));
+    }
+    /// A small stone basin filled with water for the transparent-water tests.
+    fn water_world(registry: &Arc<Registry>) -> World {
+        let stone = registry.id_or_air("openblock:stone");
+        let water = registry.id_or_air("openblock:water");
+        assert_ne!(water, BlockId::AIR);
+        let mut column = ChunkColumn::new(ChunkPos::new(0, 0));
+        for z in 0..SECTION_SIZE as i32 {
+            for x in 0..SECTION_SIZE as i32 {
+                column.set_block(BlockPos::new(x, 64, z), stone);
+                column.set_block(BlockPos::new(x, 65, z), water);
+            }
+        }
+        column.recompute_heightmap();
+        let mut world = World::new(Arc::clone(registry), 2);
+        world.insert_chunk(column);
+        world
+    }
+
+    fn mean_luma(pixels: &[u8]) -> f32 {
+        let mut sum = 0f64;
+        for pixel in pixels.as_chunks::<4>().0 {
+            sum += 0.2126 * f64::from(pixel[0]) + 0.7152 * f64::from(pixel[1]) + 0.0722 * f64::from(pixel[2]);
+        }
+        (sum / (pixels.len() / 4) as f64) as f32
+    }
+
+    #[test]
+    fn sun_shadows_darken_shadowed_terrain_and_report_cascades() {
+        let Some(mut renderer) = open_renderer(480, 270, "sun_shadows_darken_shadowed_terrain_and_report_cascades")
+        else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let world = test_world(&registry);
+        // Late-morning sun: clearly slanted, so the pillars cast visible
+        // shadows across the platform the camera looks down on.
+        let environment = Environment::new(0.40);
+        let scene = SceneParams::new(environment);
+        let mut camera = Camera::new(WorldVec::new(5.0, 78.0, 8.0), 0.6, -0.85);
+        camera.far = 128.0;
+
+        let render = |renderer: &mut OffscreenRenderer, quality: crate::ShadowQuality| {
+            let mut graphics = renderer.graphics();
+            graphics.shadow_quality = quality;
+            renderer.set_graphics(graphics);
+            renderer
+                .render_world_scene(&world, &camera, &scene)
+                .expect("render shadowed world");
+            (renderer.read_rgba(), renderer.stats())
+        };
+
+        let (lit, lit_stats) = render(&mut renderer, crate::ShadowQuality::High);
+        // The cascade must actually contain rasterised casters; a map that is all
+        // 1.0 would make the pixel comparison below fail for the wrong reason.
+        let (min_depth, max_depth, written) = renderer
+            .debug_shadow_depth()
+            .expect("shadow map readback for the first cascade");
+        assert!(
+            written > 1000,
+            "shadow map has no casters (min {min_depth}, max {max_depth}, written {written})"
+        );
+        let (flat, flat_stats) = render(&mut renderer, crate::ShadowQuality::Off);
+        assert_eq!(lit_stats.shadow_cascades, 2);
+        assert_eq!(lit_stats.shadow_resolution, 2048);
+        assert!(lit_stats.shadow_draw_calls > 0, "the shadow pass drew no casters");
+        assert_eq!(flat_stats.shadow_cascades, 0);
+        assert_eq!(flat_stats.shadow_resolution, 0);
+
+        let darker = lit
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(flat.as_chunks::<4>().0)
+            .filter(|(shadowed, plain)| {
+                let luma = |pixel: [u8; 4]| {
+                    0.2126 * f32::from(pixel[0]) + 0.7152 * f32::from(pixel[1]) + 0.0722 * f32::from(pixel[2])
+                };
+                luma(**shadowed) + 4.0 < luma(**plain)
+            })
+            .count();
+        assert!(darker > 200, "only {darker} pixels were darkened by shadows");
+        // The same quality and environment must produce identical pixels.
+        let (lit_again, _) = render(&mut renderer, crate::ShadowQuality::High);
+        assert_eq!(lit, lit_again, "shadow rendering is not deterministic");
+    }
+
+    #[test]
+    fn water_uses_a_separate_pass_and_animates() {
+        let Some(mut renderer) = open_renderer(320, 180, "water_uses_a_separate_pass_and_animates") else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let world = water_world(&registry);
+        let mut camera = Camera::new(WorldVec::new(8.0, 72.0, 20.0), 0.0, -0.55);
+        camera.far = 128.0;
+        let scene = SceneParams::new(Environment::default());
+        let mut graphics = renderer.graphics();
+        graphics.water = crate::WaterQuality::High;
+        renderer.set_graphics(graphics);
+
+        renderer
+            .render_world_scene(&world, &camera, &scene)
+            .expect("render water world");
+        let moving = renderer.read_rgba();
+        let stats = renderer.stats();
+        assert!(stats.water_draw_calls > 0, "the water pass drew nothing");
+        assert!(stats.water_vertices > 0);
+        assert!(stats.draw_calls > 0, "the stone basin should still be opaque");
+
+        // A different animation clock must change the water surface pixels (the
+        // rest of the scene is static).
+        let animated = SceneParams {
+            time_seconds: 4.0,
+            ..scene
+        };
+        renderer
+            .render_cached_scene(&camera, &animated)
+            .expect("render animated water");
+        let later = renderer.read_rgba();
+        let changed = moving
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(later.as_chunks::<4>().0)
+            .filter(|(a, b)| a[0].abs_diff(b[0]) > 1 || a[1].abs_diff(b[1]) > 1 || a[2].abs_diff(b[2]) > 1)
+            .count();
+        assert!(changed > 50, "the animated water clock changed only {changed} pixels");
+
+        // Opaque water (`Off`) must still draw, but looks different.
+        let mut graphics = renderer.graphics();
+        graphics.water = crate::WaterQuality::Off;
+        renderer.set_graphics(graphics);
+        renderer
+            .render_cached_scene(&camera, &scene)
+            .expect("render opaque water");
+        assert!(renderer.stats().water_draw_calls > 0);
+        let opaque = renderer.read_rgba();
+        let different = moving
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(opaque.as_chunks::<4>().0)
+            .filter(|(a, b)| a[0].abs_diff(b[0]) > 2 || a[1].abs_diff(b[1]) > 2 || a[2].abs_diff(b[2]) > 2)
+            .count();
+        assert!(different > 100, "water quality changed only {different} pixels");
+    }
+
+    #[test]
+    fn water_only_sections_draw_in_the_water_pass() {
+        let Some(mut renderer) = open_renderer(160, 90, "water_only_sections_draw_in_the_water_pass") else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let empty = World::new(registry, 1);
+        let mut camera = Camera::new(WorldVec::new(8.0, 72.0, 8.0), 0.0, -1.4);
+        camera.far = 128.0;
+        let scene = SceneParams::new(Environment::default());
+        // Start from an empty cache and capture the sky as the background.
+        renderer
+            .render_world_scene(&empty, &camera, &scene)
+            .expect("render empty world");
+        let background = renderer.read_rgba();
+
+        // A single water quad at world y = 65 in section (0, 4, 0), with no opaque
+        // vertices at all. This is exactly the case the opaque/water split must
+        // handle: the section must not be dropped and must issue one water draw.
+        let corners = [
+            [0.0f32, 65.0, 0.0],
+            [0.0, 65.0, 16.0],
+            [16.0, 65.0, 16.0],
+            [16.0, 65.0, 0.0],
+        ];
+        let uvs = [[0.0f32, 16.0], [0.0, 0.0], [16.0, 0.0], [16.0, 16.0]];
+        let mut water = Vec::new();
+        for index in [0usize, 1, 2, 0, 2, 3] {
+            water.push(crate::Vertex {
+                position: corners[index],
+                uv: uvs[index],
+                layer: u32::from(ob_content::textures::WATER.0),
+                light: 1.0,
+            });
+        }
+        renderer.upload_mesh(
+            SectionPos::new(0, 4, 0),
+            crate::MeshData {
+                vertices: Vec::new(),
+                water_vertices: water,
+            },
+        );
+        let stats = renderer
+            .render_cached_scene(&camera, &scene)
+            .expect("render water-only section");
+        assert_eq!(stats.sections, 0, "there are no opaque triangles to draw");
+        assert_eq!(stats.draw_calls, 0);
+        assert_eq!(stats.water_draw_calls, 1);
+        assert_eq!(stats.water_vertices, 6);
+        let pixels = renderer.read_rgba();
+        let different = pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(background.as_chunks::<4>().0)
+            .filter(|(a, b)| a[0].abs_diff(b[0]) > 1 || a[1].abs_diff(b[1]) > 1 || a[2].abs_diff(b[2]) > 1)
+            .count();
+        assert!(different > 100, "the water quad changed only {different} pixels");
+    }
+
+    #[test]
+    fn clouds_cover_the_sky_deterministically() {
+        let Some(mut renderer) = open_renderer(320, 180, "clouds_cover_the_sky_deterministically") else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let empty = World::new(registry, 1);
+        let camera = Camera::new(WorldVec::new(0.0, 128.0, 0.0), 0.0, 0.18);
+        let scene = |time| SceneParams {
+            environment: Environment::default(),
+            ui: None,
+            outline: None,
+            time_seconds: time,
+        };
+
+        let mut graphics = renderer.graphics();
+        graphics.clouds = crate::CloudQuality::High;
+        graphics.cloud_coverage = 0.5;
+        renderer.set_graphics(graphics);
+        renderer
+            .render_world_scene(&empty, &camera, &scene(8.0))
+            .expect("render clouds");
+        let cloudy = renderer.read_rgba();
+        renderer
+            .render_cached_scene(&camera, &scene(8.0))
+            .expect("render clouds again");
+        assert_eq!(
+            cloudy,
+            renderer.read_rgba(),
+            "clouds are not deterministic at a fixed time"
+        );
+        renderer
+            .render_cached_scene(&camera, &scene(40.0))
+            .expect("render moved clouds");
+        let moved = renderer.read_rgba();
+        let moved_pixels = cloudy
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(moved.as_chunks::<4>().0)
+            .filter(|(a, b)| a[0].abs_diff(b[0]) > 1 || a[1].abs_diff(b[1]) > 1 || a[2].abs_diff(b[2]) > 1)
+            .count();
+        assert!(moved_pixels > 500, "the cloud clock moved only {moved_pixels} pixels");
+
+        let mut graphics = renderer.graphics();
+        graphics.clouds = crate::CloudQuality::Off;
+        renderer.set_graphics(graphics);
+        renderer
+            .render_cached_scene(&camera, &scene(8.0))
+            .expect("render clear sky");
+        let clear = renderer.read_rgba();
+        let covered = cloudy
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(clear.as_chunks::<4>().0)
+            .filter(|(a, b)| a[0].abs_diff(b[0]) > 2 || a[1].abs_diff(b[1]) > 2 || a[2].abs_diff(b[2]) > 2)
+            .count();
+        assert!(covered > 2000, "clouds only covered {covered} pixels");
+    }
+
+    #[test]
+    fn every_graphics_preset_renders_and_outputs_sane_colours() {
+        let Some(mut renderer) = open_renderer(320, 180, "every_graphics_preset_renders_and_outputs_sane_colours")
+        else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let world = water_world(&registry);
+        let mut camera = Camera::new(WorldVec::new(8.0, 74.0, 22.0), 0.0, -0.42);
+        camera.far = 160.0;
+        let scene = SceneParams::new(Environment::new(0.42));
+        let mut summaries = Vec::new();
+        for preset in crate::GraphicsPreset::ALL {
+            renderer.set_graphics(crate::GraphicsSettings::from_preset(preset));
+            renderer
+                .render_world_scene(&world, &camera, &scene)
+                .expect("render preset");
+            let stats = renderer.stats();
+            let pixels = renderer.read_rgba();
+            let mean = mean_luma(&pixels);
+            assert!(
+                (5.0..250.0).contains(&mean),
+                "{} preset produced an implausible frame (mean {mean:.1})",
+                preset.name()
+            );
+            assert!(
+                stats.passes >= 3,
+                "{} preset recorded only {} passes",
+                preset.name(),
+                stats.passes
+            );
+            assert!(
+                pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|pixel| pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32 > 3)
+                    .count()
+                    > 1000,
+                "{} preset rendered a black frame",
+                preset.name()
+            );
+            summaries.push(preset.name().to_string());
+        }
+        assert_eq!(summaries.len(), crate::GraphicsPreset::ALL.len());
+    }
+
+    #[test]
+    fn post_target_resize_reallocates_and_keeps_rendering() {
+        let Some(mut renderer) = open_renderer(320, 180, "post_target_resize_reallocates_and_keeps_rendering") else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let world = test_world(&registry);
+        let camera = Camera::new(WorldVec::new(8.0, 76.0, 8.0), 0.6, -1.0);
+        renderer.render_world(&world, &camera).expect("first frame");
+        assert_eq!(renderer.read_rgba().len(), 320 * 180 * 4);
+
+        renderer.resize(160, 90);
+        assert_eq!(renderer.size(), (160, 90));
+        renderer.render_world(&world, &camera).expect("resized frame");
+        let pixels = renderer.read_rgba();
+        assert_eq!(pixels.len(), 160 * 90 * 4, "readback must follow the resized target");
+        assert!(pixels.iter().any(|value| *value != 0));
+        assert!(renderer.stats().passes >= 3);
+
+        // Resizing back and to a 1-pixel target must stay valid.
+        renderer.resize(320, 180);
+        renderer.render_world(&world, &camera).expect("restored frame");
+        renderer.resize(1, 1);
+        renderer.render_world(&world, &camera).expect("1x1 frame");
+        assert_eq!(renderer.read_rgba().len(), 4);
+    }
+
+    #[test]
+    fn gpu_validation_scopes_are_clean_for_shadow_water_and_post() {
+        let Some(mut renderer) = open_renderer(320, 180, "gpu_validation_scopes_are_clean_for_shadow_water_and_post")
+        else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let world = water_world(&registry);
+        let mut camera = Camera::new(WorldVec::new(8.0, 74.0, 22.0), 0.0, -0.42);
+        camera.far = 160.0;
+        let scene = SceneParams::new(Environment::new(0.42));
+        renderer.set_graphics(crate::GraphicsSettings::from_preset(crate::GraphicsPreset::Ultra));
+
+        let scope = renderer.push_validation_scope();
+        renderer
+            .render_world_scene(&world, &camera, &scene)
+            .expect("shadow/water/post frame");
+        renderer.render_cached_scene(&camera, &scene).expect("second frame");
+        let error = OffscreenRenderer::pop_validation_scope(scope);
+        assert!(error.is_none(), "wgpu validation error: {error:?}");
     }
 }

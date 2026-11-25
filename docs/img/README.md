@@ -166,3 +166,29 @@ ui frame Crafting: 989 quads, 5934 vertices, <=4 texture draws
 The UI renderer batches by texture (solid rectangles, Monocraft glyphs, bitmap
 title glyphs and block icons), so a frame is at most four draw calls;
 quads/vertices are the useful per-screen workload numbers.
+
+## v1.1.0 screenshots (512-block reach and shaders)
+
+The v1.1.0 set shows the 512-block distance-LOD view and the new HDR shader
+pipeline using classic procedural textures. The vista captures come from the
+`render_distance_bench` tool (seed 42, 512-block radius, High preset); gameplay
+and menu captures use the offscreen client as above.
+
+```sh
+# 512-block vistas and shader features (windowless; render_distance_bench)
+render-distance-bench --render-distance 32 --graphics high --time 0.5 --png docs/img/v1.1.0-vista-day.png
+render-distance-bench --render-distance 32 --graphics high --time 0.82 --png docs/img/v1.1.0-vista-dusk.png
+render-distance-bench --render-distance 32 --graphics high --time 0.12 --png docs/img/v1.1.0-vista-night.png
+render-distance-bench --render-distance 32 --graphics high --scene-time 12 --png docs/img/v1.1.0-clouds.png
+# The water scene is a dedicated offscreen scene from the shader GPU tests.
+# UI/gameplay captures (classic textures, fresh data dirs)
+openblock --no-audio --no-texture-pack --screenshot docs/img/v1.1.0-title.png --screenshot-title
+openblock --no-audio --no-texture-pack --screenshot docs/img/v1.1.0-survival.png --screenshot-items --render-distance 12 --time-of-day 0.38 --data-dir /tmp/ob-shots/v1.1.0-survival
+openblock --no-audio --no-texture-pack --screenshot docs/img/v1.1.0-settings-display.png --screenshot-settings=display --data-dir /tmp/ob-shots/v1.1.0-settings
+openblock --no-audio --no-texture-pack --screenshot docs/img/v1.1.0-settings-graphics.png --screenshot-settings=graphics --data-dir /tmp/ob-shots/v1.1.0-settings-g
+openblock --no-audio --no-texture-pack --screenshot docs/img/v1.1.0-f3.png --screenshot-debug --screenshot-items --render-distance 12 --time-of-day 0.38 --data-dir /tmp/ob-shots/v1.1.0-debug
+```
+
+Note: `render-distance-bench` must be built from `ob_tools`; the screenshots
+here were captured with the release `openblock` 1.1.0 binary. The water and F3
+captures are documentation-only.

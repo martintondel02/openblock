@@ -159,6 +159,11 @@ Preset scaling, from [chapter 03 §3.11](03-rendering.md); estimates are ±15%, 
 | `performance` | 512 | 0.85 | 3.33 ms | 5.25 of 6.94 | reference mode gate |
 | `ultra` | 768 | 1.00 | 7.6 ms | > 8.33; 60 FPS | not a gate |
 
+> The 1.1 shader wave is measured separately in [§5.9](#59-v11-shader-wave-measured-512-block-report-2026-11-25):
+> its two-cascade HDR/shadow/water/post implementation reaches 61.7 FPS p50 at 1080p on the
+> integrated RADV test machine (Ultra) but does not meet the p95 gate methodology above; it
+> is a Report row, not a replacement for the envelope.
+
 ### 3.5 Tick budget at 20 Hz
 
 The period is 50 ms and the p99 gate is 35 ms ([PERF-ARCH-002](01-technical-architecture.md)),
@@ -524,6 +529,49 @@ MS-16 inherits everything.
 | MS-15 | PERF-SRV-002/003, PERF-NET-001/005/009, PERF-TICK-005/009, PERF-MEM-010/011/016, and the distributed capacity row (Report until this milestone measures it) |
 | MS-16 | Every active Gate budget on the release candidate, with the signed report attached; Report rows are published, not blocking |
 | MS-20 (post-1.0) | PERF-MEM-010/011/012 at 1024 blocks and the §3.5 1024-block cull row, as Report |
+
+### 5.9 v1.1 shader wave: measured 512-block report (2026-11-25)
+
+This is a **Report** measurement of the 1.1 HDR/shadow/water/cloud/post slice, not a
+change to a gate. It uses the Wave 1 `render_distance_bench` harness (seed 42, 4,225
+columns, 2,620 near sections + 1,010 far batches, cached scene, offscreen 120 measured
+frames after 10 warm-up frames) on the reference-class CPU with the integrated RADV
+Raphael GPU. Every frame includes a blocking GPU→CPU readback, so absolute times are
+higher than a windowed present-to-present frame; compare rows within this table and
+against the Wave 1 baseline measured the same way.
+
+| Preset | Resolution | p50 ms | p95 ms | p99 ms | p50 FPS | vs Wave 1 p50 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Low | 1280×720 | 6.80 | 7.53 | 8.26 | 147.1 | 5.22 → +30% |
+| Low | 1920×1080 | 10.03 | 11.45 | 11.97 | 99.7 | 7.94 → +26% |
+| Medium | 1280×720 | 9.86 | 10.79 | 11.73 | 101.4 | +89% |
+| Medium | 1920×1080 | 15.36 | 16.58 | 17.58 | 65.1 | +93% |
+| **High** | 1280×720 | **11.04** | 11.86 | 12.28 | **90.6** | +112% |
+| **High** | 1920×1080 | **16.20** | 16.93 | 17.42 | **61.7** | +104% |
+| **Ultra** | 1280×720 | **11.64** | 12.70 | 14.40 | **85.9** | +123% |
+| **Ultra** | 1920×1080 | **16.21** | 17.21 | 17.45 | **61.7** | +104% |
+
+All presets rendered 861 opaque draws (577 sections + 284 far batches), 6,528,426 opaque
+vertices and 1,122 water vertices. Low recorded 4 passes; the others recorded 9 (two
+shadow cascades, main, sky, water, three bloom passes, post) and 303–411 shadow draws plus
+16 water draws. RSS after build was 452–455 MiB and peak RSS 457–463 MiB in every run
+(Wave 1: ~455 MiB).
+
+**Status against the 1.1 target.** Ultra at 512 blocks and 1080p reaches 61.7 FPS at p50
+(target ≥ 60) but only ~58 FPS at p95. High reaches 90.6 FPS at 720p but 61.7 FPS at
+1080p, so the aspirational 1080p/90 High target is **not** met. Low remains within ~30% of
+the pre-HDR baseline; the difference is the HDR scene target, the post pass and the
+separate water pass, not a regression in the opaque geometry path.
+
+**Cost attribution.** Diagnostic toggles at 1080p show the opaque/water/cloud/post base at
+~10 ms, two shadow cascades adding ~3–4 ms (dominated by per-fragment cascade sampling, not
+draw count), clouds high plus water high adding ~0.2–0.8 ms, bloom ~0.1–0.2 ms and FXAA
+~0.2–0.6 ms. The full per-feature table, screenshots and the deviation list (far-cascade
+single-tap PCF, AABB shadow proxies beyond 64 m, no SSR/refraction/foam/underwater volume,
+fixed exposure, FXAA-lite instead of TAA) live in
+[08-measurements §v1.1 shaders](../plan/08-measurements.md#2026-11-25--v11-high-quality-built-in-shaders-hdr-sun-shadows-water-clouds-post).
+The gate tables in §3.4 and §5.1 remain the long-term target; a future gate run must use
+GPU timestamp queries and the p95 methodology of §3.7 before it can replace this report.
 
 ## 6. Failure modes and edge cases
 

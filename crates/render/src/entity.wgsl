@@ -102,6 +102,18 @@ fn vs_entity(vertex: EntityVertex, instance: EntityInstance) -> VertexOutput {
     return output;
 }
 
+// Depth-only shadow variant: textured items keep their alpha cut-outs, flat
+// items always cast. Drawn into the sun cascade depth arrays.
+@fragment
+fn fs_shadow_entity(input: VertexOutput) {
+    if input.textured != 0u {
+        let texel = textureSample(blocks, block_sampler, input.uv, i32(input.layer));
+        if texel.a < 0.5 {
+            discard;
+        }
+    }
+}
+
 @fragment
 fn fs_entity(input: VertexOutput) -> @location(0) vec4<f32> {
     let tint = srgb_to_linear(input.tint);

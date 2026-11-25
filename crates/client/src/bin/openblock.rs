@@ -23,7 +23,9 @@ fn main() {
             "          --screenshot-dead[=network] renders the death screen; --screenshot-items seeds items and vitals"
         );
         println!("          --screenshot-settings renders the tabbed settings screen over the world");
-        println!("          --screenshot-settings=audio selects the Audio tab (game/display/audio/controls/textures)");
+        println!(
+            "          --screenshot-settings=audio selects the Audio tab (game/display/audio/controls/textures/graphics)"
+        );
         println!("          --screenshot-crafting[=hand] renders the crafting screen (hand gating with hand)");
         println!("          --screenshot-debug renders the survival HUD with the F3 debug overlay");
         println!("          --screenshot-mobs[=plain] spawns avatars; plain omits the F3 overlay");
