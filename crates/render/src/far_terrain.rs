@@ -64,6 +64,15 @@ pub const FAR_TIER_OFFSET_STEP: f32 = 0.15;
 /// Far-water surface rise above the near sea level, in blocks.
 pub const FAR_WATER_RISE: f32 = 0.05;
 
+/// Half-width in blocks of the near/far seam cross-fade.
+///
+/// The near world fades towards the shared seam colour over
+/// `seam - band .. seam`; the far heightfield starts at that colour at `seam`
+/// and reaches its own shading by `seam + band`. 64 blocks is short enough
+/// that the aerial band does not read as fog and long enough that the change
+/// from 2×2-chunk shells to 8 m heightfield cells is visually continuous.
+pub const FAR_SEAM_BLEND_BAND: f32 = 64.0;
+
 /// One visual surface biome, deliberately independent of `ob_worldgen` types.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum FarBiome {
@@ -273,6 +282,14 @@ pub struct FarTerrainMesh {
     /// Camera XZ the mesh was centred on (for diagnostics; vertices are fixed
     /// world-space positions and the renderer does not recenter them).
     pub center: [f64; 2],
+    /// Radius in blocks at which the full-detail near world ends.
+    ///
+    /// This is the *simulation* radius, not the far mesh's own inner radius:
+    /// near sections and surface-shell batches cover the disc out to here, so
+    /// this is where the visible near/far seam sits. The renderer cross-fades
+    /// both sides of the seam around this radius. Zero means "unknown", which
+    /// disables the seam fade.
+    pub seam_radius: f32,
     /// Opaque heightfield vertices.
     pub vertices: Vec<FarTerrainVertex>,
     /// Opaque triangle indices.
@@ -360,6 +377,7 @@ pub fn build_far_terrain(
     let sea_level = config.sea_level;
     let mut mesh = FarTerrainMesh {
         center,
+        seam_radius: config.simulation_distance_blocks(),
         ..FarTerrainMesh::default()
     };
     let mut stats = FarTerrainStats {
@@ -647,12 +665,41 @@ const CLAY: [f32; 3] = [0.61, 0.63, 0.70];
 const WATER_SHALLOW: [f32; 3] = [0.13, 0.36, 0.44];
 const WATER_DEEP: [f32; 3] = [0.025, 0.10, 0.22];
 
+/// Smooth deterministic 2D value noise in `0.0..=1.0` for baked large-scale
+/// colour patches. Four hashes per sample; sampled only at build time.
+fn patch_noise(seed: u64, x: f32, z: f32, scale: f32, salt: u64) -> f32 {
+    let fx = x / scale;
+    let fz = z / scale;
+    let x0 = fx.floor();
+    let z0 = fz.floor();
+    let tx = fx - x0;
+    let tz = fz - z0;
+    let sx = tx * tx * (3.0 - 2.0 * tx);
+    let sz = tz * tz * (3.0 - 2.0 * tz);
+    let sample = |ix: i32, iz: i32| hash01(seed, ix, iz, salt);
+    let a = sample(x0 as i32, z0 as i32);
+    let b = sample(x0 as i32 + 1, z0 as i32);
+    let c = sample(x0 as i32, z0 as i32 + 1);
+    let d = sample(x0 as i32 + 1, z0 as i32 + 1);
+    (a + (b - a) * sx) + ((c + (d - c) * sx) - (a + (b - a) * sx)) * sz
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// Authored surface colour for one far vertex.
 ///
 /// Mirrors the world generator's surface rules on the cheap sampler: sea and
 /// beaches are sand, deserts sand, snowy taiga snow, steep slopes stone and
-/// high mountains snow. A small deterministic tint variation and curvature
-/// shading keep distant fields from reading as flat colour blobs.
+/// high mountains snow. The transitions are deliberately soft — both the
+/// snowline and the beach band blend over a few blocks and are perturbed by
+/// smooth noise — because a coarse 8–128 m lattice turns hard thresholds into
+/// visible jagged bands. A small deterministic tint variation and a broad
+/// multi-scale noise field keep distant fields from reading as flat colour
+/// blobs. Everything is baked into the vertex colour, so it costs nothing per
+/// frame.
 #[allow(clippy::too_many_arguments)]
 fn surface_color(
     seed: u64,
@@ -665,59 +712,70 @@ fn surface_color(
     normal: [f32; 3],
 ) -> [f32; 3] {
     let sea = sea_level.floor() as i32;
-    let steep = slope > 0.45;
+    let xf = x as f32;
+    let zf = z as f32;
+    // Large-scale biome/height patches at 96 m and 320 m; two octaves are
+    // enough at far-LOD vertex spacing and are baked once per vertex.
+    let patch = patch_noise(seed, xf, zf, 96.0, 0x5041_5443_4831) * 0.65
+        + patch_noise(seed, xf, zf, 320.0, 0x5041_5443_4832) * 0.35;
+    let ridge = patch_noise(seed, xf, zf, 48.0, 0x5249_4447_4531);
+
     let mut color = if height < sea {
-        // Seabed: sand with occasional clay/gravel patches.
+        // Seabed: sand with clay/gravel patches, darkening with depth so the
+        // translucent far water gets a believable bed rather than flat tan.
+        let depth = (sea - height) as f32;
         let patch = hash01(seed, x, z, 0x5345_4142_4544);
-        if patch > 0.72 {
+        let base = if patch > 0.74 {
             CLAY
-        } else if patch < 0.20 {
+        } else if patch < 0.18 {
             GRAVEL
         } else {
-            [SAND[0] * 0.86, SAND[1] * 0.90, SAND[2] * 0.92]
-        }
-    } else if height <= sea + 2 {
-        SAND
+            [SAND[0] * 0.88, SAND[1] * 0.90, SAND[2] * 0.88]
+        };
+        let deep = (depth / 22.0).clamp(0.0, 1.0);
+        lerp3(base, [0.17, 0.27, 0.30], deep * 0.72)
     } else {
-        match biome {
-            FarBiome::Desert => SAND,
+        let base = match biome {
+            FarBiome::Desert => {
+                let dune = 0.94 + 0.12 * patch;
+                [SAND[0] * dune, SAND[1] * dune, SAND[2] * (dune * 0.97)]
+            }
             FarBiome::SnowyTaiga => {
-                if steep {
-                    STONE
-                } else {
-                    SNOW
-                }
+                // Snow above the shore; exposed rock on steep faces.
+                let rock = smoothstep(0.35, 0.55, slope);
+                lerp3(SNOW, STONE, rock)
             }
             FarBiome::Mountains => {
-                if height >= 100 {
-                    SNOW
-                } else if steep || height >= 90 {
-                    STONE
-                } else {
-                    GRASS
-                }
+                // A noisy snowline rather than a hard altitude: high peaks snow,
+                // steep mid-slopes rock, lower slopes grass.
+                let snowline = 100.0 + patch * 14.0;
+                let snow = smoothstep(snowline - 5.0, snowline + 5.0, height as f32);
+                let rock = smoothstep(0.34, 0.54, slope) * (1.0 - snow * 0.35);
+                lerp3(lerp3(GRASS, STONE, rock), SNOW, snow)
             }
             FarBiome::Plains | FarBiome::Forest => {
-                if height >= 100 {
-                    SNOW
-                } else if steep {
-                    STONE
-                } else if biome == FarBiome::Forest {
-                    FOREST_GRASS
+                let grass = if biome == FarBiome::Forest {
+                    lerp3(GRASS, FOREST_GRASS, 0.55 + 0.35 * patch)
                 } else {
                     GRASS
-                }
+                };
+                let rock = smoothstep(0.38, 0.58, slope);
+                let snowline = 104.0 + patch * 12.0;
+                let snow = smoothstep(snowline - 5.0, snowline + 5.0, height as f32);
+                lerp3(lerp3(grass, STONE, rock), SNOW, snow)
             }
-        }
+        };
+        // Beach band: sand blends into the land colour over the first few
+        // blocks above sea level. The upper edge is noisy so the coastline is
+        // not a ruler-straight contour at the coarse tiers.
+        let shore = 1.0 - smoothstep(0.0, 3.5 + ridge * 2.0, (height - sea) as f32);
+        lerp3(base, SAND, shore)
     };
 
-    // Subtle deterministic variation and a gentle curvature term keep a
-    // low-poly plain from reading as one flat colour block. The per-vertex hash
-    // breaks large surfaces; the broad sine field adds metre-scale patches that
-    // survive the tier's vertex spacing. Both are baked into the colour, so they
-    // cost nothing per frame.
+    // Fine per-vertex variation and broad sinusoidal patches keep a low-poly
+    // plain from reading as one flat colour block. Both are baked.
     let fine = 0.94 + 0.12 * hash01(seed, x, z, 0x0046_4152_5449_4E54);
-    let broad = (x as f32 * 0.011 + z as f32 * 0.007).sin() * (z as f32 * 0.009 - x as f32 * 0.005).cos() * 0.055;
+    let broad = (xf * 0.011 + zf * 0.007).sin() * (zf * 0.009 - xf * 0.005).cos() * 0.055 + (patch - 0.5) * 0.10;
     let curvature = (1.0 - normal[1]).mul_add(-0.18, 1.0).clamp(0.88, 1.0);
     let shade = (fine + broad) * curvature;
     for channel in &mut color {
@@ -894,6 +952,62 @@ mod tests {
     }
 
     #[test]
+    fn seam_radius_is_the_simulation_edge_and_survives_recentering() {
+        let config = config(512);
+        for center in [[0.0, 0.0], [3_017.5, -8_120.25], [-40_000.0, 12_000.0]] {
+            let build = build_far_terrain(9, config, synthetic_sampler, center);
+            assert_eq!(build.mesh.seam_radius, config.simulation_distance_blocks());
+            assert_eq!(build.mesh.seam_radius, 512.0);
+            assert!(
+                FAR_SEAM_BLEND_BAND < build.mesh.seam_radius,
+                "the cross-fade band must stay inside the near world"
+            );
+        }
+        // A smaller simulation radius moves the seam with it; the far mesh's
+        // own inner radius is deliberately *not* the seam.
+        let small = build_far_terrain(9, FarTerrainConfig::new(128, 6, 63.0), synthetic_sampler, [0.0, 0.0]);
+        assert_eq!(small.mesh.seam_radius, 96.0);
+        assert!(small.mesh.seam_radius > FarTerrainConfig::new(128, 6, 63.0).inner_radius());
+    }
+
+    #[test]
+    fn surface_palette_is_deterministic_and_height_ordered() {
+        let sea = 63.0;
+        let normal = [0.0, 1.0, 0.0];
+        let luminance = |color: [f32; 3]| 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
+        let surface = |x, z, height, slope, biome| surface_color(0x512, x, z, height, slope, biome, sea, normal);
+        // Same inputs -> identical linear albedo, every tier and rebuild.
+        assert_eq!(
+            surface(12, -7, 80, 0.1, FarBiome::Plains),
+            surface(12, -7, 80, 0.1, FarBiome::Plains)
+        );
+        for color in [surface(12, -7, 80, 0.1, FarBiome::Plains)] {
+            for channel in color {
+                assert!((0.0..=1.0).contains(&channel));
+            }
+        }
+        // The seabed darkens with depth, which is what the far-water shader's
+        // luminance depth proxy relies on.
+        let shallow = surface(0, 0, 61, 0.02, FarBiome::Plains);
+        let deep = surface(0, 0, 30, 0.02, FarBiome::Plains);
+        assert!(
+            luminance(deep) < luminance(shallow),
+            "deep seabed {deep:?} is not darker than shallow {shallow:?}"
+        );
+        // The beach band at the waterline is sand, the inland plain is green:
+        // red must dominate blue at the shore and the reverse inland.
+        let beach = surface(0, 0, 64, 0.05, FarBiome::Plains);
+        let grass = surface(0, 0, 75, 0.05, FarBiome::Plains);
+        assert!(beach[0] > beach[2], "beach {beach:?} is not sandy");
+        assert!(grass[1] > grass[0], "grass {grass:?} is not green");
+        // High mountains become snow/rock, never grass green at the peak.
+        let peak = surface(0, 0, 130, 0.1, FarBiome::Mountains);
+        assert!(luminance(peak) > 0.4, "snow/rock peak is too dark: {peak:?}");
+        let steep = surface(0, 0, 120, 0.8, FarBiome::Mountains);
+        assert!(steep[0].abs() >= 0.0 && steep.iter().all(|c| c.is_finite()));
+    }
+
+    #[test]
     fn tier_lattice_padding_overlaps_the_neighbour() {
         let config = config(512);
         let tiers = config.tiers();
@@ -928,6 +1042,8 @@ pub(crate) struct GpuFarTerrain {
     pub(crate) max: [f32; 3],
     pub(crate) vertex_count: u32,
     pub(crate) water_vertex_count: u32,
+    /// Near-world edge the seam fade is centred on (0 disables it).
+    pub(crate) seam_radius: f32,
 }
 
 impl GpuFarTerrain {
@@ -998,6 +1114,7 @@ impl GpuFarTerrain {
             max: mesh.max,
             vertex_count,
             water_vertex_count,
+            seam_radius: mesh.seam_radius.clamp(0.0, 16_384.0),
         })
     }
 }
@@ -1202,6 +1319,7 @@ mod gpu_tests {
         let normal = [0.0, 1.0, 0.0];
         let mut mesh = FarTerrainMesh {
             center: [0.0, -2_000.0],
+            seam_radius: 512.0,
             vertices: Vec::new(),
             indices: vec![0, 2, 1, 0, 3, 2],
             water_vertices: Vec::new(),
@@ -1278,6 +1396,7 @@ mod gpu_tests {
         let color = [0.04, 0.15, 0.30];
         let mut mesh = FarTerrainMesh {
             center: [0.0, -2_000.0],
+            seam_radius: 512.0,
             water_vertices: vec![
                 FarTerrainVertex {
                     position: [-2_000.0, -2_000.0, -2_000.0],

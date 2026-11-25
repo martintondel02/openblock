@@ -2134,3 +2134,119 @@ confirming that the UI is drawn after and outside FSR.
 
 The full limitation list and the recommendation live in
 [1.3-fsr](../plan/1.3-fsr.md) and [spec/04 §3.13.9](../spec/04-shaders-and-visuals.md#3139-fsr-10-integration-v13-optional).
+
+## 2026-11-25 — v1.4 graphics polish (512 chunks, native)
+
+### Environment and method
+
+| | |
+| --- | --- |
+| OS | Fedora Linux 45, kernel 7.3.4, headless Vulkan |
+| CPU/GPU | AMD Ryzen 7 9800X3D, integrated RADV "RAPHAEL_MENDOCINO" (Vulkan) |
+| Renderer | wgpu 30.0.2, offscreen `Rgba8UnormSrgb`, seed 42, native (FSR off) |
+| Build | release (thin LTO, `codegen-units = 1`), `CARGO_TARGET_DIR=/home/martintondel/Projects/openblock/target-graphics14 ./dev-cargo build -p ob_tools --release --bin render_distance_bench` |
+| Scene | simulation 32 chunks (512 blocks), view 512 chunks (8,192 blocks), 4,225 columns, 2,620 near sections + 1,010 far batches, 47,950 far quads, 11,581 far-water triangles |
+| Camera | spawn eye +18 m, pitch −0.10, noon (unless stated) |
+| Harness | `render-distance-bench --frames 60 --warmup 15 --width W --height H --graphics PRESET`; blocking GPU→CPU readback in every measured frame |
+| Control | detached worktree at `3559cce` (v1.3.0), same target settings and harness, run interleaved on the same box |
+
+The box was shared with a 2-core server test from another in-flight branch; the v1.3 binary
+and the v1.4 binary were interleaved in the same window so the comparison is paired. GPU
+utilisation was 0% between runs and the v1.3 High controls (15.79/11.28 ms) reproduce the
+recorded quiet-box baseline (15.70/11.19 ms) within 0.8%, so the pairing is sound.
+
+### Frame time
+
+| Preset | Resolution | v1.3 p50 | v1.4 p50 | v1.4 p95 | v1.4 p99 | v1.4 p50 FPS | Δ p50 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **High** | 1280×720 | 11.28 | **11.83** | 12.03 | 12.70 | **84.3** | +0.55 |
+| **High** | 1920×1080 | 15.79 | **16.61** | 17.35 | 17.67 | **59.9** | +0.82 |
+| Ultra | 1920×1080 | 15.84 | **17.74** | 18.07 | 18.80 | **56.2** | +1.90 |
+| Medium | 1920×1080 | 15.07 | **13.88** | 14.01 | 14.17 | **72.0** | −1.19 |
+| Low | 1920×1080 | 10.26 | **9.60** | 9.69 | 9.76 | **104.2** | −0.66 |
+
+All rows submit the same 751 opaque draws (433 sections + 317 far batches + 1 far mesh),
+7,649,544 vertices (49,950 far), 312 shadow draws and 19 water draws (26,223 vertices).
+High/Ultra record 11 passes (the SSAO raw + blur pair added to the previous 9); Medium/Low
+stay at 9. Far-water draws are unchanged.
+
+**Target check.** The slice target was High p50 ≤ 15.7 ms at 1080p and ≤ 11.2 ms at 720p.
+v1.4 measures 16.61 ms (+0.82 / +5.8%) and 11.83 ms (+0.63 / +5.4%): the strict target is
+**not met**, although the 60 FPS line is reached at p50 within noise (59.9). p95 at 1080p
+is 17.35 ms (57.6 FPS), so 60 FPS at p95 is also not met. Ultra is 56.2 FPS p50.
+
+### What changed and what it cost
+
+| Change | Cost / saving at 1920×1080 (paired toggles) |
+| --- | ---: |
+| Per-fragment cloud noise → baked 128² tiling cloud-density texture | −3.4 ms (4.5 → 1.1 ms) |
+| One front-to-back opaque list (sections + far batches) | −1.0 to −1.2 ms |
+| Quarter-resolution SSAO pair (High) | +0.81 ms |
+| Half-resolution SSAO pair (Ultra) | +~1.1 ms |
+| Height fog + near/far seam cross-fade | +0.65 ms |
+| Depth-responsive water (depth copy + shader) | +0.2 to +0.4 ms |
+| Projected cloud shadows (Ultra only) | +1.1 ms |
+| Per-vertex far-terrain atmosphere / sqrt-free seam | −0.2 to −0.4 ms |
+
+The per-fragment cloud-shadow experiment was the main performance surprise: evaluating the
+same value-noise field that the sky uses on every terrain fragment cost ~4.5 ms at 1080p; a
+128² baked tiling texture sampled with one bilinear fetch brought that to ~1.1 ms, still the
+largest single new effect, which is why it is Ultra-only. Depth-responsive water is cheap in
+the benchmark scene because water covers a small fraction of the view; the copy is skipped
+when no near water is visible.
+
+### Visual changes inspected
+
+- `/tmp/openblock-1.4-high-angle.png` vs `/tmp/openblock-1.3-before-high-angle.png` — the
+  hard pale ring / tree-line colour step at the 512-block near-world edge is now a soft
+  aerial band; the far palette reads as the same world (grass/stone/sand/snow are closer)
+  and has height fog and (on Ultra) moving cloud shadows. The far heightfield still has no
+  trees or structures, so the tree line itself is unchanged.
+- `/tmp/openblock-1.4-day.png` — noon 512-chunk vista; far terrain fades into the sky instead
+  of ending on a flat colour band. No overexposure at the horizon.
+- `/tmp/openblock-1.4-fog.png` — dawn/dusk height haze aligned with the sun direction; distant
+  ridges layer into the horizon.
+- `/tmp/openblock-1.4-dusk.png` — stars, orange twilight horizon and dimmed far terrain; far
+  snow is still brighter than near snow (a known limitation of the unshadowed far palette).
+- `/tmp/openblock-1.4-water.png` / `-underwater.png` — near lake at High: depth-based dark
+  blue tint, animated wave normals with sun glints, Fresnel sky reflection; below the
+  surface the frame gets a blue-green absorbed tint and the surface is shaded from below.
+  No block-edge halos; the foam band did not trigger on the tested 3-block-deep basin
+  (thickness > 0.5 m at the wall), which is expected.
+- `/tmp/openblock-1.4-ssao.png` — concave well at High with the quarter-resolution SSAO
+  pair: soft contact darkening in corners and under edges, no AO on the sky, no visible
+  blockiness after the depth-aware blur.
+- `/tmp/openblock-1.4-low.png` / `-medium.png` not captured; the presets render in the GPU
+  tests and record no new passes.
+
+### Tests and checks
+
+- `./dev-cargo test -p ob_render --all-targets`: 206 passed, 6 ignored screenshot tests.
+  New coverage: seam radius/palette determinism, quality gating (SSAO resolution, Ultra-only
+  cloud shadows), SSAO depth linearisation and quarter/half target sizing, depth-aware AO
+  output with neutral sky and no sky darkening, underwater tint + clean validation around
+  the depth copy, resize/quality reallocation of the AO/post bind groups, and all-preset
+  rendering.
+- `./dev-cargo clippy -p ob_render --all-targets -- -D warnings`: clean.
+- `./dev-cargo fmt -p ob_render -- --check`: clean.
+- `./dev-cargo doc -p ob_render --no-deps`: clean.
+- `./dev-cargo check --workspace --all-targets`: fails only in `ob_client` on the concurrent
+  mobs/protocol branch (`EntityStateEntry` missing `baby`/`variant`), which is outside this
+  slice; `ob_render` itself compiles and tests clean.
+- FSR remains functional: the existing 1080p/720p/odd-size upscale, resize, quality-change,
+  UI-native and unsupported-format tests still pass with the added SSAO/water bindings.
+
+### Limitations and recommendation
+
+No SSR, refraction, caustics or volumetric froxel fog. Far terrain omits trees/structures
+(unchanged), its dusk snow is brighter than near snow, SSAO darkens the whole HDR rather
+than separating direct sun, and cloud shadows are Ultra-only. Low/Medium deliberately keep
+the 1.3 look. The 15.7 ms High budget is missed by 0.8 ms at 1080p and 0.6 ms at 720p; the
+remaining cost is dominated by SSAO (~0.8 ms) plus the seam/height-fog terms (~0.65 ms),
+both required by the slice.
+
+Recommended follow-up for the Lead: add one explicit `cloud_shadows` (or `ssao`) quality
+row, or allow High to choose between quarter-res SSAO and projected cloud shadows. This
+would let High meet the 15.7 ms budget without hiding either feature behind Ultra. A
+settings/UI change was out of scope for this slice, so the trade-off is hard-coded and
+documented here rather than added.

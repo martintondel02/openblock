@@ -637,6 +637,64 @@ by shadows, geometry and memory traffic rather than fill rate. The feature there
 recommendation. Full detail, screenshots and limitations are in
 [1.3-fsr](../plan/1.3-fsr.md).
 
+### 5.11 v1.4 graphics polish: measured 512-chunk report (2026-11-25)
+
+This is a **Report** measurement of the 1.4 render-polish slice (near/far seam blend,
+far-terrain palette/atmosphere, depth-responsive water, underwater grade, height fog,
+SSAO and Ultra cloud shadows), not a change to the gate methodology in §3.7. It uses the
+`render_distance_bench` harness: seed 42, simulation radius 32 chunks (512 blocks), visual
+radius 512 chunks (8,192 blocks), 4,225 columns, High/Ultra native (FSR off), offscreen
+`Rgba8UnormSrgb` with a blocking GPU→CPU readback, 60 measured frames after 15 warm-up
+frames, release build, integrated RADV `RAPHAEL_MENDOCINO` (Ryzen 7 9800X3D). The **v1.3
+control is a detached worktree at `3559cce`**, built and run interleaved on the same box so
+clock/load drift cannot favour either side.
+
+| Preset | Resolution | v1.3 p50 | v1.4 p50 | v1.4 p95 | v1.4 p99 | v1.4 p50 FPS | Δ p50 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **High** | 1280×720 | 11.28 | **11.83** | 12.03 | 12.70 | **84.3** | +0.55 |
+| **High** | 1920×1080 | 15.79 | **16.61** | 17.35 | 17.67 | **59.9** | +0.82 |
+| Ultra | 1920×1080 | 15.84 | **17.74** | 18.07 | 18.80 | **56.2** | +1.90 |
+| Medium | 1920×1080 | 15.07 | **13.88** | 14.01 | 14.17 | **72.0** | −1.19 |
+| Low | 1920×1080 | 10.26 | **9.60** | 9.69 | 9.76 | **104.2** | −0.66 |
+
+**Status against the 1.4 slice target (High p50 ≤ 15.7 ms at 1080p, ≤ 11.2 ms at 720p).**
+High reaches 59.9 FPS at p50, i.e. the 60 FPS target is met within run-to-run noise, but the
+strict p50 values miss the stated budgets by 0.9 ms (1080p, +5.8%) and 0.6 ms (720p, +5.4%);
+p95 is 57.6 FPS at 1080p, so 60 FPS at p95 is not met. Ultra is 56.2 FPS at p50. The report
+does **not** claim the gate is met. Medium and Low are faster than their v1.3 controls,
+because the new passes are absent there and the v1.4 front-to-back opaque ordering saves
+more than the always-on additions cost.
+
+**Cost attribution** (paired 1080p runs, toggling one effect or the relevant row): baked
+cloud-noise texture instead of per-fragment value noise saves ~3.4 ms (the original
+per-fragment cloud-shadow version measured ~4.5 ms; the baked version ~1.1 ms); front-to-back
+opaque submission saves ~1.0–1.2 ms on the same geometry; quarter-resolution SSAO costs
+~0.8 ms (High; half-resolution Ultra ~1.1 ms); height fog + seam cross-fade cost ~0.65 ms;
+depth-responsive High water costs ~0.2–0.4 ms (depth copy plus shader); Ultra cloud shadows
+cost ~1.1 ms. Per-vertex far-terrain atmosphere and the sqrt-free seam ramp each save a few
+tenths of a millisecond. Pass count rises from 9 to 11 on High/Ultra (the SSAO pair); the
+water depth copy is a transfer, not a pass, and is skipped when no near water is visible or
+the water quality is Low/Off.
+
+**Quality gating.** Low/Medium allocate no SSAO target, take no depth copy and upload zero
+atmosphere/seam uniforms, preserving the 1.3 path. High runs quarter-resolution SSAO,
+height fog, the seam blend and depth-responsive water. Ultra adds the half-resolution AO
+target and projected cloud shadows. There is no new core/client setting; cloud shadows
+being Ultra-only is a deliberate measured trade-off, and a dedicated `cloud_shadows` (or
+`ssao`) row is recommended to the Lead if High should expose it.
+
+**Verification.** `./dev-cargo test -p ob_render --all-targets` passes 206 tests (6 ignored
+screenshot tests), including SSAO target/neutral-sky/no-halo coverage, underwater tint,
+depth-copy validation, resize/quality reallocation, all-preset rendering, FSR on/off and
+the far-terrain seam/palette determinism. `clippy -p ob_render --all-targets -- -D warnings`,
+`fmt --check` and rustdoc are clean. The workspace check currently fails only in
+`ob_client` on another in-flight content/protocol branch (`EntityStateEntry` missing
+`baby`/`variant`), not in `ob_render`. Screenshots: `/tmp/openblock-1.4-day.png`,
+`-dusk`, `-fog`, `-high-angle`, `-water`, `-underwater`, `-ssao`, plus the before/after
+high-angle seam pair (`/tmp/openblock-1.3-before-high-angle.png` and the v1.4
+`-high-angle`). Full detail is in
+[08-measurements §v1.4](../plan/08-measurements.md#2026-11-25--v14-graphics-polish-512-chunks-native).
+
 ## 6. Failure modes and edge cases
 
 | Failure | Symptom | Mitigation |

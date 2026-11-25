@@ -20,6 +20,9 @@ struct PostUniform {
     params: vec4<f32>,
     // x: 1 / width, y: 1 / height, z: bloom threshold, w: scene time.
     texels: vec4<f32>,
+    // x: SSAO strength (0 disables the fetch), y: underwater amount,
+    // zw: reserved.
+    effects: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -36,6 +39,9 @@ var bloom1: texture_2d<f32>;
 var bloom2: texture_2d<f32>;
 @group(0) @binding(5)
 var post_sampler: sampler;
+// Blurred half-resolution SSAO (or a white 1×1 fallback when disabled).
+@group(0) @binding(6)
+var ao_texture: texture_2d<f32>;
 
 struct PostOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -103,9 +109,34 @@ fn grade(toned: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
     return saturated * vignette(uv);
 }
 
+// Ambient-occlusion multiplier fetched at half resolution and blurred. The
+// pass writes 1.0 on sky and beyond its distance fade, so the multiply is a
+// no-op there; `effects.x` is zero on Low/Medium and skips the fetch entirely.
+fn apply_ao(hdr: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    if post.effects.x <= 0.0 {
+        return hdr;
+    }
+    let ao = clamp(textureSampleLevel(ao_texture, post_sampler, uv, 0.0).r, 0.0, 1.0);
+    return hdr * mix(1.0, ao, post.effects.x);
+}
+
+// Cheap underwater grade: absorb warm light, lift a deep blue-green veil and
+// desaturate the highlights. Applied after tonemapping so the bloom halo is
+// tinted with the rest of the frame.
+fn underwater_grade(toned: vec3<f32>) -> vec3<f32> {
+    let amount = clamp(post.effects.y, 0.0, 1.0);
+    if amount <= 0.0 {
+        return toned;
+    }
+    let absorbed = toned * vec3<f32>(0.42, 0.78, 0.92);
+    let veil = vec3<f32>(0.012, 0.058, 0.082) * (0.35 + 0.65 * luminance(toned) * 4.0);
+    return mix(toned, absorbed + veil, amount * 0.8);
+}
+
 @fragment
 fn fs_post(input: PostOutput) -> @location(0) vec4<f32> {
     var hdr = textureSampleLevel(scene, post_sampler, input.uv, 0.0).rgb;
+    hdr = apply_ao(hdr, input.uv);
     hdr = hdr + bloom_contribution(input.uv) * post.params.y;
     var toned = tone(hdr);
 
@@ -137,13 +168,15 @@ fn fs_post(input: PostOutput) -> @location(0) vec4<f32> {
             toned = mix(toned, average, amount * 0.65);
         }
     }
-    return vec4<f32>(clamp(grade(toned, input.uv), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    return vec4<f32>(clamp(underwater_grade(grade(toned, input.uv)), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 
-// No bloom or FXAA work at all: one HDR fetch, ACES, saturation and vignette.
+// No bloom, FXAA or SSAO work at all: one HDR fetch, ACES, saturation and
+// vignette (plus the cheap underwater tint when the camera is submerged).
 @fragment
 fn fs_post_simple(input: PostOutput) -> @location(0) vec4<f32> {
     let hdr = textureSampleLevel(scene, post_sampler, input.uv, 0.0).rgb;
     let toned = tone(hdr);
-    return vec4<f32>(clamp(grade(toned, input.uv), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    let graded = underwater_grade(grade(toned, input.uv));
+    return vec4<f32>(clamp(graded, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
