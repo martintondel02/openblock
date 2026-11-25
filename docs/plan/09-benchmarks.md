@@ -162,10 +162,12 @@ matrix are unchanged.
   server message, but they do not decode chunk payloads, simulate physics or
   verify world state; the scenario is creative so edits are deterministic and
   survival item/hunger paths are only exercised by the scripted `soak` tool.
-- **Zero overruns is not demonstrated.** The 10-minute 8-bot soak recorded one
-  85.8 ms tick immediately after an autosave (synchronous `Host::save`), while
-  its p99 was 0.146 ms. The no-overrun part of `PERF-TICK-010` needs a longer
-  run after the save-pause work, not a relaxed threshold in this harness.
+- **Zero overruns is not demonstrated for an hour.** A clean 1.0.1 audit
+  10-minute 8-bot soak recorded zero overruns (p99 0.186 ms, max 11.928 ms, 60
+  autosaves, 20.00 TPS), whereas the published 1.0 soak recorded one 85.8 ms
+  tick immediately after an autosave. The 1 Hz 1,089-column diagnostic still
+  produces 44 overruns, so neither result supports a one-hour zero-overrun
+  claim until the save-pause work lands.
 - **The 35 ms tick gate is not a 50-player claim.** Measuring 1,000 ticks on a
   single-player host with 18 mobs is a baseline, not the 2,000-column
   50-player co-located case in spec/25 §3.5. The reference `--radius 22` run
@@ -189,12 +191,14 @@ matrix are unchanged.
   50-minute wall-clock leak test. The 2 h/24 h bot soak in spec/24 §3.13 remains
   the long-running gate.
 - **Whole-world save pause is over budget at scale.** The measured 2,025-column
-  save takes 154–156 ms, against the 30 ms PERF-IO-004 tick-impact budget; the
+  save takes 152 ms on tmpfs and 158 ms on btrfs, against the 30 ms
+  PERF-IO-004 tick-impact budget; the
   current snapshot writer is synchronous. At 1,089 columns an end-to-end 1 Hz
   autosave moves tick p99 to 85 ms and every logged overrun lands on an
-  autosave tick. The 289-column 21–24 ms result is tmpfs-only; on a btrfs data
-  directory the same save is slower and the 169-column point is the currently
-  demonstrated safe size. The phase breakdown and design proposal are in
+  autosave tick. The 289-column save is 21.7 ms on tmpfs and 22.2 ms on btrfs,
+  still under the 30 ms budget; the 169-column 1 Hz run moves tick p99 to
+  11.1 ms (under 35 ms), while 1,089 columns fails. The phase breakdown and
+  design proposal are in
   [the 1.0.1 performance audit](1.0.1-performance.md).
 - **`--ticks 0` is not a read-only verification.** `Host::open` streams the
   two-column ring and the headless path saves it, so reopening the same world

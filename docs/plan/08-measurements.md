@@ -995,7 +995,7 @@ not a quiet-box claim.
 
 | Metric | 1.0.0 published | 1.0.1 audit | Verdict |
 | --- | ---: | ---: | :---: |
-| `worldgen_bench --full` mean | 0.921 ms/chunk | **0.918** (p99 1.123) | PASS |
+| `worldgen_bench --full` mean | 0.921 ms/chunk | **0.920** (0.918–0.922; p99 1.114–1.123) | PASS |
 | `worldgen_bench --quick` mean, 3 runs | 0.940 | **0.947** (0.936–0.952) | PASS |
 | `server_bench` player/mobs/items/containers p99 | 0.0091 / 0.0190 / 0.0261 / 0.0242 ms | **0.0090 / 0.0191 / 0.0245 / 0.0257** | PASS |
 | 289-column save / reload | 21.24 / 73.5 ms | **21.39 / 72.20 ms** | PASS |
@@ -1004,7 +1004,7 @@ not a quiet-box claim.
 | `soak --ticks 60000` save mean | 15.92 ms | **16.42 ms** (16.36–16.60) | PASS |
 | 60k soak hash | `b907560a3c528183` | **`c828635abf0645df`** (3/3) | deterministic; old value stale |
 | 60k soak RSS end | 71.5 MiB | **88.1 MiB** (84.4–100.5) | allocator spread, plateau |
-| load gate quick p99 | 5.418 ms | **5.041 ms** (4.944–5.165) | PASS |
+| load gate quick p99 | 5.418 ms | **5.05 ms** (4.94–6.47 across 6 runs) | PASS |
 | load gate 8×60 p99 / overruns | 0.163 ms / 0 | **0.892 ms** (0.225–1.288) / 0,0,1 | PASS; cold tail |
 
 The four quick tools, quick load gate and backup/restore test ran repeatedly
@@ -1015,9 +1015,10 @@ cold phase; the steady-state p99 stayed ≤1.3 ms).
 
 ### Save pause (PERF-IO-004)
 
-Pristine v1.0.0 decomposition at 2,025 columns: `Host::save` = 154–166 ms;
-~57% zstd-3 compression, ~39% serialization/allocation/CRC, <1% write+rename,
-~1.5% fsync probes. An IO thread alone cannot meet the 30 ms budget.
+Pristine v1.0.0 decomposition at 2,025 columns: `Host::save` = 152 ms on
+tmpfs and 158 ms on btrfs (one 168 ms btrfs outlier); 57–62% zstd-3
+compression, 37–39% serialization/allocation/CRC, ~1% write+rename and ~1.5%
+fsync probes. An IO thread alone cannot meet the 30 ms budget.
 
 End-to-end autosave impact, measured window started after interest sets:
 
@@ -1031,22 +1032,42 @@ End-to-end autosave impact, measured window started after interest sets:
 At 1,089 columns all 45 logged overrun warnings landed on the line immediately
 after an autosave; the 1 Hz run correctly fails the 35 ms p99 target. At the
 2,025-column reference size the network server cannot load enough columns
-(interest radius is capped at 16), so the 154–156 ms `save_bench` value is the
+(interest radius is capped at 16), so the 152–158 ms `save_bench` value is the
 applicable one. `--save-interval 0` disables the timer but not the pause: the
 console `save` and shutdown save call the same synchronous path.
 
 ### Reliability and CI (summary)
 
-The new `scripts/reliability-audit.py` exercised 20 network start/stop/reload
-cycles, 60 s of 8-client connect/disconnect churn, a 300 s persistent-bot soak
-with `/proc` RSS/fd/thread sampling, truncated `mobs.txt`/`spawn.txt` and
-`world.obs`, SIGTERM under save, a console save+stop race and read-only /
-file-size-limit disk proxies. Every lane passed; the notable gaps are (1) a
-truncated `world.obs` is refused with exit 1 but there is no last-good
-fallback, and (2) `--ticks 0` is not read-only: `Host::open` streams the
-two-column ring and the headless path saves it, so repeated opens of the same
-directory grow the resident set and change the hash. The reliability harness
-therefore compares two independent copies.
+The new `scripts/reliability-audit.py` ran 20 network start/stop/reload
+cycles (20/20 PASS, world dir 399.8–400.6 KiB), 60 s of 8-client
+connect/disconnect churn (29 cycles, 0 client errors, FDs 29→29, threads
+37→37), a 300 s persistent-bot soak (RSS 7.9→49.3 MiB, plateau by 40 s, +1.6
+MiB over the last 240 s; 29 autosaves, no overrun warnings, hash stable),
+truncated `mobs.txt`/`spawn.txt` and `world.obs`, SIGTERM under save (10/10 at
+radius 6; 10/10 with 9 autosaves in a focused radius-16 run), a console
+save+stop race (5/5) and read-only / file-size-limit disk proxies (previous
+snapshot preserved and reloadable). The notable findings are:
+
+- **Churn memory growth:** with 8 fresh clients every ~2 s, RSS grew
+  21→88 MiB in 60 s and 21→167 MiB in 180 s while FDs/threads stayed flat;
+  `MALLOC_ARENA_MAX=2` bounded it at 60.8 MiB (plateau by ~44 s), pointing at
+  glibc per-thread arena retention rather than an object leak.
+- **`--ticks 0` is not read-only:** `Host::open` streams the two-column ring
+  and the headless path saves it, so repeated opens of the same directory grow
+  the resident set and change the hash. The harness compares two independent
+  copies instead.
+- **No last-good fallback:** a truncated `world.obs` is refused with exit 1
+  (good: no silent partial load), but there is no previous-generation recovery.
+  Truncated sidecars degrade to warnings and missing records.
+
+A clean 10-minute 8-bot load-gate soak (10 s autosave) passed with tick
+p50/p95/p99/max 0.058/0.103/0.186/11.928 ms, 20.00 TPS, **zero** overruns
+above 35/50 ms, 60 autosaves, RSS 49.8 MiB (+2.1 MiB after a 120 s warm-up,
+1.1 MiB last-half range), flat FDs 29/threads 37 and a stable
+`9ab9070a666601db` hash across two reloads. The published 1.0 soak's single
+85.8 ms tick did not reproduce on this quiet run, but the 1 Hz 1,089-column
+diagnostic still produces 44 overruns, so this is not a zero-overrun/hour
+claim.
 
 CI now uploads benchmark and load-gate artifacts, has per-job timeouts, runs
 `save_bench --quick --phases`, uses `--wait-interest` in the quick gate, and
