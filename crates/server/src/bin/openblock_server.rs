@@ -19,13 +19,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ob_content::Registry;
 use ob_protocol::{MAX_FRAME_LEN, PROTOCOL_VERSION, sanitise_motd};
 use ob_server::net::{
     DEFAULT_CHUNKS_PER_TICK, DEFAULT_INTEREST_RADIUS_CHUNKS, DEFAULT_MAX_PLAYERS, DEFAULT_MOTD,
-    DEFAULT_SAVE_INTERVAL_SECONDS, MAX_INTEREST_RADIUS_CHUNKS, NetConfig, ServerFileConfig, load_server_config,
+    DEFAULT_SAVE_INTERVAL_SECONDS, MAX_INTEREST_RADIUS_CHUNKS, NetConfig, ServerFileConfig, ServerMetrics,
+    load_server_config,
 };
 use ob_server::{DedicatedServer, GameMode, Host, HostConfig};
 use ob_sim::PlayerInput;
@@ -65,6 +66,8 @@ fn main() {
         "render-distance",
         "interest-radius",
         "save-interval",
+        "metrics-json",
+        "metrics-interval",
         "pack",
         "ticks",
     ] {
@@ -139,6 +142,12 @@ fn main() {
         Ok(_) => exit_usage("save-interval must be at most 86400 seconds"),
         Err(message) => exit_usage(&message),
     };
+    let metrics_json = value("metrics-json").map(PathBuf::from);
+    let metrics_interval = match resolve_u64(value("metrics-interval").as_deref(), None, 5, "metrics-interval") {
+        Ok(value) if (1..=3600).contains(&value) => value,
+        Ok(_) => exit_usage("metrics-interval must be in 1..=3600 seconds"),
+        Err(message) => exit_usage(&message),
+    };
     if !(1..=MAX_INTEREST_RADIUS_CHUNKS).contains(&interest_radius) {
         exit_usage(&format!("interest-radius must be in 1..={MAX_INTEREST_RADIUS_CHUNKS}"));
     }
@@ -169,6 +178,10 @@ fn main() {
             Err(message) => exit_usage(&message),
         }
     };
+
+    if metrics_json.is_some() && listen.is_none() {
+        exit_usage("--metrics-json requires --listen (dedicated server mode)");
+    }
 
     let config = HostConfig {
         seed,
@@ -234,7 +247,7 @@ fn main() {
             exit_usage(&error);
         }
         match DedicatedServer::start(host, net_config) {
-            Ok(server) => std::process::exit(run_network(server, save_interval)),
+            Ok(server) => std::process::exit(run_network(server, save_interval, metrics_json, metrics_interval)),
             Err(error) => {
                 log::error!("could not start the network server on {listen}: {error}");
                 std::process::exit(1);
@@ -289,6 +302,8 @@ fn print_help() {
     println!("  --motd TEXT              message of the day, at most 128 bytes");
     println!("  --interest-radius N      per-client chunk radius, 1..=16 (default: 6)");
     println!("  --save-interval SECONDS  autosave interval, 0 disables (default: 60)");
+    println!("  --metrics-json PATH      write periodic JSON metrics snapshots (listener mode)");
+    println!("  --metrics-interval SEC   seconds between metrics snapshots (default: 5)");
     println!("  --survival               default game mode for new network players (default)");
     println!("  --creative               creative default for network players (no item use)");
     println!();
@@ -417,10 +432,154 @@ fn run_ticks(mut host: Host, ticks: u64) -> i32 {
     0
 }
 
+/// Writes one atomic JSON metrics snapshot, logging and continuing on failure.
+fn write_metrics_snapshot(path: &Path, server: &DedicatedServer) {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let result =
+        std::fs::write(&temporary, metrics_json(&server.metrics())).and_then(|()| std::fs::rename(&temporary, path));
+    if let Err(error) = result {
+        log::warn!("could not write metrics JSON {}: {error}", path.display());
+        let _ = std::fs::remove_file(&temporary);
+    }
+}
+
+/// Formats a [`ServerMetrics`] snapshot as the documented JSON object.
+fn metrics_json(metrics: &ServerMetrics) -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let mut out = String::with_capacity(2048);
+    out.push('{');
+    let mut first = true;
+    json_string_field(&mut out, &mut first, "schema", "openblock.server-metrics/1");
+    json_u64_field(&mut out, &mut first, "timestamp_unix_ms", timestamp);
+    json_f64_field(&mut out, &mut first, "uptime_seconds", metrics.uptime_seconds);
+    json_string_field(&mut out, &mut first, "listen", &metrics.listen);
+    json_string_field(&mut out, &mut first, "world", &metrics.world_name);
+    json_u64_field(&mut out, &mut first, "seed", metrics.seed);
+    json_string_field(&mut out, &mut first, "game_mode", metrics.game_mode);
+    json_u64_field(&mut out, &mut first, "max_players", u64::from(metrics.max_players));
+    json_u64_field(
+        &mut out,
+        &mut first,
+        "interest_radius_chunks",
+        metrics.interest_radius_chunks as u64,
+    );
+    json_u64_field(&mut out, &mut first, "chunks_per_tick", metrics.chunks_per_tick as u64);
+    json_u64_field(
+        &mut out,
+        &mut first,
+        "save_interval_seconds",
+        metrics.save_interval_seconds,
+    );
+    json_u64_field(&mut out, &mut first, "tick_count", metrics.tick_count);
+    json_f64_field(&mut out, &mut first, "tps", f64::from(metrics.tps));
+    json_u64_field(&mut out, &mut first, "tick_samples", metrics.tick_samples as u64);
+    json_f64_field(&mut out, &mut first, "tick_p50_ms", metrics.tick_p50_ms);
+    json_f64_field(&mut out, &mut first, "tick_p95_ms", metrics.tick_p95_ms);
+    json_f64_field(&mut out, &mut first, "tick_p99_ms", metrics.tick_p99_ms);
+    json_f64_field(&mut out, &mut first, "tick_max_ms", metrics.tick_max_ms);
+    json_u64_field(&mut out, &mut first, "tick_overruns", metrics.tick_overruns);
+    json_u64_field(&mut out, &mut first, "tick_over_35ms", metrics.tick_over_envelope);
+    json_u64_field(
+        &mut out,
+        &mut first,
+        "players_connected",
+        metrics.players_connected as u64,
+    );
+    json_u64_field(&mut out, &mut first, "chunks_queued", metrics.chunks_queued);
+    json_u64_field(&mut out, &mut first, "chunk_bytes_queued", metrics.chunk_bytes_queued);
+    json_u64_field(&mut out, &mut first, "bytes_in", metrics.bytes_in);
+    json_u64_field(&mut out, &mut first, "bytes_out", metrics.bytes_out);
+    json_u64_field(&mut out, &mut first, "moves", metrics.moves);
+    json_u64_field(&mut out, &mut first, "edits_attempted", metrics.edits_attempted);
+    json_u64_field(&mut out, &mut first, "edits_accepted", metrics.edits_accepted);
+    json_u64_field(&mut out, &mut first, "edits_rejected", metrics.edits_rejected);
+    json_u64_field(&mut out, &mut first, "chats", metrics.chats);
+    json_u64_field(&mut out, &mut first, "pings", metrics.pings);
+    json_u64_field(&mut out, &mut first, "chunk_requests", metrics.chunk_requests);
+    json_u64_field(&mut out, &mut first, "actions_rejected", metrics.actions_rejected);
+    json_u64_field(&mut out, &mut first, "mobs", metrics.mobs as u64);
+    json_u64_field(&mut out, &mut first, "item_entities", metrics.item_entities as u64);
+    json_u64_field(&mut out, &mut first, "loaded_columns", metrics.loaded_columns as u64);
+    json_option_u64_field(&mut out, &mut first, "rss_kib", metrics.rss_kib);
+    json_option_u64_field(&mut out, &mut first, "threads", metrics.threads);
+    json_option_u64_field(&mut out, &mut first, "open_fds", metrics.open_fds);
+    out.push_str("}\n");
+    out
+}
+
+/// Appends `"key":` with the comma placement owned by `first`.
+fn json_key(out: &mut String, first: &mut bool, key: &str) {
+    if !*first {
+        out.push(',');
+    }
+    *first = false;
+    json_string(out, key);
+    out.push(':');
+}
+
+/// Appends a JSON string with the characters that can appear in paths escaped.
+fn json_string(out: &mut String, value: &str) {
+    out.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            character if character.is_control() => {
+                out.push_str(&format!("\\u{:04x}", character as u32));
+            }
+            character => out.push(character),
+        }
+    }
+    out.push('"');
+}
+
+fn json_string_field(out: &mut String, first: &mut bool, key: &str, value: &str) {
+    json_key(out, first, key);
+    json_string(out, value);
+}
+
+fn json_u64_field(out: &mut String, first: &mut bool, key: &str, value: u64) {
+    json_key(out, first, key);
+    out.push_str(&value.to_string());
+}
+
+fn json_option_u64_field(out: &mut String, first: &mut bool, key: &str, value: Option<u64>) {
+    json_key(out, first, key);
+    match value {
+        Some(value) => out.push_str(&value.to_string()),
+        None => out.push_str("null"),
+    }
+}
+
+fn json_f64_field(out: &mut String, first: &mut bool, key: &str, value: f64) {
+    json_key(out, first, key);
+    if value.is_finite() {
+        out.push_str(&format!("{value:.3}"));
+    } else {
+        out.push_str("null");
+    }
+}
+
 /// Network mode: start the tick/accept threads, then serve the admin console and
 /// signals until `stop`. `save_interval` is only logged here (the net layer
 /// owns autosave).
-fn run_network(server: DedicatedServer, save_interval: u64) -> i32 {
+fn run_network(
+    server: DedicatedServer,
+    save_interval: u64,
+    metrics_json: Option<PathBuf>,
+    metrics_interval: u64,
+) -> i32 {
     let shutdown = Arc::new(AtomicBool::new(false));
     {
         let flag = Arc::clone(&shutdown);
@@ -448,11 +607,26 @@ fn run_network(server: DedicatedServer, save_interval: u64) -> i32 {
         save_interval
     );
     log::info!("commands: help | list | say <msg> | kick <id|name> [reason] | save | tps | stop");
+    let mut next_metrics = Instant::now() + Duration::from_secs(metrics_interval);
+    if let Some(path) = &metrics_json {
+        write_metrics_snapshot(path, &server);
+        log::info!(
+            "metrics: writing a JSON snapshot to {} every {} s",
+            path.display(),
+            metrics_interval
+        );
+    }
     let mut exit_code = 0;
     'run: loop {
         if shutdown.load(Ordering::SeqCst) {
             log::info!("shutdown signal received");
             break;
+        }
+        if let Some(path) = &metrics_json
+            && Instant::now() >= next_metrics
+        {
+            write_metrics_snapshot(path, &server);
+            next_metrics = Instant::now() + Duration::from_secs(metrics_interval);
         }
         loop {
             match rx.try_recv() {
@@ -472,6 +646,9 @@ fn run_network(server: DedicatedServer, save_interval: u64) -> i32 {
         std::thread::sleep(Duration::from_millis(10));
     }
 
+    if let Some(path) = &metrics_json {
+        write_metrics_snapshot(path, &server);
+    }
     log::info!("stopping: disconnecting clients and saving the world");
     match server.stop() {
         Ok(()) => log::info!("world saved; shutdown complete"),

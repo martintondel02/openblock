@@ -17,11 +17,14 @@ This page is the map for the CPU-only benchmark and soak tools added for the
 | `server_bench` | [server_bench.rs](../../crates/tools/src/bin/server_bench.rs) | `Host::tick` p50/p95/p99/max for idle, moving player, mobs, items, containers; streaming; RSS; save/reload | `--quick` (300 ticks, radius 5) | `--ticks 1000`, reference `--radius 22` (2,025 columns) |
 | `save_bench` | [save_bench.rs](../../crates/tools/src/bin/save_bench.rs) | Save/sidecar size, save and reload latency, state-hash round-trip, v1–v4 migration smoke | `--quick` | `--radius 8` / `--radius 22` |
 | `soak` | [soak.rs](../../crates/tools/src/bin/soak.rs) | 60,000-tick scripted survival session, invariant/cap checks, save-size and RSS series, final save/reload hash | `--quick` (4,000 ticks) | `--ticks 60000` |
+| `load-gate.py` | [load-gate.py](../../scripts/load-gate.py) | Spawns the real `openblock-server`, drives protocol-v2 bots, waits for the interest set, exercises Move/edit/chat/ping and reports server tick percentiles, TPS, RSS, bandwidth, chunks, edits and a save/reload soak check | `--quick` (4 bots, 12 s; target advisory) | 8 bots / 60 s at radius 6; `--soak` 8 bots / 600 s |
 
-All four are CPU-only and headless: they never initialize a GPU adapter or open
-a window, never touch `crates/client`, and live in the `ob_tools` crate behind
-the public `Host`/`World`/`Generator` APIs. The separate offscreen render
-benchmark (`openblock-tools bench`) is unchanged.
+The four Rust tools are CPU-only and headless: they never initialize a GPU
+adapter or open a window, never touch `crates/client`, and live in the
+`ob_tools` crate behind the public `Host`/`World`/`Generator` APIs. The Python
+load gate spawns the real headless server binary on loopback with a temporary
+data directory and ephemeral port; it never opens a window or a GPU adapter.
+The separate offscreen render benchmark (`openblock-tools bench`) is unchanged.
 
 Shared measurement helpers live in
 [measure.rs](../../crates/tools/src/lib.rs) and implement the nearest-rank
@@ -47,13 +50,30 @@ cargo run --release -p ob_tools --bin save_bench -- \
 
 cargo run --release -p ob_tools --bin soak -- --quick
 cargo run --release -p ob_tools --bin soak -- --ticks 60000
+
+# Multiplayer gate: build the headless server, then run 4 or 8 loopback bots.
+cargo build --release -p ob_server --bin openblock-server
+python3 scripts/load-gate.py --quick \
+  --binary target/release/openblock-server \
+  --json target/load-gate.json --markdown target/load-gate.md
+python3 scripts/load-gate.py --clients 8 --seconds 60 \
+  --binary target/release/openblock-server \
+  --json target/load-gate-full.json --markdown target/load-gate-full.md
+python3 scripts/load-gate.py --soak \
+  --binary target/release/openblock-server \
+  --json target/soak.json --markdown target/soak.md
 ```
 
-Each binary prints a human-readable report and can additionally write CSV and
-Markdown tables. `server_bench` and `soak` exit non-zero when the save/reload
-hash differs or an invariant fails; `worldgen_bench` exits non-zero on a
-determinism mismatch or an explicitly requested timing gate. Wall-clock gates
-are opt-in (`--max-mean-ms`, `--max-p95-ms`) and are not enabled on shared CI.
+Each tool prints a human-readable report and the Rust tools can additionally
+write CSV and Markdown tables; the load gate writes JSON and Markdown. The Rust
+`server_bench` and `soak` exit non-zero when the save/reload hash differs or an
+invariant fails; `worldgen_bench` exits non-zero on a determinism mismatch or
+an explicitly requested timing gate. The load gate exits non-zero on functional
+failures (join, interest set, chunks, edits, pongs, disconnects) and, in the
+full and soak profiles, on a 35 ms tick p99 miss; `--quick` reports the target
+as advisory unless `--enforce-quick` is passed. Wall-clock gates for the
+single-player benchmarks remain opt-in (`--max-mean-ms`, `--max-p95-ms`) and
+are not enabled on shared CI.
 
 ## 3. What the reference run measures
 
@@ -69,25 +89,52 @@ The reference profile in [Measurements](08-measurements.md) records:
   warm reload latency, state-hash round-trip, and v1/v2/v3 migration readers;
 - soak: 60,000 ticks (50 game minutes) with breaks/places, combat, meals,
   deaths, streaming churn, periodic saves, RSS and save-size series, and a
-  final save/reload hash.
+  final save/reload hash;
+- load gate: 8 protocol-v2 bots at a 6-chunk interest radius for 60 s on a
+  fresh server, recording join and interest-set load time, chunk frames,
+  bytes in/out per client, Move/edit/chat/ping counters, nearest-rank tick
+  p50/p95/p99/max over the server's rolling window, TPS, overruns, RSS and
+  shutdown drain; the `--soak` profile repeats it for 10 minutes with 10 s
+  autosaves, an RSS/fd/thread plateau check and a save/reload state-hash check.
 
 ## 4. CI
 
 The `bench` job in `.github/workflows/ci.yml` builds the release tools and runs
-the four `--quick` profiles on Ubuntu. The quick profiles assert correctness
-(determinism, invariants, save/reload hash), not wall-clock thresholds; a
-shared hosted runner is not a bench box. Their measured local run time is
-recorded in [Measurements](08-measurements.md).
+the four `--quick` profiles on Ubuntu. A separate `load-gate` job builds the
+headless server and runs `scripts/load-gate.py --quick` (4 bots, 12 s, temp data
+directory, ephemeral loopback port, no GPU) and uploads the JSON/Markdown
+report. The quick profiles assert correctness (determinism, invariants,
+save/reload hash, joins, interest sets, chunks and edits), not wall-clock
+thresholds; a shared hosted runner is not a bench box, so the 35 ms target is
+advisory in the quick gate. The local quick gate took about 14 s of run time
+(0.05 s startup + 2.2 s streaming + 12 s load + shutdown). Measured local
+numbers are recorded in [Measurements](08-measurements.md).
 
 The pre-existing offscreen render gate, save-size guard and Fedora/Windows/macOS
 matrix are unchanged.
 
 ## 5. Known gaps
 
-- **Multiplayer capacity is not in this lane.** The tools measure the
-  single-player `Host`; raw protocol-v2 loopback bots and the server capacity
-  matrix (PERF-SRV-002/003, MS-15) remain a follow-up. The protocol load script
-  is owned by the server/networking slice.
+- **The 8-player gate is smaller than the 50-player reference case.** The load
+  gate now measures 8 co-located protocol-v2 bots at a 6-chunk (169-column)
+  interest radius and passes the 35 ms tick p99 target on the local
+  workstation; the 16- and 50-player 256-block rows (PERF-SRV-001/002/003) and
+  the 2,000-column resident set remain unmeasured by this harness.
+- **The "reference machine" caveat.** The 1.0 gate names the 4 vCPU / 8 GiB
+  reference-server class. The recorded 8-player run is a single run on a
+  Ryzen 7 9800X3D workstation (8 cores/16 threads, 30 GiB) with the same
+  process running on loopback, so it demonstrates the software path, not the
+  published reference-hardware row. A 4-vCPU pinned run and the 3-run median
+  rule of spec/25 §3.7 are still required before quoting the gate as an
+  official capacity result.
+- **The bots are synthetic.** They speak the v2 framing and consume every
+  server message, but they do not decode chunk payloads, simulate physics or
+  verify world state; the scenario is creative so edits are deterministic and
+  survival item/hunger paths are only exercised by the scripted `soak` tool.
+- **Zero overruns is not demonstrated.** The 10-minute 8-bot soak recorded one
+  85.8 ms tick immediately after an autosave (synchronous `Host::save`), while
+  its p99 was 0.146 ms. The no-overrun part of `PERF-TICK-010` needs a longer
+  run after the save-pause work, not a relaxed threshold in this harness.
 - **The 35 ms tick gate is not a 50-player claim.** Measuring 1,000 ticks on a
   single-player host with 18 mobs is a baseline, not the 2,000-column
   50-player co-located case in spec/25 §3.5. The reference `--radius 22` run
@@ -117,10 +164,11 @@ matrix are unchanged.
 
 ## Open questions
 
-1. **Protocol bot harness** (owner MS-15): should the in-process
-   `DedicatedServer` + raw v2 client loopback benchmark live in `ob_tools` or in
-   the server/networking test scripts? It needs its own budget row before it can
-   gate.
+1. **Protocol bot harness** (owner MS-15) — resolved for the 8-player row:
+   `scripts/load-gate.py` owns the server spawn, bot loop and report, so it
+   does not need an in-process `DedicatedServer` harness in `ob_tools`. The
+   remaining question is whether the 16/50-player matrix gets its own budget
+   row and runner or extends this script.
 2. **Quick-lane budget** (owner MS-00): the four quick profiles measured
    1.31 s total locally (0.31 + 0.21 + 0.34 + 0.45 s), but the hosted-runner
    variance should be measured before adding a hard time limit or enabling

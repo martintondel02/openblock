@@ -1457,3 +1457,19 @@ fn network_survival_screenshot_probe() {
     }
     ob_client::screenshot_network_demo(&path, Some(&debug_path), 42).expect("network survival screenshot");
 }
+
+/// Optional documentation probe for the multiplayer name-tag overlay. Draws
+/// synthetic remote players through the production projection/fade/overlap code
+/// over a real generated world. Ignored by default because it needs a Vulkan
+/// adapter and writes a repository screenshot.
+#[test]
+#[ignore = "offscreen GPU demo; run manually to refresh screenshots/client-net-name-tags.png"]
+fn network_name_tag_screenshot_probe() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("screenshots/client-net-name-tags.png");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("screenshot directory");
+    }
+    ob_client::screenshot_name_tags_demo(&path, 42).expect("name tag screenshot");
+}

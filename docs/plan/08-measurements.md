@@ -757,3 +757,209 @@ far inside the 60 s guideline even allowing for a slower hosted runner. The
 quick profiles assert determinism, invariants and the save/reload hash; they do
 not assert wall-clock thresholds on a shared runner. The existing offscreen
 render gate, save-size guard and OS matrix are unchanged.
+
+## 2026-11-25 — 1.0 multiplayer load gate (8 players, 6-chunk interest)
+
+### Environment and method
+
+| | |
+| --- | --- |
+| OS | Fedora Linux 45 (kernel 7.3.4-300.fc45.x86_64), x86_64 |
+| CPU / RAM | AMD Ryzen 7 9800X3D, 8 cores / 16 threads (16 logical CPUs available), 30 GiB |
+| Build | release (thin LTO, `codegen-units = 1`), `CARGO_TARGET_DIR=/home/martintondel/Projects/openblock/target-1.0-load`, `./dev-cargo` |
+| Server | `openblock-server` 0.1.0, protocol 2 (JSON/TCP), creative default, seed 42, fresh temporary data directory |
+| Harness | [scripts/load-gate.py](../../scripts/load-gate.py), Python stdlib, loopback TCP only, no window/GPU |
+| Run | one run per row; the machine was shared with other agents/builds (no CPU pinning, no `performance` governor) |
+
+This is **not** the 4 vCPU / 8 GiB reference-server class named by the 1.0
+performance envelope, and it is not a three-run median under the spec/25 §3.7
+protocol. It is the first end-to-end measurement of the real dedicated server
+with real protocol-v2 clients; treat it as the software-path gate, not a
+published reference-hardware capacity claim.
+
+**Gate definition.** 8 stock loopback clients (`scripts/load-gate.py`) join a
+fresh `openblock-server` at a 6-chunk interest radius (169 columns each) in
+creative mode, wait until every client has received its full interest set, then
+run for 60 s with Move at 20/s per client, a place+break pair every 1.5 s, chat
+every 3 s, ping every 1 s, and a missing-column chunk-request fallback only
+after 3 s. The target is **server tick p99 <= 35 ms**, with functional checks:
+8/8 handshakes and joins, every interest set complete, all chunk frames
+received, accepted edits, pong samples, no client errors and no unexpected
+disconnects. The server records each tick's `process_events + core.tick`
+duration (the 20 Hz work, excluding sleep) in a rolling 1,200-tick window and
+reports nearest-rank p50/p95/p99/max, cumulative overruns above 35 ms and 50 ms,
+TPS, players, chunk frames/bytes, socket bytes, action counters, entity/column
+counts and Linux `/proc` RSS/thread/fd proxies.
+
+Commands:
+
+```bash
+CARGO_TARGET_DIR=/home/martintondel/Projects/openblock/target-1.0-load \
+  ./dev-cargo build --release --locked -p ob_server --bin openblock-server
+
+python3 scripts/load-gate.py --clients 8 --seconds 60 \
+  --binary /home/martintondel/Projects/openblock/target-1.0-load/release/openblock-server \
+  --json target/load-gate-full.json --markdown target/load-gate-full.md
+
+python3 scripts/load-gate.py --quick \
+  --binary /home/martintondel/Projects/openblock/target-1.0-load/release/openblock-server
+
+python3 scripts/load-gate.py --soak \
+  --binary /home/martintondel/Projects/openblock/target-1.0-load/release/openblock-server
+```
+
+### Server metrics implementation
+
+`crates/server/src/net.rs` now owns a lock-free `Metrics` block: a 1,200-slot
+`AtomicU64` tick-duration ring, cumulative overrun counters, chunk frames and
+chunk bytes queued, socket bytes in/out, and received Move/edit/chat/ping/
+chunk-request counters. The tick thread writes one `AtomicU64` and increments a
+sequence per tick after releasing the core mutex; reader and writer threads add
+frame bytes; `Core::send` counts chunk frames and `send_action_rejected` counts
+action rejections. No lock is added to any network I/O path, and the snapshot
+(`DedicatedServer::metrics`) takes the existing core mutex only for a few reads
+and a sort of at most 1,200 integers.
+
+`openblock-server --metrics-json PATH --metrics-interval SECONDS` (listener
+mode only) writes `openblock.server-metrics/1` JSON atomically (temporary file
++ rename) immediately after binding and then every interval; the first snapshot
+also advertises the ephemeral `listen` address. Write failures are logged and
+never stop the tick. The JSON includes tick percentiles and overruns, players,
+TPS, chunk/bandwidth counters, accepted/rejected edits and actions, moves,
+chats, pings, chunk requests, mob/item/column counts and RSS/thread/fd proxies.
+
+**Instrumentation cost.** `server_bench --quick` (the `Host::tick` path, which
+does not run the network tick loop) before → after the change: idle p99 0.0004
+→ 0.0003 ms, player 0.0022 → 0.0021 ms, mobs 0.0184 → 0.0183 ms, items 0.0140 →
+0.0185 ms, containers 0.0101 → 0.0102 ms. The differences are timer noise; the
+only change on the network path is one relaxed atomic store and two compare/
+increment operations per tick, outside `Host::tick`.
+
+### Full 8-player / 60 s gate — PASS on this host
+
+| Metric | Value |
+| --- | ---: |
+| Handshakes / joins | 8 / 8 |
+| Interest sets complete | 8/8, p50/p95 2.152 s, max 2.152 s |
+| Interest set per client | 169 columns (13x13) |
+| Unique chunk frames received by clients | 1,352 (169.0/client) |
+| Server chunk frames queued | 1,352 (21.12/s over the 64.0 s rate window) |
+| Server bytes out / in | 225.1 KiB/s / 16.9 KiB/s (28.1 KiB/s down per client) |
+| Tick p50 / p95 / p99 / max | **0.061 / 0.124 / 0.163 / 13.574 ms** |
+| Tick overruns > 35 ms / > 50 ms | 0 / 0 |
+| TPS (tick delta / measured window) | 19.99 |
+| Server RSS / peak | 22.3 MiB / 22.3 MiB |
+| Loaded columns at end | 169 |
+| Server startup / shutdown drain | 0.05 s / 0.12 s |
+| Moves / chats / pings / chunk requests received | 9,800 / 168 / 496 / 0 |
+| Block edits accepted / attempted / rejected | 656 / 656 / 0 |
+| Action rejections / client errors / unexpected disconnects | 0 / 0 / 0 |
+| Client ping p50 / p95 / p99 | 25.38 / 50.63 / 50.71 ms |
+| Client chat delivery p50 / p95 | 25.37 / 45.65 ms |
+
+**Verdict: PASS against the 8-player / 6-chunk / 35 ms p99 target on this
+host** (p99 0.163 ms, about 215x inside the target; 0 overruns). The final
+1,200-tick window starts after the 2.15 s interest-set streaming, so the quoted
+p99 is steady-state; the cumulative counters retain the cold phase and reported
+0 ticks above 35 ms and 0 above 50 ms for this run. A separate 15 s 8-client
+run, whose window still contained the cold phase, measured p99 28.2 ms,
+max 58.3 ms and one tick above 50 ms while the 169 columns were generated. It
+also passed the 35 ms p99 target, but the cold tail is why max/overruns are
+reported beside p99 rather than hidden.
+
+### Scaling (8 bots vs 2/4, 30 s each)
+
+Each row is a fresh server and world, same seed, creative, radius 6, 30 s of
+load after all interest sets were complete.
+
+| Clients | Tick p50 | p95 | p99 | Max | TPS | RSS | Chunks/s | Out total | Down/client | Accepted edits |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 0.028 | 0.400 | 2.425 | 2.559 | 19.99 | 20.8 MiB | 9.93 | 53.6 KiB/s | 26.8 KiB/s | 84 |
+| 4 | 0.037 | 0.721 | 4.841 | 6.367 | 19.98 | 20.9 MiB | 19.87 | 117.7 KiB/s | 29.4 KiB/s | 168 |
+| 8 | 0.060 | 1.325 | 1.982 | 9.981 | 19.99 | 21.1 MiB | 39.75 | 276.9 KiB/s | 34.6 KiB/s | 336 |
+
+The p99 is not monotonic in client count because these are single runs on a
+shared host and streaming/GC noise lands differently; all rows are well inside
+35 ms. RSS includes the fixed world and Python-independent server only; the
+8-client row is 21 MiB, far below the `2 GiB + 20 MiB/player` budget.
+
+### Quick CI profile (4 bots / 12 s, tick target advisory)
+
+Fresh server, seed 42, creative, radius 6: 4/4 joins, 4/4 interest sets in
+2.15 s, 676 chunks, 72 accepted edits, 0 rejections/errors/disconnects;
+tick p50/p95/p99/max 0.034 / 0.915 / 5.418 / 6.640 ms, 19.98 TPS, 0 overruns,
+20.9 MiB RSS, 42.21 chunks/s, 178.4 KiB/s out (44.6 KiB/s per client). Run
+time was about 14 s including startup, 12 s load and shutdown. The CI job runs
+this profile with the target advisory; functional checks still fail the job.
+
+### Soak (10 min, 8 bots, 10 s autosave)
+
+One `--soak` run: 8 bots, radius 6, creative, seed 42, 600 s of load after the
+interest sets were complete, autosave every 10 s. The server ran 12,115 ticks
+(20.00 TPS) and wrote 60 autosaves.
+
+| Metric | Value |
+| --- | ---: |
+| Tick p50 / p95 / p99 / max | 0.056 / 0.100 / 0.146 / 11.287 ms |
+| Ticks > 35 ms / > 50 ms | 1 / 1 |
+| RSS at 5 s / 60 s / end | 21.0 / 47.7 / 49.8 MiB |
+| RSS growth after 120 s warm-up | +1.9 MiB (last-half range 1.1 MiB) |
+| Open FDs (first half -> end) | 29 -> 29 |
+| Server threads (first half -> end) | 37 -> 37 |
+| Autosaves | 60 (>= 59 expected) |
+| World file after stop | 390,416 B |
+| Save/reload state hash | `1b4459542eb792df`, stable across two reloads |
+| Block edits accepted / rejected | 6,432 / 0 |
+| Moves / chats / pings received | 95,472 / 1,616 / 4,832 |
+| Client errors / unexpected disconnects | 0 / 0 |
+| Server bytes out / in | 173.8 KiB/s / 17.3 KiB/s (21.7 KiB/s down per client) |
+
+The memory series rose from 21 MiB to ~49 MiB while the first autosaves and
+allocator arenas were touched, then plateaued: after a 120 s warm-up it grew
+only +1.9 MiB over the remaining 8 minutes, with a 1.1 MiB range in the last
+half. FDs and threads were flat at 29/37 and the save/reload hash was stable.
+The soak passes the memory-plateau, leak, autosave and hash checks.
+
+One tick exceeded both the 35 ms and 50 ms thresholds: the server logged
+`tick overran the 50 ms budget: 85.825545ms` immediately after the autosave at
+tick 602. The p99 stayed at 0.146 ms, but this is a real zero-overrun gap:
+`PERF-TICK-010` asks for zero ticks above 50 ms in an hour, and one in 10
+minutes is a poor extrapolation. The likely contributor is the synchronous
+whole-world `Host::save` inside the tick (`PERF-IO-004` is already a known 1.0
+gap); the run is too short to prove a rate.
+
+### CI and scripts
+
+`.github/workflows/ci.yml` has a new `load-gate` job that builds the release
+server and runs the quick profile on Ubuntu, then uploads the JSON/Markdown
+report. `scripts/load-gate.py` is `py_compile`d in the server-deps job together
+with `scripts/load-test.py`. The existing `bench` job is unchanged, so the four
+Rust quick benchmarks still run as before.
+
+### Known gaps and caveats
+
+- **Hardware:** 8-core/16-thread workstation, not the 4 vCPU reference server;
+  one run, no governor pinning, shared machine, no three-run median.
+- **Scale:** 8 co-located players sharing a 169-column interest set, not the
+  16/50-player 256-block or 2,000-column PERF-SRV rows. The 50-player matrix
+  is still unmeasured.
+- **Cold tail:** chunk generation runs inside the network tick; a 15 s run saw
+  a 58.3 ms maximum and one >50 ms tick while streaming, although the 60 s p99
+  was 0.163 ms. Streaming is fast (2.15 s for 169 columns/client) but not free
+  at the join instant.
+- **Autosave overrun:** the 10-minute soak recorded one 85.8 ms tick directly
+  after an autosave. The synchronous whole-world save is still inside the tick,
+  so a zero-overrun-per-hour claim is not yet supported even though p99 passes.
+- **Creative gate:** edits are deterministic creative place/break; survival
+  item, hunger and death paths are exercised by the scripted `soak` tool, not
+  by these bots. The bots consume but do not verify chunk payloads or world
+  state, so this is not a protocol conformance test.
+- **Loopback:** no packet loss, RTT or bandwidth policing; client ping/chat
+  latency includes Python scheduling and the 20 Hz tick, so it is end-to-end
+  application latency, not network RTT.
+- **RSS proxy:** `/proc/self/status` VmRSS includes allocator retention and the
+  whole process, not only the host world heap; the soak plateau check is a
+  coarse leak detector, not a 24 h proof.
+- **No network-side perf regression gate:** the tick loop's new atomic writes
+  were measured only indirectly; a CI regression threshold for the load gate
+  needs a quieter runner first.

@@ -1,6 +1,6 @@
 # 19 — Server Administration
 
-> Status: normative - Last updated: 2026-11-24
+> Status: normative - Last updated: 2026-11-25
 > Depends on: [DEC-003](../decisions.md), [DEC-024](../decisions.md), [DEC-026](../decisions.md), [DEC-028](../decisions.md), [DEC-031](../decisions.md), [DEC-033](../decisions.md), [DEC-035](../decisions.md), [DEC-038](../decisions.md), [DEC-042](../decisions.md), [DEC-044](../decisions.md), [DEC-046](../decisions.md), [DEC-047](../decisions.md), [DEC-050](../decisions.md), [DEC-052](../decisions.md); [architecture](01-technical-architecture.md), [engine core](02-engine-core.md), [gameplay](08-gameplay-survival.md), [persistence](17-persistence.md), [networking](18-networking-multiplayer.md), [security](20-security-and-anti-cheat.md); [research 04](../research/04-networking-sota.md) §5, [research 09](../research/09-persistence-assets-packaging.md) §6.7
 > Implements: MS-07
 
@@ -699,6 +699,8 @@ a listener the binary keeps the original headless host mode and its
 | `--max-players N` | `8` | 1–500 |
 | `--motd TEXT` | `A self-hosted OpenBlock world` | ≤128 bytes, plain text |
 | `--save-interval SECONDS` | `60` | dirty-world autosave; `0` disables |
+| `--metrics-json PATH` | disabled | write periodic JSON metrics snapshots while listening |
+| `--metrics-interval SECONDS` | `5` | seconds between snapshots (`1`–`3600`) |
 | `--survival` | default | default mode for new network players (items/vitals apply) |
 | `--creative` | — | creative default for new network players (instant edits, immunity) |
 | `--pack PATH` | base | JSON content pack |
@@ -750,6 +752,22 @@ TPS/tick timing are logged through the existing `OPENBLOCK_LOG` logger; IP
 addresses and chat are not treated as secrets, but no credentials exist in
 this build.
 
+**Metrics snapshots (interim observability).** `--metrics-json PATH` writes an
+atomic JSON object (`"schema": "openblock.server-metrics/1"`) immediately after
+the listener binds and then every `--metrics-interval` seconds. It is available
+only in listener mode and is not an HTTP/Prometheus endpoint. The object
+contains the bound `listen` address (useful with port `0`), world name/seed,
+game mode, limits, tick count and TPS, a rolling 1,200-tick (60 s) nearest-rank
+tick p50/p95/p99/max window, cumulative tick counts above the 35 ms envelope
+and the 50 ms period, connected players, chunk frames queued and their bytes,
+socket bytes in/out, received Move/edit/chat/ping/chunk-request counters,
+accepted/rejected edits and action rejections, mob/item/column counts, and
+Linux `/proc` proxies for RSS, thread count and open file descriptors (`null`
+on platforms without procfs). A failed write is logged and does not stop the
+tick or the listener. The load gate (`scripts/load-gate.py`) reads these
+snapshots; sample commands and the gate definition are in
+[plan/08](../plan/08-measurements.md).
+
 **Limits and behaviour.** See [18 §3.13.5](18-networking-multiplayer.md#3135-authority-streaming-and-limits)
 and [18 §3.13.9](18-networking-multiplayer.md#3139-server-authoritative-survival-protocol-v2)
 for the survival state machine, container windows, entity replication and
@@ -774,9 +792,10 @@ including across a server restart. A dead record requires `respawn`. This is
 **name-based, without authentication**: anyone who knows a name can resume that
 player, so protect the port and whitelist accordingly. Network state is not
 part of the single-player smoke/state hash. There is no world-directory lock
-(run one process per world), TLS, authentication, server browser, metrics
-endpoint, remote console or backup scheduler yet. Bind to loopback/LAN or
-firewall the port.
+(run one process per world), TLS, authentication, server browser,
+Prometheus/HTTP metrics endpoint, remote console or backup scheduler yet; the
+opt-in JSON snapshots above are the interim observability surface. Bind to
+loopback/LAN or firewall the port.
 
 ## 4. Data structures and formats
 

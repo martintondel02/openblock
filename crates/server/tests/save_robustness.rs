@@ -8,10 +8,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ob_content::Registry;
-use ob_server::{GameMode, Host, HostConfig};
+#[cfg(unix)]
+use ob_server::GameMode;
+use ob_server::{Host, HostConfig};
 
 struct TempDir(PathBuf);
 

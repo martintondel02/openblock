@@ -47,7 +47,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -156,6 +156,12 @@ const MOVE_MIN_ALLOWANCE: f64 = 2.0;
 const FALL_ALLOWANCE_PER_SECOND: f64 = 100.0;
 /// Minimum vertical movement allowance for one Move message, in metres.
 const FALL_MIN_ALLOWANCE: f64 = 5.0;
+/// Tick durations kept for the rolling p50/p95/p99 window (60 s at 20 Hz).
+const TICK_HISTORY_SAMPLES: usize = 1200;
+/// A tick longer than this misses the 20 Hz deadline (50 ms period).
+const TICK_OVERRUN: Duration = Duration::from_millis(50);
+/// A tick longer than this misses the 1.0 p99 tick envelope (PERF-TICK-009).
+const TICK_ENVELOPE: Duration = Duration::from_millis(35);
 
 /// Runtime configuration for the dedicated network layer.
 #[derive(Debug, Clone)]
@@ -252,6 +258,209 @@ impl NetConfig {
     }
 }
 
+/// Lock-free counters and a rolling tick-duration window for `--metrics-json`.
+///
+/// Every field is updated with relaxed atomics so the tick and socket threads
+/// never take another lock for observability. The single tick thread is the
+/// only writer of [`Metrics::tick_micros`], so a snapshot's window can only be
+/// short of the newest tick, never internally reordered.
+struct Metrics {
+    tick_micros: [AtomicU64; TICK_HISTORY_SAMPLES],
+    tick_sequence: AtomicU64,
+    tick_overruns: AtomicU64,
+    tick_over_envelope: AtomicU64,
+    chunks_queued: AtomicU64,
+    chunk_bytes_queued: AtomicU64,
+    bytes_in: AtomicU64,
+    bytes_out: AtomicU64,
+    moves: AtomicU64,
+    edits_attempted: AtomicU64,
+    chats: AtomicU64,
+    pings: AtomicU64,
+    chunk_requests: AtomicU64,
+    actions_rejected: AtomicU64,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        Self {
+            tick_micros: std::array::from_fn(|_| AtomicU64::new(0)),
+            tick_sequence: AtomicU64::new(0),
+            tick_overruns: AtomicU64::new(0),
+            tick_over_envelope: AtomicU64::new(0),
+            chunks_queued: AtomicU64::new(0),
+            chunk_bytes_queued: AtomicU64::new(0),
+            bytes_in: AtomicU64::new(0),
+            bytes_out: AtomicU64::new(0),
+            moves: AtomicU64::new(0),
+            edits_attempted: AtomicU64::new(0),
+            chats: AtomicU64::new(0),
+            pings: AtomicU64::new(0),
+            chunk_requests: AtomicU64::new(0),
+            actions_rejected: AtomicU64::new(0),
+        }
+    }
+
+    /// Records one completed tick duration into the rolling window.
+    fn record_tick(&self, duration: Duration) {
+        let micros = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+        let index = (self.tick_sequence.load(Ordering::Relaxed) as usize) % TICK_HISTORY_SAMPLES;
+        self.tick_micros[index].store(micros, Ordering::Relaxed);
+        self.tick_sequence.fetch_add(1, Ordering::Relaxed);
+        if duration > TICK_OVERRUN {
+            self.tick_overruns.fetch_add(1, Ordering::Relaxed);
+        }
+        if duration > TICK_ENVELOPE {
+            self.tick_over_envelope.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Counts one inbound message of a given type.
+    fn count(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Nearest-rank p50/p95/p99 and max over the rolling window, in ms.
+    fn tick_stats(&self) -> (usize, f64, f64, f64, f64) {
+        let written = self.tick_sequence.load(Ordering::Relaxed);
+        let count = written.min(TICK_HISTORY_SAMPLES as u64) as usize;
+        if count == 0 {
+            return (0, 0.0, 0.0, 0.0, 0.0);
+        }
+        let mut samples: Vec<u64> = (0..count)
+            .map(|index| self.tick_micros[index].load(Ordering::Relaxed))
+            .collect();
+        samples.sort_unstable();
+        (
+            count,
+            percentile_micros(&samples, 50.0),
+            percentile_micros(&samples, 95.0),
+            percentile_micros(&samples, 99.0),
+            micros_to_ms(samples[count - 1]),
+        )
+    }
+}
+
+/// Nearest-rank percentile of an ascending microsecond series, in milliseconds.
+fn percentile_micros(sorted: &[u64], percentile: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = (percentile.clamp(0.0, 100.0) / 100.0 * sorted.len() as f64).ceil() as usize;
+    let index = rank.clamp(1, sorted.len()) - 1;
+    micros_to_ms(sorted[index])
+}
+
+/// Converts integer microseconds to a millisecond value for reports.
+fn micros_to_ms(micros: u64) -> f64 {
+    micros as f64 / 1000.0
+}
+
+/// A cheap observability snapshot of one running dedicated server.
+#[derive(Debug, Clone)]
+pub struct ServerMetrics {
+    /// Seconds since the network layer started its tick thread.
+    pub uptime_seconds: f64,
+    /// Bound TCP address, useful when the caller requested port 0.
+    pub listen: String,
+    /// World directory name.
+    pub world_name: String,
+    /// World seed.
+    pub seed: u64,
+    /// Default game mode for new network players.
+    pub game_mode: &'static str,
+    /// Configured player cap.
+    pub max_players: u16,
+    /// Configured per-client interest radius in chunks.
+    pub interest_radius_chunks: i32,
+    /// Chunk columns streamed per client per tick.
+    pub chunks_per_tick: usize,
+    /// Autosave interval in seconds (`0` disables it).
+    pub save_interval_seconds: u64,
+    /// Completed server ticks.
+    pub tick_count: u64,
+    /// Most recent one-second TPS measurement.
+    pub tps: f32,
+    /// Ticks currently in the rolling window.
+    pub tick_samples: usize,
+    /// Tick p50 over the rolling window, in milliseconds.
+    pub tick_p50_ms: f64,
+    /// Tick p95 over the rolling window, in milliseconds.
+    pub tick_p95_ms: f64,
+    /// Tick p99 over the rolling window, in milliseconds.
+    pub tick_p99_ms: f64,
+    /// Longest tick over the rolling window, in milliseconds.
+    pub tick_max_ms: f64,
+    /// Ticks above the 50 ms period since start.
+    pub tick_overruns: u64,
+    /// Ticks above the 35 ms 1.0 envelope since start.
+    pub tick_over_envelope: u64,
+    /// Connected players at snapshot time.
+    pub players_connected: usize,
+    /// Chunk frames queued to per-client writers since start.
+    pub chunks_queued: u64,
+    /// Encoded bytes in those chunk frames.
+    pub chunk_bytes_queued: u64,
+    /// Bytes received on player sockets (framing included).
+    pub bytes_in: u64,
+    /// Bytes written to player sockets (framing included).
+    pub bytes_out: u64,
+    /// Move intents received.
+    pub moves: u64,
+    /// Block-edit intents received (accepted and rejected).
+    pub edits_attempted: u64,
+    /// Accepted block edits.
+    pub edits_accepted: u64,
+    /// Rejected block edits.
+    pub edits_rejected: u64,
+    /// Chat lines received.
+    pub chats: u64,
+    /// Ping intents received.
+    pub pings: u64,
+    /// Chunk requests received.
+    pub chunk_requests: u64,
+    /// Action rejections of every kind sent to clients.
+    pub actions_rejected: u64,
+    /// Loaded mobs at snapshot time.
+    pub mobs: usize,
+    /// Dropped item entities at snapshot time.
+    pub item_entities: usize,
+    /// Resident world columns at snapshot time.
+    pub loaded_columns: usize,
+    /// Process RSS from `/proc/self/status` on Linux.
+    pub rss_kib: Option<u64>,
+    /// Process thread count from `/proc/self/status` on Linux.
+    pub threads: Option<u64>,
+    /// Open file descriptors from `/proc/self/fd` on Linux.
+    pub open_fds: Option<u64>,
+}
+
+/// Reads RSS, thread count and open descriptors from procfs when available.
+fn process_stats() -> (Option<u64>, Option<u64>, Option<u64>) {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok();
+        let field = |name: &str| {
+            status.as_deref().and_then(|text| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+        };
+        let rss = field("VmRSS:");
+        let threads = field("Threads:");
+        let fds = std::fs::read_dir("/proc/self/fd")
+            .ok()
+            .map(|entries| entries.count() as u64);
+        (rss, threads, fds)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (None, None, None)
+    }
+}
+
 /// A running dedicated server.
 ///
 /// The server owns the [`Host`] and shuts it down gracefully on [`stop`].
@@ -271,6 +480,7 @@ struct Shared {
     events: Sender<ServerEvent>,
     shutdown: AtomicBool,
     handshakes: AtomicUsize,
+    metrics: Arc<Metrics>,
 }
 
 enum ServerEvent {
@@ -286,6 +496,8 @@ struct Core {
     next_id: u64,
     next_window_id: u32,
     tick_count: u64,
+    started: Instant,
+    metrics: Arc<Metrics>,
     dirty: bool,
     last_save: Instant,
     edits_accepted: u64,
@@ -383,6 +595,7 @@ impl DedicatedServer {
             config.game_mode.name()
         );
 
+        let metrics = Arc::new(Metrics::new());
         let core = Core {
             host,
             config,
@@ -390,6 +603,8 @@ impl DedicatedServer {
             next_id: 1,
             next_window_id: 1,
             tick_count: 0,
+            started: Instant::now(),
+            metrics: Arc::clone(&metrics),
             dirty: false,
             last_save: Instant::now(),
             edits_accepted: 0,
@@ -408,6 +623,7 @@ impl DedicatedServer {
             events,
             shutdown: AtomicBool::new(false),
             handshakes: AtomicUsize::new(0),
+            metrics,
         });
 
         let tick_shared = Arc::clone(&shared);
@@ -566,6 +782,56 @@ impl DedicatedServer {
         (core.edits_accepted, core.edits_rejected)
     }
 
+    /// A consistent snapshot of the server's observability counters.
+    ///
+    /// Locks the core for the duration of a few reads and a sort of at most
+    /// 1,200 integers; it is meant for a 1-5 s metrics
+    /// writer, not the tick loop.
+    pub fn metrics(&self) -> ServerMetrics {
+        let core = lock(&self.shared.core);
+        let (tick_samples, tick_p50_ms, tick_p95_ms, tick_p99_ms, tick_max_ms) = core.metrics.tick_stats();
+        let (rss_kib, threads, open_fds) = process_stats();
+        ServerMetrics {
+            uptime_seconds: core.started.elapsed().as_secs_f64(),
+            listen: self.addr.to_string(),
+            world_name: core.world_name.clone(),
+            seed: core.seed,
+            game_mode: core.config.game_mode.name(),
+            max_players: core.config.max_players,
+            interest_radius_chunks: core.config.interest_radius_chunks,
+            chunks_per_tick: core.config.chunks_per_tick,
+            save_interval_seconds: core.config.save_interval_seconds,
+            tick_count: core.tick_count,
+            tps: core.tps,
+            tick_samples,
+            tick_p50_ms,
+            tick_p95_ms,
+            tick_p99_ms,
+            tick_max_ms,
+            tick_overruns: core.metrics.tick_overruns.load(Ordering::Relaxed),
+            tick_over_envelope: core.metrics.tick_over_envelope.load(Ordering::Relaxed),
+            players_connected: core.players.len(),
+            chunks_queued: core.metrics.chunks_queued.load(Ordering::Relaxed),
+            chunk_bytes_queued: core.metrics.chunk_bytes_queued.load(Ordering::Relaxed),
+            bytes_in: core.metrics.bytes_in.load(Ordering::Relaxed),
+            bytes_out: core.metrics.bytes_out.load(Ordering::Relaxed),
+            moves: core.metrics.moves.load(Ordering::Relaxed),
+            edits_attempted: core.metrics.edits_attempted.load(Ordering::Relaxed),
+            edits_accepted: core.edits_accepted,
+            edits_rejected: core.edits_rejected,
+            chats: core.metrics.chats.load(Ordering::Relaxed),
+            pings: core.metrics.pings.load(Ordering::Relaxed),
+            chunk_requests: core.metrics.chunk_requests.load(Ordering::Relaxed),
+            actions_rejected: core.metrics.actions_rejected.load(Ordering::Relaxed),
+            mobs: core.host.mobs().len(),
+            item_entities: core.host.item_entities().len(),
+            loaded_columns: core.host.world().chunk_count(),
+            rss_kib,
+            threads,
+            open_fds,
+        }
+    }
+
     /// Saves the world immediately. Atomic, like [`Host::save`].
     pub fn save(&self) -> Result<(), HostError> {
         lock(&self.shared.core).host.save()
@@ -693,6 +959,12 @@ fn run_accept_loop(shared: Arc<Shared>, listener: TcpListener) {
 
 /// Performs the Hello exchange and registers a player.
 fn handshake(shared: Arc<Shared>, stream: TcpStream) {
+    // Darwin (and some BSDs) inherit the listener's non-blocking flag on
+    // accepted sockets, unlike Linux. Handshake and gameplay I/O assume a
+    // blocking socket with explicit read/write timeouts; switch it back before
+    // the first read or macOS clients would see an immediate WouldBlock and be
+    // rejected as "timeout".
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
@@ -710,6 +982,10 @@ fn handshake(shared: Arc<Shared>, stream: TcpStream) {
             return;
         }
     };
+    shared
+        .metrics
+        .bytes_in
+        .fetch_add(payload.len() as u64 + 4, Ordering::Relaxed);
     let message: ClientMessage = match decode_payload(&payload, MAX_FRAME_LEN) {
         Ok(message) => message,
         Err(error) => {
@@ -953,6 +1229,10 @@ fn writer_loop(shared: Arc<Shared>, id: u64, mut stream: TcpStream, receiver: Re
             let _ = shared.events.send(ServerEvent::WriterFailed { id });
             break;
         }
+        shared
+            .metrics
+            .bytes_out
+            .fetch_add(frame.len() as u64, Ordering::Relaxed);
     }
     let _ = stream.flush();
     let _ = stream.shutdown(Shutdown::Both);
@@ -971,6 +1251,10 @@ fn reader_loop(shared: Arc<Shared>, id: u64, mut stream: TcpStream) {
                 return;
             }
         };
+        shared
+            .metrics
+            .bytes_in
+            .fetch_add(payload.len() as u64 + 4, Ordering::Relaxed);
         if !limit.allow_now() {
             let _ = shared.events.send(ServerEvent::Closed {
                 id,
@@ -1058,6 +1342,7 @@ fn run_tick_loop(shared: Arc<Shared>, receiver: Receiver<ServerEvent>) {
                 log::warn!("tick overran the 50 ms budget: {tick_duration:?}");
             }
         }
+        shared.metrics.record_tick(tick_duration);
         ticks_in_window += 1;
         if now.duration_since(window_start) >= Duration::from_secs(1) {
             let tps = ticks_in_window as f32 / now.duration_since(window_start).as_secs_f32();
@@ -1205,9 +1490,18 @@ impl Core {
                     "duplicate hello",
                 );
             }
-            ClientMessage::ChunkRequest { cx, cz } => self.handle_chunk_request(id, cx, cz, now),
-            ClientMessage::Move { pos, yaw, pitch } => self.handle_move(id, pos, yaw, pitch, now),
-            ClientMessage::BlockEdit { pos, block } => self.handle_block_edit(id, pos, block, now),
+            ClientMessage::ChunkRequest { cx, cz } => {
+                Metrics::count(&self.metrics.chunk_requests);
+                self.handle_chunk_request(id, cx, cz, now);
+            }
+            ClientMessage::Move { pos, yaw, pitch } => {
+                Metrics::count(&self.metrics.moves);
+                self.handle_move(id, pos, yaw, pitch, now);
+            }
+            ClientMessage::BlockEdit { pos, block } => {
+                Metrics::count(&self.metrics.edits_attempted);
+                self.handle_block_edit(id, pos, block, now);
+            }
             ClientMessage::SelectSlot { slot } => self.handle_select_slot(id, slot, now),
             ClientMessage::UseBlock { pos } => self.handle_use_block(id, pos, now),
             ClientMessage::Attack { target } => self.handle_attack(id, target, now),
@@ -1221,8 +1515,12 @@ impl Core {
             ClientMessage::Equip { hotbar_slot } => self.handle_equip(id, hotbar_slot, now),
             ClientMessage::Respawn => self.handle_respawn(id, now),
             ClientMessage::ContainerClose => self.handle_container_close(id, now),
-            ClientMessage::Chat { text } => self.handle_chat(id, text, now),
+            ClientMessage::Chat { text } => {
+                Metrics::count(&self.metrics.chats);
+                self.handle_chat(id, text, now);
+            }
             ClientMessage::Ping { id: nonce } => {
+                Metrics::count(&self.metrics.pings);
                 let allowed = self
                     .players
                     .get_mut(&id)
@@ -1723,6 +2021,7 @@ impl Core {
 
     /// Sends a short rejection hint to one player.
     fn send_action_rejected(&mut self, id: u64, action: &str, reason: &str) {
+        Metrics::count(&self.metrics.actions_rejected);
         self.send(
             id,
             ServerMessage::ActionRejected {
@@ -2220,14 +2519,20 @@ impl Core {
 
     /// Sends one message to one player; a full queue disconnects that player.
     fn send(&mut self, id: u64, message: ServerMessage) -> bool {
+        let is_chunk = matches!(&message, ServerMessage::ChunkData { .. });
         let Ok(frame) = encode_server_frame(&message) else {
             log::error!("could not encode message for client {id}");
             return false;
         };
+        let frame_len = frame.len() as u64;
         let queued = self
             .players
             .get(&id)
             .is_some_and(|player| player.sender.try_send(frame).is_ok());
+        if queued && is_chunk {
+            self.metrics.chunks_queued.fetch_add(1, Ordering::Relaxed);
+            self.metrics.chunk_bytes_queued.fetch_add(frame_len, Ordering::Relaxed);
+        }
         if !queued {
             self.disconnect(id, None, "outbound queue full");
         }
@@ -2716,6 +3021,26 @@ mod tests {
         assert_eq!(sanitise_reason(" hello\nworld "), "hello world");
         assert_eq!(sanitise_reason(""), "disconnected");
         assert!(sanitise_reason(&"x".repeat(MAX_REASON_LEN + 10)).len() <= MAX_REASON_LEN);
+    }
+
+    #[test]
+    fn tick_window_reports_nearest_rank_percentiles_and_overruns() {
+        let metrics = Metrics::new();
+        for micros in 1..=1000u64 {
+            metrics.record_tick(Duration::from_micros(micros));
+        }
+        let (count, p50, p95, p99, max) = metrics.tick_stats();
+        assert_eq!(count, 1000);
+        assert!((p50 - 0.500).abs() < 1e-9, "p50 {p50}");
+        assert!((p95 - 0.950).abs() < 1e-9, "p95 {p95}");
+        assert!((p99 - 0.990).abs() < 1e-9, "p99 {p99}");
+        assert!((max - 1.000).abs() < 1e-9, "max {max}");
+        assert_eq!(metrics.tick_overruns.load(Ordering::Relaxed), 0);
+
+        metrics.record_tick(Duration::from_millis(36));
+        metrics.record_tick(Duration::from_millis(51));
+        assert_eq!(metrics.tick_over_envelope.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.tick_overruns.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -25,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ob_audio::{AudioEngine, Material as AudioMaterial, Sfx as AudioSfx};
 use ob_content::{BlockId, Registry};
-use ob_core::config::{load_settings, save_settings};
+use ob_core::config::{Action, load_settings, save_settings};
 use ob_math::{BlockPos, SectionPos, WorldVec};
 use ob_render::{BlockOutline, Camera, Environment, Renderer, SceneParams, TextureSource, UiFrame};
 use ob_server::ContainerState;
@@ -88,14 +88,20 @@ pub(crate) fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Erro
     #[cfg(not(target_os = "linux"))]
     let event_loop = EventLoop::builder().build()?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = NetApp { options, state: None };
+    let mut app = NetApp::new(options);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
 
-struct NetApp {
+pub(crate) struct NetApp {
     options: ClientOptions,
     state: Option<NetGameState>,
+}
+
+impl NetApp {
+    pub(crate) fn new(options: ClientOptions) -> Self {
+        Self { options, state: None }
+    }
 }
 
 impl ApplicationHandler for NetApp {
@@ -193,6 +199,7 @@ impl ApplicationHandler for NetApp {
             debug_stats: DebugStats::default(),
             damage_flash: DamageFlash::default(),
             camera_shake: 0.0,
+            last_camera: Camera::new(placeholder.eye(), 0.0, 0.0),
             audio,
             audio_status,
             audio_enabled_before_mute,
@@ -224,10 +231,13 @@ impl ApplicationHandler for NetApp {
         self.state = Some(state);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _window_id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+        if state.window.id() != window_id {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 state.shutdown();
@@ -271,78 +281,171 @@ impl ApplicationHandler for NetApp {
                     }
                     return;
                 }
-                match code {
-                    KeyCode::KeyW => state.keys[0] = pressed,
-                    KeyCode::KeyS => state.keys[1] = pressed,
-                    KeyCode::KeyA => state.keys[2] = pressed,
-                    KeyCode::KeyD => state.keys[3] = pressed,
-                    KeyCode::Space => state.keys[4] = pressed,
-                    KeyCode::ShiftLeft => state.keys[5] = pressed,
-                    KeyCode::ShiftRight => state.keys[7] = pressed,
-                    KeyCode::ControlLeft => state.keys[6] = pressed,
-                    KeyCode::KeyT
-                        if pressed
-                            && !event.repeat
-                            && state.ui.screen == Screen::Playing
-                            && state.client.as_ref().is_some_and(|client| client.state().is_playing()) =>
+                if state.ui.screen == Screen::Settings {
+                    // Key capture owns every key while the Controls tab is
+                    // waiting for a new binding.
+                    if state.ui.bind_capture.is_some() {
+                        if pressed {
+                            match code {
+                                KeyCode::Escape => state.ui.cancel_bind(),
+                                KeyCode::Backspace | KeyCode::Delete => {
+                                    if state.ui.clear_binding().is_some() {
+                                        state.persist_settings();
+                                    }
+                                }
+                                _ => {
+                                    if let Some(key) = crate::bind_key_for_code(code)
+                                        && state.ui.apply_bind(key).is_ok()
+                                    {
+                                        state.persist_settings();
+                                    }
+                                }
+                            }
+                        }
+                        state.update_title();
+                        return;
+                    }
+                    if pressed
+                        && matches!(code, KeyCode::Delete | KeyCode::Backspace)
+                        && state.ui.clear_binding().is_some()
                     {
-                        state.open_chat();
-                    }
-                    KeyCode::KeyF if pressed && state.ui.screen == Screen::Playing && state.client_playing() => {
-                        state
-                            .ui
-                            .toasts
-                            .push_warning("Flight is not available in multiplayer survival");
-                    }
-                    KeyCode::KeyE if pressed => match state.ui.screen {
-                        Screen::Playing if state.can_act() => state.open_inventory(),
-                        Screen::Inventory => state.close_inventory(),
-                        Screen::Furnace | Screen::Chest => state.close_container_ui(true),
-                        Screen::Settings | Screen::Death | Screen::Connecting | Screen::Crafting => {}
-                        Screen::Playing => {}
-                    },
-                    KeyCode::KeyC if pressed && matches!(state.ui.screen, Screen::Playing | Screen::Inventory) => {
-                        state.ui.toasts.push_warning(CRAFTING_HINT);
-                    }
-                    KeyCode::F1 if pressed && state.ui.screen != Screen::Settings => {
-                        state.ui.hud_visible = !state.ui.hud_visible;
                         state.persist_settings();
+                        state.update_title();
+                        return;
                     }
-                    KeyCode::F2 if pressed && state.ui.screen == Screen::Playing => {
-                        state
-                            .ui
-                            .toasts
-                            .push("Screenshots are local-mode only in this prototype");
+                    match code {
+                        KeyCode::Escape if pressed => state.handle_escape(),
+                        KeyCode::Tab if pressed => {
+                            if state.keys[5] {
+                                state.ui.settings_tab_prev();
+                            } else {
+                                state.ui.settings_tab_next();
+                            }
+                        }
+                        KeyCode::ArrowUp if pressed => state.ui.settings_row_up(),
+                        KeyCode::ArrowDown if pressed => state.ui.settings_row_down(),
+                        KeyCode::ArrowLeft if pressed => {
+                            if let Some(row) = state.ui.settings_adjust(-1) {
+                                state.apply_settings_row(row);
+                            }
+                        }
+                        KeyCode::ArrowRight if pressed => {
+                            if let Some(row) = state.ui.settings_adjust(1) {
+                                state.apply_settings_row(row);
+                            }
+                        }
+                        KeyCode::Enter if pressed => {
+                            if let Some(action) = state.ui.settings_activate() {
+                                state.play_ui_sound(matches!(
+                                    action,
+                                    SettingsAction::Resume | SettingsAction::SaveAndQuit
+                                ));
+                                if state.handle_settings_action(action) {
+                                    event_loop.exit();
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    KeyCode::F3 if pressed && state.ui.screen != Screen::Settings => {
-                        state.ui.toggle_debug_overlay();
-                        state.persist_settings();
+                    if pressed {
+                        state.update_title();
                     }
-                    KeyCode::Escape if pressed => {
+                    return;
+                }
+
+                // Gameplay actions resolve through the persisted keybind model.
+                if let Some(action) =
+                    crate::bind_key_for_code(code).and_then(|key| state.ui.settings.keybinds.action_for(key))
+                {
+                    if let Some(slot) = crate::movement_slot(action) {
+                        state.keys[slot] = pressed;
+                    } else if pressed && !event.repeat {
+                        match action {
+                            Action::Chat => state.open_chat(),
+                            Action::Inventory => match state.ui.screen {
+                                Screen::Playing if state.can_act() => state.open_inventory(),
+                                Screen::Inventory => state.close_inventory(),
+                                Screen::Furnace | Screen::Chest => state.close_container_ui(true),
+                                Screen::Settings | Screen::Death | Screen::Connecting | Screen::Crafting => {}
+                                Screen::Playing => {}
+                            },
+                            Action::Crafting => {
+                                if matches!(state.ui.screen, Screen::Playing | Screen::Inventory) {
+                                    state.ui.toasts.push_warning(CRAFTING_HINT);
+                                }
+                            }
+                            Action::DebugOverlay => {
+                                if state.ui.screen != Screen::Settings {
+                                    state.ui.toggle_debug_overlay();
+                                    state.persist_settings();
+                                }
+                            }
+                            Action::ToggleHud => {
+                                if state.ui.screen != Screen::Settings {
+                                    state.ui.toggle_hud();
+                                    state.persist_settings();
+                                }
+                            }
+                            Action::Screenshot => {
+                                if state.ui.screen == Screen::Playing {
+                                    state
+                                        .ui
+                                        .toasts
+                                        .push("Screenshots are local-mode only in this prototype");
+                                }
+                            }
+                            Action::Pause => {
+                                if state.ui.screen == Screen::Connecting {
+                                    state.shutdown();
+                                    state.persist_settings();
+                                    event_loop.exit();
+                                    return;
+                                }
+                                state.handle_escape();
+                            }
+                            Action::Fly => {
+                                if state.ui.screen == Screen::Playing && state.client_playing() {
+                                    state
+                                        .ui
+                                        .toasts
+                                        .push_warning("Flight is not available in multiplayer survival");
+                                }
+                            }
+                            Action::Mine | Action::Use => {}
+                            Action::MoveForward
+                            | Action::MoveBack
+                            | Action::MoveLeft
+                            | Action::MoveRight
+                            | Action::Jump
+                            | Action::Sneak
+                            | Action::Sprint => {}
+                        }
+                    }
+                    if pressed {
+                        state.update_title();
+                    }
+                    return;
+                }
+
+                // UI-only keys stay available regardless of bindings.
+                match code {
+                    KeyCode::Escape if pressed && state.ui.screen != Screen::Playing => {
                         if state.ui.screen == Screen::Connecting {
                             state.shutdown();
                             state.persist_settings();
                             event_loop.exit();
-                        } else {
-                            state.handle_escape();
+                            return;
                         }
+                        state.handle_escape();
                     }
                     KeyCode::KeyR | KeyCode::Enter
                         if pressed && !event.repeat && state.ui.screen == Screen::Connecting =>
                     {
                         state.retry();
                     }
-                    KeyCode::Tab if pressed => {
-                        state.tab_held = true;
-                        if state.ui.screen == Screen::Settings {
-                            if state.keys[5] || state.keys[7] {
-                                state.ui.settings_tab_prev();
-                            } else {
-                                state.ui.settings_tab_next();
-                            }
-                        }
+                    KeyCode::Tab => {
+                        state.tab_held = pressed;
                     }
-                    KeyCode::Tab if !pressed => state.tab_held = false,
                     KeyCode::Digit1
                     | KeyCode::Digit2
                     | KeyCode::Digit3
@@ -362,37 +465,25 @@ impl ApplicationHandler for NetApp {
                         Screen::Death => state.ui.move_death_selection(-1),
                         Screen::Inventory => state.move_inventory_selection(0, -1),
                         Screen::Furnace | Screen::Chest => state.move_container_selection(0, -1),
-                        Screen::Settings => state.ui.settings_row_up(),
-                        Screen::Playing | Screen::Connecting | Screen::Crafting => {}
+                        Screen::Playing | Screen::Connecting | Screen::Crafting | Screen::Settings => {}
                     },
                     KeyCode::ArrowDown if pressed => match state.ui.screen {
                         Screen::Death => state.ui.move_death_selection(1),
                         Screen::Inventory => state.move_inventory_selection(0, 1),
                         Screen::Furnace | Screen::Chest => state.move_container_selection(0, 1),
-                        Screen::Settings => state.ui.settings_row_down(),
-                        Screen::Playing | Screen::Connecting | Screen::Crafting => {}
+                        Screen::Playing | Screen::Connecting | Screen::Crafting | Screen::Settings => {}
                     },
                     KeyCode::ArrowLeft if pressed => match state.ui.screen {
                         Screen::Death => state.ui.move_death_selection(-1),
                         Screen::Inventory => state.move_inventory_selection(-1, 0),
                         Screen::Furnace | Screen::Chest => state.move_container_selection(-1, 0),
-                        Screen::Settings => {
-                            if let Some(row) = state.ui.settings_adjust(-1) {
-                                state.apply_settings_row(row);
-                            }
-                        }
-                        Screen::Playing | Screen::Connecting | Screen::Crafting => {}
+                        Screen::Playing | Screen::Connecting | Screen::Crafting | Screen::Settings => {}
                     },
                     KeyCode::ArrowRight if pressed => match state.ui.screen {
                         Screen::Death => state.ui.move_death_selection(1),
                         Screen::Inventory => state.move_inventory_selection(1, 0),
                         Screen::Furnace | Screen::Chest => state.move_container_selection(1, 0),
-                        Screen::Settings => {
-                            if let Some(row) = state.ui.settings_adjust(1) {
-                                state.apply_settings_row(row);
-                            }
-                        }
-                        Screen::Playing | Screen::Connecting | Screen::Crafting => {}
+                        Screen::Playing | Screen::Connecting | Screen::Crafting | Screen::Settings => {}
                     },
                     KeyCode::Enter if pressed => match state.ui.screen {
                         Screen::Death => {
@@ -400,20 +491,11 @@ impl ApplicationHandler for NetApp {
                                 state.handle_death_action(action);
                             }
                         }
-                        Screen::Inventory => state.assign_inventory_selection(),
-                        Screen::Furnace | Screen::Chest => state.activate_container_slot(),
-                        Screen::Settings => {
-                            if let Some(action) = state.ui.settings_activate() {
-                                state.play_ui_sound(matches!(
-                                    action,
-                                    SettingsAction::Resume | SettingsAction::SaveAndQuit
-                                ));
-                                if state.handle_settings_action(action) {
-                                    event_loop.exit();
-                                }
-                            }
+                        Screen::Inventory => {
+                            state.assign_inventory_selection();
                         }
-                        Screen::Playing | Screen::Connecting | Screen::Crafting => {}
+                        Screen::Furnace | Screen::Chest => state.activate_container_slot(),
+                        Screen::Playing | Screen::Connecting | Screen::Crafting | Screen::Settings => {}
                     },
                     _ => {}
                 }
@@ -424,10 +506,19 @@ impl ApplicationHandler for NetApp {
             WindowEvent::MouseInput {
                 state: element, button, ..
             } => {
-                if button == MouseButton::Left && element == ElementState::Released {
+                if element == ElementState::Released {
                     state.cancel_mining();
                 }
                 if element != ElementState::Pressed {
+                    return;
+                }
+                if state.ui.screen == Screen::Settings && state.ui.bind_capture.is_some() {
+                    if let Some(key) = crate::bind_key_for_mouse(button)
+                        && state.ui.apply_bind(key).is_ok()
+                    {
+                        state.persist_settings();
+                    }
+                    state.update_title();
                     return;
                 }
                 match state.ui.screen {
@@ -503,9 +594,9 @@ impl ApplicationHandler for NetApp {
                 if !state.can_act() {
                     return;
                 }
-                match button {
-                    MouseButton::Left => state.start_mining(),
-                    MouseButton::Right => state.use_or_place(),
+                match crate::bind_key_for_mouse(button).and_then(|key| state.ui.settings.keybinds.action_for(key)) {
+                    Some(Action::Mine) => state.start_mining(),
+                    Some(Action::Use) => state.use_or_place(),
                     _ => {}
                 }
             }
@@ -621,6 +712,8 @@ struct NetGameState {
     debug_stats: DebugStats,
     damage_flash: DamageFlash,
     camera_shake: f32,
+    /// Camera used by the current frame, for projecting name tags.
+    last_camera: Camera,
     audio: Option<AudioEngine>,
     audio_status: String,
     audio_enabled_before_mute: Option<bool>,
@@ -806,6 +899,7 @@ impl NetGameState {
             return;
         }
         client.chat_input_mut().open();
+        self.ui.text_input_active = true;
         self.keys = [false; 8];
         self.cancel_mining();
         self.release_pointer();
@@ -815,6 +909,7 @@ impl NetGameState {
         if let Some(client) = &mut self.client {
             client.chat_input_mut().cancel();
         }
+        self.ui.text_input_active = false;
         if self.ui.screen == Screen::Playing {
             self.capture_pointer();
         }
@@ -825,9 +920,11 @@ impl NetGameState {
             return;
         };
         let Some(text) = client.chat_input_mut().submit() else {
+            self.ui.text_input_active = false;
             self.capture_pointer();
             return;
         };
+        self.ui.text_input_active = false;
         match client.send_chat(&text) {
             Ok(()) => log::debug!("chat sent ({} chars)", text.len()),
             Err(error) => self.ui.toasts.push_warning(error),
@@ -843,6 +940,7 @@ impl NetGameState {
         self.damage_flash.reset();
         self.cancel_mining();
         self.ui.screen = Screen::Connecting;
+        self.ui.text_input_active = false;
         self.release_pointer();
         self.placeholder = Player::new(crate::default_spawn_hint());
         self.prev_eye = self.placeholder.eye();
@@ -996,7 +1094,9 @@ impl NetGameState {
                 NetEvent::Disconnected { reason } => self.fail_connection(reason),
                 NetEvent::Damage { amount, cause } => {
                     self.damage_flash.trigger();
-                    self.camera_shake = DAMAGE_SHAKE_RADIANS;
+                    if !self.ui.settings.reduced_motion {
+                        self.camera_shake = DAMAGE_SHAKE_RADIANS;
+                    }
                     if let Some(engine) = &mut self.audio {
                         engine.play_sfx(AudioSfx::Hurt);
                     }
@@ -1592,16 +1692,17 @@ impl NetGameState {
         let alpha = (self.accumulator.as_secs_f32() / TICK.as_secs_f32()).clamp(0.0, 1.0);
         let eye = self.prev_eye.lerp(self.current_eye, f64::from(alpha));
         let player = self.player();
-        let shake = if self.camera_shake > 0.0 {
+        let shake = if !self.ui.settings.reduced_motion && self.camera_shake > 0.0 {
             (self.started.elapsed().as_secs_f32() * 72.0).sin() * self.camera_shake
         } else {
             0.0
         };
         let mut camera = Camera::new(eye, player.yaw, (player.pitch + shake).clamp(-1.5533, 1.5533));
-        let target_fov = self.ui.settings.fov_degrees * if player.sprinting { 1.10 } else { 1.0 };
+        let target_fov = crate::target_fov(&self.ui.settings, player.sprinting);
         let blend = 1.0 - (-dt.as_secs_f32() * 12.0).exp();
         self.current_fov += (target_fov - self.current_fov) * blend;
         camera.fov_y = self.current_fov.to_radians();
+        self.last_camera = camera;
         let radius = self
             .client
             .as_ref()
@@ -2066,6 +2167,20 @@ impl NetGameState {
                 net_ui::draw_multiplayer_notice(&mut frame, self.notice_seconds, screen);
             }
             if let Some(client) = client {
+                let avatars = client.avatar_states(Instant::now());
+                let players: Vec<(u64, &str, [f64; 3])> = avatars
+                    .iter()
+                    .map(|avatar| (avatar.id, avatar.name.as_str(), avatar.pos))
+                    .collect();
+                let tags = crate::name_tags::project_name_tags(
+                    &self.last_camera,
+                    screen,
+                    &players,
+                    crate::name_tags::NAME_TAG_MAX_DISTANCE,
+                );
+                crate::name_tags::draw_name_tags(&mut frame, &tags, screen);
+            }
+            if let Some(client) = client {
                 net_ui::draw_chat(&mut frame, client.chat_log(), client.chat_input().text(), screen);
                 if self.tab_held {
                     net_ui::draw_player_list(
@@ -2323,11 +2438,14 @@ impl NetGameState {
             SettingsRow::MasterVolume | SettingsRow::SfxVolume | SettingsRow::MusicVolume => {
                 self.sync_audio_settings();
             }
-            SettingsRow::ShowHud
+            SettingsRow::ReducedMotion
+            | SettingsRow::ShowHud
             | SettingsRow::DebugOverlay
             | SettingsRow::Fov
             | SettingsRow::MouseSensitivity
-            | SettingsRow::MeshWorkers => {}
+            | SettingsRow::MeshWorkers
+            | SettingsRow::Keybind(_)
+            | SettingsRow::ResetKeybinds => {}
         }
         self.persist_settings();
     }
@@ -2349,6 +2467,15 @@ impl NetGameState {
             }
             SettingsAction::Adjust(row) => {
                 self.apply_settings_row(row);
+                false
+            }
+            SettingsAction::BeginBind(action) => {
+                self.ui.begin_bind(action);
+                false
+            }
+            SettingsAction::ResetKeybinds => {
+                self.ui.reset_keybinds();
+                self.persist_settings();
                 false
             }
         }

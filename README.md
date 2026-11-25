@@ -177,6 +177,19 @@ risk-register delay. The 2.0 Tier-2 track is a further ~500–800 dev-weeks and
 needs a funded 6–10 person team for 2–3 years. The plan and its assumptions are
 public: [`docs/plan/00-roadmap.md`](docs/plan/00-roadmap.md).
 
+## Multiplayer load gate
+
+The dedicated server exposes lock-free tick metrics (`--metrics-json`, tick
+p50/p95/p99/max, overrun counters, bandwidth, chunk queue depth, RSS/thread/fd
+proxies) and CI runs an 8-bot load gate (`scripts/load-gate.py --quick`), with a
+full 8-client/60 s gate and a 10-minute soak available locally. Recent numbers on
+the reference workstation: 8/8 joins, all interest sets loaded in ~2.2 s,
+20.0 TPS, tick p50/p95/p99 0.061/0.124/0.163 ms, 0 overruns >35 ms, RSS
+22.3 MiB, ~28 KiB/s per client; 10-minute soak plateaued (+1.9 MiB after
+warm-up) with stable save/reload hash and no fd/thread leaks. The 4-vCPU
+reference-hardware capacity claim, 16/50-player rows and zero-autosave-pause
+require the known save-pause gap to be closed first (documented).
+
 ## Performance targets
 
 Measured on the reference machine (8-core CPU, 32 GiB RAM, RTX 3060-class GPU,
@@ -244,6 +257,25 @@ hungry, and watch out for falls. Health and hunger regenerate or drain over time
 at zero health a respawn screen appears. Creative mode (infinite blocks, no
 damage) remains available via `--creative` and the settings menu.
 
+## Front-end, controls and accessibility
+
+OpenBlock now launches into a proper title screen: **Continue** (last world),
+**New World** (validated name + seed), **Load World** (world browser with
+size/date and safe delete), **Multiplayer** (address/name + recent servers),
+**Settings** and **Quit**. Settings works from the title with host-optional
+rows, and every gameplay action can be rebound in **Controls** (click/Enter to
+capture, duplicates rejected, reset defaults, persisted immediately). A
+Reduced-motion option disables damage camera shake and the sprint FOV pump;
+HUD visibility persists; remote players get distance-faded name tags.
+
+| Title | New world | Load world | Multiplayer connect |
+| --- | --- | --- | --- |
+| ![Title](docs/img/v0.2.0-title.png) | ![New world](docs/img/v0.2.0-new-world.png) | ![Worlds](docs/img/v0.2.0-worlds.png) | ![Connect](docs/img/v0.2.0-connect.png) |
+
+| Controls rebinding | Multiplayer name tags |
+| --- | --- |
+| ![Controls](docs/img/v0.2.0-controls.png) | ![Name tags](docs/img/v0.2.0-name-tags.png) |
+
 ## Multiplayer alpha
 
 A dedicated server is included; it does not need a GPU or an audio device and
@@ -284,6 +316,19 @@ furnace to smelt raw ores into ingots (coal/charcoal/planks are fuel), craft
 iron tools and leather/iron armor, and keep an eye on zombies at night. Armor
 mitigates damage up to 80% and wears down with hits; chests and furnaces are
 container windows with authoritative server state.
+
+## Multiplayer load gate
+
+The dedicated server exposes lock-free tick metrics (`--metrics-json`, tick
+p50/p95/p99/max, overrun counters, bandwidth, chunk queue depth, RSS/thread/fd
+proxies) and CI runs an 8-bot load gate (`scripts/load-gate.py --quick`), with a
+full 8-client/60 s gate and a 10-minute soak available locally. Recent numbers on
+the reference workstation: 8/8 joins, all interest sets loaded in ~2.2 s,
+20.0 TPS, tick p50/p95/p99 0.061/0.124/0.163 ms, 0 overruns >35 ms, RSS
+22.3 MiB, ~28 KiB/s per client; 10-minute soak plateaued (+1.9 MiB after
+warm-up) with stable save/reload hash and no fd/thread leaks. The 4-vCPU
+reference-hardware capacity claim, 16/50-player rows and zero-autosave-pause
+require the known save-pause gap to be closed first (documented).
 
 ## Performance
 

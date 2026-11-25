@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 
 use ob_content::{BlockType, Registry};
-use ob_core::config::{GameMode, Settings, TextureStyle};
+use ob_core::config::{Action, BindKey, GameMode, KeybindError, Settings, TextureStyle};
 use ob_render::UiFrame;
 
 use crate::crafting::CraftingState;
@@ -107,9 +107,13 @@ pub const SETTINGS_SLIDER_GAP: f32 = 16.0;
 pub const SETTINGS_SUMMARY_HEIGHT: f32 = 40.0;
 /// Vertical gap between the last row and a summary/source box.
 pub const SETTINGS_SUMMARY_GAP: f32 = 16.0;
-/// Row pitch of the two-column Controls reference.
-pub const SETTINGS_CONTROLS_ROW_STEP: f32 = 26.0;
-/// Height of the row used to draw the Controls reference.
+/// Row pitch of the two-column interactive Controls tab.
+pub const SETTINGS_CONTROLS_ROW_STEP: f32 = 28.0;
+/// Height of one interactive Controls row.
+pub const SETTINGS_CONTROLS_ROW_HEIGHT: f32 = 22.0;
+/// Gap between the two Controls columns.
+pub const SETTINGS_CONTROLS_COLUMN_GAP: f32 = 12.0;
+/// Height of the small type on the Controls tab.
 pub const SETTINGS_CONTROLS_TEXT_HEIGHT: f32 = 10.0;
 /// Top offset of the footer separator, measured from the panel bottom.
 pub const SETTINGS_FOOTER_Y_FROM_BOTTOM: f32 = 70.0;
@@ -136,6 +140,10 @@ pub const SETTINGS_SENSITIVITY_STEP: f32 = 0.1;
 /// Volume step applied by Left/Right, Enter and the mouse wheel.
 pub const SETTINGS_VOLUME_STEP: f32 = 0.05;
 /// Footer hint lines, split so they fit the panel at the 8x8 font.
+pub const SETTINGS_CONTROLS_HINT_LINES: [&str; 2] = [
+    "Enter rebind  |  Backspace/Delete clear  |  Reset restores defaults",
+    "Tab switch tabs  |  Up/Down select  |  Esc back",
+];
 pub const SETTINGS_HINT_LINES: [&str; 2] = [
     "Tab: switch   Up/Down: select   Left/Right or scroll: change",
     "Click < > to change   Enter: activate   Esc: back",
@@ -217,7 +225,7 @@ pub enum SettingsTab {
     Display,
     /// Sound on/off and the master/SFX/music volumes.
     Audio,
-    /// Read-only keyboard and mouse reference.
+    /// Interactive action bindings and reset button.
     Controls,
     /// Procedural texture style and external resource pack.
     Textures,
@@ -308,6 +316,12 @@ pub enum SettingsRow {
     SfxVolume,
     /// Music and ambience bus volume.
     MusicVolume,
+    /// Rebindable action; activating starts key capture.
+    Keybind(Action),
+    /// Restore every control binding to its factory default.
+    ResetKeybinds,
+    /// Remove camera shake and the sprint FOV pump.
+    ReducedMotion,
 }
 
 impl SettingsRow {
@@ -328,6 +342,9 @@ impl SettingsRow {
             SettingsRow::MasterVolume => "Master volume",
             SettingsRow::SfxVolume => "SFX volume",
             SettingsRow::MusicVolume => "Music volume",
+            SettingsRow::Keybind(action) => action.label(),
+            SettingsRow::ResetKeybinds => "Reset controls",
+            SettingsRow::ReducedMotion => "Reduced motion",
         }
     }
 
@@ -335,9 +352,11 @@ impl SettingsRow {
     pub fn kind(self) -> SettingsRowKind {
         match self {
             SettingsRow::GameMode | SettingsRow::TextureStyle => SettingsRowKind::Choice,
-            SettingsRow::ShowHud | SettingsRow::DebugOverlay | SettingsRow::Fullscreen | SettingsRow::AudioEnabled => {
-                SettingsRowKind::Toggle
-            }
+            SettingsRow::ShowHud
+            | SettingsRow::DebugOverlay
+            | SettingsRow::Fullscreen
+            | SettingsRow::AudioEnabled
+            | SettingsRow::ReducedMotion => SettingsRowKind::Toggle,
             SettingsRow::RenderDistance
             | SettingsRow::Fov
             | SettingsRow::MouseSensitivity
@@ -346,6 +365,7 @@ impl SettingsRow {
             | SettingsRow::MusicVolume => SettingsRowKind::Range,
             SettingsRow::TexturePack => SettingsRowKind::Action,
             SettingsRow::MeshWorkers => SettingsRowKind::ReadOnly,
+            SettingsRow::Keybind(_) | SettingsRow::ResetKeybinds => SettingsRowKind::Action,
         }
     }
 }
@@ -381,6 +401,10 @@ pub enum SettingsAction {
     SaveAndQuit,
     /// A row changed; the client must apply its side effect and persist settings.
     Adjust(SettingsRow),
+    /// Enter key capture for an action.
+    BeginBind(Action),
+    /// Restore every keybinding to its factory default.
+    ResetKeybinds,
 }
 
 /// One binding listed by the read-only Controls tab.
@@ -711,6 +735,14 @@ impl UiRect {
     /// Centre point of the rectangle.
     pub fn center(&self) -> (f32, f32) {
         (self.x + self.w / 2.0, self.y + self.h / 2.0)
+    }
+
+    /// Whether this rectangle overlaps another one (touching edges count).
+    pub fn intersects(&self, other: Self) -> bool {
+        self.x <= other.x + other.w
+            && self.x + self.w >= other.x
+            && self.y <= other.y + other.h
+            && self.y + self.h >= other.y
     }
 }
 
@@ -1301,6 +1333,18 @@ pub struct UiState {
     pub hit_marker_seconds: f32,
     /// Optional cause hint shown on the death screen.
     pub death_cause: Option<String>,
+    /// Settings opened without a loaded world (the title screen). The Game
+    /// mode row is disabled and explained instead of silently changing a host.
+    pub host_optional: bool,
+    /// Action currently waiting for a key or mouse-button capture.
+    pub bind_capture: Option<Action>,
+    /// Feedback shown below the Controls rows.
+    pub binding_message: Option<String>,
+    /// Whether [`Self::binding_message`] reports an error (red) or success.
+    pub binding_message_error: bool,
+    /// Whether a text field currently owns the keyboard. Keybind capture is
+    /// refused while this is set, so typing a world name or chat cannot rebind.
+    pub text_input_active: bool,
 }
 
 impl Default for UiState {
@@ -1330,6 +1374,11 @@ impl Default for UiState {
             death_hovered: None,
             hit_marker_seconds: 0.0,
             death_cause: None,
+            host_optional: false,
+            bind_capture: None,
+            binding_message: None,
+            binding_message_error: false,
+            text_input_active: false,
         }
     }
 }
@@ -1340,6 +1389,7 @@ impl UiState {
         settings.clamp();
         Self {
             debug_overlay: settings.show_debug_overlay,
+            hud_visible: settings.show_hud,
             settings,
             ..Self::default()
         }
@@ -1360,6 +1410,12 @@ impl UiState {
     pub fn toggle_debug_overlay(&mut self) {
         self.debug_overlay = !self.debug_overlay;
         self.settings.show_debug_overlay = self.debug_overlay;
+    }
+
+    /// Toggles the HUD and mirrors it into settings.
+    pub fn toggle_hud(&mut self) {
+        self.hud_visible = !self.hud_visible;
+        self.settings.show_hud = self.hud_visible;
     }
 
     /// Selects a hotbar slot, showing the block name.
@@ -1488,6 +1544,8 @@ impl UiState {
         self.settings_tab = SettingsTab::Game;
         self.settings_selected_row = 0;
         self.settings_clear_hover();
+        self.cancel_bind();
+        self.text_input_active = false;
     }
 
     /// Closes settings and returns to gameplay.
@@ -1496,6 +1554,7 @@ impl UiState {
             self.screen = Screen::Playing;
         }
         self.settings_clear_hover();
+        self.cancel_bind();
     }
 
     /// Closes menus and returns to gameplay.
@@ -1503,14 +1562,15 @@ impl UiState {
         self.screen = Screen::Playing;
         self.death_cause = None;
         self.settings_clear_hover();
+        self.cancel_bind();
     }
 
-    /// Switches to a settings tab and focuses its first row (or Resume on the
-    /// Controls tab, which has no rows).
+    /// Switches to a settings tab and focuses its first row.
     pub fn settings_select_tab(&mut self, tab: SettingsTab) {
         self.settings_tab = tab;
         self.settings_selected_row = 0;
         self.settings_clear_hover();
+        self.cancel_bind();
     }
 
     /// Advances to the next settings tab, wrapping around.
@@ -1532,6 +1592,7 @@ impl UiState {
                 SettingsRow::Fov,
                 SettingsRow::MouseSensitivity,
                 SettingsRow::Fullscreen,
+                SettingsRow::ReducedMotion,
                 SettingsRow::MeshWorkers,
             ],
             SettingsTab::Audio => vec![
@@ -1540,7 +1601,11 @@ impl UiState {
                 SettingsRow::SfxVolume,
                 SettingsRow::MusicVolume,
             ],
-            SettingsTab::Controls => Vec::new(),
+            SettingsTab::Controls => {
+                let mut rows: Vec<SettingsRow> = Action::ALL.into_iter().map(SettingsRow::Keybind).collect();
+                rows.push(SettingsRow::ResetKeybinds);
+                rows
+            }
             SettingsTab::Textures => vec![SettingsRow::TextureStyle, SettingsRow::TexturePack],
         }
     }
@@ -1592,6 +1657,7 @@ impl UiState {
     /// Whether a row can currently be changed.
     pub fn settings_row_enabled(&self, row: SettingsRow) -> bool {
         match row {
+            SettingsRow::GameMode if self.host_optional => false,
             SettingsRow::MeshWorkers => false,
             SettingsRow::TexturePack => {
                 self.active_texture_pack.is_some()
@@ -1661,7 +1727,10 @@ impl UiState {
             | SettingsRow::DebugOverlay
             | SettingsRow::Fullscreen
             | SettingsRow::TexturePack
-            | SettingsRow::AudioEnabled => true,
+            | SettingsRow::AudioEnabled
+            | SettingsRow::ReducedMotion
+            | SettingsRow::Keybind(_)
+            | SettingsRow::ResetKeybinds => true,
             SettingsRow::MeshWorkers => false,
         }
     }
@@ -1728,6 +1797,13 @@ impl UiState {
             SettingsRow::MasterVolume => volume_percent(self.settings.master_volume, Settings::default().master_volume),
             SettingsRow::SfxVolume => volume_percent(self.settings.sfx_volume, Settings::default().sfx_volume),
             SettingsRow::MusicVolume => volume_percent(self.settings.music_volume, Settings::default().music_volume),
+            SettingsRow::Keybind(action) => self
+                .settings
+                .keybinds
+                .binding(action)
+                .map_or_else(|| "unbound".to_string(), |key| key.label().to_string()),
+            SettingsRow::ResetKeybinds => "Defaults".to_string(),
+            SettingsRow::ReducedMotion => checkbox(self.settings.reduced_motion),
         }
     }
 
@@ -1813,7 +1889,7 @@ impl UiState {
                 }
             }
             SettingsRow::ShowHud => {
-                self.hud_visible = !self.hud_visible;
+                self.toggle_hud();
                 true
             }
             SettingsRow::DebugOverlay => {
@@ -1897,7 +1973,11 @@ impl UiState {
             SettingsRow::MusicVolume => {
                 adjust_volume(&mut self.settings.music_volume, delta, Settings::default().music_volume)
             }
-            SettingsRow::MeshWorkers => false,
+            SettingsRow::ReducedMotion => {
+                self.settings.reduced_motion = !self.settings.reduced_motion;
+                true
+            }
+            SettingsRow::MeshWorkers | SettingsRow::Keybind(_) | SettingsRow::ResetKeybinds => false,
             SettingsRow::TextureStyle => {
                 let index = TextureStyle::ALL
                     .iter()
@@ -1932,7 +2012,91 @@ impl UiState {
         if !self.settings_row_enabled(row) || row.kind() == SettingsRowKind::ReadOnly {
             return None;
         }
-        self.settings_adjust(1).map(SettingsAction::Adjust)
+        match row {
+            SettingsRow::Keybind(action) => Some(SettingsAction::BeginBind(action)),
+            SettingsRow::ResetKeybinds => Some(SettingsAction::ResetKeybinds),
+            _ => self.settings_adjust(1).map(SettingsAction::Adjust),
+        }
+    }
+
+    /// Starts capturing a key or mouse button for `action`.
+    ///
+    /// Refused while a text field owns the keyboard; the message explains why.
+    pub fn begin_bind(&mut self, action: Action) -> bool {
+        if self.text_input_active {
+            self.binding_message = Some(KeybindError::TextInputActive.to_string());
+            self.binding_message_error = true;
+            return false;
+        }
+        self.bind_capture = Some(action);
+        self.binding_message = Some(format!(
+            "Press a key or mouse button for '{}' - Esc cancels.",
+            action.label()
+        ));
+        self.binding_message_error = false;
+        true
+    }
+
+    /// Cancels an in-progress capture and clears its feedback.
+    pub fn cancel_bind(&mut self) {
+        self.bind_capture = None;
+        self.binding_message = None;
+        self.binding_message_error = false;
+    }
+
+    /// Applies the captured key to the action waiting for it.
+    ///
+    /// Returns the rejection reason on a conflict, leaving capture active so the
+    /// player can simply try another key.
+    pub fn apply_bind(&mut self, key: BindKey) -> Result<(), KeybindError> {
+        let Some(action) = self.bind_capture else {
+            return Err(KeybindError::Invalid);
+        };
+        match self.settings.keybinds.rebind(action, key) {
+            Ok(()) => {
+                self.bind_capture = None;
+                self.binding_message = Some(format!("Bound '{}' to {}.", action.label(), key.label()));
+                self.binding_message_error = false;
+                Ok(())
+            }
+            Err(error) => {
+                self.binding_message = Some(error.to_string());
+                self.binding_message_error = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// Clears the binding of the action currently capturing, or of the focused
+    /// binding row when no capture is active.
+    pub fn clear_binding(&mut self) -> Option<Action> {
+        let action = self.bind_capture.or_else(|| match self.settings_focused_row() {
+            Some(SettingsRow::Keybind(action)) => Some(action),
+            _ => None,
+        })?;
+        if self.settings.keybinds.clear(action) {
+            self.bind_capture = None;
+            self.binding_message = Some(format!("Cleared the binding for '{}'.", action.label()));
+            self.binding_message_error = false;
+            Some(action)
+        } else {
+            self.binding_message = Some(format!("'{}' is already unbound.", action.label()));
+            self.binding_message_error = false;
+            None
+        }
+    }
+
+    /// Restores every factory binding.
+    pub fn reset_keybinds(&mut self) {
+        self.settings.keybinds.reset_defaults();
+        self.bind_capture = None;
+        self.binding_message = Some("Controls reset to their default keys.".to_string());
+        self.binding_message_error = false;
+    }
+
+    /// Action currently waiting for capture, if any.
+    pub fn binding_action(&self) -> Option<Action> {
+        self.bind_capture
     }
 
     /// Updates hover highlights and mouse row/button focus from [`Self::cursor`].
@@ -1999,11 +2163,31 @@ impl UiState {
     }
 
     /// Row hit rectangles for the active tab and target size.
+    ///
+    /// The Controls tab lays its 18 entries out in two columns so every action
+    /// fits above the footer buttons; other tabs use the single-column list.
     pub fn settings_row_rects(&self, screen: [f32; 2]) -> Vec<UiRect> {
         let panel = settings_panel_rect(screen);
         let start_y = panel.y + SETTINGS_CONTENT_TOP;
-        self.settings_rows()
-            .iter()
+        let rows = self.settings_rows();
+        if self.settings_tab == SettingsTab::Controls && !rows.is_empty() {
+            let count = rows.len();
+            let per_column = count.div_ceil(2);
+            let column_width = (panel.w - SETTINGS_MARGIN * 2.0 - SETTINGS_CONTROLS_COLUMN_GAP) / 2.0;
+            return (0..count)
+                .map(|index| {
+                    let column = index / per_column;
+                    let row = index % per_column;
+                    UiRect::new(
+                        panel.x + SETTINGS_MARGIN + column as f32 * (column_width + SETTINGS_CONTROLS_COLUMN_GAP),
+                        start_y + row as f32 * SETTINGS_CONTROLS_ROW_STEP,
+                        column_width,
+                        SETTINGS_CONTROLS_ROW_HEIGHT,
+                    )
+                })
+                .collect();
+        }
+        rows.iter()
             .enumerate()
             .map(|(index, _)| {
                 UiRect::new(
@@ -2258,14 +2442,17 @@ pub fn draw_settings_screen(frame: &mut UiFrame, ui: &UiState, info: &SettingsIn
             draw_settings_rows(frame, ui, &rows, &row_rects, screen);
             draw_audio_status(frame, info, panel, rows.len());
         }
-        SettingsTab::Controls => draw_controls_reference(frame, panel),
+        SettingsTab::Controls => {
+            draw_settings_rows(frame, ui, &rows, &row_rects, screen);
+            draw_controls_help(frame, ui, panel, &row_rects);
+        }
         SettingsTab::Textures => {
             draw_settings_rows(frame, ui, &rows, &row_rects, screen);
             draw_texture_source(frame, info, panel, rows.len());
         }
     }
     draw_settings_buttons(frame, ui, screen);
-    draw_settings_footer(frame, panel);
+    draw_settings_footer(frame, panel, ui.settings_tab);
 }
 
 fn draw_settings_panel(frame: &mut UiFrame, panel: UiRect) {
@@ -2355,12 +2542,13 @@ fn draw_settings_rows(frame: &mut UiFrame, ui: &UiState, rows: &[SettingsRowInfo
         } else {
             [0.50, 0.55, 0.63, 1.0]
         };
-        frame.text(rect.x + 16.0, rect.y + 11.0, 1.5, label_color, info.label);
+        let label_y = rect.y + (rect.h - ob_render::line_height(1.35)) / 2.0;
+        frame.text(rect.x + 16.0, label_y, 1.35, label_color, info.label);
         let row_arrows = arrows.get(index).copied().flatten();
         let value_right = row_arrows.map_or(rect.x + rect.w - 14.0, |(left, _)| left.x - SETTINGS_VALUE_GAP);
         let value_color = settings_value_color(info);
-        let value_width = frame.text_width(1.35, &info.value);
-        frame.text(value_right - value_width, rect.y + 11.0, 1.35, value_color, &info.value);
+        let value_width = frame.text_width(1.25, &info.value);
+        frame.text(value_right - value_width, label_y, 1.25, value_color, &info.value);
         if let Some((left, right)) = row_arrows {
             let left_active = ui.settings_can_adjust(info.row, -1);
             let right_active = ui.settings_can_adjust(info.row, 1);
@@ -2450,6 +2638,15 @@ fn draw_game_summary(frame: &mut UiFrame, ui: &UiState, info: &SettingsInfo, pan
         [0.90, 0.94, 0.99, 1.0],
         &text,
     );
+    if ui.host_optional {
+        frame.text(
+            x,
+            y + SETTINGS_SUMMARY_HEIGHT + 12.0,
+            1.05,
+            [0.96, 0.80, 0.42, 1.0],
+            "No world loaded: game mode is chosen when you start a world.",
+        );
+    }
 }
 
 fn draw_texture_source(frame: &mut UiFrame, info: &SettingsInfo, panel: UiRect, row_count: usize) {
@@ -2508,47 +2705,44 @@ fn draw_audio_status(frame: &mut UiFrame, info: &SettingsInfo, panel: UiRect, ro
     );
 }
 
-fn draw_controls_reference(frame: &mut UiFrame, panel: UiRect) {
-    let columns = controls_reference_columns();
-    let top = panel.y + SETTINGS_CONTENT_TOP;
-    let column_x = [panel.x + SETTINGS_MARGIN + 8.0, panel.x + panel.w / 2.0 + 8.0];
-    let mut last_y = top;
-    for (column, bindings) in columns.iter().enumerate() {
-        for (index, binding) in bindings.iter().enumerate() {
-            let y = top + index as f32 * SETTINGS_CONTROLS_ROW_STEP;
-            last_y = last_y.max(y);
-            frame.text(column_x[column], y, 1.1, [0.96, 0.80, 0.42, 1.0], binding.keys);
-            frame.text(
-                column_x[column] + 104.0,
-                y,
-                1.1,
-                [0.83, 0.88, 0.95, 1.0],
-                binding.action,
-            );
-        }
-    }
-    let note_y = last_y + SETTINGS_CONTROLS_TEXT_HEIGHT + 22.0;
+fn draw_controls_help(frame: &mut UiFrame, ui: &UiState, panel: UiRect, rects: &[UiRect]) {
+    let top = rects
+        .last()
+        .map_or(panel.y + SETTINGS_CONTENT_TOP, |rect| rect.y + rect.h)
+        + 8.0;
+    let x = panel.x + SETTINGS_MARGIN;
+    let (message, color) = if let Some(action) = ui.binding_action() {
+        (
+            format!("Press a key or mouse button for '{}' - Esc cancels.", action.label()),
+            [0.98, 0.83, 0.44, 1.0],
+        )
+    } else if let Some(message) = &ui.binding_message {
+        (
+            message.clone(),
+            if ui.binding_message_error {
+                [1.0, 0.66, 0.56, 1.0]
+            } else {
+                [0.72, 0.93, 0.55, 1.0]
+            },
+        )
+    } else {
+        (
+            "Bindings apply immediately and save automatically.".to_string(),
+            [0.62, 0.68, 0.76, 1.0],
+        )
+    };
     frame.rect(
-        panel.x + SETTINGS_MARGIN,
-        note_y - 12.0,
+        x,
+        top - 6.0,
         panel.w - SETTINGS_MARGIN * 2.0,
         1.0,
         [0.19, 0.23, 0.29, 0.9],
     );
-    frame.text(
-        panel.x + SETTINGS_MARGIN,
-        note_y,
-        1.2,
-        [0.96, 0.80, 0.42, 1.0],
-        SETTINGS_PERSISTENCE_NOTE,
-    );
-    frame.text(
-        panel.x + SETTINGS_MARGIN,
-        note_y + 16.0,
-        1.2,
-        [0.72, 0.84, 0.98, 1.0],
-        SETTINGS_AUDIO_NOTE,
-    );
+    frame.text(x, top, 1.0, color, &message);
+    let conflicts = ui.settings.keybinds.conflict_lines();
+    if !conflicts.is_empty() {
+        frame.text(x, top + 14.0, 1.0, [1.0, 0.66, 0.56, 1.0], &conflicts[0]);
+    }
 }
 
 fn draw_settings_buttons(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2]) {
@@ -2586,7 +2780,7 @@ fn draw_settings_buttons(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2]) {
     }
 }
 
-fn draw_settings_footer(frame: &mut UiFrame, panel: UiRect) {
+fn draw_settings_footer(frame: &mut UiFrame, panel: UiRect, tab: SettingsTab) {
     let separator_y = panel.y + panel.h - SETTINGS_FOOTER_Y_FROM_BOTTOM;
     frame.rect(
         panel.x + SETTINGS_MARGIN,
@@ -2596,7 +2790,12 @@ fn draw_settings_footer(frame: &mut UiFrame, panel: UiRect) {
         [0.24, 0.28, 0.35, 1.0],
     );
     let hint_y = panel.y + panel.h - SETTINGS_HINT_Y_FROM_BOTTOM;
-    for (index, line) in SETTINGS_HINT_LINES.iter().enumerate() {
+    let lines = if tab == SettingsTab::Controls {
+        SETTINGS_CONTROLS_HINT_LINES
+    } else {
+        SETTINGS_HINT_LINES
+    };
+    for (index, line) in lines.iter().enumerate() {
         frame.text_centered(
             panel.x + panel.w / 2.0,
             hint_y + index as f32 * SETTINGS_HINT_STEP,
@@ -3231,8 +3430,8 @@ mod tests {
         assert_eq!(state.settings_focused_button(), None);
 
         state.settings_select_tab(SettingsTab::Display);
-        assert_eq!(state.settings_focus_count(), 7);
-        state.settings_selected_row = 6;
+        assert_eq!(state.settings_focus_count(), 8);
+        state.settings_selected_row = 7;
         assert_eq!(state.settings_focused_button(), Some(SettingsButton::SaveAndQuit));
         state.settings_row_down();
         assert_eq!(state.settings_selected_row, 0);
@@ -3246,13 +3445,19 @@ mod tests {
         assert_eq!(state.settings_focused_row(), Some(SettingsRow::MasterVolume));
 
         state.settings_select_tab(SettingsTab::Controls);
-        assert!(state.settings_rows().is_empty());
-        assert_eq!(state.settings_focus_count(), 2);
-        assert_eq!(state.settings_focused_button(), Some(SettingsButton::Resume));
+        assert_eq!(state.settings_rows().len(), Action::ALL.len() + 1);
+        assert_eq!(state.settings_focus_count(), Action::ALL.len() + 3);
+        assert_eq!(
+            state.settings_focused_row(),
+            Some(SettingsRow::Keybind(Action::MoveForward))
+        );
         state.settings_row_up();
         assert_eq!(state.settings_focused_button(), Some(SettingsButton::SaveAndQuit));
         state.settings_row_down();
-        assert_eq!(state.settings_focused_button(), Some(SettingsButton::Resume));
+        assert_eq!(
+            state.settings_focused_row(),
+            Some(SettingsRow::Keybind(Action::MoveForward))
+        );
     }
 
     #[test]
@@ -3401,8 +3606,10 @@ mod tests {
         state.settings_selected_row = 1;
         assert_eq!(state.settings_adjust(1), Some(SettingsRow::ShowHud));
         assert!(!state.hud_visible);
+        assert!(!state.settings.show_hud, "the HUD preference is persisted");
         assert_eq!(state.settings_adjust(-1), Some(SettingsRow::ShowHud));
         assert!(state.hud_visible);
+        assert!(state.settings.show_hud);
 
         state.settings_selected_row = 2;
         assert_eq!(state.settings_adjust(1), Some(SettingsRow::DebugOverlay));
@@ -3418,6 +3625,11 @@ mod tests {
         assert_eq!(state.settings_adjust(1), Some(SettingsRow::Fullscreen));
         assert!(state.settings.fullscreen);
         state.settings_selected_row = 4;
+        assert_eq!(state.settings_focused_row(), Some(SettingsRow::ReducedMotion));
+        assert!(!state.settings.reduced_motion);
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::ReducedMotion));
+        assert!(state.settings.reduced_motion);
+        state.settings_selected_row = 5;
         assert_eq!(state.settings_focused_row(), Some(SettingsRow::MeshWorkers));
         assert_eq!(state.settings_adjust(1), None);
         assert_eq!(state.settings_activate(), None);
@@ -3471,7 +3683,7 @@ mod tests {
         assert_eq!(state.settings_tab, SettingsTab::Display);
 
         let rows = state.settings_row_rects(screen);
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 6);
         state.cursor = rows[3].center();
         assert_eq!(
             state.settings_click(screen),
@@ -3563,6 +3775,11 @@ mod tests {
                 state.settings_select_tab(tab);
                 let rows = state.settings_row_rects(screen);
                 for pair in rows.windows(2) {
+                    if pair[1].y <= pair[0].y {
+                        // Two-column Controls layout: the next entry starts
+                        // back at the top of the second column.
+                        continue;
+                    }
                     let pitch = pair[1].y - pair[0].y;
                     assert!(
                         pitch >= ob_render::line_height(1.5) + 4.0,
@@ -3592,11 +3809,11 @@ mod tests {
             }
         }
         assert!(SETTINGS_CONTROLS_ROW_STEP >= ob_render::line_height(1.1) + 4.0);
+        let controls_rows = Action::ALL.len().div_ceil(2);
         let controls_note_bottom = SETTINGS_CONTENT_TOP
-            + 6.0 * SETTINGS_CONTROLS_ROW_STEP
-            + SETTINGS_CONTROLS_TEXT_HEIGHT
-            + 22.0
-            + ob_render::line_height(1.2);
+            + (controls_rows - 1) as f32 * SETTINGS_CONTROLS_ROW_STEP
+            + SETTINGS_CONTROLS_ROW_HEIGHT
+            + 16.0;
         assert!(
             controls_note_bottom <= SETTINGS_PANEL_HEIGHT - 116.0,
             "the Controls note must clear the footer buttons"
@@ -3611,12 +3828,13 @@ mod tests {
         let screen = [1280.0, 720.0];
         let rows = state.settings_row_rects(screen);
         let arrows = state.settings_arrow_rects(screen);
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 6);
         assert!(arrows[0].is_some(), "render distance is a range");
         assert!(arrows[1].is_some(), "FOV is a range");
         assert!(arrows[2].is_some(), "sensitivity is a range");
         assert!(arrows[3].is_none(), "fullscreen is a toggle");
-        assert!(arrows[4].is_none(), "mesh workers is read-only");
+        assert!(arrows[4].is_none(), "reduced motion is a toggle");
+        assert!(arrows[5].is_none(), "mesh workers is read-only");
         let (left, right) = arrows[0].expect("render distance arrows");
         assert!(left.x + left.w < right.x, "arrows must not touch");
         assert!(right.x + right.w <= rows[0].x + rows[0].w);
@@ -3656,7 +3874,7 @@ mod tests {
             Some(SettingsAction::Adjust(SettingsRow::RenderDistance))
         );
         assert_eq!(state.settings.render_distance_chunks, 6, "right arrow increments");
-        state.cursor = rows[4].center();
+        state.cursor = rows[5].center();
         assert_eq!(
             state.settings_click(screen),
             None,
@@ -4329,6 +4547,117 @@ mod tests {
         draw_toasts(&mut frame, &toasts, [1280.0, 720.0]);
         let (_, quads) = frame.measure();
         assert!(quads >= MAX_TOASTS * 2);
+    }
+
+    #[test]
+    fn controls_tab_rebinds_rejects_duplicates_and_resets() {
+        use ob_core::config::{BindKey, KeyName};
+
+        let mut state = UiState::default();
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Controls);
+        let action = match state.settings_activate() {
+            Some(SettingsAction::BeginBind(action)) => action,
+            other => panic!("expected BeginBind, got {other:?}"),
+        };
+        assert_eq!(action, Action::MoveForward);
+        assert!(state.begin_bind(action));
+        assert_eq!(state.binding_action(), Some(Action::MoveForward));
+        assert_eq!(
+            state.apply_bind(BindKey::Key(KeyName::KeyQ)),
+            Ok(()),
+            "a free key binds"
+        );
+        assert_eq!(
+            state.settings.keybinds.binding(Action::MoveForward),
+            Some(BindKey::Key(KeyName::KeyQ))
+        );
+        assert_eq!(state.binding_action(), None);
+        assert!(!state.binding_message_error);
+
+        // Rebinding Jump to the same key is a conflict and keeps capture open.
+        assert!(state.begin_bind(Action::Jump));
+        assert_eq!(
+            state.apply_bind(BindKey::Key(KeyName::KeyQ)),
+            Err(KeybindError::Duplicate {
+                action: Action::MoveForward
+            })
+        );
+        assert_eq!(state.binding_action(), Some(Action::Jump));
+        assert!(state.binding_message_error);
+        state.cancel_bind();
+        assert_eq!(state.binding_action(), None);
+        assert_eq!(state.binding_message, None);
+
+        // Clearing the focused binding row removes it.
+        state.settings_selected_row = 0;
+        assert_eq!(state.clear_binding(), Some(Action::MoveForward));
+        assert_eq!(state.settings.keybinds.binding(Action::MoveForward), None);
+        assert_eq!(
+            state.settings_row_value(SettingsRow::Keybind(Action::MoveForward), &SettingsInfo::default()),
+            "unbound"
+        );
+
+        state.reset_keybinds();
+        assert!(state.settings.keybinds.is_default());
+        assert!(!state.binding_message_error);
+        assert_eq!(
+            state.settings.keybinds.binding(Action::MoveForward),
+            Some(BindKey::Key(KeyName::KeyW))
+        );
+
+        // A text field suppresses capture instead of stealing its keystrokes.
+        state.text_input_active = true;
+        assert!(!state.begin_bind(Action::Jump));
+        assert_eq!(state.binding_action(), None);
+        assert!(state.binding_message_error);
+    }
+
+    #[test]
+    fn host_optional_settings_disable_game_mode_without_hiding_other_rows() {
+        let mut state = UiState {
+            host_optional: true,
+            ..UiState::default()
+        };
+        state.open_settings();
+        assert!(!state.settings_row_enabled(SettingsRow::GameMode));
+        assert!(!state.settings_can_adjust(SettingsRow::GameMode, 1));
+        assert_eq!(state.settings_activate(), None);
+        assert!(state.settings_row_enabled(SettingsRow::RenderDistance));
+        assert!(state.settings_row_enabled(SettingsRow::ReducedMotion));
+        let info = SettingsInfo::default();
+        assert_eq!(
+            state.settings_row_value(SettingsRow::GameMode, &info),
+            "Survival",
+            "the value is still shown, only the row is disabled"
+        );
+        let mut frame = UiFrame::new(1280.0, 720.0);
+        draw_settings_screen(&mut frame, &state, &info, [1280.0, 720.0]);
+        let (_, quads) = frame.measure();
+        assert!(quads > 0);
+    }
+
+    #[test]
+    fn reduced_motion_is_a_display_toggle_and_round_trips() {
+        let mut state = UiState::default();
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Display);
+        state.settings_selected_row = 4;
+        assert_eq!(state.settings_focused_row(), Some(SettingsRow::ReducedMotion));
+        assert_eq!(
+            state.settings_activate(),
+            Some(SettingsAction::Adjust(SettingsRow::ReducedMotion))
+        );
+        assert!(state.settings.reduced_motion);
+        assert_eq!(
+            state.settings_row_value(SettingsRow::ReducedMotion, &SettingsInfo::default()),
+            "[x]"
+        );
+        assert_eq!(
+            state.settings_activate(),
+            Some(SettingsAction::Adjust(SettingsRow::ReducedMotion))
+        );
+        assert!(!state.settings.reduced_motion);
     }
 
     #[test]

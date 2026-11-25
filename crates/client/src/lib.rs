@@ -19,7 +19,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ob_audio::{AudioEngine, Material as AudioMaterial, Sfx as AudioSfx};
 use ob_content::{ArmorSlot, BlockId, MobKind, Registry};
-use ob_core::config::{GameMode as SettingsGameMode, Settings, TextureStyle, load_settings, save_settings};
+use ob_core::config::{
+    Action, BindKey, GameMode as SettingsGameMode, KeyName, Settings, TextureStyle, load_settings, save_settings,
+};
 use ob_math::{BlockPos, ChunkPos, SEA_LEVEL, SectionPos, WorldVec};
 use ob_render::{
     BlockOutline, Camera, DAY_LENGTH_TICKS, EntityInstance, Environment, OffscreenRenderer, Renderer, SceneParams,
@@ -39,10 +41,13 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 pub mod containers;
 pub mod crafting;
+pub mod frontend;
 pub mod inventory;
+mod menu_app;
 pub mod mesh_scheduler;
 pub mod mining;
 pub mod mobs;
+pub mod name_tags;
 pub mod net;
 mod net_app;
 pub mod net_state;
@@ -149,6 +154,25 @@ pub struct ClientOptions {
     pub connect: Option<String>,
     /// Requested multiplayer player name; `None` chooses `playerNNNN` at start.
     pub name: Option<String>,
+    /// Force the title screen even when a bypassing flag (such as --data-dir)
+    /// was supplied. `--title` / `--menu`.
+    pub force_title: bool,
+    /// Render the title screen offscreen with deterministic temporary data.
+    pub screenshot_title: bool,
+    /// Render the world list offscreen with deterministic temporary worlds.
+    pub screenshot_worlds: bool,
+    /// Render the multiplayer form offscreen with deterministic recent servers.
+    pub screenshot_connect: bool,
+    /// Render the new-world form offscreen.
+    pub screenshot_new_world: bool,
+    /// Render the host-optional settings screen offscreen.
+    pub screenshot_settings_title: bool,
+    /// Whether `--world` was passed explicitly (the title is bypassed).
+    pub saw_world: bool,
+    /// Whether `--seed` was passed explicitly (the title is bypassed).
+    pub saw_seed: bool,
+    /// Whether `--data-dir` was passed explicitly (the title is bypassed).
+    pub saw_data_dir: bool,
 }
 
 impl Default for ClientOptions {
@@ -182,6 +206,15 @@ impl Default for ClientOptions {
             mute: false,
             connect: None,
             name: None,
+            force_title: false,
+            screenshot_title: false,
+            screenshot_worlds: false,
+            screenshot_connect: false,
+            screenshot_new_world: false,
+            screenshot_settings_title: false,
+            saw_world: false,
+            saw_seed: false,
+            saw_data_dir: false,
         }
     }
 }
@@ -195,7 +228,14 @@ fn default_mesh_workers() -> usize {
 }
 
 /// Runs the client until the window closes, or writes a single screenshot and exits.
+///
+/// Explicit world/seed/data-dir/connect/screenshot flags preserve the pre-menu
+/// behaviour and bypass the title. A plain launch opens the front-end, which
+/// returns a world or multiplayer choice and then starts the matching runtime.
 pub fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(mode) = menu_screenshot_mode(&options) {
+        return menu_app::screenshot_menu(&options, mode);
+    }
     if options.connect.is_some() {
         return net_app::run(options);
     }
@@ -222,21 +262,78 @@ pub fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
         };
         return screenshot_with_mode(&options, path, mode);
     }
+    if should_show_title(&options) {
+        let event_loop = build_event_loop(&options)?;
+        event_loop.set_control_flow(ControlFlow::Poll);
+        let mut app = RootApp::new(options);
+        event_loop.run_app(&mut app)?;
+        return Ok(());
+    }
+    run_world(options)
+}
+
+/// Builds the process-wide winit event loop. Only one may exist at a time.
+fn build_event_loop(options: &ClientOptions) -> Result<EventLoop<()>, Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
-    let event_loop = {
+    {
         use winit::platform::x11::EventLoopBuilderExtX11;
         let mut builder = EventLoop::builder();
         if options.force_x11 || std::env::var_os("OPENBLOCK_X11").is_some() {
             builder.with_x11();
         }
-        builder.build()?
-    };
+        Ok(builder.build()?)
+    }
     #[cfg(not(target_os = "linux"))]
-    let event_loop = EventLoop::builder().build()?;
+    {
+        Ok(EventLoop::builder().build()?)
+    }
+}
+
+/// Runs the single-player window event loop for an already chosen world.
+fn run_world(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let event_loop = build_event_loop(&options)?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(options);
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+/// Whether a normal launch should open the title screen.
+///
+/// Any explicit world/seed/data-dir/connect or screenshot flag bypasses the
+/// front-end exactly as it did before the title screen existed. `--title`/
+/// `--menu` forces it back on for screenshots and debugging.
+pub fn should_show_title(options: &ClientOptions) -> bool {
+    if options.force_title {
+        return true;
+    }
+    !options.saw_world
+        && !options.saw_seed
+        && !options.saw_data_dir
+        && options.connect.is_none()
+        && options.screenshot.is_none()
+        && options.screenshot_inventory.is_none()
+        && !options.screenshot_title
+        && !options.screenshot_worlds
+        && !options.screenshot_connect
+        && !options.screenshot_new_world
+        && !options.screenshot_settings_title
+}
+
+/// Which front-end screen an offscreen screenshot should render.
+pub fn menu_screenshot_mode(options: &ClientOptions) -> Option<menu_app::MenuScreenshot> {
+    let modes = [
+        (options.screenshot_title, menu_app::MenuScreenshot::Title),
+        (options.screenshot_new_world, menu_app::MenuScreenshot::NewWorld),
+        (options.screenshot_worlds, menu_app::MenuScreenshot::Worlds),
+        (options.screenshot_connect, menu_app::MenuScreenshot::Multiplayer),
+        (options.screenshot_settings_title, menu_app::MenuScreenshot::Settings),
+    ];
+    let selected: Vec<_> = modes
+        .into_iter()
+        .filter_map(|(enabled, mode)| enabled.then_some(mode))
+        .collect();
+    selected.first().copied()
 }
 
 /// Which UI overlay an offscreen screenshot should compose.
@@ -298,6 +395,116 @@ pub fn screenshot_network_demo(
     let result = screenshot_network_demo_inner(path, debug_path, seed, &registry, &data_dir);
     let _ = std::fs::remove_dir_all(&data_dir);
     result
+}
+
+/// Renders a synthetic multiplayer name-tag probe over a real single-player
+/// world. The fake remote players exercise the same camera projection, distance
+/// fade and overlap culling the network runtime uses, without needing a second
+/// live connection. Used only by an ignored screenshot probe.
+#[doc(hidden)]
+pub fn screenshot_name_tags_demo(path: &Path, seed: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let registry = Arc::new(Registry::base());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let data_dir = std::env::temp_dir().join(format!("openblock-name-tags-shot-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&data_dir)?;
+    let result = screenshot_name_tags_demo_inner(path, seed, &registry, &data_dir);
+    let _ = std::fs::remove_dir_all(&data_dir);
+    result
+}
+
+fn screenshot_name_tags_demo_inner(
+    path: &Path,
+    seed: u64,
+    registry: &Arc<Registry>,
+    data_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut host = Host::open(
+        Arc::clone(registry),
+        HostConfig {
+            seed,
+            world_name: "name-tags-demo".to_string(),
+            data_dir: Some(data_dir.to_path_buf()),
+            render_distance_chunks: 4,
+            generate_budget: GENERATE_BUDGET,
+        },
+    )?;
+    let mut steps = 0;
+    loop {
+        if host.ensure_streaming(SCREENSHOT_STREAM_BUDGET) == 0 {
+            break;
+        }
+        steps += 1;
+        if steps >= SCREENSHOT_STREAM_GUARD {
+            break;
+        }
+    }
+    host.set_game_mode(HostGameMode::Survival);
+    seed_screenshot_items(&mut host, registry);
+    let mut options = ClientOptions {
+        seed,
+        data_dir: Some(data_dir.to_path_buf()),
+        no_audio: true,
+        render_distance_chunks: 4,
+        ..ClientOptions::default()
+    };
+    options.game_mode = Some(SettingsGameMode::Survival);
+    let (settings, _) = effective_settings(&options);
+    let (mut renderer, _texture_source) = create_offscreen_renderer(&options, &settings)?;
+    let player = host.player();
+    let eye = player.eye();
+    let mut camera = Camera::new(eye, player.yaw, player.pitch);
+    camera.fov_y = settings.fov_degrees.to_radians();
+    camera.far = 256.0;
+    let forward = camera.forward();
+    let right = camera.right();
+    let at = |distance: f32, offset: f32| -> [f64; 3] {
+        let x = eye.x + f64::from(forward[0]) * f64::from(distance) + f64::from(right[0]) * f64::from(offset);
+        let y = eye.y + f64::from(forward[1]) * f64::from(distance) + f64::from(right[1]) * f64::from(offset);
+        let z = eye.z + f64::from(forward[2]) * f64::from(distance) + f64::from(right[2]) * f64::from(offset);
+        [x, y - 1.6, z]
+    };
+    let players = [
+        (1_u64, "alice", at(7.0, -2.2)),
+        (2, "bob", at(13.0, 2.6)),
+        (3, "carol", at(27.0, 0.6)),
+        (4, "dave_far", at(54.0, 0.0)),
+    ];
+    let screen = [SCREENSHOT_WIDTH as f32, SCREENSHOT_HEIGHT as f32];
+    let tags = name_tags::project_name_tags(&camera, screen, &players, name_tags::NAME_TAG_MAX_DISTANCE);
+    let mut frame = UiFrame::new(screen[0], screen[1]);
+    let centre_x = screen[0] / 2.0;
+    let centre_y = screen[1] / 2.0;
+    let cross = [0.95, 0.97, 1.0, 0.85];
+    frame.rect(centre_x - 1.0, centre_y - 9.0, 2.0, 18.0, cross);
+    frame.rect(centre_x - 9.0, centre_y - 1.0, 18.0, 2.0, cross);
+    draw_vitals_for_mode(&mut frame, &UiState::from_settings(settings.clone()), &host, screen);
+    let mut ui = UiState::from_settings(settings.clone());
+    draw_hotbar_for_mode(&mut frame, &ui, registry, &host, screen);
+    ui.toasts.push("Name tags: nearest-first, distance-faded");
+    ui_state::draw_toasts(&mut frame, &ui.toasts, screen);
+    name_tags::draw_name_tags(&mut frame, &tags, screen);
+    let environment = Environment::default();
+    renderer.render_world_scene(
+        host.world(),
+        &camera,
+        &SceneParams {
+            environment,
+            ui: Some(&frame),
+            outline: None,
+        },
+    )?;
+    let rgba = renderer.read_rgba();
+    write_png(path, SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT, &rgba)?;
+    log::info!(
+        "name-tag screenshot written to {} ({} projected, {} culled by distance/overlap)",
+        path.display(),
+        tags.len(),
+        players.len().saturating_sub(tags.len())
+    );
+    Ok(())
 }
 
 fn screenshot_network_demo_inner(
@@ -883,6 +1090,10 @@ fn screenshot_with_mode(
             ui.open_settings();
             if let Some(tab) = options.screenshot_settings_tab {
                 ui.settings_select_tab(tab);
+            }
+            if ui.settings_tab == SettingsTab::Controls {
+                // Show the capture affordance rather than an idle list.
+                ui.begin_bind(Action::Jump);
             }
             let info = SettingsInfo {
                 health: host.player().health,
@@ -1725,6 +1936,113 @@ fn draw_creative_hotbar(frame: &mut UiFrame, ui: &UiState, registry: &Registry, 
     }
 }
 
+/// Top-level handler for the menu launch path.
+///
+/// winit allows exactly one `EventLoop` per process, so the front-end cannot
+/// create its own loop and hand off to `App`/`NetApp` through a second one.
+/// This router owns the single loop and swaps the active application handler
+/// when the menu returns a world or server choice. Each runtime still creates
+/// its own window in its `resumed` method; windows are cheap and independent.
+enum RootState {
+    Menu(Box<menu_app::MenuApp>),
+    World(Box<App>),
+    Network(Box<net_app::NetApp>),
+    Empty,
+}
+
+struct RootApp {
+    options: ClientOptions,
+    state: RootState,
+}
+
+impl RootApp {
+    fn new(options: ClientOptions) -> Self {
+        Self {
+            options: options.clone(),
+            state: RootState::Menu(Box::new(menu_app::MenuApp::new(options))),
+        }
+    }
+
+    fn dispatch_resumed(&mut self, event_loop: &ActiveEventLoop) {
+        match &mut self.state {
+            RootState::Menu(menu) => menu.resumed(event_loop),
+            RootState::World(app) => app.resumed(event_loop),
+            RootState::Network(net) => net.resumed(event_loop),
+            RootState::Empty => {}
+        }
+    }
+
+    /// Applies a pending front-end choice inside the existing event loop.
+    fn transition(&mut self, event_loop: &ActiveEventLoop) {
+        let outcome = match &mut self.state {
+            RootState::Menu(menu) => menu.take_outcome(),
+            _ => None,
+        };
+        let Some(outcome) = outcome else {
+            return;
+        };
+        match outcome {
+            menu_app::MenuOutcome::Quit => {
+                self.state = RootState::Empty;
+                event_loop.exit();
+            }
+            menu_app::MenuOutcome::PlayWorld { world, seed } => {
+                self.options.world = world;
+                self.options.seed = seed;
+                self.options.force_title = false;
+                self.options.saw_world = true;
+                self.options.saw_seed = true;
+                self.options.connect = None;
+                self.state = RootState::World(Box::new(App::new(self.options.clone())));
+                self.dispatch_resumed(event_loop);
+            }
+            menu_app::MenuOutcome::Connect { address, name } => {
+                self.options.connect = Some(address);
+                self.options.name = Some(name);
+                self.options.force_title = false;
+                self.state = RootState::Network(Box::new(net_app::NetApp::new(self.options.clone())));
+                self.dispatch_resumed(event_loop);
+            }
+        }
+    }
+}
+
+impl ApplicationHandler for RootApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        self.dispatch_resumed(event_loop);
+        self.transition(event_loop);
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
+        match &mut self.state {
+            RootState::Menu(menu) => menu.window_event(event_loop, window_id, event),
+            RootState::World(app) => app.window_event(event_loop, window_id, event),
+            RootState::Network(net) => net.window_event(event_loop, window_id, event),
+            RootState::Empty => {}
+        }
+        self.transition(event_loop);
+    }
+
+    fn device_event(&mut self, event_loop: &ActiveEventLoop, device_id: DeviceId, event: DeviceEvent) {
+        match &mut self.state {
+            RootState::Menu(menu) => menu.device_event(event_loop, device_id, event),
+            RootState::World(app) => app.device_event(event_loop, device_id, event),
+            RootState::Network(net) => net.device_event(event_loop, device_id, event),
+            RootState::Empty => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        match &mut self.state {
+            RootState::Menu(menu) => menu.about_to_wait(event_loop),
+            RootState::World(app) => app.about_to_wait(event_loop),
+            RootState::Network(net) => net.about_to_wait(event_loop),
+            RootState::Empty => {}
+        }
+        self.transition(event_loop);
+    }
+}
+
 struct App {
     options: ClientOptions,
     state: Option<GameState>,
@@ -2558,11 +2876,14 @@ impl GameState {
             SettingsRow::MasterVolume | SettingsRow::SfxVolume | SettingsRow::MusicVolume => {
                 self.sync_audio_settings();
             }
-            SettingsRow::ShowHud
+            SettingsRow::ReducedMotion
+            | SettingsRow::ShowHud
             | SettingsRow::DebugOverlay
             | SettingsRow::Fov
             | SettingsRow::MouseSensitivity
-            | SettingsRow::MeshWorkers => {}
+            | SettingsRow::MeshWorkers
+            | SettingsRow::Keybind(_)
+            | SettingsRow::ResetKeybinds => {}
         }
         // The settings screen promises that every change is saved immediately.
         self.persist_settings();
@@ -2586,6 +2907,15 @@ impl GameState {
             }
             SettingsAction::Adjust(row) => {
                 self.apply_settings_row(row);
+                false
+            }
+            SettingsAction::BeginBind(action) => {
+                self.ui.begin_bind(action);
+                false
+            }
+            SettingsAction::ResetKeybinds => {
+                self.ui.reset_keybinds();
+                self.persist_settings();
                 false
             }
         }
@@ -3101,14 +3431,15 @@ impl GameState {
         let alpha = (self.accumulator.as_secs_f32() / TICK.as_secs_f32()).clamp(0.0, 1.0);
         let eye = self.prev_eye.lerp(self.current_eye, alpha as f64);
         let player = self.host.player();
-        let shake = if self.camera_shake > 0.0 {
+        let shake = if !self.ui.settings.reduced_motion && self.camera_shake > 0.0 {
             (self.started.elapsed().as_secs_f32() * 72.0).sin() * self.camera_shake
         } else {
             0.0
         };
         let mut camera = Camera::new(eye, player.yaw, (player.pitch + shake).clamp(-1.5533, 1.5533));
-        // Sprinting slightly widens the FOV; crouching leaves it alone.
-        let target_fov = self.ui.settings.fov_degrees * if player.sprinting { 1.10 } else { 1.0 };
+        // Sprinting slightly widens the FOV; crouching leaves it alone. Reduced
+        // motion disables the pump entirely.
+        let target_fov = target_fov(&self.ui.settings, player.sprinting);
         let blend = 1.0 - (-dt.as_secs_f32() * 12.0).exp();
         self.current_fov += (target_fov - self.current_fov) * blend;
         camera.fov_y = self.current_fov.to_radians();
@@ -3887,6 +4218,10 @@ impl ApplicationHandler for App {
         let (mut settings, data_dir) = effective_settings(&self.options);
         persist_texture_pack_choice(&self.options, &mut settings, &data_dir);
         persist_game_mode_choice(&self.options, &mut settings, &data_dir);
+        // Continue on the title screen points at the most recently opened
+        // single-player world, including worlds started from the CLI.
+        menu_app::remember_last_world_choice(&data_dir, &self.options.world);
+        settings.last_world = Some(self.options.world.clone());
         let (renderer, texture_source) = match create_window_renderer(Arc::clone(&window), &self.options, &settings) {
             Ok(pair) => pair,
             Err(err) => {
@@ -4016,10 +4351,15 @@ impl ApplicationHandler for App {
         self.state = Some(state);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _window_id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+        // The menu router can swap handlers inside the same event loop; ignore
+        // late events addressed to the window that has already been dropped.
+        if state.window.id() != window_id {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 if let Err(err) = state.host.save() {
@@ -4037,148 +4377,212 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
-                if let PhysicalKey::Code(code) = event.physical_key {
+                let PhysicalKey::Code(code) = event.physical_key else {
+                    return;
+                };
+                if state.ui.screen == Screen::Settings {
+                    // Rebinding capture owns every key while it is active, so a
+                    // new binding can never trigger gameplay or UI navigation.
+                    if state.ui.bind_capture.is_some() {
+                        if pressed {
+                            match code {
+                                KeyCode::Escape => state.ui.cancel_bind(),
+                                KeyCode::Backspace | KeyCode::Delete => {
+                                    if state.ui.clear_binding().is_some() {
+                                        state.persist_settings();
+                                    }
+                                }
+                                _ => {
+                                    if let Some(key) = bind_key_for_code(code)
+                                        && state.ui.apply_bind(key).is_ok()
+                                    {
+                                        state.persist_settings();
+                                    }
+                                }
+                            }
+                        }
+                        state.update_title();
+                        return;
+                    }
+                    if pressed
+                        && matches!(code, KeyCode::Delete | KeyCode::Backspace)
+                        && state.ui.clear_binding().is_some()
+                    {
+                        state.persist_settings();
+                        state.update_title();
+                        return;
+                    }
                     match code {
-                        KeyCode::KeyW => state.keys[0] = pressed,
-                        KeyCode::KeyS => state.keys[1] = pressed,
-                        KeyCode::KeyA => state.keys[2] = pressed,
-                        KeyCode::KeyD => state.keys[3] = pressed,
-                        KeyCode::Space => state.keys[4] = pressed,
-                        KeyCode::ShiftLeft => state.keys[5] = pressed,
-                        KeyCode::ShiftRight => state.keys[7] = pressed,
-                        KeyCode::ControlLeft => state.keys[6] = pressed,
-                        KeyCode::KeyF if pressed && state.ui.screen == Screen::Playing && !state.host.is_dead() => {
-                            state.fly_toggle = true;
-                        }
-                        KeyCode::KeyE if pressed => match state.ui.screen {
-                            Screen::Playing if !state.host.is_dead() => state.open_inventory(),
-                            Screen::Inventory => state.close_inventory(),
-                            Screen::Crafting => state.close_crafting(),
-                            Screen::Furnace | Screen::Chest => state.close_container(),
-                            Screen::Settings | Screen::Death | Screen::Connecting => {}
-                            Screen::Playing => {}
-                        },
-                        KeyCode::KeyC if pressed => state.toggle_crafting(),
                         KeyCode::Escape if pressed => state.handle_escape(),
-                        KeyCode::F1 if pressed && overlay_shortcuts_allowed(state.ui.screen) => {
-                            state.ui.hud_visible = !state.ui.hud_visible;
-                            state.persist_settings();
-                        }
-                        KeyCode::F2 if pressed && state.ui.screen == Screen::Playing && !state.host.is_dead() => {
-                            state.screenshot_requested = true;
-                        }
-                        KeyCode::F3 if pressed && overlay_shortcuts_allowed(state.ui.screen) => {
-                            state.ui.toggle_debug_overlay();
-                            state.persist_settings();
-                        }
-                        KeyCode::Tab if pressed => match state.ui.screen {
-                            Screen::Settings => {
-                                if state.keys[5] || state.keys[7] {
-                                    state.ui.settings_tab_prev();
-                                } else {
-                                    state.ui.settings_tab_next();
-                                }
+                        KeyCode::Tab if pressed => {
+                            if state.keys[5] {
+                                state.ui.settings_tab_prev();
+                            } else {
+                                state.ui.settings_tab_next();
                             }
-                            Screen::Playing
-                            | Screen::Inventory
-                            | Screen::Crafting
-                            | Screen::Furnace
-                            | Screen::Chest
-                            | Screen::Death
-                            | Screen::Connecting => {}
-                        },
-                        KeyCode::ArrowUp if pressed => match state.ui.screen {
-                            Screen::Death => state.ui.move_death_selection(-1),
-                            Screen::Inventory => state.move_inventory_selection(0, -1),
-                            Screen::Settings => state.ui.settings_row_up(),
-                            Screen::Crafting => state.move_crafting_selection(-1),
-                            Screen::Furnace | Screen::Chest => state.move_container_selection(0, -1),
-                            Screen::Playing | Screen::Connecting => {}
-                        },
-                        KeyCode::ArrowDown if pressed => match state.ui.screen {
-                            Screen::Death => state.ui.move_death_selection(1),
-                            Screen::Inventory => state.move_inventory_selection(0, 1),
-                            Screen::Settings => state.ui.settings_row_down(),
-                            Screen::Crafting => state.move_crafting_selection(1),
-                            Screen::Furnace | Screen::Chest => state.move_container_selection(0, 1),
-                            Screen::Playing | Screen::Connecting => {}
-                        },
-                        KeyCode::PageUp if pressed && state.ui.screen == Screen::Crafting => {
-                            state.page_crafting(-1);
                         }
-                        KeyCode::PageDown if pressed && state.ui.screen == Screen::Crafting => {
-                            state.page_crafting(1);
+                        KeyCode::ArrowUp if pressed => state.ui.settings_row_up(),
+                        KeyCode::ArrowDown if pressed => state.ui.settings_row_down(),
+                        KeyCode::ArrowLeft if pressed => {
+                            if let Some(row) = state.ui.settings_adjust(-1) {
+                                state.apply_settings_row(row);
+                            }
                         }
-                        KeyCode::ArrowLeft if pressed => match state.ui.screen {
-                            Screen::Death => state.ui.move_death_selection(-1),
-                            Screen::Inventory => state.move_inventory_selection(-1, 0),
-                            Screen::Settings => {
-                                if let Some(row) = state.ui.settings_adjust(-1) {
-                                    state.apply_settings_row(row);
-                                }
+                        KeyCode::ArrowRight if pressed => {
+                            if let Some(row) = state.ui.settings_adjust(1) {
+                                state.apply_settings_row(row);
                             }
-                            Screen::Crafting => state.move_crafting_selection(-1),
-                            Screen::Furnace | Screen::Chest => state.move_container_selection(-1, 0),
-                            Screen::Playing | Screen::Connecting => {}
-                        },
-                        KeyCode::ArrowRight if pressed => match state.ui.screen {
-                            Screen::Death => state.ui.move_death_selection(1),
-                            Screen::Inventory => state.move_inventory_selection(1, 0),
-                            Screen::Settings => {
-                                if let Some(row) = state.ui.settings_adjust(1) {
-                                    state.apply_settings_row(row);
-                                }
-                            }
-                            Screen::Crafting => state.move_crafting_selection(1),
-                            Screen::Furnace | Screen::Chest => state.move_container_selection(1, 0),
-                            Screen::Playing | Screen::Connecting => {}
-                        },
-                        KeyCode::Enter if pressed => match state.ui.screen {
-                            Screen::Death => {
-                                if let Some(action) = state.ui.activate_death()
-                                    && state.handle_death_action(action)
-                                {
+                        }
+                        KeyCode::Enter if pressed => {
+                            if let Some(action) = state.ui.settings_activate() {
+                                state.play_ui_sound(matches!(
+                                    action,
+                                    SettingsAction::Resume | SettingsAction::SaveAndQuit
+                                ));
+                                if state.handle_settings_action(action) {
                                     state.persist_settings();
                                     event_loop.exit();
                                 }
                             }
-                            Screen::Inventory => {
-                                state.assign_inventory_selection();
-                            }
-                            Screen::Settings => {
-                                let action = state.ui.settings_activate();
-                                if let Some(action) = action {
-                                    state.play_ui_sound(matches!(
-                                        action,
-                                        SettingsAction::Resume | SettingsAction::SaveAndQuit
-                                    ));
-                                    if state.handle_settings_action(action) {
-                                        state.persist_settings();
-                                        event_loop.exit();
-                                    }
-                                }
-                            }
-                            Screen::Crafting => state.craft_selected(),
-                            Screen::Furnace | Screen::Chest => state.activate_container_slot(),
-                            Screen::Playing | Screen::Connecting => {}
-                        },
-                        KeyCode::Digit1
-                        | KeyCode::Digit2
-                        | KeyCode::Digit3
-                        | KeyCode::Digit4
-                        | KeyCode::Digit5
-                        | KeyCode::Digit6
-                        | KeyCode::Digit7
-                        | KeyCode::Digit8
-                        | KeyCode::Digit9
-                            if state.ui.screen == Screen::Playing && !state.host.is_dead() =>
-                        {
-                            if let Some(slot) = digit_slot(code) {
-                                state.select_hotbar_slot(slot);
-                            }
                         }
                         _ => {}
                     }
+                    if pressed {
+                        state.update_title();
+                    }
+                    return;
+                }
+
+                // Gameplay and menu actions are resolved through the persisted
+                // keybind model rather than hard-coded physical keys.
+                if let Some(action) = bind_key_for_code(code).and_then(|key| state.ui.settings.keybinds.action_for(key))
+                {
+                    if let Some(slot) = movement_slot(action) {
+                        state.keys[slot] = pressed;
+                    } else if pressed {
+                        match action {
+                            Action::Fly => {
+                                if state.ui.screen == Screen::Playing && !state.host.is_dead() {
+                                    state.fly_toggle = true;
+                                }
+                            }
+                            Action::Inventory => match state.ui.screen {
+                                Screen::Playing if !state.host.is_dead() => state.open_inventory(),
+                                Screen::Inventory => state.close_inventory(),
+                                Screen::Crafting => state.close_crafting(),
+                                Screen::Furnace | Screen::Chest => state.close_container(),
+                                Screen::Settings | Screen::Death | Screen::Connecting => {}
+                                Screen::Playing => {}
+                            },
+                            Action::Crafting => state.toggle_crafting(),
+                            Action::Pause => state.handle_escape(),
+                            Action::DebugOverlay => {
+                                if overlay_shortcuts_allowed(state.ui.screen) {
+                                    state.ui.toggle_debug_overlay();
+                                    state.persist_settings();
+                                }
+                            }
+                            Action::ToggleHud => {
+                                if overlay_shortcuts_allowed(state.ui.screen) {
+                                    state.ui.toggle_hud();
+                                    state.persist_settings();
+                                }
+                            }
+                            Action::Screenshot => {
+                                if state.ui.screen == Screen::Playing && !state.host.is_dead() {
+                                    state.screenshot_requested = true;
+                                }
+                            }
+                            Action::Chat | Action::Mine | Action::Use => {}
+                            Action::MoveForward
+                            | Action::MoveBack
+                            | Action::MoveLeft
+                            | Action::MoveRight
+                            | Action::Jump
+                            | Action::Sneak
+                            | Action::Sprint => {}
+                        }
+                    }
+                    if pressed {
+                        state.update_title();
+                    }
+                    return;
+                }
+
+                // UI-only navigation remains available regardless of bindings:
+                // arrows drive menus, Enter activates and digits select hotbar
+                // slots. Escape still backs out of a modal screen when Pause has
+                // been rebound away from it.
+                match code {
+                    KeyCode::Escape if pressed && state.ui.screen != Screen::Playing => {
+                        state.handle_escape();
+                    }
+                    KeyCode::ArrowUp if pressed => match state.ui.screen {
+                        Screen::Death => state.ui.move_death_selection(-1),
+                        Screen::Inventory => state.move_inventory_selection(0, -1),
+                        Screen::Crafting => state.move_crafting_selection(-1),
+                        Screen::Furnace | Screen::Chest => state.move_container_selection(0, -1),
+                        Screen::Playing | Screen::Settings | Screen::Connecting => {}
+                    },
+                    KeyCode::ArrowDown if pressed => match state.ui.screen {
+                        Screen::Death => state.ui.move_death_selection(1),
+                        Screen::Inventory => state.move_inventory_selection(0, 1),
+                        Screen::Crafting => state.move_crafting_selection(1),
+                        Screen::Furnace | Screen::Chest => state.move_container_selection(0, 1),
+                        Screen::Playing | Screen::Settings | Screen::Connecting => {}
+                    },
+                    KeyCode::PageUp if pressed && state.ui.screen == Screen::Crafting => {
+                        state.page_crafting(-1);
+                    }
+                    KeyCode::PageDown if pressed && state.ui.screen == Screen::Crafting => {
+                        state.page_crafting(1);
+                    }
+                    KeyCode::ArrowLeft if pressed => match state.ui.screen {
+                        Screen::Death => state.ui.move_death_selection(-1),
+                        Screen::Inventory => state.move_inventory_selection(-1, 0),
+                        Screen::Crafting => state.move_crafting_selection(-1),
+                        Screen::Furnace | Screen::Chest => state.move_container_selection(-1, 0),
+                        Screen::Playing | Screen::Settings | Screen::Connecting => {}
+                    },
+                    KeyCode::ArrowRight if pressed => match state.ui.screen {
+                        Screen::Death => state.ui.move_death_selection(1),
+                        Screen::Inventory => state.move_inventory_selection(1, 0),
+                        Screen::Crafting => state.move_crafting_selection(1),
+                        Screen::Furnace | Screen::Chest => state.move_container_selection(1, 0),
+                        Screen::Playing | Screen::Settings | Screen::Connecting => {}
+                    },
+                    KeyCode::Enter if pressed => match state.ui.screen {
+                        Screen::Death => {
+                            if let Some(action) = state.ui.activate_death()
+                                && state.handle_death_action(action)
+                            {
+                                state.persist_settings();
+                                event_loop.exit();
+                            }
+                        }
+                        Screen::Inventory => {
+                            state.assign_inventory_selection();
+                        }
+                        Screen::Crafting => state.craft_selected(),
+                        Screen::Furnace | Screen::Chest => state.activate_container_slot(),
+                        Screen::Playing | Screen::Settings | Screen::Connecting => {}
+                    },
+                    KeyCode::Digit1
+                    | KeyCode::Digit2
+                    | KeyCode::Digit3
+                    | KeyCode::Digit4
+                    | KeyCode::Digit5
+                    | KeyCode::Digit6
+                    | KeyCode::Digit7
+                    | KeyCode::Digit8
+                    | KeyCode::Digit9
+                        if pressed && state.ui.screen == Screen::Playing && !state.host.is_dead() =>
+                    {
+                        if let Some(slot) = digit_slot(code) {
+                            state.select_hotbar_slot(slot);
+                        }
+                    }
+                    _ => {}
                 }
                 if pressed {
                     state.update_title();
@@ -4187,10 +4591,19 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput {
                 state: element, button, ..
             } => {
-                if button == MouseButton::Left && element == ElementState::Released {
+                if element == ElementState::Released {
                     state.cancel_mining();
                 }
                 if element != ElementState::Pressed {
+                    return;
+                }
+                if state.ui.screen == Screen::Settings && state.ui.bind_capture.is_some() {
+                    if let Some(key) = bind_key_for_mouse(button)
+                        && state.ui.apply_bind(key).is_ok()
+                    {
+                        state.persist_settings();
+                    }
+                    state.update_title();
                     return;
                 }
                 match state.ui.screen {
@@ -4259,9 +4672,9 @@ impl ApplicationHandler for App {
                     state.capture_pointer();
                     return;
                 }
-                match button {
-                    MouseButton::Left => state.start_mining(),
-                    MouseButton::Right => state.place_block(),
+                match bind_key_for_mouse(button).and_then(|key| state.ui.settings.keybinds.action_for(key)) {
+                    Some(Action::Mine) => state.start_mining(),
+                    Some(Action::Use) => state.place_block(),
                     _ => {}
                 }
             }
@@ -4376,6 +4789,155 @@ fn digit_slot(code: KeyCode) -> Option<usize> {
         KeyCode::Digit8 => Some(7),
         KeyCode::Digit9 => Some(8),
         _ => None,
+    }
+}
+
+/// Maps a physical winit key to the serialisable keybind set.
+///
+/// Only keys present in [`KeyName`] are mappable, so a persisted binding can
+/// never refer to a key the game cannot recognise. `None` also means the key is
+/// reserved for text input or UI navigation (for example an unmapped media key).
+fn key_name_for_code(code: KeyCode) -> Option<KeyName> {
+    Some(match code {
+        KeyCode::KeyA => KeyName::KeyA,
+        KeyCode::KeyB => KeyName::KeyB,
+        KeyCode::KeyC => KeyName::KeyC,
+        KeyCode::KeyD => KeyName::KeyD,
+        KeyCode::KeyE => KeyName::KeyE,
+        KeyCode::KeyF => KeyName::KeyF,
+        KeyCode::KeyG => KeyName::KeyG,
+        KeyCode::KeyH => KeyName::KeyH,
+        KeyCode::KeyI => KeyName::KeyI,
+        KeyCode::KeyJ => KeyName::KeyJ,
+        KeyCode::KeyK => KeyName::KeyK,
+        KeyCode::KeyL => KeyName::KeyL,
+        KeyCode::KeyM => KeyName::KeyM,
+        KeyCode::KeyN => KeyName::KeyN,
+        KeyCode::KeyO => KeyName::KeyO,
+        KeyCode::KeyP => KeyName::KeyP,
+        KeyCode::KeyQ => KeyName::KeyQ,
+        KeyCode::KeyR => KeyName::KeyR,
+        KeyCode::KeyS => KeyName::KeyS,
+        KeyCode::KeyT => KeyName::KeyT,
+        KeyCode::KeyU => KeyName::KeyU,
+        KeyCode::KeyV => KeyName::KeyV,
+        KeyCode::KeyW => KeyName::KeyW,
+        KeyCode::KeyX => KeyName::KeyX,
+        KeyCode::KeyY => KeyName::KeyY,
+        KeyCode::KeyZ => KeyName::KeyZ,
+        KeyCode::Digit0 => KeyName::Digit0,
+        KeyCode::Digit1 => KeyName::Digit1,
+        KeyCode::Digit2 => KeyName::Digit2,
+        KeyCode::Digit3 => KeyName::Digit3,
+        KeyCode::Digit4 => KeyName::Digit4,
+        KeyCode::Digit5 => KeyName::Digit5,
+        KeyCode::Digit6 => KeyName::Digit6,
+        KeyCode::Digit7 => KeyName::Digit7,
+        KeyCode::Digit8 => KeyName::Digit8,
+        KeyCode::Digit9 => KeyName::Digit9,
+        KeyCode::F1 => KeyName::F1,
+        KeyCode::F2 => KeyName::F2,
+        KeyCode::F3 => KeyName::F3,
+        KeyCode::F4 => KeyName::F4,
+        KeyCode::F5 => KeyName::F5,
+        KeyCode::F6 => KeyName::F6,
+        KeyCode::F7 => KeyName::F7,
+        KeyCode::F8 => KeyName::F8,
+        KeyCode::F9 => KeyName::F9,
+        KeyCode::F10 => KeyName::F10,
+        KeyCode::F11 => KeyName::F11,
+        KeyCode::F12 => KeyName::F12,
+        KeyCode::ArrowUp => KeyName::ArrowUp,
+        KeyCode::ArrowDown => KeyName::ArrowDown,
+        KeyCode::ArrowLeft => KeyName::ArrowLeft,
+        KeyCode::ArrowRight => KeyName::ArrowRight,
+        KeyCode::Space => KeyName::Space,
+        KeyCode::Enter => KeyName::Enter,
+        KeyCode::Tab => KeyName::Tab,
+        KeyCode::Escape => KeyName::Escape,
+        KeyCode::Backspace => KeyName::Backspace,
+        KeyCode::Delete => KeyName::Delete,
+        KeyCode::Insert => KeyName::Insert,
+        KeyCode::Home => KeyName::Home,
+        KeyCode::End => KeyName::End,
+        KeyCode::PageUp => KeyName::PageUp,
+        KeyCode::PageDown => KeyName::PageDown,
+        KeyCode::ShiftLeft => KeyName::ShiftLeft,
+        KeyCode::ShiftRight => KeyName::ShiftRight,
+        KeyCode::ControlLeft => KeyName::ControlLeft,
+        KeyCode::ControlRight => KeyName::ControlRight,
+        KeyCode::AltLeft => KeyName::AltLeft,
+        KeyCode::AltRight => KeyName::AltRight,
+        KeyCode::CapsLock => KeyName::CapsLock,
+        KeyCode::Minus => KeyName::Minus,
+        KeyCode::Equal => KeyName::Equal,
+        KeyCode::BracketLeft => KeyName::BracketLeft,
+        KeyCode::BracketRight => KeyName::BracketRight,
+        KeyCode::Backslash => KeyName::Backslash,
+        KeyCode::Semicolon => KeyName::Semicolon,
+        KeyCode::Quote => KeyName::Quote,
+        KeyCode::Comma => KeyName::Comma,
+        KeyCode::Period => KeyName::Period,
+        KeyCode::Slash => KeyName::Slash,
+        KeyCode::Backquote => KeyName::Backquote,
+        KeyCode::Numpad0 => KeyName::Numpad0,
+        KeyCode::Numpad1 => KeyName::Numpad1,
+        KeyCode::Numpad2 => KeyName::Numpad2,
+        KeyCode::Numpad3 => KeyName::Numpad3,
+        KeyCode::Numpad4 => KeyName::Numpad4,
+        KeyCode::Numpad5 => KeyName::Numpad5,
+        KeyCode::Numpad6 => KeyName::Numpad6,
+        KeyCode::Numpad7 => KeyName::Numpad7,
+        KeyCode::Numpad8 => KeyName::Numpad8,
+        KeyCode::Numpad9 => KeyName::Numpad9,
+        KeyCode::NumpadAdd => KeyName::NumpadAdd,
+        KeyCode::NumpadSubtract => KeyName::NumpadSubtract,
+        KeyCode::NumpadMultiply => KeyName::NumpadMultiply,
+        KeyCode::NumpadDivide => KeyName::NumpadDivide,
+        KeyCode::NumpadDecimal => KeyName::NumpadDecimal,
+        KeyCode::NumpadEnter => KeyName::NumpadEnter,
+        _ => return None,
+    })
+}
+
+/// Converts a physical key into a bindable input.
+fn bind_key_for_code(code: KeyCode) -> Option<BindKey> {
+    key_name_for_code(code).map(BindKey::Key)
+}
+
+/// Converts a mouse button into a bindable input.
+fn bind_key_for_mouse(button: MouseButton) -> Option<BindKey> {
+    match button {
+        MouseButton::Left => Some(BindKey::Mouse(ob_core::config::MouseButton::Left)),
+        MouseButton::Right => Some(BindKey::Mouse(ob_core::config::MouseButton::Right)),
+        MouseButton::Middle => Some(BindKey::Mouse(ob_core::config::MouseButton::Middle)),
+        _ => None,
+    }
+}
+
+/// Input-array slot for movement actions; non-movement actions return `None`.
+fn movement_slot(action: Action) -> Option<usize> {
+    match action {
+        Action::MoveForward => Some(0),
+        Action::MoveBack => Some(1),
+        Action::MoveLeft => Some(2),
+        Action::MoveRight => Some(3),
+        Action::Jump => Some(4),
+        Action::Sneak => Some(5),
+        Action::Sprint => Some(6),
+        _ => None,
+    }
+}
+
+/// Target vertical FOV for the current sprint state.
+///
+/// Reduced motion disables the sprint FOV pump entirely; this is a pure helper
+/// so the accessibility behaviour is testable without a window.
+fn target_fov(settings: &Settings, sprinting: bool) -> f32 {
+    if settings.reduced_motion || !sprinting {
+        settings.fov_degrees
+    } else {
+        settings.fov_degrees * 1.10
     }
 }
 
@@ -4692,10 +5254,12 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
             "seed" => {
                 options.seed = value.parse().map_err(|_| format!("invalid --seed value '{value}'"))?;
                 saw_seed = true;
+                options.saw_seed = true;
             }
             "world" => {
                 options.world = value.clone();
                 saw_world = true;
+                options.saw_world = true;
             }
             "connect" => {
                 if value.is_empty() {
@@ -4715,7 +5279,10 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
                 }
                 options.name = Some(value.clone());
             }
-            "data-dir" => options.data_dir = Some(value.into()),
+            "data-dir" => {
+                options.data_dir = Some(value.into());
+                options.saw_data_dir = true;
+            }
             "render-distance" => {
                 options.render_distance_chunks = value
                     .parse()
@@ -4802,6 +5369,12 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
             "mute" => options.mute = true,
             "survival" => options.game_mode = Some(SettingsGameMode::Survival),
             "creative" => options.game_mode = Some(SettingsGameMode::Creative),
+            "title" | "menu" => options.force_title = true,
+            "screenshot-title" => options.screenshot_title = true,
+            "screenshot-worlds" => options.screenshot_worlds = true,
+            "screenshot-connect" => options.screenshot_connect = true,
+            "screenshot-new-world" => options.screenshot_new_world = true,
+            "screenshot-settings-title" => options.screenshot_settings_title = true,
             "help" | "version" => {}
             other => return Err(format!("unknown option --{other}")),
         }
@@ -4809,6 +5382,11 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
     if options.screenshot_dead && options.screenshot.is_none() {
         return Err("--screenshot-dead requires --screenshot PATH".into());
     }
+    let menu_screenshot_modes = usize::from(options.screenshot_title)
+        + usize::from(options.screenshot_new_world)
+        + usize::from(options.screenshot_worlds)
+        + usize::from(options.screenshot_connect)
+        + usize::from(options.screenshot_settings_title);
     let screenshot_modes = usize::from(options.screenshot_dead)
         + usize::from(options.screenshot_settings)
         + usize::from(options.screenshot_crafting)
@@ -4816,9 +5394,19 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
         + usize::from(options.screenshot_mobs)
         + usize::from(options.screenshot_furnace)
         + usize::from(options.screenshot_chest)
-        + usize::from(options.screenshot_inventory.is_some());
+        + usize::from(options.screenshot_inventory.is_some())
+        + menu_screenshot_modes;
     if screenshot_modes > 1 {
         return Err("--screenshot screen modes cannot be combined".into());
+    }
+    if menu_screenshot_modes > 0 && options.screenshot.is_none() {
+        return Err(
+            "--screenshot-title/--screenshot-new-world/--screenshot-worlds/--screenshot-connect/--screenshot-settings-title require --screenshot PATH"
+                .into(),
+        );
+    }
+    if menu_screenshot_modes > 0 && options.screenshot_items {
+        return Err("front-end screenshot flags cannot be combined with --screenshot-items".into());
     }
     if options.screenshot_settings
         && (options.screenshot_dead
@@ -4891,10 +5479,18 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
             || options.screenshot_mobs
             || options.screenshot_furnace
             || options.screenshot_chest
-            || options.screenshot_items;
+            || options.screenshot_items
+            || options.screenshot_title
+            || options.screenshot_new_world
+            || options.screenshot_worlds
+            || options.screenshot_connect
+            || options.screenshot_settings_title;
         if screenshot {
             return Err("--connect is windowed only; offscreen screenshots are supported for local worlds".into());
         }
+    }
+    if options.force_title && (saw_world || saw_seed || options.connect.is_some()) {
+        return Err("--title/--menu cannot be combined with --world, --seed or --connect".into());
     }
     Ok(options)
 }
@@ -4912,6 +5508,116 @@ pub fn world_hash(host: &Host) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_is_the_default_and_explicit_world_flags_bypass_it() {
+        assert!(should_show_title(&ClientOptions::default()));
+        let options = options_from_args(&[("world".to_string(), "survival".to_string())]).expect("world");
+        assert!(!should_show_title(&options));
+        let options = options_from_args(&[("seed".to_string(), "7".to_string())]).expect("seed");
+        assert!(!should_show_title(&options));
+        let options = options_from_args(&[("data-dir".to_string(), "/tmp/ob".to_string())]).expect("data dir");
+        assert!(!should_show_title(&options));
+        let options = options_from_args(&[("connect".to_string(), "127.0.0.1:25565".to_string())]).expect("connect");
+        assert!(!should_show_title(&options));
+        let options = options_from_args(&[
+            ("title".to_string(), String::new()),
+            ("data-dir".to_string(), "/tmp/ob".to_string()),
+        ])
+        .expect("title with data dir");
+        assert!(should_show_title(&options), "--title forces the menu with a data dir");
+        let options = options_from_args(&[("menu".to_string(), String::new())]).expect("menu alias");
+        assert!(should_show_title(&options));
+
+        let error = options_from_args(&[
+            ("title".to_string(), String::new()),
+            ("world".to_string(), "survival".to_string()),
+        ])
+        .expect_err("--title and --world conflict");
+        assert!(error.contains("--title"));
+    }
+
+    #[test]
+    fn menu_screenshot_flags_parse_and_require_a_screenshot_path() {
+        for (name, expected) in [
+            ("screenshot-title", menu_app::MenuScreenshot::Title),
+            ("screenshot-new-world", menu_app::MenuScreenshot::NewWorld),
+            ("screenshot-worlds", menu_app::MenuScreenshot::Worlds),
+            ("screenshot-connect", menu_app::MenuScreenshot::Multiplayer),
+            ("screenshot-settings-title", menu_app::MenuScreenshot::Settings),
+        ] {
+            let error = options_from_args(&[(name.to_string(), String::new())])
+                .expect_err("menu screenshots need --screenshot");
+            assert!(error.contains("require --screenshot"), "{name}: {error}");
+            let options = options_from_args(&[
+                ("screenshot".to_string(), "/tmp/menu.png".to_string()),
+                (name.to_string(), String::new()),
+            ])
+            .expect("valid menu screenshot flags");
+            assert_eq!(menu_screenshot_mode(&options), Some(expected));
+        }
+        let error = options_from_args(&[
+            ("screenshot".to_string(), "/tmp/menu.png".to_string()),
+            ("screenshot-title".to_string(), String::new()),
+            ("screenshot-worlds".to_string(), String::new()),
+        ])
+        .expect_err("only one menu screen");
+        assert!(error.contains("cannot be combined"));
+
+        let error = options_from_args(&[
+            ("screenshot".to_string(), "/tmp/menu.png".to_string()),
+            ("screenshot-connect".to_string(), String::new()),
+            ("connect".to_string(), "127.0.0.1:25565".to_string()),
+        ])
+        .expect_err("menu screenshots are offscreen local only");
+        assert!(error.contains("windowed only"));
+    }
+
+    #[test]
+    fn key_mapping_resolves_the_documented_defaults() {
+        for (code, action) in [
+            (KeyCode::KeyW, Action::MoveForward),
+            (KeyCode::KeyS, Action::MoveBack),
+            (KeyCode::KeyA, Action::MoveLeft),
+            (KeyCode::KeyD, Action::MoveRight),
+            (KeyCode::Space, Action::Jump),
+            (KeyCode::ShiftLeft, Action::Sneak),
+            (KeyCode::ControlLeft, Action::Sprint),
+            (KeyCode::KeyF, Action::Fly),
+            (KeyCode::KeyE, Action::Inventory),
+            (KeyCode::KeyC, Action::Crafting),
+            (KeyCode::KeyT, Action::Chat),
+            (KeyCode::F1, Action::ToggleHud),
+            (KeyCode::F2, Action::Screenshot),
+            (KeyCode::F3, Action::DebugOverlay),
+            (KeyCode::Escape, Action::Pause),
+        ] {
+            let key = bind_key_for_code(code).unwrap_or_else(|| panic!("{code:?} is mappable"));
+            assert_eq!(Settings::default().keybinds.action_for(key), Some(action), "{code:?}");
+        }
+        assert_eq!(
+            bind_key_for_mouse(MouseButton::Left),
+            Some(BindKey::Mouse(ob_core::config::MouseButton::Left))
+        );
+        assert_eq!(
+            bind_key_for_mouse(MouseButton::Right),
+            Some(BindKey::Mouse(ob_core::config::MouseButton::Right))
+        );
+        assert_eq!(bind_key_for_code(KeyCode::F24), None);
+        assert_eq!(bind_key_for_mouse(MouseButton::Other(9)), None);
+        assert_eq!(movement_slot(Action::Jump), Some(4));
+        assert_eq!(movement_slot(Action::Fly), None);
+    }
+
+    #[test]
+    fn reduced_motion_disables_the_sprint_fov_pump() {
+        let mut settings = Settings::default();
+        assert!((target_fov(&settings, true) - settings.fov_degrees * 1.10).abs() < 0.001);
+        assert_eq!(target_fov(&settings, false), settings.fov_degrees);
+        settings.reduced_motion = true;
+        assert_eq!(target_fov(&settings, true), settings.fov_degrees);
+        assert_eq!(target_fov(&settings, false), settings.fov_degrees);
+    }
 
     #[test]
     fn settings_screen_suppresses_f1_and_f3_shortcuts() {

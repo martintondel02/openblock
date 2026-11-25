@@ -29,6 +29,14 @@
     <content_attribute id="social-chat">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.2.0" date="2026-11-25" type="development">
+      <description>
+        <p>Front-end (title screen, world browser/creation, multiplayer
+        connect and recent servers), interactive key rebinding, accessibility
+        options and multiplayer name tags, plus a measured 8-player server load
+        gate and cross-platform fixes.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-11-25" type="development">
       <description>
         <p>Multiplayer alpha with a self-hostable dedicated server and

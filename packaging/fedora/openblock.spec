@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           openblock
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Fast, deeply moddable, server-first voxel sandbox
 
@@ -151,6 +151,19 @@ update-desktop-database &>/dev/null || :
 %config(noreplace) %{_sysconfdir}/openblock/server.env.example
 
 %changelog
+* Sat Nov 25 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.2.0-1
+- Front-end: title screen with Continue/New World/Load World/Multiplayer/
+  Settings/Quit, world creation and world browser with safe delete, direct-
+  connect screen with recent servers, host-optional settings from the menu.
+- Interactive controls rebinding for 17 actions with duplicate rejection, reset
+  and persisted keybinds; reduced-motion accessibility option; persisted HUD
+  visibility; multiplayer name tags.
+- Multiplayer load gate: lock-free server metrics (tick p50/p95/p99/max, overrun
+  counters, bandwidth/RSS), --metrics-json, 8-bot load-gate/soak script and CI
+  job; measured 8-player p99 0.163 ms, 20 TPS, stable 10-minute soak.
+- Cross-platform fix: accepted sockets are forced blocking on Darwin (macOS
+  loopback/network failures) and Windows-only clippy test imports fixed.
+
 * Sat Nov 25 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.1.0-1
 - Multiplayer alpha: dedicated server (TCP/JSON protocol v2) with
   server-authoritative survival (inventories, vitals, equipment, actions,

@@ -6,6 +6,49 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [0.2.0] — 2026-11-25 (front-end, controls, load gate)
+
+### Added
+- Front-end: single-loop `RootApp` router; title screen (Continue with last
+  world, New World with validated filesystem-safe name + numeric seed, Load
+  World browser with size/mtime/recent-first sorting and safe confirmed delete,
+  Multiplayer direct-connect with address/name validation and five persisted
+  recent servers, Settings, Quit); host-optional settings from the title;
+  offscreen screenshot modes for every menu (`--screenshot-title`,
+  `--screenshot-new-world`, `--screenshot-worlds`, `--screenshot-connect`,
+  `--screenshot-settings-title`); `--title|--menu` override.
+- Interactive key rebinding: `ob_core::config::{Action, KeyName, MouseButton,
+  BindKey, Keybinds}` for 17 actions, duplicate rejection, clear/reset,
+  unknown-key-tolerant serde, atomically persisted, applied live in both
+  single-player and network runtimes; text fields/chat own the keyboard while
+  editing.
+- Accessibility/UX: Reduced-motion setting (no damage shake / sprint FOV pump),
+  persisted Show HUD, multiplayer name tags (camera projection, distance fade,
+  overlap culling), persisted last world/recent servers, HUD/death/chat/roster
+  polish, menu version/save/protocol/OS line.
+- Multiplayer load gate: lock-free `ServerMetrics` (rolling tick p50/p95/p99/max,
+  >35/>50 ms overrun counters, chunk queue, bandwidth, edits/actions, RSS/fd/
+  thread proxies), `--metrics-json`/`--metrics-interval`, stdlib
+  `scripts/load-gate.py` (quick 4-bot CI mode, full 8-bot gate, `--soak`
+  10-minute scenario with plateau/hash checks) and a CI job; docs with measured
+  results and known gaps.
+
+### Fixed
+- macOS networking: accepted sockets are forced back to blocking mode (Darwin
+  inherits the listener's non-blocking flag; every loopback/network test was
+  rejected as `timeout`).
+- Windows clippy: platform-gated imports in the save-robustness tests.
+- Cross-platform network loopback tests now pass on macOS/Windows CI.
+
+### Measured
+- 8-client/60 s load gate: 8/8 joins, all interest sets in 2.15 s, 20.0 TPS,
+  tick p50/p95/p99 0.061/0.124/0.163 ms, 0 overruns >35 ms, RSS 22.3 MiB,
+  21 chunks/s, ~28 KiB/s per client, 656/656 edits accepted.
+- 10-minute 8-client soak: 20.00 TPS, p99 0.146 ms, RSS plateau +1.9 MiB after
+  warm-up, fds/threads stable, 60 autosaves, stable save/reload hash.
+- Test suite 683+ tests plus the new front-end/keybind/load-gate tests; smoke
+  seed 42 unchanged (`33875a6597c2ce7b`).
+
 ## [0.1.0] — 2026-11-25 (multiplayer alpha)
 
 ### Added

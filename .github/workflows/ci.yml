@@ -137,7 +137,7 @@ jobs:
           bash -n scripts/server-restore.sh
           bash -n scripts/check-server-deps.sh
           bash -n scripts/tests/test-backup-restore.sh
-          python3 -m py_compile scripts/load-test.py
+          python3 -m py_compile scripts/load-test.py scripts/load-gate.py
 
   container:
     name: Container manifests
@@ -191,6 +191,34 @@ jobs:
         run: cargo run --release --locked -p ob_tools --bin save_bench -- --quick
       - name: Soak smoke (quick)
         run: cargo run --release --locked -p ob_tools --bin soak -- --quick
+
+  load-gate:
+    name: Multiplayer load gate (quick)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Build headless server
+        run: cargo build --release --locked -p ob_server --bin openblock-server
+      # 4 loopback protocol-v2 bots for 12 s. Functional checks (joins,
+      # interest sets, chunks, edits, pongs) always gate; the 35 ms tick target
+      # is reported as advisory on a shared runner unless --enforce-quick is
+      # passed. No GPU, no window, temp data dir and ephemeral port.
+      - name: Quick load gate
+        run: |
+          python3 scripts/load-gate.py --quick \
+            --binary target/release/openblock-server \
+            --json target/load-gate.json --markdown target/load-gate.md
+      - name: Upload load-gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-gate-report
+          path: |
+            target/load-gate.json
+            target/load-gate.md
+          if-no-files-found: ignore
 
   arch:
     name: Architecture guard

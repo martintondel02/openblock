@@ -1,6 +1,6 @@
 //! The `openblock` game client binary.
 
-const USAGE: &str = "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--mesh-workers N] [--survival|--creative] [--fly] [--x11] [--no-audio] [--mute] [--connect HOST:PORT] [--name NAME] [--screenshot PATH] [--screenshot-inventory PATH] [--screenshot-dead] [--screenshot-settings[=TAB]] [--screenshot-settings-tab TAB] [--screenshot-crafting] [--screenshot-debug] [--screenshot-mobs] [--screenshot-furnace] [--screenshot-chest] [--screenshot-items] [--seconds N] [--texture-style NAME] [--texture-pack PATH] [--no-texture-pack] [--time-of-day F] [--version]";
+const USAGE: &str = "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--mesh-workers N] [--survival|--creative] [--fly] [--x11] [--no-audio] [--mute] [--connect HOST:PORT] [--name NAME] [--screenshot PATH] [--screenshot-inventory PATH] [--screenshot-dead] [--screenshot-settings[=TAB]] [--screenshot-settings-tab TAB] [--screenshot-crafting] [--screenshot-title] [--screenshot-new-world] [--screenshot-worlds] [--screenshot-connect] [--screenshot-debug] [--screenshot-mobs] [--screenshot-furnace] [--screenshot-chest] [--screenshot-items] [--seconds N] [--texture-style NAME] [--texture-pack PATH] [--no-texture-pack] [--time-of-day F] [--title|--menu] [--version]";
 
 fn main() {
     ob_core::init_logging();
@@ -24,6 +24,9 @@ fn main() {
         println!("          --screenshot-mobs spawns avatars in front of the player and shows F3 mob counts");
         println!("          --screenshot-furnace opens a seeded furnace screen");
         println!("          --screenshot-chest opens a seeded 27-slot chest screen");
+        println!("front-end: a plain launch opens the title/world-selection screens;");
+        println!("          --world/--seed/--data-dir/--connect and screenshot flags bypass it");
+        println!("          --title or --menu forces the title screen (useful for screenshots)");
         println!("modes:    --survival (default) or --creative; an explicit CLI mode is saved");
         println!("network:  --connect HOST:PORT joins an interim TCP server (windowed, creative building)");
         println!("          --name NAME chooses the multiplayer player name (default playerNNNN)");
@@ -56,6 +59,12 @@ fn main() {
         println!("  --screenshot-furnace  place and open a seeded furnace screen");
         println!("  --screenshot-chest  place and open a seeded chest screen");
         println!("  --screenshot-items  seed ores, ingots, iron tools/armor, food, planks and 14 HP / 12 hunger");
+        println!("  --screenshot-title  render the title screen (requires --screenshot PATH)");
+        println!("  --screenshot-new-world  render the new-world form (requires --screenshot PATH)");
+        println!("  --screenshot-worlds  render the world list with temporary worlds");
+        println!("  --screenshot-connect  render the multiplayer form with recent servers");
+        println!("  --screenshot-settings-title  render host-optional settings as opened from the title");
+        println!("  --title, --menu    force the front-end on a normal launch (screenshot/debug aid)");
         println!("  --connect HOST:PORT  join a dedicated server over TCP (windowed; no local world)");
         println!("  --name NAME        multiplayer player name (1-32 ASCII [A-Za-z0-9_.-]; default playerNNNN)");
         println!("                     multiplayer is creative building only in this milestone");
