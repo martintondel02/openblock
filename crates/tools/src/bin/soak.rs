@@ -21,7 +21,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ob_content::{BlockId, MobKind, Registry};
 use ob_math::{BlockPos, WorldVec};
@@ -53,6 +53,7 @@ usage: soak [options]
   --radius N           streaming radius in chunks (default 6; quick 4)
   --seed S             world seed (default 42)
   --save-every N       ticks between saves (default 10,000; quick 2,000)
+  --async-save         use Host::save_async and report the tick-side start pause
   --progress-every N   ticks between progress lines (default 5,000; quick 1,000)
   --max-items N        invariant cap on live item entities (default 2,048)
   --data-dir DIR       soak data root instead of a temporary directory
@@ -69,6 +70,7 @@ struct Options {
     radius: i32,
     seed: u64,
     save_every: u64,
+    async_save: bool,
     progress_every: u64,
     max_items: usize,
     data_dir: Option<PathBuf>,
@@ -85,6 +87,7 @@ impl Default for Options {
             radius: 6,
             seed: 42,
             save_every: 10_000,
+            async_save: false,
             progress_every: 5_000,
             max_items: 2048,
             data_dir: None,
@@ -122,6 +125,8 @@ struct Counters {
 #[derive(Debug, Default)]
 struct SaveSeries {
     times_ms: Vec<f64>,
+    /// Tick-side pause of the async start (empty for synchronous saves).
+    start_ms: Vec<f64>,
     sizes: Vec<u64>,
     first_size: u64,
     last_size: u64,
@@ -201,6 +206,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Options, String> 
                 }
                 explicit[2] = true;
             }
+            "async-save" => options.async_save = true,
             "progress-every" => {
                 options.progress_every = parse_u64(&name, &value)?;
                 if options.progress_every == 0 {
@@ -346,8 +352,29 @@ fn run(options: &Options) -> Result<bool, String> {
     let session_start = Instant::now();
     let save = |host: &mut Host, counters: &mut Counters, saves: &mut SaveSeries| -> Result<(), String> {
         let started = Instant::now();
-        host.save().map_err(|error| format!("save failed: {error}"))?;
-        saves.times_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        if options.async_save {
+            let is_new = host
+                .save_async()
+                .map_err(|error| format!("async save failed to start: {error}"))?;
+            let start_ms = started.elapsed().as_secs_f64() * 1000.0;
+            if !is_new {
+                let _ = host
+                    .wait_for_save(Duration::from_secs(60))
+                    .map_err(|error| format!("async save wait failed: {error}"))?;
+                host.save_async()
+                    .map_err(|error| format!("async save failed to start: {error}"))?;
+            }
+            let wait_started = Instant::now();
+            host.wait_for_save(Duration::from_secs(300))
+                .map_err(|error| format!("async save wait failed: {error}"))?
+                .ok_or_else(|| "async save reported no completion".to_string())?;
+            let wall_ms = wait_started.elapsed().as_secs_f64() * 1000.0;
+            saves.start_ms.push(start_ms);
+            saves.times_ms.push(start_ms + wall_ms);
+        } else {
+            host.save().map_err(|error| format!("save failed: {error}"))?;
+            saves.times_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
         let size = directory_size(&world_path)?;
         if saves.sizes.is_empty() {
             saves.first_size = size;
@@ -614,6 +641,13 @@ fn run(options: &Options) -> Result<bool, String> {
         "| saves | {} (mean {:.2} ms, p95 {:.2} ms, last {:.2} ms) |",
         counters.saves, save_stats.mean_ms, save_stats.p95_ms, final_save_ms
     );
+    if !saves.start_ms.is_empty() {
+        let start_stats = Stats::from_samples(&saves.start_ms);
+        println!(
+            "| async save start pause (tick) | mean {:.2} ms, p95 {:.2} ms, max {:.2} ms |",
+            start_stats.mean_ms, start_stats.p95_ms, start_stats.max_ms
+        );
+    }
     println!(
         "| save size | {} -> {} (peak {}) |",
         measure::bytes_label(saves.first_size),

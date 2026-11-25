@@ -62,7 +62,7 @@ In scope: `ob_world` storage, the `openblock-server` world manager, and the
 | REQ-SAVE-032 | Every write path MUST be idempotent: replaying the journal or re-running a commit MUST NOT duplicate or corrupt data. | Journal replay test |
 | REQ-SAVE-033 | Autosave interval MUST be configurable (10–3,600 s) and default to 60 s. | Config test |
 | REQ-SAVE-034 | A quarantined chunk MUST retain its bytes for forensics under `<world>/quarantine/`. | Quarantine test |
-| REQ-SAVE-035 | While the interim v0.x snapshot format stores dense block ids, it MUST record a content-registry fingerprint and MUST refuse to load when the current registry differs, naming both fingerprints; it MUST NOT silently reinterpret block ids. A v1-v3 snapshot written before a documented append-only block addition MAY load with a warning, because every earlier id is unchanged; v4+ keeps the strict check. | Mismatch fixture + pack test |
+| REQ-SAVE-035 | While the interim v0.x snapshot format stores dense block ids, it MUST record a content-registry fingerprint and MUST refuse to load when the saved registry is neither today's registry nor a strict prefix of it, naming both fingerprints; it MUST NOT silently reinterpret block ids. Appending block types at the end is compatible (the saved fingerprint equals the current prefix's fingerprint); removing or reordering any saved block is rejected. A v1-v3 snapshot written before a documented append-only addition MAY load with a warning because every earlier id is unchanged, but a v3 reorder is rejected in v1.1. | Mismatch fixture + pack test |
 
 ## 3. Design
 
@@ -389,7 +389,13 @@ full and mismatched slots/items are skipped with a warning.
 coordinates. It is written on every save and preferred on the next open so a
 restart, reconnect and respawn use the same safe column; an older world without
 the file resolves a spawn once and persists it on the next save. A malformed,
-non-finite or out-of-range line is ignored with a warning.
+non-finite or out-of-range line is ignored with a warning. The v1.1 spawn
+resolver additionally rejects any candidate column inside a generated worldgen
+structure footprint (ruined tower, abandoned camp, stone circle or mineshaft)
+before the existing solid/dry/clear checks; structures are wholly inside their
+owning chunk, so the candidate's chunk is the only possible owner. The stored
+spawn file remains authoritative across restarts, so an older world keeps its
+existing point.
 
 The host state hash covers player state, inventory, item entities sorted by id,
 the persisted world spawn, furnaces and chests sorted by position (all slots,
@@ -418,6 +424,28 @@ but a crash between two renames can still mix one new sidecar with the previous
 world; the multi-file journal in §3.5 remains the target design for a future
 region-file save path. The interim `.tmp` files are best-effort cleaned after a
 failed staging/rename.
+
+**1.1 asynchronous save (implemented).** `Host::save_async` captures a
+`WorldSnapshot` in O(number of loaded columns): the world stores each column
+behind `Arc`, so the snapshot clones only pointers and sorts them by `(cx, cz)`.
+The host serializes the sidecars while still holding the simulation lock, then
+the `ob-save` worker serializes the world chunk stream straight into a streaming
+zstd level-3 encoder, stages and `fsync`s every file, and renames sidecars first
+and `world.obs` last. The 300+ MiB uncompressed payload is never materialised on
+a normal async save; peak additional RSS is the compressed body plus a small
+scratch buffer. Edits made while the worker runs copy-on-write only the touched
+column, so the save sees a consistent pre-snapshot world. At most one writer may
+exist: `save_async` coalesces (returns `false`) while a save is in flight, and the
+network autosave skips the interval instead of queueing. `Host::save()` remains
+the synchronous compatibility path (tests, the client's existing call site and
+explicit saves); `save_and_wait` drains an in-flight worker before writing the
+current state. On shutdown the server waits for an in-flight worker with a
+bounded timeout and reaps its result; if the worker failed or its thread stopped,
+the synchronous path writes the final state (a still-running worker yields
+`SaveTimeout` rather than starting a second writer). A worker error is surfaced
+to the caller, marks the host dirty and leaves the previous committed save
+intact; the next autosave retries. See `docs/plan/08-measurements.md` for the
+measured pauses and peak RSS at 289, 2,025 and 4,225 columns.
 
 ### 3.5 Write path
 
@@ -475,6 +503,19 @@ is unloaded. Fsyncs per cycle are `2 × dirty_regions`, which is why block edits
 never fsync (REQ-SAVE-012): an edit only sets a bit. Servers may raise the interval
 to reduce IO; the cost is a larger worst-case loss window, which the config
 documentation states explicitly.
+
+**Interim v4 host (1.1 and 1.2).** Until the region store lands, the host keeps
+the interval semantics above but moves the whole-world encode/compress/write to
+an `ob-save` worker (`Host::save_async`). The tick thread only captures the
+`Arc` world snapshot and serializes sidecars; the interval timer and the dirty
+flag are otherwise unchanged, and completion is reaped on a later tick. One
+writer is allowed, so a save that overruns its interval is coalesced: the next
+interval is skipped rather than queued. Console `save`, explicit saves and
+shutdown drain the worker and then use the synchronous `Host::save`/commit path;
+shutdown waits a bounded 60 s and falls back to synchronous only after a worker
+has failed or stopped, never while it may still be writing. This is an
+implementation detail of the interim format, not the frozen region-store
+protocol.
 
 **Graceful shutdown.** Stop accepting edits, flush the dirty set, run one final
 commit, set `clean_shutdown` in `level.json` and in every touched header, `fsync`,
@@ -574,16 +615,24 @@ container version, seed, a content-registry fingerprint (REQ-SAVE-035), a
 compression flag (stored or zstd level 3), uncompressed/compressed payload
 lengths, the payload, and a CRC32C over everything before it. Snapshot v1
 (stored, dense light), v2 (zstd, compact light) and v3 (registry fingerprint)
-remain readable and are upgraded on the next save; v4 is the current format and
-keeps the strict fingerprint check. Registry block ids in the interim format are
-session-local dense indices and are append-only by policy: the crafting slice
-appends `planks`, `cobblestone` and `crafting_table` without moving any earlier
-id. Consequently a v3 snapshot whose fingerprint predates that append is
-accepted with a warning naming both fingerprints and its ids are interpreted
-unchanged; v1 and v2 carry no fingerprint and load ids unchanged by
-construction. Reordering or removing blocks still fails (an out-of-range id is
-`UnknownBlock`, and v4 rejects any fingerprint change). This format is explicitly not the frozen region
-format and makes no compatibility promise beyond the migration chain above.
+remain readable and are upgraded on the next save; v4 is the current format.
+Registry block ids in the interim format are session-local dense indices and are
+append-only by policy: the crafting slice appends `planks`, `cobblestone` and
+`crafting_table` without moving any earlier id, and the 1.2 content append uses
+the same rule. Validation is therefore **append-only prefix acceptance**: a
+saved fingerprint is accepted when it equals the current registry's fingerprint
+or the fingerprint of one of its strict prefixes; because v4 stores only the
+fingerprint, the loader hashes every current prefix and compares. Appending
+blocks at the end keeps every saved id valid, while removing or reordering a
+saved block changes the saved prefix and is rejected with
+`RegistryMismatch { saved, current }` naming both fingerprints. A v3 snapshot
+whose fingerprint predates an append is accepted with a warning and its ids are
+interpreted unchanged; a v3 reorder is rejected in v1.1 instead of loading with
+silently reinterpreted ids. v1 and v2 carry no fingerprint and load ids
+unchanged by construction (out-of-range ids are still `UnknownBlock`). The
+fingerprint covers the ordered block registry; appending item types does not
+change it. This format is explicitly not the frozen region format and makes no
+compatibility promise beyond the migration chain above.
 
 **Forward-compatibility promise.** A world written by any `1.x` build opens in any
 later `1.x` build through the migration chain. A newer world never opens in an

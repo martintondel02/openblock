@@ -98,6 +98,23 @@ pub fn peak_rss_kib() -> Option<u64> {
     read_status_kib("VmHWM:")
 }
 
+/// Resets the process peak-RSS high-water mark (`VmHWM`) where supported.
+///
+/// Writes `5` ("reset peak RSS") to `/proc/self/clear_refs`. Returns `false` on
+/// non-Linux hosts or when procfs refuses the write, in which case callers must
+/// treat [`peak_rss_kib`] as a lifetime high-water mark rather than a per-phase
+/// measurement.
+pub fn reset_peak_rss() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::write("/proc/self/clear_refs", b"5").is_ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// Reads one kilobyte field from `/proc/self/status`.
 fn read_status_kib(field: &str) -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;

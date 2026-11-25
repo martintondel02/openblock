@@ -28,9 +28,18 @@
 //! Version 3 added the registry fingerprint but did not know about the block
 //! types appended by the crafting slice. Because block ids are append-only,
 //! v1/v2 (which carry no fingerprint) and v3 saves whose fingerprint predates
-//! the append are accepted: ids are interpreted unchanged and a v3 mismatch
-//! logs a warning naming both fingerprints. v4 and later keep the strict
-//! fingerprint check.
+//! an append are accepted: ids are interpreted unchanged and a v3 mismatch logs
+//! a warning naming both fingerprints. v4 (and later) use **append-only prefix
+//! acceptance**: the saved fingerprint is accepted when it equals today's
+//! registry fingerprint or the fingerprint of one of its strict prefixes.
+//! Appending blocks at the end keeps every saved id valid; removing or
+//! reordering any saved block changes the saved prefix and is rejected with
+//! [`SaveError::RegistryMismatch`]. The fingerprint covers the ordered block
+//! registry only; appended item types do not change it.
+//!
+//! [`WorldSnapshot`] captures the loaded columns as shared [`Arc`]s so the host
+//! can move encoding, compression and the staged write to a background worker
+//! without copying the world or holding the simulation lock.
 //!
 //! Version 1 used the same chunk stream without compression, with light flag 1
 //! always carrying a dense array even for a uniform non-zero value:
@@ -49,11 +58,14 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::sync::Arc;
 
-use ob_content::{BlockId, Registry};
+use ob_content::{BlockId, BlockType, Registry};
 use ob_math::{ChunkPos, N_SECTIONS, SECTION_SIZE};
 use rustc_hash::FxHashSet;
 use zstd::decompress::zstd_decompress::{ZSTD_CONTENTSIZE_ERROR, ZSTD_CONTENTSIZE_UNKNOWN, ZSTD_getFrameContentSize};
-use zstd::prelude::{ZSTD_compress, ZSTD_compressBound, ZSTD_decompress, ZSTD_isError};
+use zstd::prelude::{
+    ZSTD_CCtx, ZSTD_CStreamOutSize, ZSTD_compress, ZSTD_compressBound, ZSTD_compressStream, ZSTD_createCCtx,
+    ZSTD_decompress, ZSTD_endStream, ZSTD_initCStream_srcSize, ZSTD_isError,
+};
 
 use crate::chunk::ChunkColumn;
 use crate::light::Light;
@@ -210,6 +222,124 @@ impl std::error::Error for SaveError {}
 #[derive(Debug, Clone, Default)]
 pub struct WorldSave;
 
+/// Immutable, cheaply shareable view of the loaded world for a background save.
+///
+/// Captured by [`World::snapshot`](crate::World::snapshot) under the simulation
+/// lock in O(columns) pointer copies: the columns are shared through [`Arc`],
+/// not cloned. Encoding the snapshot on a worker thread therefore does not
+/// block the tick thread and does not duplicate the world's block data. A later
+/// edit copy-on-writes only the column it touches; the snapshot keeps the
+/// pre-edit version, which is exactly the consistency a save needs.
+///
+/// The chunk order is fixed at capture time, so encoding the same snapshot
+/// twice produces identical bytes. The v4 stream produced here is the same
+/// uncompressed chunk payload as [`to_bytes`]; only the zstd encoder is driven
+/// incrementally so the 300+ MiB uncompressed buffer never has to exist. The
+/// compressed bytes are a deterministic function of the payload but are not
+/// guaranteed to be byte-identical to the one-shot encoder's output.
+#[derive(Debug, Clone)]
+pub struct WorldSnapshot {
+    seed: u64,
+    registry_fingerprint: u64,
+    chunks: Vec<Arc<ChunkColumn>>,
+}
+
+impl WorldSnapshot {
+    /// Builds a snapshot from already sorted, shared columns.
+    pub(crate) fn new(seed: u64, registry: &Registry, chunks: Vec<Arc<ChunkColumn>>) -> Self {
+        Self {
+            seed,
+            registry_fingerprint: registry_fingerprint(registry),
+            chunks,
+        }
+    }
+
+    /// The persisted world seed.
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// The registry fingerprint recorded when the snapshot was captured.
+    pub fn registry_fingerprint(&self) -> u64 {
+        self.registry_fingerprint
+    }
+
+    /// Number of captured columns.
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Bytes the chunk payload would occupy before compression.
+    ///
+    /// This is computed by walking the sections, so the streaming encoder can
+    /// declare the payload length in the v4 header without materialising the
+    /// payload. It is tested to equal the length of the buffered encoder.
+    pub fn payload_len(&self) -> Result<usize, SaveError> {
+        let mut len = 4usize; // chunk_count
+        for chunk in &self.chunks {
+            len = len.checked_add(8).ok_or(SaveError::PayloadTooLarge {
+                len: usize::MAX,
+                max: MAX_SAVE_PAYLOAD_BYTES,
+            })?;
+            for (_, section) in chunk.sections() {
+                len = len
+                    .checked_add(section_encoded_len(section))
+                    .ok_or(SaveError::PayloadTooLarge {
+                        len: usize::MAX,
+                        max: MAX_SAVE_PAYLOAD_BYTES,
+                    })?;
+            }
+        }
+        Ok(len)
+    }
+
+    /// Serializes the captured world to the v4 snapshot format.
+    ///
+    /// The uncompressed chunk stream is fed straight into a streaming zstd
+    /// encoder, so peak memory is the compressed body plus a small scratch
+    /// buffer instead of the whole payload. If the streaming encoder reports an
+    /// error the encoder falls back to the buffered path, preserving the
+    /// historical output at the cost of the transient payload allocation.
+    pub fn to_bytes_checked(&self) -> Result<Vec<u8>, SaveError> {
+        let payload_len = self.payload_len()?;
+        if payload_len > MAX_SAVE_PAYLOAD_BYTES {
+            return Err(SaveError::PayloadTooLarge {
+                len: payload_len,
+                max: MAX_SAVE_PAYLOAD_BYTES,
+            });
+        }
+        match compress_snapshot_streaming(self, payload_len) {
+            Ok(body) => finish_v4(
+                self.seed,
+                self.registry_fingerprint,
+                payload_len,
+                COMPRESSION_ZSTD,
+                body,
+                MAX_SAVE_PAYLOAD_BYTES,
+                MAX_SAVE_FILE_BYTES,
+            ),
+            Err(()) => {
+                // Streaming is an optimisation, not a format requirement. Keep
+                // the save working if the codec rejects incremental input.
+                let payload = encode_snapshot_payload(self);
+                if payload.len() != payload_len {
+                    return Err(SaveError::InvalidFormat("streaming payload length mismatch"));
+                }
+                let (compression, body) = compress_payload(&payload);
+                finish_v4(
+                    self.seed,
+                    self.registry_fingerprint,
+                    payload_len,
+                    compression,
+                    body,
+                    MAX_SAVE_PAYLOAD_BYTES,
+                    MAX_SAVE_FILE_BYTES,
+                )
+            }
+        }
+    }
+}
+
 /// Serializes a world to the compressed v4 snapshot format.
 ///
 /// Chunks are emitted in ascending `(cx, cz)` order so repeated saves of the
@@ -245,11 +375,33 @@ fn encode_v4(world: &World, max_payload: usize, max_file: u64) -> Result<Vec<u8>
             max: max_payload,
         });
     }
-    let payload_len = u32::try_from(payload.len()).map_err(|_| SaveError::PayloadTooLarge {
-        len: payload.len(),
+    let (compression, body) = compress_payload(&payload);
+    finish_v4(
+        world.seed(),
+        registry_fingerprint(world.registry()),
+        payload.len(),
+        compression,
+        body,
+        max_payload,
+        max_file,
+    )
+}
+
+/// Assembles the v4 header, compressed body and trailing CRC32C.
+#[allow(clippy::too_many_arguments)]
+fn finish_v4(
+    seed: u64,
+    registry: u64,
+    payload_len: usize,
+    compression: u8,
+    body: Vec<u8>,
+    max_payload: usize,
+    max_file: u64,
+) -> Result<Vec<u8>, SaveError> {
+    let payload_len_u32 = u32::try_from(payload_len).map_err(|_| SaveError::PayloadTooLarge {
+        len: payload_len,
         max: max_payload,
     })?;
-    let (compression, body) = compress_payload(&payload);
     let body_len = u32::try_from(body.len()).map_err(|_| SaveError::SaveFileTooLarge {
         len: u64::try_from(body.len()).unwrap_or(u64::MAX),
         max: max_file,
@@ -265,10 +417,10 @@ fn encode_v4(world: &World, max_payload: usize, max_file: u64) -> Result<Vec<u8>
     let mut out = Vec::with_capacity(V4_HEADER_LEN + body.len() + CRC_LEN);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
-    out.extend_from_slice(&world.seed().to_le_bytes());
-    out.extend_from_slice(&registry_fingerprint(world.registry()).to_le_bytes());
+    out.extend_from_slice(&seed.to_le_bytes());
+    out.extend_from_slice(&registry.to_le_bytes());
     out.push(compression);
-    out.extend_from_slice(&payload_len.to_le_bytes());
+    out.extend_from_slice(&payload_len_u32.to_le_bytes());
     out.extend_from_slice(&body_len.to_le_bytes());
     out.extend_from_slice(&body);
 
@@ -375,6 +527,130 @@ fn encode_payload(world: &World, write_section: fn(&mut Vec<u8>, &Section)) -> V
         }
     }
     out
+}
+
+/// Encodes the chunk stream of a captured snapshot.
+///
+/// Only used by the streaming encoder's fallback and by unit tests; the normal
+/// background-save path never materialises this payload.
+fn encode_snapshot_payload(snapshot: &WorldSnapshot) -> Vec<u8> {
+    let mut out = Vec::new();
+    let chunk_count = u32::try_from(snapshot.chunks.len()).expect("world snapshot has more than 4 billion chunks");
+    out.extend_from_slice(&chunk_count.to_le_bytes());
+    for chunk in &snapshot.chunks {
+        let pos = chunk.pos();
+        out.extend_from_slice(&pos.x.to_le_bytes());
+        out.extend_from_slice(&pos.z.to_le_bytes());
+        for (_, section) in chunk.sections() {
+            write_section(&mut out, section);
+        }
+    }
+    out
+}
+
+/// Exact number of payload bytes [`write_section`] emits for one section.
+fn section_encoded_len(section: &Section) -> usize {
+    let storage = match section.storage() {
+        SectionStorage::Uniform(_) => 3,
+        SectionStorage::Bits4 { palette, .. } => 3 + 2 * palette.len().min(u16::MAX as usize) + 8 * BITS4_WORDS,
+        SectionStorage::Bits8 { palette, .. } => 3 + 2 * palette.len().min(u16::MAX as usize) + 8 * BITS8_WORDS,
+        SectionStorage::Bits16 { palette, .. } => 3 + 2 * palette.len().min(u16::MAX as usize) + 8 * BITS16_WORDS,
+    };
+    let light = match section.light().uniform_value() {
+        Some(0) => 1,
+        Some(_) => 3,
+        None => 1 + BLOCK_COUNT * 2,
+    };
+    storage + light
+}
+
+/// Streaming zstd encoder state.
+struct StreamingCompressor {
+    context: Box<ZSTD_CCtx>,
+    output: Vec<u8>,
+    buffer: Vec<u8>,
+}
+
+impl StreamingCompressor {
+    /// Starts a zstd level-3 frame that declares `payload_len` as its content
+    /// size, so the loader's frame-size check can reject truncation early.
+    fn new(payload_len: usize) -> Option<Self> {
+        let mut context = ZSTD_createCCtx()?;
+        let result = ZSTD_initCStream_srcSize(&mut context, ZSTD_LEVEL, payload_len as u64);
+        if ZSTD_isError(result) {
+            return None;
+        }
+        Some(Self {
+            context,
+            output: Vec::new(),
+            buffer: vec![0u8; ZSTD_CStreamOutSize().max(32)],
+        })
+    }
+
+    /// Feeds one section-sized input chunk and appends all produced bytes.
+    fn write(&mut self, bytes: &[u8]) -> Result<(), ()> {
+        let mut input_pos = 0usize;
+        while input_pos < bytes.len() {
+            let mut output_pos = 0usize;
+            let result = ZSTD_compressStream(
+                &mut self.context,
+                &mut self.buffer,
+                &mut output_pos,
+                bytes,
+                &mut input_pos,
+            );
+            if ZSTD_isError(result) {
+                return Err(());
+            }
+            self.output.extend_from_slice(&self.buffer[..output_pos]);
+            if output_pos == 0 && input_pos < bytes.len() && result == 0 {
+                // Defensive: the codec should consume input or produce output.
+                // Avoid spinning forever if it reports no progress.
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends the frame and returns the compressed body.
+    fn finish(mut self) -> Result<Vec<u8>, ()> {
+        loop {
+            let mut output_pos = 0usize;
+            let result = ZSTD_endStream(&mut self.context, &mut self.buffer, &mut output_pos);
+            if ZSTD_isError(result) {
+                return Err(());
+            }
+            self.output.extend_from_slice(&self.buffer[..output_pos]);
+            if result == 0 {
+                return Ok(self.output);
+            }
+            if output_pos == 0 {
+                // No progress and the frame is not finished: report an encoder
+                // failure so the snapshot falls back to the buffered path
+                // instead of spinning forever.
+                return Err(());
+            }
+        }
+    }
+}
+
+/// Compresses a snapshot section by section, never holding the full payload.
+fn compress_snapshot_streaming(snapshot: &WorldSnapshot, payload_len: usize) -> Result<Vec<u8>, ()> {
+    let mut compressor = StreamingCompressor::new(payload_len).ok_or(())?;
+    let chunk_count = u32::try_from(snapshot.chunks.len()).map_err(|_| ())?;
+    compressor.write(&chunk_count.to_le_bytes())?;
+    let mut scratch = Vec::new();
+    for chunk in &snapshot.chunks {
+        let pos = chunk.pos();
+        compressor.write(&pos.x.to_le_bytes())?;
+        compressor.write(&pos.z.to_le_bytes())?;
+        for (_, section) in chunk.sections() {
+            scratch.clear();
+            write_section(&mut scratch, section);
+            compressor.write(&scratch)?;
+        }
+    }
+    compressor.finish()
 }
 
 /// Compresses a payload with zstd level 3.
@@ -540,20 +816,24 @@ fn load_compressed(registry: Arc<Registry>, bytes: &[u8], strict_fingerprint: bo
     ]);
     let current_registry = registry_fingerprint(&registry);
     if saved_registry != current_registry {
-        if strict_fingerprint {
+        if !registry_is_append_only_prefix(saved_registry, &registry) {
             return Err(SaveError::RegistryMismatch {
                 saved: saved_registry,
                 current: current_registry,
             });
         }
-        // v1-v3 predate the append-only additions: block ids are unchanged, so
-        // the saved ids still resolve. A reorder would likely hit UnknownBlock
-        // or silently reinterpret ids, which is why v4 keeps this strict.
-        log::warn!(
-            "world snapshot registry fingerprint {saved_registry:016x} differs from the current \
-             {current_registry:016x}; loading its block ids unchanged because registry block ids \
-             are append-only"
+        // The saved registry is a prefix of the current one: every id it uses
+        // keeps its old meaning and the appended block ids were never present
+        // in the save. This is the 1.0.x -> 1.1/1.2 compatibility path.
+        let message = format!(
+            "world snapshot registry fingerprint {saved_registry:016x} predates appended block \
+             types (current {current_registry:016x}); loading its ids unchanged"
         );
+        if strict_fingerprint {
+            log::info!("{message}");
+        } else {
+            log::warn!("{message}");
+        }
     }
     let compression = bytes[22];
     let uncompressed_len = u32::from_le_bytes([bytes[23], bytes[24], bytes[25], bytes[26]]);
@@ -580,21 +860,49 @@ fn load_compressed(registry: Arc<Registry>, bytes: &[u8], strict_fingerprint: bo
 
 /// Stable content-pack fingerprint: FNV-1a over the block count and ids in order.
 pub fn registry_fingerprint(registry: &Registry) -> u64 {
+    let blocks: Vec<&BlockType> = registry.iter().map(|(_, block)| block).collect();
+    fingerprint_blocks(&blocks, blocks.len())
+}
+
+/// FNV-1a over `count` followed by the first `count` block ids.
+///
+/// The registry fingerprint covers the ordered *block* registry; appending
+/// items does not change it. A save written before a content append records the
+/// fingerprint of a strict prefix of today's registry.
+fn fingerprint_blocks(blocks: &[&BlockType], count: usize) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     let mut mix = |byte: u8| {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     };
-    for byte in (registry.len() as u32).to_le_bytes() {
+    for byte in (count as u32).to_le_bytes() {
         mix(byte);
     }
-    for (_, block) in registry.iter() {
+    for block in blocks.iter().take(count) {
         for byte in block.id.as_bytes() {
             mix(*byte);
         }
         mix(0xff);
     }
     hash
+}
+
+/// Whether `saved` is the fingerprint of a strict prefix of `registry`.
+///
+/// v4 stores only the fingerprint, not the registry length, so append-only
+/// acceptance compares the saved value with the fingerprint of every prefix of
+/// the current registry. A removal or reorder changes the bytes of the saved
+/// prefix and no longer matches; an appended block only adds a new, longer
+/// prefix. The comparison is a 64-bit hash test (collisions are negligible) and
+/// block ids beyond the current registry are still rejected later by
+/// [`validate_block`]. Realistic registries have tens to hundreds of blocks, so
+/// the O(n²) byte walk is far below the save's I/O cost.
+fn registry_is_append_only_prefix(saved: u64, registry: &Registry) -> bool {
+    let blocks: Vec<&BlockType> = registry.iter().map(|(_, block)| block).collect();
+    if saved == fingerprint_blocks(&blocks, blocks.len()) {
+        return true;
+    }
+    (0..blocks.len()).any(|count| fingerprint_blocks(&blocks, count) == saved)
 }
 
 fn read_payload(
@@ -1692,6 +2000,16 @@ mod tests {
         world.insert_chunk(ChunkColumn::from_sections(pos, sections));
 
         let bytes = to_bytes(&world);
+        let snapshot = world.snapshot();
+        assert_eq!(
+            snapshot.payload_len().expect("payload length"),
+            encode_payload(&world, write_section).len(),
+            "streaming length must cover 8- and 16-bit palettes and dense light"
+        );
+        let async_bytes = snapshot.to_bytes_checked().expect("streaming snapshot encodes");
+        let async_loaded = from_bytes(Arc::clone(&registry), &async_bytes).expect("streaming snapshot is valid");
+        assert_same_world(&world, &async_loaded);
+
         let loaded = from_bytes(Arc::clone(&registry), &bytes).expect("snapshot is valid");
         let loaded_chunk = loaded.chunk(pos).expect("chunk was loaded");
         let modes: Vec<StorageMode> = loaded_chunk.sections().map(|(_, s)| s.mode()).collect();
@@ -1753,6 +2071,219 @@ mod tests {
         match from_bytes(changed, &bytes) {
             Err(SaveError::RegistryMismatch { saved, current }) => assert_ne!(saved, current),
             other => panic!("expected RegistryMismatch, got {other:?}"),
+        }
+    }
+
+    /// Decompresses the v4 body so tests can compare the snapshot encoder's
+    /// payload with the buffered reference encoder.
+    fn v4_payload(bytes: &[u8]) -> Vec<u8> {
+        assert_eq!(bytes[22], COMPRESSION_ZSTD);
+        let uncompressed = u32::from_le_bytes([bytes[23], bytes[24], bytes[25], bytes[26]]) as usize;
+        let compressed = u32::from_le_bytes([bytes[27], bytes[28], bytes[29], bytes[30]]) as usize;
+        decode_payload(
+            COMPRESSION_ZSTD,
+            uncompressed,
+            &bytes[V4_HEADER_LEN..V4_HEADER_LEN + compressed],
+        )
+        .expect("snapshot body decompresses")
+    }
+
+    #[test]
+    fn snapshot_encoding_matches_the_buffered_payload_and_is_deterministic() {
+        let (registry, world) = sample_world();
+        let snapshot = world.snapshot();
+        assert_eq!(snapshot.seed(), world.seed());
+        assert_eq!(snapshot.chunk_count(), world.chunk_count());
+        assert_eq!(
+            snapshot.registry_fingerprint(),
+            registry_fingerprint(&registry),
+            "snapshot freezes the registry fingerprint"
+        );
+
+        let payload = encode_payload(&world, write_section);
+        assert_eq!(
+            snapshot.payload_len().expect("payload length is computable"),
+            payload.len(),
+            "the streaming length walk must exactly match write_section"
+        );
+
+        let first = snapshot.to_bytes_checked().expect("snapshot encodes");
+        let second = snapshot.to_bytes_checked().expect("snapshot encodes deterministically");
+        assert_eq!(first, second, "the same snapshot must always encode identically");
+        assert_eq!(
+            v4_payload(&first),
+            payload,
+            "streaming and buffered encoders must agree on the v4 payload"
+        );
+
+        let loaded = from_bytes(Arc::clone(&registry), &first).expect("snapshot loads");
+        assert_same_world(&world, &loaded);
+        assert_eq!(
+            v4_payload(&to_bytes(&loaded)),
+            payload,
+            "a loaded snapshot re-encodes the same chunk payload"
+        );
+    }
+
+    #[test]
+    fn snapshot_is_isolated_from_later_world_edits() {
+        let (registry, world) = sample_world();
+        let snapshot = world.snapshot();
+        let before = snapshot.to_bytes_checked().expect("snapshot encodes");
+        let original_payload = v4_payload(&before);
+
+        // An air block high above the sample terrain is a real edit that the
+        // snapshot must not observe (Arc copy-on-write per touched column).
+        let mut edited = world;
+        let edit_pos = BlockPos::new(1, 200, 1);
+        let stone = block(&registry, "openblock:stone");
+        assert!(edited.set_block(edit_pos, stone), "edit applies to the live world");
+
+        assert_eq!(
+            v4_payload(&snapshot.to_bytes_checked().expect("snapshot still encodes")),
+            original_payload,
+            "the snapshot must not observe an edit made after capture"
+        );
+        assert_ne!(
+            v4_payload(&to_bytes(&edited)),
+            original_payload,
+            "the live world changed, so its own encoding must differ"
+        );
+        // The pre-edit snapshot must still load the original blocks.
+        let loaded = from_bytes(Arc::clone(&registry), &before).expect("old snapshot still loads");
+        assert_eq!(loaded.get_block(edit_pos), BlockId::AIR);
+        assert_eq!(edited.get_block(edit_pos), stone);
+    }
+
+    #[test]
+    fn empty_snapshot_round_trips() {
+        let registry = base_registry();
+        let world = World::new(Arc::clone(&registry), 42);
+        let snapshot = world.snapshot();
+        assert_eq!(snapshot.chunk_count(), 0);
+        let bytes = snapshot.to_bytes_checked().expect("empty snapshot encodes");
+        let loaded = from_bytes(registry, &bytes).expect("empty snapshot loads");
+        assert_eq!(loaded.chunk_count(), 0);
+        assert_eq!(loaded.seed(), 42);
+        assert_eq!(v4_payload(&to_bytes(&loaded)), v4_payload(&bytes));
+    }
+
+    #[test]
+    fn v4_accepts_an_append_only_registry_prefix() {
+        let current = base_registry();
+        // The 1.0.2-era block registry: air through the crafting table, before
+        // the five wave-1 blocks (three ores, furnace, chest) were appended at
+        // the end. This is the realistic pre-1.2 content pack; the bytes are
+        // generated here rather than committed as a fixture.
+        let mut old_blocks: Vec<_> = current.iter().map(|(_, block)| block.clone()).collect();
+        old_blocks.truncate(15);
+        let old_registry = Arc::new(Registry::from_blocks(old_blocks).expect("old registry is valid"));
+        let old_fingerprint = registry_fingerprint(&old_registry);
+        assert_ne!(old_fingerprint, registry_fingerprint(&current));
+
+        let (_, world) = sample_world_with(Arc::clone(&old_registry));
+        let bytes = to_bytes(&world);
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 4, "1.0.2 wrote v4");
+        assert_eq!(
+            u64::from_le_bytes([
+                bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21]
+            ]),
+            old_fingerprint
+        );
+
+        let loaded = from_bytes(Arc::clone(&current), &bytes).expect("a prefix registry save must load");
+        assert_same_world(&world, &loaded);
+
+        // Re-saving records today's full fingerprint and stays deterministic.
+        let upgraded = to_bytes(&loaded);
+        assert_eq!(
+            u64::from_le_bytes([
+                upgraded[14],
+                upgraded[15],
+                upgraded[16],
+                upgraded[17],
+                upgraded[18],
+                upgraded[19],
+                upgraded[20],
+                upgraded[21]
+            ]),
+            registry_fingerprint(&current)
+        );
+        let reloaded = from_bytes(Arc::clone(&current), &upgraded).expect("upgraded save loads");
+        assert_same_world(&loaded, &reloaded);
+        assert_eq!(to_bytes(&reloaded), upgraded);
+    }
+
+    #[test]
+    fn v4_accepts_every_append_only_registry_prefix() {
+        let current = base_registry();
+        let blocks: Vec<_> = current.iter().map(|(_, block)| block.clone()).collect();
+        let (_, world) = sample_world_with(Arc::clone(&current));
+        for count in 1..=blocks.len() {
+            let prefix = Arc::new(Registry::from_blocks(blocks[..count].to_vec()).expect("a registry prefix is valid"));
+            let (_, prefix_world) = sample_world_with(Arc::clone(&prefix));
+            let bytes = to_bytes(&prefix_world);
+            let loaded = from_bytes(Arc::clone(&current), &bytes)
+                .unwrap_or_else(|error| panic!("prefix of {count} blocks was rejected: {error}"));
+            assert_same_world(&prefix_world, &loaded);
+            assert_eq!(prefix_world.seed(), world.seed());
+        }
+    }
+
+    #[test]
+    fn v4_rejects_reordered_and_removed_registries() {
+        let current = base_registry();
+        let (_, world) = sample_world();
+        let bytes = to_bytes(&world);
+
+        // Reorder two existing block ids: the saved fingerprint is no longer a
+        // prefix of today's ordered registry.
+        let mut reordered_blocks: Vec<_> = current.iter().map(|(_, block)| block.clone()).collect();
+        reordered_blocks.swap(1, 2);
+        let reordered = Arc::new(Registry::from_blocks(reordered_blocks).expect("a reordered registry is valid"));
+        match from_bytes(reordered, &bytes) {
+            Err(SaveError::RegistryMismatch { .. }) => {}
+            other => panic!("a reordered registry must be rejected, got {other:?}"),
+        }
+
+        // Remove a block from the middle: later ids shift, so this is not a
+        // prefix even though the registry is shorter.
+        let mut removed_blocks: Vec<_> = current.iter().map(|(_, block)| block.clone()).collect();
+        removed_blocks.remove(1);
+        let removed = Arc::new(Registry::from_blocks(removed_blocks).expect("a shortened registry is valid"));
+        match from_bytes(removed, &bytes) {
+            Err(SaveError::RegistryMismatch { .. }) => {}
+            other => panic!("a registry with a removed block must be rejected, got {other:?}"),
+        }
+
+        // Appending to the *saved* registry while reordering the saved prefix
+        // must also be rejected: a longer registry is not a prefix of a shorter
+        // save, and the modified prefix changes the hash.
+        let mut tampered_blocks: Vec<_> = current.iter().map(|(_, block)| block.clone()).collect();
+        tampered_blocks.truncate(12);
+        tampered_blocks.swap(1, 2);
+        let tampered = Arc::new(Registry::from_blocks(tampered_blocks).expect("tampered registry is valid"));
+        let (_, tampered_world) = sample_world_with(Arc::clone(&tampered));
+        let tampered_bytes = to_bytes(&tampered_world);
+        match from_bytes(Arc::clone(&current), &tampered_bytes) {
+            Err(SaveError::RegistryMismatch { .. }) => {}
+            other => panic!("a mutated saved prefix must be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v3_reordered_fingerprint_is_rejected() {
+        let (registry, world) = sample_world();
+        let mut bytes = to_v3_bytes(&world);
+        let mut blocks: Vec<_> = registry.iter().map(|(_, block)| block.clone()).collect();
+        blocks.swap(1, 2);
+        let reordered = Registry::from_blocks(blocks).expect("reordered registry is valid");
+        let fingerprint = registry_fingerprint(&reordered);
+        bytes[14..22].copy_from_slice(&fingerprint.to_le_bytes());
+        resign(&mut bytes);
+        match from_bytes(registry, &bytes) {
+            Err(SaveError::RegistryMismatch { .. }) => {}
+            other => panic!("a reordered v3 registry must be rejected, got {other:?}"),
         }
     }
 

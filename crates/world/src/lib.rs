@@ -14,8 +14,8 @@ pub mod world;
 pub use chunk::ChunkColumn;
 pub use light::Light;
 pub use save::{
-    MAX_SAVE_FILE_BYTES, MAX_SAVE_PAYLOAD_BYTES, SaveError, from_bytes, read_save_file, registry_fingerprint, to_bytes,
-    to_bytes_checked,
+    MAX_SAVE_FILE_BYTES, MAX_SAVE_PAYLOAD_BYTES, SaveError, WorldSnapshot, from_bytes, read_save_file,
+    registry_fingerprint, to_bytes, to_bytes_checked,
 };
 pub use section::{Section, SectionStorage};
 pub use world::{RayHit, World};

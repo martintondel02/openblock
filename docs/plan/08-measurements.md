@@ -1421,3 +1421,167 @@ Artifacts: `/tmp/openblock-512.png` (1280×720, Classic textures) and
 `/tmp/openblock-512-1080p.png` (1920×1080). The ignored tests are
 `streaming_unload_plateau_at_512_blocks` and
 `join_512_blocks_loopback_transfer`.
+
+---
+
+## 2026-11-25 — v1.1 persistence hardening: async saves, append-only saves, structure-aware spawn
+
+### Environment and methodology
+
+| | |
+| --- | --- |
+| OS | Fedora Linux 45, kernel 7.3.4 |
+| CPU | AMD Ryzen 7 9800X3D (16 threads) |
+| Build | `./dev-cargo build --release -p ob_tools --bin save_bench` |
+| Tool | `save_bench --radius {8,22,32} --no-migration`, release, fresh temporary world, seed 42 |
+| World sizes | 289 / 2,025 / 4,225 columns (17×17 / 45×45 / 65×65 interest rings) |
+| Samples | 5 async + 5 sync saves at 289; 3 + 3 at 2,025; 3 + 3 at 4,225 |
+| Content | 256 item entities, 18 mobs, 32 furnaces, 16 chests in every run |
+| Peak RSS | per-sample `VmHWM` after writing `5` to `/proc/self/clear_refs`, so transient encode/compress buffers are included |
+
+The benchmark runs the async series first, while no previous full-payload
+allocation is resident, then the synchronous series. "Sync pause" is the whole
+`Host::save()` call on the tick thread: sidecar serialization, full in-memory v4
+encode, zstd compression, staged writes, `fsync`s and renames. "Async start" is
+the part of `Host::save_async` that runs on the caller's thread: sidecar
+serialization plus the `Arc` world snapshot. The worker wall time is measured
+separately. The process also holds the world heap (322.5 MiB at 4,225 columns),
+so the peak-RSS table reports the delta over the RSS immediately before the
+series.
+
+```text
+save_bench --radius 8  --saves 5 --loads 2 --no-migration
+save_bench --radius 22 --saves 3 --loads 2 --no-migration
+save_bench --radius 32 --saves 3 --loads 1 --no-migration
+```
+
+### Architecture
+
+- `World` now stores each column as `Arc<ChunkColumn>`. `World::snapshot()`
+  copies the pointer map, sorts by `(cx, cz)` and freezes seed and registry
+  fingerprint in O(columns); no block data is copied. A later edit
+  copy-on-writes only the touched column, so the worker sees a consistent
+  pre-snapshot world.
+- `Host::save_async()` serializes the sidecars on the tick thread, captures the
+  snapshot, and spawns one `ob-save` worker. The worker writes the v4 chunk
+  stream section-by-section into a streaming zstd level-3 encoder, then stages
+  every payload as `.tmp`, `fsync`s it, renames sidecars first and `world.obs`
+  last, and best-effort `fsync`s the directory. The 300+ MiB uncompressed buffer
+  never exists on a normal async save; if streaming compression errors, the
+  encoder falls back to the historical buffered path.
+- At most one writer exists. `save_async()` returns `Ok(false)` while a save is
+  in flight; the network autosave coalesces by skipping its interval. The tick
+  loop reaps completion with `poll_save()`. A worker error or panic is surfaced,
+  marks the host dirty and leaves the previous commit intact; the next autosave
+  retries. `save()` remains the synchronous compatibility path and
+  `save_and_wait()` drains an in-flight worker before writing current state.
+  Shutdown waits up to 60 s for the worker, reaps its result, and uses the
+  synchronous fallback if the worker failed or stopped; a worker that is merely
+  still running after the timeout yields `SaveTimeout` instead of starting a
+  second writer over the same files.
+
+### Results (seed 42, release)
+
+| Metric | 289 columns | 2,025 columns | 4,225 columns |
+| --- | ---: | ---: | ---: |
+| World heap | 21.59 MiB | 155.06 MiB | 322.45 MiB |
+| Sync save pause (mean) | 22.44 ms | 154.92 ms | 317.63 ms |
+| Async start pause (mean / max) | **0.28 / 0.35 ms** | **0.31 / 0.33 ms** | **0.41 / 0.50 ms** |
+| Async worker wall (mean) | 22.58 ms | 140.22 ms | 288.63 ms |
+| Worker encode / write (means) | 21.22 / 0.22 ms | 138.19 / 0.90 ms | 285.16 / 1.76 ms |
+| Peak RSS delta, sync | +47.8 MiB | +169.5 MiB | +350.8 MiB |
+| Peak RSS delta, async | **+10.4 MiB** | **+16.2 MiB** | **+35.8 MiB** |
+| `world.obs` on disk | 655.3 KiB | 4.63 MiB | 9.60 MiB |
+| Uncompressed v4 payload | 21.63 MiB | 155.32 MiB | 322.99 MiB |
+| Save/reload state hash | PASS | PASS | PASS |
+
+Every async run produced byte-identical `world.obs` bytes, and all reloads
+reproduced the pre-save state hash. The synchronous numbers reproduce the
+1.0.1 audit within noise at 2,025 columns (154.9 ms here vs 154.5 ms then); at
+4,225 columns the old path costs 317.6 ms. The 30 ms tick-pause budget
+(PERF-IO-004) is met with a ~0.41 ms attributable cost, about 73× under the
+30 ms target and ~775× below the synchronous call. The async worker wall time
+is also lower than the synchronous call at 4,225 columns (288.6 vs 317.6 ms)
+because streaming avoids materialising and copying the 323 MiB payload. Across
+repeated runs the 4,225-column async start stayed between 0.35 and 0.50 ms and
+the async peak delta between 26 and 36 MiB, so the margin is robust.
+
+### Save-format compatibility for 1.2 content appends
+
+v4 is unchanged. The loader now accepts a saved registry fingerprint when it
+equals the current registry's fingerprint or the fingerprint of one of its
+strict prefixes. Appending blocks at the end keeps every saved id valid;
+removing or reordering any saved block changes the saved prefix and fails with
+`RegistryMismatch { saved, current }` naming both fingerprints. v1/v2 carry no
+fingerprint and load ids unchanged by construction; a v3 prefix mismatch is
+accepted with a warning, while a v3 reorder is now rejected rather than silently
+reinterpreted. The fingerprint covers the ordered block registry, so appending
+item types does not affect save compatibility.
+
+Tests generate the 1.0.2-era fixture in code (air through the crafting table,
+before the five wave-1 blocks, saved as v4), load it with today's registry,
+re-save it with the full fingerprint and prove the state hash is unchanged.
+Further tests cover every current prefix, reordered and removed middle blocks,
+a mutated saved prefix plus appended blocks, v3 reorder rejection, corrupt
+payloads and deterministic snapshot encoding. No large binary fixture is
+committed.
+
+### Spawn and structures
+
+`Host::resolve_spawn` now rejects a candidate column that lies inside a
+generated structure footprint before the solid/dry/clear/heightmap checks.
+Structures are wholly inside their owning chunk, so one
+`Generator::structure_in_chunk(candidate_chunk)` lookup suffices. The host uses
+the conservative wave-1 maximum half-extent of 4 blocks (the mineshaft adit);
+the private per-kind table in worldgen is untouched. A host test samples seeds
+42, 3, 29, 94, 7 and 0xA11CE and asserts the stored spawn is outside every
+sampled structure bbox and that the helper agrees with generated plans at the
+anchor, footprint edge and one block beyond.
+
+Seed 42 is unchanged: spawn remains `(0.5, 81.0, 0.5)`, and the smoke state hash
+is `eba0c42219691190` on both this build and a clean HEAD (`66ffde7`) build. The
+older `1dba6105028ba6e5` hash in the 1.0.0 section predates the wave-1 structure
+generator, not this slice.
+
+### Dedicated-server chunk memory: verdict and recommendation
+
+Not implemented in this slice. The server still retains the union of every
+explored column (the 4,225-column world above is ~322 MiB); client eviction does
+not free server memory. A save-safe unload needs per-column save provenance
+that the current whole-world snapshot does not track:
+
+1. Track a `saved_revision`/dirty epoch per column (or a world generation plus a
+   dirty-column set) updated whenever a block is written and cleared only after a
+   commit that included that column.
+2. Evict only columns outside the union of all players' interest plus a
+   two-chunk margin, and only after they are clean. Dirty columns need a small
+   forced async save and completion before eviction; never evict while an
+   in-flight snapshot or the current tick may still reference the column.
+3. Reload deterministically from `world.obs` (generation is a pure function), and
+   cover the policy with unload/re-save/reload state-hash tests plus an RSS bound
+   at 4,225 columns.
+
+Rushing this without the dirty-epoch proof risks silently dropping edits between
+an autosave and an unload; the open item should stay visible until the region
+file/IO-thread design in spec 17 §3.5 lands. TODO(1.2): implement the dirty-epoch
+unloader with save-before-unload batching and prove no data loss and a bounded
+peak RSS.
+
+### Limits and remaining risks
+
+- A save still snapshots and writes every loaded column; there is no incremental
+  region file yet. The O(columns) capture and sidecar serialization are
+  sub-millisecond at 4,225 columns, but worker wall time grows linearly (~277 ms).
+- Peak compressed-body memory is bounded by the encoded file size; incompressible
+  data could approach the 323 MiB payload plus the world heap, still below the old
+  synchronous full-payload path.
+- A save that starts before an edit does not contain that edit. The network
+  autosave marks the tick dirty and saves again on the next interval; the
+  single-player client still calls the synchronous `Host::save()` path and was
+  left to the client/graphics slice.
+- The multi-file commit is still not crash-transactional: a crash between two
+  renames can mix one new sidecar with the previous world. The previous
+  `world.obs` is always intact because it is renamed last.
+- `save_bench` async numbers exclude concurrent tick/copy-on-write traffic. The
+  start pause is the measured tick-side cost; a sustained edit workload during a
+  save pays one column copy per touched column.

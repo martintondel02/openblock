@@ -15,6 +15,8 @@ use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use ob_content::{ArmorSlot, BlockId, ItemId, ItemType, RecipeId, Registry};
 use ob_math::{Aabb, BlockPos, ChunkPos, SEA_LEVEL, SectionPos, WorldVec};
@@ -31,6 +33,9 @@ mod items;
 mod mobs;
 pub mod net;
 pub mod net_players;
+mod save_worker;
+
+pub use save_worker::SaveReport;
 
 pub use block_entities::{CHEST_SLOTS, ContainerState, FurnaceSlot, FurnaceState};
 pub use items::ItemEntity;
@@ -57,6 +62,14 @@ pub const ARMOR_REDUCTION_PER_POINT: f32 = 0.04;
 const EQUIPMENT_FILE: &str = "equipment.txt";
 /// World-directory filename for the persisted world-spawn point.
 const SPAWN_FILE: &str = "spawn.txt";
+/// Conservative horizontal half-extent of a wave-1 worldgen structure.
+///
+/// Every structure is wholly inside its owning chunk and the largest footprint
+/// (the mineshaft adit) reaches four blocks from its anchor. The exact
+/// per-kind half-extents live in worldgen's private `StructureKind`; using the
+/// maximum keeps the host-side spawn check conservative without duplicating the
+/// structure table or adding a cross-crate dependency on its internals.
+const STRUCTURE_MAX_HALF_EXTENT: i32 = 4;
 
 /// Defensive upper bound on one inventory stack.
 ///
@@ -267,6 +280,13 @@ pub enum HostError {
     UnsupportedSave(u16),
     /// A player state file was malformed.
     PlayerState(String),
+    /// An in-flight background save did not finish within the bounded wait.
+    ///
+    /// The worker is left running (starting a second writer would corrupt the
+    /// commit order); the previous save on disk is still intact.
+    SaveTimeout(Duration),
+    /// The background save thread stopped without returning a result.
+    SaveWorkerStopped(String),
 }
 
 impl std::fmt::Display for HostError {
@@ -276,6 +296,10 @@ impl std::fmt::Display for HostError {
             HostError::Save(err) => write!(f, "world save error: {err}"),
             HostError::UnsupportedSave(v) => write!(f, "save format {v} is newer than this build"),
             HostError::PlayerState(reason) => write!(f, "invalid player state: {reason}"),
+            HostError::SaveTimeout(timeout) => {
+                write!(f, "background save did not finish within {} s", timeout.as_secs())
+            }
+            HostError::SaveWorkerStopped(reason) => write!(f, "background save stopped: {reason}"),
         }
     }
 }
@@ -325,6 +349,27 @@ pub struct Host {
     network_damage_events: Vec<net_players::NetworkDamageEvent>,
     /// Entity removals for the net layer to broadcast (runtime only).
     network_entity_removals: Vec<net_players::RemovedEntity>,
+    /// A background save currently owns the writer role.
+    save_task: Option<SaveTask>,
+    /// Result of the last completed background save (diagnostics/benchmarks).
+    last_save_report: Option<SaveReport>,
+}
+
+/// One background save in flight. Only one may exist: the host never overlaps
+/// writers, so `save_async` coalesces while this is `Some`.
+struct SaveTask {
+    join: JoinHandle<Result<SaveReport, save_worker::SaveFailure>>,
+    started: Instant,
+    chunks: usize,
+}
+
+impl std::fmt::Debug for SaveTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SaveTask")
+            .field("started", &self.started)
+            .field("chunks", &self.chunks)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Host {
@@ -368,6 +413,8 @@ impl Host {
                 saved_network_players: BTreeMap::new(),
                 network_damage_events: Vec::new(),
                 network_entity_removals: Vec::new(),
+                save_task: None,
+                last_save_report: None,
             };
             host.inventory = load_inventory(&host.world_dir, &host.registry);
             host.items = items::load_items(&host.world_dir, &host.registry);
@@ -412,6 +459,8 @@ impl Host {
                 saved_network_players: BTreeMap::new(),
                 network_damage_events: Vec::new(),
                 network_entity_removals: Vec::new(),
+                save_task: None,
+                last_save_report: None,
             };
             host.ensure_streaming(3);
             // Generate the chosen candidate column before reading its surface,
@@ -489,6 +538,11 @@ impl Host {
     /// Whether the generated column at `terrain_height` is dry, solid and has
     /// two clear cells for the player's feet and head.
     fn spawn_column_is_safe(&self, x: i32, terrain_height: i32, z: i32) -> bool {
+        // A worldgen structure (ruined tower, camp, stone circle or mineshaft)
+        // is part of the surface: never spawn a player inside or on top of one.
+        if self.spawn_column_is_in_structure(x, z) {
+            return false;
+        }
         let surface = BlockPos::new(x, terrain_height, z);
         if self.world.chunk(surface.chunk()).is_none() {
             return false;
@@ -504,6 +558,22 @@ impl Host {
         let feet = BlockPos::new(x, terrain_height + 1, z);
         let head = BlockPos::new(x, terrain_height + 2, z);
         self.world.get_block(feet) == BlockId::AIR && self.world.get_block(head) == BlockId::AIR
+    }
+
+    /// Whether a world column lies inside a generated structure footprint.
+    ///
+    /// Structures are wholly inside their owning chunk, so one
+    /// `structure_in_chunk` lookup on the candidate's chunk is sufficient. The
+    /// check is a pure function of the seed and chunk (no loaded columns are
+    /// needed), with a conservative maximum half-extent so a new structure kind
+    /// cannot silently widen a spawn footprint without this constant being
+    /// revisited.
+    fn spawn_column_is_in_structure(&self, x: i32, z: i32) -> bool {
+        let chunk = ChunkPos::new(x.div_euclid(16), z.div_euclid(16));
+        let Some(structure) = self.generator.structure_in_chunk(chunk) else {
+            return false;
+        };
+        (x - structure.x).abs() <= STRUCTURE_MAX_HALF_EXTENT && (z - structure.z).abs() <= STRUCTURE_MAX_HALF_EXTENT
     }
 
     /// One loaded chunk column, if it is currently resident.
@@ -1976,36 +2046,13 @@ impl Host {
         self.dirty_player = true;
     }
 
-    /// Saves the world, player state, spawn point, inventory, dropped items,
-    /// block entities and equipped armor.
+    /// Serializes every sidecar in commit order.
     ///
     /// Stale furnace/chest records are pruned first (with a warning), so a block
     /// removed through a direct world edit does not survive in the sidecar.
-    ///
-    /// # Commit protocol
-    ///
-    /// Every payload is serialised first, then written to a `.tmp` file and
-    /// `fsync`ed, and only after **all** temporary files exist are they renamed
-    /// over the targets. Renames put the sidecars first and `world.obs` last,
-    /// so a failure while staging or a rename failure leaves the previous world
-    /// snapshot in place; the next start can still open the last committed
-    /// world. The individual replacements are atomic; the multi-file group is
-    /// not transactional (a crash between two renames can mix one new sidecar
-    /// with the previous world), which is why the format still expects the
-    /// journal from spec 17 §3.5 for a future region-file save path.
-    ///
-    /// The encoded world is checked against the loader limits
-    /// ([`ob_world::MAX_SAVE_PAYLOAD_BYTES`] / [`ob_world::MAX_SAVE_FILE_BYTES`])
-    /// before anything is written, so a long-running server cannot create a
-    /// snapshot it will refuse to open on the next start.
-    pub fn save(&mut self) -> Result<(), HostError> {
-        std::fs::create_dir_all(&self.world_dir)?;
+    fn sidecar_payloads(&mut self) -> Result<Vec<(&'static str, Vec<u8>)>, HostError> {
         block_entities::prune_block_entities(&self.world, &self.registry, &mut self.furnaces, &mut self.chests);
-
-        // Serialise everything before touching the directory. The world is
-        // last so the renames below commit sidecars before the snapshot they
-        // describe.
-        let files: [(&str, Vec<u8>); 9] = [
+        Ok(vec![
             ("player.txt", player_state(&self.player, self.tick_count).into_bytes()),
             (SPAWN_FILE, spawn_state(&self.spawn).into_bytes()),
             (
@@ -2033,51 +2080,221 @@ impl Host {
                 net_players::network_players_state(&self.registry, &self.network_players, &self.saved_network_players)
                     .into_bytes(),
             ),
-            ("world.obs", ob_world::to_bytes_checked(&self.world)?),
-        ];
+        ])
+    }
 
-        // Reject a target path that is a directory before staging anything: a
-        // rename over a directory would otherwise leave the group half written.
-        for (name, _) in &files {
-            let target = self.world_dir.join(name);
-            if target.is_dir() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("save target {} is a directory", target.display()),
-                )
-                .into());
-            }
-        }
+    /// Saves the world, player state, spawn point, inventory, dropped items,
+    /// block entities and equipped armor synchronously.
+    ///
+    /// This is the compatibility path used by tests, the client's existing
+    /// autosave call site and explicit shutdown saves. It waits for any
+    /// in-flight background save (so two writers never overlap) and then writes
+    /// the current state on the calling thread. New tick-loop code should use
+    /// [`Host::save_async`] instead.
+    ///
+    /// # Commit protocol
+    ///
+    /// Every payload is serialised first, then written to a `.tmp` file and
+    /// `fsync`ed, and only after **all** temporary files exist are they renamed
+    /// over the targets. Renames put the sidecars first and `world.obs` last,
+    /// so a failure while staging or a rename failure leaves the previous world
+    /// snapshot in place; the next start can still open the last committed
+    /// world. The individual replacements are atomic; the multi-file group is
+    /// not transactional (a crash between two renames can mix one new sidecar
+    /// with the previous world), which is why the format still expects the
+    /// journal from spec 17 §3.5 for a future region-file save path.
+    ///
+    /// The encoded world is checked against the loader limits
+    /// ([`ob_world::MAX_SAVE_PAYLOAD_BYTES`] / [`ob_world::MAX_SAVE_FILE_BYTES`])
+    /// before anything is written, so a long-running server cannot create a
+    /// snapshot it will refuse to open on the next start.
+    pub fn save(&mut self) -> Result<(), HostError> {
+        self.save_and_wait()
+    }
 
-        let mut staged: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::with_capacity(files.len());
-        for (name, bytes) in &files {
-            let target = self.world_dir.join(name);
-            let temporary = target.with_extension("tmp");
-            if let Err(error) = write_staged(&temporary, bytes) {
-                let _ = std::fs::remove_file(&temporary);
-                for (temporary, _) in &staged {
-                    let _ = std::fs::remove_file(temporary);
+    /// Synchronous save that first drains a background save already in flight.
+    ///
+    /// On a worker failure the failed worker has already stopped, so falling
+    /// back to this synchronous path cannot overlap writers. A timeout is
+    /// reported instead of starting a second writer.
+    pub fn save_and_wait(&mut self) -> Result<(), HostError> {
+        if self.save_task.is_some() {
+            match self.wait_for_save(save_worker::SAVE_WAIT_TIMEOUT) {
+                Ok(_) => {}
+                Err(HostError::SaveTimeout(timeout)) => return Err(HostError::SaveTimeout(timeout)),
+                Err(error) => {
+                    log::warn!("in-flight background save failed ({error}); falling back to a synchronous save");
                 }
-                return Err(error.into());
             }
-            staged.push((temporary, target));
         }
+        self.save_blocking().map(|_| ())
+    }
 
-        for (index, (temporary, target)) in staged.iter().enumerate() {
-            if let Err(error) = std::fs::rename(temporary, target) {
-                for (temporary, _) in &staged[index..] {
-                    let _ = std::fs::remove_file(temporary);
-                }
-                return Err(error.into());
-            }
-        }
-        // Best effort: make the renames durable where the platform supports
-        // syncing a directory handle. Individual files were already fsynced.
-        if let Ok(directory) = std::fs::File::open(&self.world_dir) {
-            let _ = directory.sync_all();
-        }
+    /// Saves the current state on the calling thread.
+    fn save_blocking(&mut self) -> Result<SaveReport, HostError> {
+        let started = Instant::now();
+        std::fs::create_dir_all(&self.world_dir)?;
+        let sidecars = self.sidecar_payloads()?;
+        let encode_started = Instant::now();
+        let world = ob_world::to_bytes_checked(&self.world)?;
+        let encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
+
+        let write_started = Instant::now();
+        save_worker::commit(&self.world_dir, &sidecars, &world)?;
+        let write_ms = write_started.elapsed().as_secs_f64() * 1000.0;
+
+        let sidecar_bytes: u64 = sidecars.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+        let report = SaveReport {
+            world_bytes: world.len() as u64,
+            sidecar_bytes,
+            total_bytes: world.len() as u64 + sidecar_bytes,
+            chunks: self.world.chunk_count(),
+            encode_ms,
+            write_ms,
+            elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+        };
         self.dirty_player = false;
-        Ok(())
+        self.last_save_report = Some(report.clone());
+        Ok(report)
+    }
+
+    /// Starts an asynchronous save without blocking the tick thread.
+    ///
+    /// The world is captured as an [`ob_world::WorldSnapshot`] (one `Arc` per
+    /// column, sorted) and every sidecar is serialized while the caller still
+    /// holds the host lock. Encoding, zstd compression, staged writes, `fsync`s
+    /// and renames run on the `ob-save` worker. The host allows at most one
+    /// writer: if a save is already in flight this returns `Ok(false)` and the
+    /// caller can coalesce (the autosave loop deliberately skips the interval
+    /// instead of queuing a second writer).
+    ///
+    /// Returns `Ok(true)` when a new worker started. A previous worker that
+    /// finished with an error is reaped first and its error returned; the world
+    /// is marked dirty so the next autosave retries.
+    pub fn save_async(&mut self) -> Result<bool, HostError> {
+        if let Some(result) = self.poll_save() {
+            result?;
+        }
+        if self.save_task.is_some() {
+            return Ok(false);
+        }
+        std::fs::create_dir_all(&self.world_dir)?;
+        let sidecars = self.sidecar_payloads()?;
+        let snapshot = self.world.snapshot();
+        let chunks = snapshot.chunk_count();
+        let job = save_worker::SaveJob {
+            dir: self.world_dir.clone(),
+            snapshot,
+            sidecars,
+        };
+        let join = save_worker::spawn(job)?;
+        self.save_task = Some(SaveTask {
+            join,
+            started: Instant::now(),
+            chunks,
+        });
+        // The snapshot captured the player state as it was now. Edits made
+        // after this point call mark_player_dirty again.
+        self.dirty_player = false;
+        Ok(true)
+    }
+
+    /// Reaps a finished background save without blocking.
+    ///
+    /// Returns `None` while a worker is still running (or when none is in
+    /// flight), and `Some(result)` exactly once when it finishes. On failure
+    /// the world is marked dirty so the next autosave retries.
+    pub fn poll_save(&mut self) -> Option<Result<SaveReport, HostError>> {
+        let finished = self.save_task.as_ref()?.join.is_finished();
+        if !finished {
+            return None;
+        }
+        let task = self.save_task.take().expect("checked above");
+        Some(self.finish_save_task(task))
+    }
+
+    /// Joins one finished save task and maps its result into [`HostError`].
+    fn finish_save_task(&mut self, task: SaveTask) -> Result<SaveReport, HostError> {
+        match task.join.join() {
+            Ok(Ok(report)) => {
+                self.last_save_report = Some(report.clone());
+                Ok(report)
+            }
+            Ok(Err(failure)) => {
+                self.dirty_player = true;
+                Err(match failure {
+                    save_worker::SaveFailure::World(error) => HostError::Save(error),
+                    save_worker::SaveFailure::Io(error) => HostError::Io(error),
+                })
+            }
+            Err(payload) => {
+                self.dirty_player = true;
+                Err(HostError::SaveWorkerStopped(panic_message(&payload)))
+            }
+        }
+    }
+
+    /// Waits for the in-flight background save, up to `timeout`.
+    ///
+    /// Returns `Ok(None)` if no save was in flight, `Ok(Some(report))` when one
+    /// finished. A timeout returns [`HostError::SaveTimeout`] and leaves the
+    /// worker running: starting a synchronous save then would overlap two
+    /// writers over the same commit group.
+    pub fn wait_for_save(&mut self, timeout: Duration) -> Result<Option<SaveReport>, HostError> {
+        let started = Instant::now();
+        loop {
+            if let Some(result) = self.poll_save() {
+                return result.map(Some);
+            }
+            if self.save_task.is_none() {
+                return Ok(None);
+            }
+            if started.elapsed() >= timeout {
+                return Err(HostError::SaveTimeout(timeout));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Shutdown save: bounded wait for an in-flight worker, then a synchronous
+    /// save of the final state.
+    ///
+    /// The tick thread is stopped by the caller. If the worker failed or its
+    /// thread stopped, the already-stopped worker is reaped and the synchronous
+    /// path writes the final state (no overlap). A still-running worker that
+    /// exceeds `timeout` yields [`HostError::SaveTimeout`]; the previous commit
+    /// remains intact and the process should not start a competing writer.
+    pub fn shutdown_save(&mut self, timeout: Duration) -> Result<(), HostError> {
+        if self.save_task.is_some() {
+            match self.wait_for_save(timeout) {
+                Ok(_) => {}
+                Err(HostError::SaveTimeout(timeout)) => return Err(HostError::SaveTimeout(timeout)),
+                Err(error) => {
+                    log::warn!("background save failed during shutdown ({error}); using the synchronous fallback");
+                }
+            }
+        }
+        self.save_blocking().map(|_| ())
+    }
+
+    /// Whether a background save currently owns the writer role.
+    pub fn save_in_flight(&self) -> bool {
+        self.save_task.is_some()
+    }
+
+    /// How long the in-flight save has been running, if any.
+    pub fn save_in_flight_elapsed(&self) -> Option<Duration> {
+        self.save_task.as_ref().map(|task| task.started.elapsed())
+    }
+
+    /// Number of columns captured by the in-flight save, if any.
+    pub fn save_in_flight_chunks(&self) -> Option<usize> {
+        self.save_task.as_ref().map(|task| task.chunks)
+    }
+
+    /// Report from the most recently completed save (synchronous or async).
+    pub fn last_save_report(&self) -> Option<&SaveReport> {
+        self.last_save_report.as_ref()
     }
 
     /// Deterministic hash of the simulation state: world blocks in canonical
@@ -2222,6 +2439,28 @@ impl Host {
     /// Approximate heap memory used by the host.
     pub fn memory_bytes(&self) -> usize {
         self.world.heap_bytes()
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        // Never leave a save worker writing after the host (and its directory
+        // ownership) is gone. The worker owns everything it needs, so waiting
+        // here cannot deadlock the live world.
+        if let Some(task) = self.save_task.take() {
+            let _ = task.join.join();
+        }
+    }
+}
+
+/// Extracts a readable message from a panicked thread payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "save worker panicked".to_string()
     }
 }
 
@@ -2804,14 +3043,6 @@ fn apple_drop(seed: u64, pos: BlockPos) -> bool {
     hash.is_multiple_of(APPLE_DROP_MODULUS)
 }
 
-/// Writes one staged save file and flushes it to stable storage.
-fn write_staged(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::io::Write;
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
-}
-
 /// Hashes one optional stack for the block-entity and equipment sections.
 ///
 /// The encoding matches the inventory fields (resource name, count, optional
@@ -2886,18 +3117,18 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use ob_content::{ArmorSlot, BlockId, ItemId, MobKind, RecipeId, Registry};
-    use ob_math::{BlockPos, CHUNK_SIZE, WORLD_MAX_Y, WORLD_MIN_Y, WorldVec};
+    use ob_math::{BlockPos, CHUNK_SIZE, ChunkPos, WORLD_MAX_Y, WORLD_MIN_Y, WorldVec};
     use ob_sim::{BlockAction, MAX_HEALTH, MAX_HUNGER, MobAi, PlayerInput, REACH};
     use ob_world::ChunkColumn;
     use ob_worldgen::Generator;
 
     use super::{
         ARMOR_SLOTS, CHEST_SLOTS, ContainerState, CraftOutcome, DAY_LENGTH_TICKS, FurnaceSlot, FurnaceState, GameMode,
-        HOTBAR_SLOTS, Host, HostConfig, ItemStack, MAX_HOSTILE_MOBS, MAX_PASSIVE_MOBS, MOB_ATTACK_REACH, StableHasher,
-        apple_drop, armor_damage_reduction, armor_slot_index, block_centre,
+        HOTBAR_SLOTS, Host, HostConfig, ItemStack, MAX_HOSTILE_MOBS, MAX_PASSIVE_MOBS, MOB_ATTACK_REACH,
+        STRUCTURE_MAX_HALF_EXTENT, StableHasher, apple_drop, armor_damage_reduction, armor_slot_index, block_centre,
     };
 
     /// Test-only temporary data directory removed on drop (best effort).
@@ -4335,6 +4566,58 @@ mod tests {
             ]),
             ob_world::registry_fingerprint(&registry),
             "v4 saves record the current fingerprint"
+        );
+    }
+
+    #[test]
+    fn host_open_accepts_a_v4_save_from_the_1_0_2_content_set() {
+        let dir = TempDir::new("v4-prefix-host");
+        let config = test_config(dir.path(), 79);
+        let registry = Arc::new(Registry::base());
+        let mut host = Host::open(Arc::clone(&registry), config.clone()).expect("host opens");
+        converge(&mut host);
+        let expected_hash = host.state_hash();
+        host.save().expect("save succeeds");
+        drop(host);
+
+        // Rewrite the v4 header with the 1.0.2-era fingerprint (air through the
+        // crafting table, before the five wave-1 blocks were appended) and a
+        // matching checksum. The block ids in the body are all still valid.
+        let mut blocks: Vec<_> = registry.iter().map(|(_, block)| block.clone()).collect();
+        blocks.truncate(15);
+        let old_registry = Registry::from_blocks(blocks).expect("old registry is valid");
+        let old_fingerprint = ob_world::registry_fingerprint(&old_registry);
+        let world_path = test_world_dir(&dir).join("world.obs");
+        let mut bytes = std::fs::read(&world_path).expect("world.obs");
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 4);
+        bytes[14..22].copy_from_slice(&old_fingerprint.to_le_bytes());
+        resign_snapshot(&mut bytes);
+        std::fs::write(&world_path, &bytes).expect("write v4 prefix fixture");
+
+        let mut reopened = Host::open(Arc::clone(&registry), config).expect("v4 prefix save opens");
+        converge(&mut reopened);
+        assert_eq!(
+            reopened.state_hash(),
+            expected_hash,
+            "append-only ids must load unchanged"
+        );
+        // Re-saving upgrades the header to the full current registry fingerprint.
+        reopened.save().expect("re-save succeeds");
+        let upgraded = std::fs::read(&world_path).expect("upgraded world.obs");
+        assert_eq!(u16::from_le_bytes([upgraded[4], upgraded[5]]), 4);
+        assert_eq!(
+            u64::from_le_bytes([
+                upgraded[14],
+                upgraded[15],
+                upgraded[16],
+                upgraded[17],
+                upgraded[18],
+                upgraded[19],
+                upgraded[20],
+                upgraded[21]
+            ]),
+            ob_world::registry_fingerprint(&registry),
+            "the next save records the full current registry"
         );
     }
 
@@ -6567,5 +6850,175 @@ mod tests {
         assert_eq!(host.world().chunk_count(), expected_kept);
         assert_eq!(host.unload_chunks_outside(&[center], 8), 0, "unload plateau");
         assert_eq!(host.take_unloaded_chunks().len(), removed);
+    }
+    /// The spawn resolver rejects candidates whose column intersects a worldgen
+    /// structure footprint, for several representative seeds. Structures are
+    /// chunk-local, so a candidate's own chunk is the only possible owner.
+    #[test]
+    fn spawn_avoids_worldgen_structure_footprints() {
+        for seed in [42u64, 3, 29, 94, 7, 0xA11CE] {
+            let (dir, mut host) = open_host(&format!("spawn-structures-{seed}"), seed);
+            converge(&mut host);
+            let spawn = host.spawn();
+            let (sx, _, sz) = (spawn.x.floor() as i32, spawn.y.floor() as i32, spawn.z.floor() as i32);
+            let generator = Generator::new(seed);
+            let spawn_chunk = ChunkPos::new(sx.div_euclid(16), sz.div_euclid(16));
+            if let Some(structure) = generator.structure_in_chunk(spawn_chunk) {
+                assert!(
+                    (sx - structure.x).abs() > STRUCTURE_MAX_HALF_EXTENT
+                        || (sz - structure.z).abs() > STRUCTURE_MAX_HALF_EXTENT,
+                    "seed {seed}: spawn ({sx},{sz}) is inside {:?} at ({},{})",
+                    structure.kind,
+                    structure.x,
+                    structure.z
+                );
+            }
+
+            // The host-side footprint test must agree with generated plans and
+            // must not over-reject columns farther than the conservative extent.
+            let mut checked = 0usize;
+            for cz in -12..=12 {
+                for cx in -12..=12 {
+                    let pos = ChunkPos::new(cx, cz);
+                    let Some(structure) = generator.structure_in_chunk(pos) else {
+                        continue;
+                    };
+                    checked += 1;
+                    assert!(
+                        host.spawn_column_is_in_structure(structure.x, structure.z),
+                        "seed {seed}: structure anchor must be inside the footprint"
+                    );
+                    assert!(
+                        host.spawn_column_is_in_structure(structure.x + STRUCTURE_MAX_HALF_EXTENT, structure.z),
+                        "seed {seed}: footprint edge is inside"
+                    );
+                    assert!(
+                        !host.spawn_column_is_in_structure(structure.x + STRUCTURE_MAX_HALF_EXTENT + 1, structure.z),
+                        "seed {seed}: column beyond the footprint is not inside"
+                    );
+                }
+            }
+            assert!(checked > 0, "seed {seed}: no structures in the sampled window");
+            drop(dir);
+        }
+    }
+
+    /// Starts a background save, verifies the tick-side snapshot latency is
+    /// small, waits for the worker and proves the committed world reloads to the
+    /// same state hash.
+    #[test]
+    fn async_save_round_trips_and_reports() {
+        let (dir, mut host) = open_host("async-save-roundtrip", 42);
+        converge(&mut host);
+        for _ in 0..20 {
+            host.tick(&PlayerInput::default());
+        }
+        let chunk = host.world().chunks().next().expect("a loaded chunk").0;
+        let pos = BlockPos::new(chunk.x * 16 + 2, WORLD_MAX_Y - 2, chunk.z * 16 + 2);
+        let stone = host.registry().id_or_air("openblock:stone");
+        assert!(host.world_mut().set_block(pos, stone));
+        let expected = host.state_hash();
+
+        let started = Instant::now();
+        assert!(host.save_async().expect("background save starts"));
+        let start_pause_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert!(host.save_in_flight(), "the worker owns the writer role");
+        assert_eq!(host.save_in_flight_chunks(), Some(host.world().chunk_count()));
+
+        // A second request while the first is in flight is coalesced, not queued.
+        if host.save_in_flight() {
+            assert!(
+                !host.save_async().expect("coalesced save call succeeds"),
+                "at most one writer may be in flight"
+            );
+        }
+
+        let report = host
+            .wait_for_save(Duration::from_secs(60))
+            .expect("waiting succeeds")
+            .expect("a save was in flight");
+        assert!(!host.save_in_flight());
+        assert_eq!(report.chunks, host.world().chunk_count());
+        assert!(report.world_bytes > 0);
+        assert!(report.sidecar_bytes > 0);
+        assert_eq!(
+            host.last_save_report().map(|report| report.total_bytes),
+            Some(report.total_bytes)
+        );
+        assert!(
+            start_pause_ms < 50.0,
+            "the tick-side asynchronous save start took {start_pause_ms:.1} ms"
+        );
+
+        let before_chunks = host.world().chunk_count();
+        let before_ticks = host.tick_count();
+        drop(host);
+        let mut reopened = Host::open(Arc::new(Registry::base()), test_config(dir.path(), 42)).expect("reopen");
+        converge(&mut reopened);
+        assert_eq!(
+            reopened.world().chunk_count(),
+            before_chunks,
+            "async save must persist every captured column"
+        );
+        assert_eq!(
+            reopened.tick_count(),
+            before_ticks,
+            "async save must persist the tick count"
+        );
+        assert_eq!(
+            reopened.state_hash(),
+            expected,
+            "async save must persist the captured state"
+        );
+        assert_eq!(
+            reopened.world().chunk_count(),
+            report.chunks,
+            "the worker commits every captured column"
+        );
+    }
+
+    /// A failed background save is surfaced, marks the world dirty and leaves the
+    /// previous commit intact; the next attempt succeeds once the path is fixed.
+    #[test]
+    fn async_save_failure_marks_dirty_and_retries() {
+        let (dir, mut host) = open_host("async-save-retry", 7);
+        host.save().expect("initial save");
+        let world_dir = test_world_dir(&dir);
+        let before = std::fs::read(world_dir.join("world.obs")).expect("read initial world");
+        let player = world_dir.join("player.txt");
+        std::fs::remove_file(&player).expect("remove player sidecar");
+        std::fs::create_dir(&player).expect("place a directory over the player target");
+
+        assert!(host.save_async().expect("worker starts"));
+        let error = host
+            .wait_for_save(Duration::from_secs(60))
+            .expect_err("a directory target must fail the save");
+        assert!(error.to_string().contains("directory"), "{error}");
+        assert!(host.player_dirty(), "a failed save marks the player state dirty");
+        assert_eq!(
+            std::fs::read(world_dir.join("world.obs")).expect("read world after failure"),
+            before,
+            "a failed background save must keep the previous snapshot"
+        );
+
+        std::fs::remove_dir(&player).expect("remove the bad target");
+        assert!(host.save_async().expect("retry starts"));
+        host.wait_for_save(Duration::from_secs(60))
+            .expect("retry succeeds")
+            .expect("a save was in flight");
+        drop(host);
+        Host::open(Arc::new(Registry::base()), test_config(dir.path(), 7)).expect("retried save opens");
+    }
+
+    /// `save_and_wait` drains an in-flight worker before writing the final state,
+    /// so explicit/shutdown saves never overlap two writers.
+    #[test]
+    fn save_and_wait_drains_the_background_writer() {
+        let (dir, mut host) = open_host("async-save-wait", 9);
+        host.save_async().expect("start background save");
+        host.save_and_wait().expect("synchronous save after the worker");
+        assert!(!host.save_in_flight());
+        drop(host);
+        Host::open(Arc::new(Registry::base()), test_config(dir.path(), 9)).expect("save opens");
     }
 }
