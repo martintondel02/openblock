@@ -268,8 +268,9 @@ fn wrap_text(text: &str, max_chars: usize) -> Vec<String> {
 pub fn draw_chat(frame: &mut UiFrame, log: &ChatLog, input: Option<&str>, screen: [f32; 2]) {
     let scale = 1.35;
     let line_height = ob_render::line_height(scale) + 4.0;
-    // Sit above the hotbar and the centred block-name label.
-    let base_y = screen[1] - 132.0;
+    // Sit clear of the toast stack, which occupies the band just above the
+    // hearts. At 720p the old `-132` base overlapped the lowest pickup toast.
+    let base_y = (screen[1] - 180.0).max(120.0);
     if let Some(text) = input {
         let bar = UiRect::new(12.0, base_y, (screen[0] * 0.62).clamp(320.0, 760.0), line_height + 10.0);
         frame.rect(bar.x, bar.y, bar.w, bar.h, [0.03, 0.04, 0.06, 0.86]);
@@ -286,7 +287,7 @@ pub fn draw_chat(frame: &mut UiFrame, log: &ChatLog, input: Option<&str>, screen
     }
     let max_chars = (((screen[0] - 40.0) / (line_height * 0.55)).max(24.0) as usize).clamp(24, 110);
     let mut y = if input.is_some() { base_y - 8.0 } else { base_y };
-    for line in log.visible(8).into_iter().rev() {
+    for line in log.visible(6).into_iter().rev() {
         let alpha = line.alpha();
         if alpha <= 0.001 {
             continue;

@@ -963,3 +963,18 @@ Rust quick benchmarks still run as before.
 - **No network-side perf regression gate:** the tick loop's new atomic writes
   were measured only indirectly; a CI regression threshold for the load gate
   needs a quieter runner first.
+
+## 2026-11-25 — 1.0.0 release verification
+
+- 1.0 acceptance scenario (`crates/server/tests/acceptance.rs`): 8/8 tests in
+  ~12.5 s, deterministic seed 42, full single-player survival loop + raw
+  protocol-v2 multiplayer loop; spawn safety now persists in an additive
+  `spawn.txt` sidecar and is covered by the state hash.
+- Headless smoke (seed 42, save format 4): `1dba6105028ba6e5` across fresh runs
+  (the previous `33875a6597c2ce7b` predates the spawn sidecar/hash change).
+- Multiplayer load gate (8 clients / 60 s): tick p50/p95/p99
+  0.061/0.124/0.163 ms, 20.0 TPS, 0 overruns >35 ms, RSS 22.3 MiB; 10-minute
+  soak plateaued with stable hash and no fd/thread leaks. Known gaps:
+  synchronous save spikes, reference-hardware capacity, 16/50-player rows.
+- UI workload at 1280x720: 243–1335 quads and ≤3 texture draw calls per screen;
+  full 960x540 audit passes.

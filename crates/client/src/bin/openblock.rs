@@ -1,6 +1,6 @@
 //! The `openblock` game client binary.
 
-const USAGE: &str = "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--mesh-workers N] [--survival|--creative] [--fly] [--x11] [--no-audio] [--mute] [--connect HOST:PORT] [--name NAME] [--screenshot PATH] [--screenshot-inventory PATH] [--screenshot-dead] [--screenshot-settings[=TAB]] [--screenshot-settings-tab TAB] [--screenshot-crafting] [--screenshot-title] [--screenshot-new-world] [--screenshot-worlds] [--screenshot-connect] [--screenshot-debug] [--screenshot-mobs] [--screenshot-furnace] [--screenshot-chest] [--screenshot-items] [--seconds N] [--texture-style NAME] [--texture-pack PATH] [--no-texture-pack] [--time-of-day F] [--title|--menu] [--version]";
+const USAGE: &str = "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--mesh-workers N] [--survival|--creative] [--fly] [--x11] [--no-audio] [--mute] [--connect HOST:PORT] [--name NAME] [--screenshot PATH] [--screenshot-inventory PATH] [--screenshot-dead] [--screenshot-settings[=TAB]] [--screenshot-settings-tab TAB] [--screenshot-crafting] [--screenshot-title] [--screenshot-new-world] [--screenshot-worlds] [--screenshot-connect] [--screenshot-debug] [--screenshot-mobs] [--screenshot-furnace] [--screenshot-chest] [--screenshot-items] [--screenshot-network] [--screenshot-name-tags] [--screenshot-net-ui=KIND] [--screenshot-size WxH] [--seconds N] [--texture-style NAME] [--texture-pack PATH] [--no-texture-pack] [--time-of-day F] [--title|--menu] [--version]";
 
 fn main() {
     ob_core::init_logging();
@@ -16,19 +16,25 @@ fn main() {
         println!("          --no-texture-pack clears the saved pack and uses the procedural style");
         println!("headless: --screenshot PATH renders one HUD frame to a PNG and exits");
         println!("          --screenshot-inventory PATH renders the inventory screen to a PNG and exits");
-        println!("          --screenshot-dead renders the death screen; --screenshot-items seeds items and vitals");
+        println!(
+            "          --screenshot-dead[=network] renders the death screen; --screenshot-items seeds items and vitals"
+        );
         println!("          --screenshot-settings renders the tabbed settings screen over the world");
         println!("          --screenshot-settings=audio selects the Audio tab (game/display/audio/controls/textures)");
-        println!("          --screenshot-crafting renders the crafting screen over the world");
+        println!("          --screenshot-crafting[=hand] renders the crafting screen (hand gating with hand)");
         println!("          --screenshot-debug renders the survival HUD with the F3 debug overlay");
-        println!("          --screenshot-mobs spawns avatars in front of the player and shows F3 mob counts");
-        println!("          --screenshot-furnace opens a seeded furnace screen");
-        println!("          --screenshot-chest opens a seeded 27-slot chest screen");
+        println!("          --screenshot-mobs[=plain] spawns avatars; plain omits the F3 overlay");
+        println!("          --screenshot-furnace[=empty|active|full] opens a seeded furnace screen");
+        println!("          --screenshot-chest[=empty|active|full] opens a seeded 27-slot chest screen");
+        println!("          --screenshot-network renders a network survival frame from an in-process loopback server");
+        println!("          --screenshot-name-tags renders synthetic remote-player name tags over a world");
+        println!("          --screenshot-net-ui=loading|failed|disconnected|roster  multiplayer overlay audit frame");
+        println!("          --screenshot-size WxH  offscreen target size (default 1280x720; e.g. 960x540)");
         println!("front-end: a plain launch opens the title/world-selection screens;");
         println!("          --world/--seed/--data-dir/--connect and screenshot flags bypass it");
         println!("          --title or --menu forces the title screen (useful for screenshots)");
         println!("modes:    --survival (default) or --creative; an explicit CLI mode is saved");
-        println!("network:  --connect HOST:PORT joins an interim TCP server (windowed, creative building)");
+        println!("network:  --connect HOST:PORT joins a dedicated survival server (windowed; TCP)");
         println!("          --name NAME chooses the multiplayer player name (default playerNNNN)");
         println!("          --server-password is not supported by the interim protocol yet");
         println!("controls: WASD move, Space jump, Shift crouch, Ctrl sprint, F fly, LMB mine,");
@@ -59,6 +65,10 @@ fn main() {
         println!("  --screenshot-furnace  place and open a seeded furnace screen");
         println!("  --screenshot-chest  place and open a seeded chest screen");
         println!("  --screenshot-items  seed ores, ingots, iron tools/armor, food, planks and 14 HP / 12 hunger");
+        println!("  --screenshot-network  render network survival from an in-process loopback server");
+        println!("  --screenshot-name-tags  render synthetic remote-player name tags over a world");
+        println!("  --screenshot-net-ui=KIND  render loading, failed, disconnected or roster overlay");
+        println!("  --screenshot-size WxH  offscreen target size (default 1280x720)");
         println!("  --screenshot-title  render the title screen (requires --screenshot PATH)");
         println!("  --screenshot-new-world  render the new-world form (requires --screenshot PATH)");
         println!("  --screenshot-worlds  render the world list with temporary worlds");
@@ -67,7 +77,7 @@ fn main() {
         println!("  --title, --menu    force the front-end on a normal launch (screenshot/debug aid)");
         println!("  --connect HOST:PORT  join a dedicated server over TCP (windowed; no local world)");
         println!("  --name NAME        multiplayer player name (1-32 ASCII [A-Za-z0-9_.-]; default playerNNNN)");
-        println!("                     multiplayer is creative building only in this milestone");
+        println!("                     multiplayer is server-authoritative survival over plain TCP (no TLS)");
         println!("  --survival         play survival (default; overrides and saves the settings mode)");
         println!("  --creative         play creative (overrides and saves the settings mode)");
         println!("  --mesh-workers N   section meshing worker threads (1-16, default cores - 1)");

@@ -42,7 +42,7 @@ pub const CRAFTING_SCROLLBAR_WIDTH: f32 = 3.0;
 pub const CRAFTING_SCROLLBAR_MIN_THUMB: f32 = 18.0;
 
 /// Footer key-hint line shown at the bottom of the crafting panel.
-pub const CRAFTING_KEY_HINT: &str = "Up/Down select  PgUp/PgDn page  Wheel  Enter/Click craft  C/Esc back";
+pub const CRAFTING_KEY_HINT: &str = "Up/Down select  PgUp/PgDn  Wheel  Enter craft  C/Esc back";
 
 /// Which section a recipe belongs to.
 ///
@@ -583,6 +583,15 @@ pub fn draw_crafting_screen(
         [0.98, 0.99, 1.0, 1.0],
         "Crafting",
     );
+    let version = format!("OpenBlock v{}", ob_core::VERSION);
+    let version_width = frame.text_width(1.0, &version);
+    frame.text(
+        panel.x + panel.w - CRAFTING_MARGIN - version_width,
+        panel.y + 24.0,
+        1.0,
+        [0.64, 0.70, 0.79, 1.0],
+        &version,
+    );
     let subtitle = if near_table {
         "3x3 crafting table nearby"
     } else {
@@ -799,6 +808,19 @@ mod tests {
 
     fn all_available(registry: &Registry) -> Vec<(RecipeId, u8)> {
         registry.recipes().map(|(id, _)| (id, 4)).collect()
+    }
+
+    #[test]
+    fn key_hint_fits_the_panel_inner_width_at_960x540() {
+        let screen = [960.0, 540.0];
+        let panel = crafting_panel_rect(screen);
+        let frame = UiFrame::new(screen[0], screen[1]);
+        let inner = panel.w - 2.0 * CRAFTING_MARGIN;
+        assert!(
+            frame.text_width(1.0, CRAFTING_KEY_HINT) <= inner,
+            "hint is {} px, inner width {inner}",
+            frame.text_width(1.0, CRAFTING_KEY_HINT)
+        );
     }
 
     #[test]

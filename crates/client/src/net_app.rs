@@ -2151,12 +2151,15 @@ impl NetGameState {
                         && let Some(stack) = client.selected_stack()
                     {
                         let label = inventory::item_display_name(&self.registry, stack.item);
-                        let y = self
-                            .ui
-                            .hotbar_rects(screen)
-                            .first()
-                            .map(|slot| slot.y - 30.0)
-                            .unwrap_or(screen[1] - 70.0);
+                        let y = crate::selected_name_y(screen, &self.ui.hotbar_rects(screen));
+                        let width = frame.text_width(2.0, &label);
+                        frame.rect(
+                            screen[0] / 2.0 - width / 2.0 - 7.0,
+                            y - 3.0,
+                            width + 14.0,
+                            ob_render::line_height(2.0) + 6.0,
+                            [0.02, 0.03, 0.05, 0.62],
+                        );
                         frame.text_centered(screen[0] / 2.0, y, 2.0, [1.0, 1.0, 1.0, 1.0], &label);
                     }
                     crate::ui_state::draw_vitals(&mut frame, screen, client.health(), client.hunger());
@@ -2200,26 +2203,21 @@ impl NetGameState {
                 "Multiplayer survival - LMB mine/attack, RMB use/place, E inventory",
             );
         }
-        if inventory_open {
-            if let Some(client) = &self.client {
-                inventory::draw_survival(
-                    &mut frame,
-                    &self.ui,
-                    &self.registry,
-                    &inventory::SurvivalInventoryView {
-                        inventory: client.inventory(),
-                        equipment: client.equipment(),
-                        defense: client.armor_defense(),
-                        selected: client.selected_slot(),
-                        near_table: false,
-                        craft_hint: Some(CRAFTING_HINT),
-                    },
-                    screen,
-                );
-            }
-            if self.ui.hud_visible {
-                crate::ui_state::draw_toasts(&mut frame, &self.ui.toasts, screen);
-            }
+        if inventory_open && let Some(client) = &self.client {
+            inventory::draw_survival(
+                &mut frame,
+                &self.ui,
+                &self.registry,
+                &inventory::SurvivalInventoryView {
+                    inventory: client.inventory(),
+                    equipment: client.equipment(),
+                    defense: client.armor_defense(),
+                    selected: client.selected_slot(),
+                    near_table: false,
+                    craft_hint: Some(CRAFTING_HINT),
+                },
+                screen,
+            );
         }
         if container_open
             && let Some(client) = &self.client
@@ -2259,9 +2257,6 @@ impl NetGameState {
                         );
                     }
                 }
-            }
-            if self.ui.hud_visible {
-                crate::ui_state::draw_toasts(&mut frame, &self.ui.toasts, screen);
             }
         }
         if settings_open {

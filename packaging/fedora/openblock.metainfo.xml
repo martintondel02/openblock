@@ -29,6 +29,16 @@
     <content_attribute id="social-chat">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="1.0.0" date="2026-11-25" type="stable">
+      <description>
+        <p>OpenBlock 1.0.0 Early Access: survival core (worldgen, mobs, combat,
+        crafting/smelting/tools/armor, chests, drops/pickup, death/respawn,
+        persistence), self-hosted multiplayer alpha with server-authoritative
+        survival, procedural audio, title/world UI, key rebinding and
+        accessibility, resource packs, benchmarks/load gates and server
+        operations tooling.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-11-25" type="development">
       <description>
         <p>Front-end (title screen, world browser/creation, multiplayer

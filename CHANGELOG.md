@@ -6,6 +6,58 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [1.0.0] — 2026-11-25 (Early Access)
+
+The first Early Access release: a complete single-player survival loop, a
+self-hosted multiplayer alpha with server-authoritative survival, procedural
+audio, a real front-end and measured performance/operations tooling.
+
+### Highlights since 0.2.0 (1.0 hardening)
+- **Full acceptance scenario** added to CI (`crates/server/tests/acceptance.rs`):
+  new world -> spawn safety -> trees/stone/ore reachability -> logs -> planks/
+  sticks/table/tools -> stone -> furnace smelting -> iron tools/armor -> mobs ->
+  cooked food -> fall damage -> death/respawn -> chests -> save/reload, plus a raw
+  protocol-v2 multiplayer loop and edge cases (full inventory, tool break, full
+  chest, mid-death save, dead actions).
+- **Spawn safety fix**: spawn now resolves only safe dry surface columns (no
+  starting inside a tree/feature), persists in an additive `spawn.txt` sidecar,
+  is covered by the state hash and is stable across save/reload; old saves
+  resolve once and persist. Smoke hash (seed 42) is now
+  `1dba6105028ba6e5`.
+- **Dead-player actions fixed**: dead survival players can no longer break/place
+  via the single-player action path (the network path already rejected them).
+- **UI/UX audit fixes**: title "EARLY ACCESS" + version/footer/contrast fixes;
+  960×540 panel/footer collisions; settings checkboxes as On/Off and keybind
+  conflict layout; inventory/crafting/container footer and header consistency;
+  compact furnace/chest panels; full-durability bars hidden; HUD held-item label
+  collision at narrow widths; F3 cached-section units; chat/toast/name-tag
+  overlaps; new offscreen audit modes and the final v1.0.0 screenshot set.
+- **Cross-platform CI fixes**: macOS accepted sockets forced blocking (Darwin
+  inherits non-blocking), Windows platform-gated test imports, and the
+  load-gate/benchmark/packaging jobs validated.
+- **Performance/ops**: 8-client load gate (tick p99 0.163 ms, 20 TPS, RSS
+  22.3 MiB, 0 overruns >35 ms) and a 10-minute soak (plateau, stable hash, no
+  fd/thread leaks) documented; async-save/reference-hardware rows remain known
+  gaps.
+
+### Known limitations (accepted for 1.0.0)
+- Recipe-book crafting (no spatial 3×3 grid); no torches/light propagation,
+  farming, weather, beds, dimensions or redstone.
+- Multiplayer has no TLS/auth/anti-cheat and client-authoritative movement;
+  server-side crafting is not implemented.
+- Windows/macOS audio is a silent stub; Linux uses runtime PulseAudio.
+- Whole-world synchronous saves (autosave pause on 2,000+ column worlds).
+- 4-vCPU/8-GiB reference capacity, 16/50-player and async-save work are planned
+  for the 1.0.x line; 1.0.1 is the strict post-release audit/polish update.
+
+### Verification
+- Workspace tests, acceptance suite, adversarial protocol/save/pack/audio tests,
+  network loopback survival tests, clippy `-D warnings`, fmt, rustdoc,
+  architecture/docs checks and the 4-bot CI load gate.
+- Headless smoke (seed 42, save format 4): `1dba6105028ba6e5`, stable across
+  fresh runs; save v1-v4 migrations verified.
+- Release screenshots (classic textures) in `docs/img/v1.0.0-*`.
+
 ## [0.2.0] — 2026-11-25 (front-end, controls, load gate)
 
 ### Added

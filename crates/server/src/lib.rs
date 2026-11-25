@@ -55,6 +55,8 @@ pub const ARMOR_DEFENSE_CAP: u8 = 20;
 pub const ARMOR_REDUCTION_PER_POINT: f32 = 0.04;
 /// World-directory filename for the equipped armor sidecar.
 const EQUIPMENT_FILE: &str = "equipment.txt";
+/// World-directory filename for the persisted world-spawn point.
+const SPAWN_FILE: &str = "spawn.txt";
 
 /// Defensive upper bound on one inventory stack.
 ///
@@ -373,9 +375,14 @@ impl Host {
             host.mobs = mobs::load_mobs(&host.world_dir, &host.registry);
             host.next_mob_id = mobs::next_mob_id(&host.mobs);
             host.ensure_streaming(2);
-            // Stream the area first so a saved player near spawn gets an exact
-            // surface; find_spawn falls back to generated height elsewhere.
-            host.spawn = find_spawn(&host.world, &host.generator);
+            // Prefer the spawn stored at world creation. Older worlds compute
+            // it now, then persist it on the next save; regenerating from the
+            // current loaded surface after a restart would otherwise move the
+            // spawn when the original candidate column was not streamed yet.
+            host.spawn = match load_spawn(&host.world_dir) {
+                Some(spawn) => spawn,
+                None => host.resolve_spawn(),
+            };
         } else {
             let generator = Generator::new(config.seed);
             let world = World::new(Arc::clone(&registry), config.seed);
@@ -407,7 +414,10 @@ impl Host {
                 network_entity_removals: Vec::new(),
             };
             host.ensure_streaming(3);
-            let spawn = find_spawn(&host.world, &host.generator);
+            // Generate the chosen candidate column before reading its surface,
+            // so a tree, boulder or cave entrance in that column is accounted
+            // for and the spawn is safe from the first session onward.
+            let spawn = host.resolve_spawn();
             host.spawn = spawn;
             host.player = Player::new(spawn);
             host.save()?;
@@ -434,9 +444,66 @@ impl Host {
     /// The spawn position found when the host opened.
     ///
     /// Network clients start here; it is independent of the host's internal
-    /// single-player [`Player`] and does not move when that player does.
+    /// single-player [`Player`] and does not move when that player does. The
+    /// point is persisted in `spawn.txt` so a restart and every respawn use the
+    /// same safe column even when the original candidate was outside the
+    /// initially streamed chunks.
     pub fn spawn(&self) -> WorldVec {
         self.spawn
+    }
+
+    /// Resolves and generates a safe initial spawn column.
+    ///
+    /// The search follows the same deterministic ring/angle order as the old
+    /// free function, but generates each candidate column before reading its
+    /// surface. A candidate is accepted only when its terrain-height block is
+    /// solid, nothing (tree, boulder, snow drift, overhang) sits above it, and
+    /// the two feet/head cells are clear. This prevents a fresh world from
+    /// starting inside a tree and keeps the first save and every later reopen
+    /// on the same ground.
+    fn resolve_spawn(&mut self) -> WorldVec {
+        for radius in 0..64i32 {
+            for angle_index in 0..16 {
+                let angle = angle_index as f64 * std::f64::consts::TAU / 16.0;
+                let x = (angle.cos() * radius as f64 * 8.0) as i32;
+                let z = (angle.sin() * radius as f64 * 8.0) as i32;
+                let terrain_height = self.generator.height_at(x, z);
+                if terrain_height <= SEA_LEVEL + 2 {
+                    continue;
+                }
+                // Generate the candidate column so features and carved cave
+                // entrances are visible to the safety checks below.
+                self.ensure_streaming_around(
+                    WorldVec::new(x as f64 + 0.5, f64::from(terrain_height) + 1.0, z as f64 + 0.5),
+                    0,
+                    1,
+                );
+                if self.spawn_column_is_safe(x, terrain_height, z) {
+                    return spawn_position(&self.world, x, z);
+                }
+            }
+        }
+        WorldVec::new(0.5, self.generator.height_at(0, 0) as f64 + 1.0, 0.5)
+    }
+
+    /// Whether the generated column at `terrain_height` is dry, solid and has
+    /// two clear cells for the player's feet and head.
+    fn spawn_column_is_safe(&self, x: i32, terrain_height: i32, z: i32) -> bool {
+        let surface = BlockPos::new(x, terrain_height, z);
+        if self.world.chunk(surface.chunk()).is_none() {
+            return false;
+        }
+        if !self.world.is_solid(surface) {
+            return false;
+        }
+        // Any feature above the terrain surface (tree trunk/canopy, boulder,
+        // snow drift) raises the heightmap and disqualifies the column.
+        if self.world.height_at(x, z) != Some(terrain_height) {
+            return false;
+        }
+        let feet = BlockPos::new(x, terrain_height + 1, z);
+        let head = BlockPos::new(x, terrain_height + 2, z);
+        self.world.get_block(feet) == BlockId::AIR && self.world.get_block(head) == BlockId::AIR
     }
 
     /// One loaded chunk column, if it is currently resident.
@@ -1498,8 +1565,16 @@ impl Host {
     /// [`ActionOutcome::drops`] (furnace input/fuel/output, chest slots
     /// ascending) and spawns them as item entities; creative discards them along
     /// with the block loot.
+    ///
+    /// A dead player cannot break or place anything: the call returns an
+    /// unchanged outcome. This matches the network intent path, which rejects
+    /// dead players before reaching the shared survival helpers.
     pub fn apply_action_with_outcome(&mut self, action: &BlockAction) -> ActionOutcome {
         let mut outcome = ActionOutcome::default();
+
+        if self.player.dead {
+            return outcome;
+        }
 
         if self.game_mode == GameMode::Creative {
             let break_target = self.break_target(action);
@@ -1897,8 +1972,9 @@ impl Host {
         self.dirty_player = true;
     }
 
-    /// Saves the world, player state, inventory, dropped items, block entities
-    /// and equipped armor atomically (one sidecar file at a time).
+    /// Saves the world, player state, spawn point, inventory, dropped items,
+    /// block entities and equipped armor atomically (one sidecar file at a
+    /// time).
     ///
     /// Stale furnace/chest records are pruned first (with a warning), so a block
     /// removed through a direct world edit does not survive in the sidecar.
@@ -1911,6 +1987,7 @@ impl Host {
             &self.world_dir.join("player.txt"),
             player_state(&self.player, self.tick_count).as_bytes(),
         )?;
+        write_atomic(&self.world_dir.join(SPAWN_FILE), spawn_state(&self.spawn).as_bytes())?;
         write_atomic(
             &self.world_dir.join("inventory.txt"),
             inventory_state(&self.registry, &self.inventory).as_bytes(),
@@ -1941,10 +2018,11 @@ impl Host {
     }
 
     /// Deterministic hash of the simulation state: world blocks in canonical
-    /// order, player position and vitals quantised, inventory, dropped item
-    /// entities sorted by id, mobs sorted by id (id, kind, quantised position,
-    /// yaw, health and age), furnace and chest block entities sorted by
-    /// position, equipped armor in slot order, and tick count.
+    /// order, player position and vitals quantised, the persisted spawn point,
+    /// inventory, dropped item entities sorted by id, mobs sorted by id (id,
+    /// kind, quantised position, yaw, health and age), furnace and chest block
+    /// entities sorted by position, equipped armor in slot order, and tick
+    /// count.
     ///
     /// Everything that is persisted is hashed, so a save/reload must reproduce
     /// the hash exactly. Used by the smoke test and cross-platform determinism
@@ -1959,6 +2037,12 @@ impl Host {
         hasher.write_i32((self.player.health * 1000.0) as i32);
         hasher.write_i32((self.player.hunger * 1000.0) as i32);
         hasher.write_u8(self.player.dead as u8);
+        // The spawn point is persisted and respawn-visible; changing it must
+        // change the simulation hash.
+        hasher.write_u8(0xF4);
+        hasher.write_i64(quantize(self.spawn.x));
+        hasher.write_i64(quantize(self.spawn.y));
+        hasher.write_i64(quantize(self.spawn.z));
         for (slot, stack) in self.inventory.iter().enumerate() {
             let Some(stack) = stack else {
                 continue;
@@ -2141,6 +2225,48 @@ pub(crate) fn read_sidecar(path: &Path) -> io::Result<String> {
         ));
     }
     String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Serialized world spawn: three whitespace-separated finite coordinates.
+fn spawn_state(spawn: &WorldVec) -> String {
+    format!("{:?} {:?} {:?}\n", spawn.x, spawn.y, spawn.z)
+}
+
+/// Loads `spawn.txt`, ignoring malformed or out-of-range coordinates.
+///
+/// A missing file is the normal path for worlds created before the spawn
+/// sidecar existed; the caller resolves and persists a spawn in that case.
+fn load_spawn(world_dir: &Path) -> Option<WorldVec> {
+    let path = world_dir.join(SPAWN_FILE);
+    let text = match read_sidecar(&path) {
+        Ok(text) => text,
+        Err(err) => {
+            if err.kind() != io::ErrorKind::NotFound {
+                log::warn!("could not read {}: {err}; recomputing the spawn", path.display());
+            }
+            return None;
+        }
+    };
+    let line = text.lines().find(|line| !line.trim().is_empty())?;
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if fields.len() != 3 {
+        log::warn!("{}: ignoring malformed spawn line", path.display());
+        return None;
+    }
+    let x = fields[0].parse::<f64>().ok()?;
+    let y = fields[1].parse::<f64>().ok()?;
+    let z = fields[2].parse::<f64>().ok()?;
+    if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+        log::warn!("{}: ignoring non-finite spawn", path.display());
+        return None;
+    }
+    let y_min = f64::from(ob_math::WORLD_MIN_Y) - 32.0;
+    let y_max = f64::from(ob_math::WORLD_MAX_Y) + 256.0;
+    if x.abs() > 30_000_000.0 || z.abs() > 30_000_000.0 || !(y_min..=y_max).contains(&y) {
+        log::warn!("{}: ignoring out-of-range spawn", path.display());
+        return None;
+    }
+    Some(WorldVec::new(x, y, z))
 }
 
 /// Serialized player state: ten whitespace-separated fields.

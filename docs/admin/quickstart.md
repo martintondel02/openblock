@@ -197,7 +197,7 @@ Verify the save exists:
 ```sh
 ls -lh ./data/worlds/world/
 # world.obs  player.txt  inventory.txt  items.txt  mobs.txt
-# block_entities.txt  equipment.txt  network_players.txt
+# block_entities.txt  equipment.txt  network_players.txt  spawn.txt
 ```
 
 Take a backup immediately; see [backup](backup.md):

@@ -229,10 +229,10 @@ pub fn draw_title_screen(frame: &mut UiFrame, menu: &TitleMenu, cursor: (f32, f3
         logo_y + line + 6.0,
         if screen[1] < 420.0 { 0.9 } else { 1.5 },
         [0.72, 0.82, 0.96, 1.0],
-        "MULTIPLAYER ALPHA",
+        "EARLY ACCESS",
     );
     let version = format!(
-        "v{}  |  save format {}  |  protocol {}  |  {}/{}",
+        "v{}    save format {}    protocol {}    {}/{}",
         ob_core::VERSION,
         ob_core::SAVE_FORMAT_VERSION,
         ob_core::PROTOCOL_VERSION,
@@ -243,7 +243,7 @@ pub fn draw_title_screen(frame: &mut UiFrame, menu: &TitleMenu, cursor: (f32, f3
         screen[0] / 2.0,
         logo_y + line + (if screen[1] < 420.0 { 18.0 } else { 30.0 }),
         0.95,
-        [0.55, 0.63, 0.75, 1.0],
+        [0.72, 0.79, 0.90, 1.0],
         &version,
     );
 
@@ -254,20 +254,6 @@ pub fn draw_title_screen(frame: &mut UiFrame, menu: &TitleMenu, cursor: (f32, f3
         let selected = index == menu.selected;
         let hovered = rect.contains(cursor.0, cursor.1);
         draw_menu_button(frame, rect, button.label(), selected, hovered, enabled, false);
-        if *button == TitleButton::Continue
-            && let Some(world) = &menu.continue_world
-        {
-            let width = frame.text_width(0.95, world);
-            if rect.w > width + 150.0 {
-                frame.text(
-                    rect.x + rect.w - width - 12.0,
-                    rect.y + rect.h - 14.0,
-                    0.95,
-                    [0.72, 0.78, 0.86, 0.9],
-                    world,
-                );
-            }
-        }
     }
 
     let last_played = menu
@@ -278,16 +264,16 @@ pub fn draw_title_screen(frame: &mut UiFrame, menu: &TitleMenu, cursor: (f32, f3
         });
     frame.text_centered(
         screen[0] / 2.0,
-        (screen[1] - 50.0).max(0.0),
+        (screen[1] - 58.0).max(0.0),
         1.0,
-        [0.62, 0.70, 0.80, 1.0],
+        [0.76, 0.82, 0.91, 1.0],
         &last_played,
     );
     frame.text_centered(
         screen[0] / 2.0,
         (screen[1] - 30.0).max(0.0),
         0.95,
-        [0.50, 0.57, 0.67, 1.0],
+        [0.66, 0.73, 0.83, 1.0],
         "Up/Down select   Enter choose   Mouse click   Esc quit",
     );
 }
@@ -420,7 +406,7 @@ pub fn draw_new_world_screen(frame: &mut UiFrame, form: &NewWorldForm, cursor: (
     for (index, field) in fields.iter().enumerate() {
         let active = (index == 0) == (form.field == NewWorldField::Name);
         let label = labels[index];
-        frame.text(field.x, field.y - 18.0, 1.2, [0.74, 0.81, 0.91, 1.0], label);
+        frame.text(field.x, field.y - 20.0, 1.2, [0.74, 0.81, 0.91, 1.0], label);
         let text = if index == 0 { &form.name } else { &form.seed };
         let placeholder = if index == 0 { "" } else { "0" };
         draw_text_field(frame, *field, text, placeholder, active, cursor);
@@ -453,13 +439,13 @@ pub fn draw_new_world_screen(frame: &mut UiFrame, form: &NewWorldForm, cursor: (
     for (index, (label, enabled)) in [("Create", true), ("Back", true)].iter().enumerate() {
         let rect = if index == 0 { create } else { back };
         let hovered = rect.contains(cursor.0, cursor.1);
-        draw_menu_button(frame, rect, label, hovered, hovered, *enabled, index == 1);
+        draw_menu_button(frame, rect, label, hovered, hovered, *enabled, false);
     }
     frame.text_centered(
         screen[0] / 2.0,
         (screen[1] - 30.0).max(0.0),
         0.95,
-        [0.50, 0.57, 0.67, 1.0],
+        [0.66, 0.73, 0.83, 1.0],
         "Tab/Up/Down field   Type to edit   Enter create   Esc back",
     );
 }
@@ -655,13 +641,13 @@ pub fn draw_world_list_screen(frame: &mut UiFrame, list: &WorldList, cursor: (f3
         back.contains(cursor.0, cursor.1),
         back.contains(cursor.0, cursor.1),
         true,
-        true,
+        false,
     );
     frame.text_centered(
         screen[0] / 2.0,
         (screen[1] - 30.0).max(0.0),
         0.95,
-        [0.50, 0.57, 0.67, 1.0],
+        [0.66, 0.73, 0.83, 1.0],
         "Up/Down select   Enter or double-click play   Delete remove   Esc back",
     );
     if let Some(name) = &list.confirm_delete {
@@ -914,7 +900,7 @@ pub fn draw_multiplayer_screen(
     for (index, field) in fields.iter().enumerate() {
         let active = (index == 0 && form.field == MultiplayerField::Address)
             || (index == 1 && form.field == MultiplayerField::Name);
-        frame.text(field.x, field.y - 18.0, 1.2, [0.74, 0.81, 0.91, 1.0], labels[index]);
+        frame.text(field.x, field.y - 20.0, 1.2, [0.74, 0.81, 0.91, 1.0], labels[index]);
         let (text, placeholder) = if index == 0 {
             (&form.address, DEFAULT_SERVER_ADDRESS)
         } else {
@@ -984,8 +970,7 @@ pub fn draw_multiplayer_screen(
         }
     }
     if let Some(error) = &form.error {
-        let buttons = form_button_rects(screen);
-        let y = (list_label_y + 22.0 + rows.len() as f32 * 30.0 + 4.0).min(buttons[0].y - 22.0);
+        let y = multiplayer_error_y(screen);
         frame.text(fields[0].x, y, 1.15, [1.0, 0.68, 0.58, 1.0], &shorten_text(error, 96));
     }
     let [connect, back] = form_button_rects(screen);
@@ -1005,13 +990,13 @@ pub fn draw_multiplayer_screen(
         back.contains(cursor.0, cursor.1),
         back.contains(cursor.0, cursor.1),
         true,
-        true,
+        false,
     );
     frame.text_centered(
         screen[0] / 2.0,
         (screen[1] - 30.0).max(0.0),
         0.95,
-        [0.50, 0.57, 0.67, 1.0],
+        [0.66, 0.73, 0.83, 1.0],
         "Tab/Up/Down field   Type to edit   Enter connect   Esc back",
     );
 }
@@ -1019,7 +1004,13 @@ pub fn draw_multiplayer_screen(
 /// Shared menu panel bounds.
 pub fn menu_panel_rect(screen: [f32; 2]) -> UiRect {
     let width = (screen[0] - 48.0).clamp(1.0, 760.0);
-    let height = (screen[1] - 48.0).clamp(1.0, 560.0);
+    // Leave the bottom 48 px free for the footer band and hint text; at 960x540
+    // the old `screen - 48` panel reached into the footer and the hint clipped.
+    // Very short diagnostic windows (below 480 px) keep the old, taller panel:
+    // shrinking both the panel and the footer gap would push the form fields
+    // into the buttons.
+    let reserved = if screen[1] >= 480.0 { 96.0 } else { 48.0 };
+    let height = (screen[1] - reserved).clamp(1.0, 560.0);
     UiRect::new((screen[0] - width) / 2.0, (screen[1] - height) / 2.0, width, height)
 }
 
@@ -1029,7 +1020,11 @@ pub fn new_world_field_rects(screen: [f32; 2]) -> [UiRect; 2] {
     let width = panel.w - 72.0;
     let x = panel.x + 36.0;
     let top = panel.y + (panel.h * 0.22).max(72.0);
-    let gap = (panel.h * 0.14).clamp(52.0, 76.0);
+    let gap = if screen[1] >= 480.0 {
+        (panel.h * 0.14).clamp(68.0, 76.0)
+    } else {
+        (panel.h * 0.14).clamp(44.0, 54.0)
+    };
     [UiRect::new(x, top, width, 40.0), UiRect::new(x, top + gap, width, 40.0)]
 }
 
@@ -1039,7 +1034,11 @@ pub fn multiplayer_field_rects(screen: [f32; 2]) -> [UiRect; 2] {
     let width = panel.w - 72.0;
     let x = panel.x + 36.0;
     let top = panel.y + (panel.h * 0.20).max(72.0);
-    let gap = (panel.h * 0.12).clamp(50.0, 70.0);
+    let gap = if screen[1] >= 480.0 {
+        (panel.h * 0.13).clamp(68.0, 74.0)
+    } else {
+        (panel.h * 0.13).clamp(44.0, 54.0)
+    };
     [UiRect::new(x, top, width, 40.0), UiRect::new(x, top + gap, width, 40.0)]
 }
 
@@ -1071,6 +1070,16 @@ pub fn form_button_rects(screen: [f32; 2]) -> [UiRect; 2] {
         UiRect::new(x, y, width, height),
         UiRect::new(x + width + gap, y, width, height),
     ]
+}
+
+/// Y of the multiplayer validation error line.
+///
+/// It sits a fixed distance above the Connect button so a long error or a full
+/// recent-server list cannot draw over the button at 960x540.
+pub fn multiplayer_error_y(screen: [f32; 2]) -> f32 {
+    let buttons = form_button_rects(screen);
+    let fields = multiplayer_field_rects(screen);
+    (buttons[0].y - 22.0).max(fields[1].y + fields[1].h + 40.0)
 }
 
 /// Bounds of the Play, Delete and Back buttons on the world list.
@@ -1536,7 +1545,7 @@ fn draw_world_row(frame: &mut UiFrame, rect: UiRect, world: &WorldSummary, selec
         &shorten_text(&world.name, 42),
     );
     let now = SystemTime::now();
-    let meta = format!("{}  |  modified {}", world.size_label(), world.modified_label(now));
+    let meta = format!("{}    modified {}", world.size_label(), world.modified_label(now));
     frame.text(rect.x + 14.0, rect.y + 21.0, 0.95, [0.61, 0.69, 0.80, 1.0], &meta);
     frame.text(
         rect.x + rect.w - 74.0,
@@ -1935,6 +1944,46 @@ mod tests {
             for rect in recent_server_rects(screen) {
                 assert!(rect.x >= panel.x && rect.x + rect.w <= panel.x + panel.w);
             }
+        }
+    }
+
+    #[test]
+    fn panels_clear_the_footer_band_at_1280x720_and_960x540() {
+        for screen in [[1280.0_f32, 720.0], [960.0, 540.0]] {
+            let panel = menu_panel_rect(screen);
+            assert!(
+                panel.y + panel.h <= screen[1] - 44.0,
+                "panel bottom {} overlaps the footer band at {screen:?}",
+                panel.y + panel.h
+            );
+            let fields = multiplayer_field_rects(screen);
+            assert!(
+                fields[1].y - 20.0 >= fields[0].y + fields[0].h + 4.0,
+                "player-name label crowds the address field at {screen:?}"
+            );
+            let [create, _] = form_button_rects(screen);
+            let new_fields = new_world_field_rects(screen);
+            assert!(
+                new_fields[1].y + new_fields[1].h + 8.0 <= create.y,
+                "seed field crowds Create at {screen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiplayer_error_line_clears_the_connect_button() {
+        for screen in [[1280.0_f32, 720.0], [960.0, 540.0]] {
+            let [connect, _] = form_button_rects(screen);
+            let y = multiplayer_error_y(screen);
+            assert!(
+                y + ob_render::line_height(1.15) <= connect.y - 4.0,
+                "error line overlaps Connect at {screen:?}"
+            );
+            let fields = multiplayer_field_rects(screen);
+            assert!(
+                y >= fields[1].y + fields[1].h,
+                "error line overlaps the form at {screen:?}"
+            );
         }
     }
 

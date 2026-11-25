@@ -148,6 +148,7 @@ The world lives at:
   block_entities.txt     # furnaces/chests
   equipment.txt          # host armor
   network_players.txt    # persisted network players (name, pose, vitals, inventory)
+  spawn.txt              # persisted world-spawn point
 ```
 
 The packaged systemd unit uses `--data-dir /var/lib/openblock` explicitly, so

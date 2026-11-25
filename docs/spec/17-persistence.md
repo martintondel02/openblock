@@ -385,10 +385,16 @@ in unloaded chunks are kept because the block cannot be inspected yet.
 piece, in helmet/chestplate/leggings/boots order; missing durability defaults to
 full and mismatched slots/items are skipped with a warning.
 
+`spawn.txt` — the persisted world-spawn point, three whitespace-separated
+coordinates. It is written on every save and preferred on the next open so a
+restart, reconnect and respawn use the same safe column; an older world without
+the file resolves a spawn once and persists it on the next save. A malformed,
+non-finite or out-of-range line is ignored with a warning.
+
 The host state hash covers player state, inventory, item entities sorted by id,
-furnaces and chests sorted by position (all slots, empty markers included),
-equipment in slot order and world blocks; save/reload must therefore reproduce
-the hash exactly.
+the persisted world spawn, furnaces and chests sorted by position (all slots,
+empty markers included), equipment in slot order and world blocks; save/reload
+must therefore reproduce the hash exactly.
 
 ### 3.5 Write path
 

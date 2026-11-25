@@ -141,8 +141,8 @@ pub const SETTINGS_SENSITIVITY_STEP: f32 = 0.1;
 pub const SETTINGS_VOLUME_STEP: f32 = 0.05;
 /// Footer hint lines, split so they fit the panel at the 8x8 font.
 pub const SETTINGS_CONTROLS_HINT_LINES: [&str; 2] = [
-    "Enter rebind  |  Backspace/Delete clear  |  Reset restores defaults",
-    "Tab switch tabs  |  Up/Down select  |  Esc back",
+    "Enter rebind   Backspace/Delete clear   Reset restores defaults",
+    "Tab switch tabs   Up/Down select   Esc back",
 ];
 pub const SETTINGS_HINT_LINES: [&str; 2] = [
     "Tab: switch   Up/Down: select   Left/Right or scroll: change",
@@ -1777,7 +1777,7 @@ impl UiState {
             SettingsRow::Fov => format!("{:.0} deg", self.settings.fov_degrees),
             SettingsRow::MouseSensitivity => format!("{:.2}x", self.settings.mouse_sensitivity),
             SettingsRow::Fullscreen => checkbox(self.settings.fullscreen),
-            SettingsRow::MeshWorkers => format!("{} threads", info.mesh_workers.max(1)),
+            SettingsRow::MeshWorkers => format!("{} threads (launch)", info.mesh_workers.max(1)),
             SettingsRow::TextureStyle => texture_style_label(self.settings.texture_style).to_string(),
             SettingsRow::TexturePack => {
                 if let Some(name) = &self.active_texture_pack {
@@ -2327,7 +2327,10 @@ pub fn texture_style_label(style: TextureStyle) -> &'static str {
 }
 
 fn checkbox(value: bool) -> String {
-    if value { "[x]" } else { "[ ]" }.to_string()
+    // The 8x8 bitmap font renders `[ ]` as two thin bars, which reads like
+    // "| |" at UI scales. Words are unambiguous for screenshots and screen
+    // readers alike.
+    if value { "On" } else { "Off" }.to_string()
 }
 
 fn shorten(value: &str, max_chars: usize) -> String {
@@ -2609,7 +2612,7 @@ fn settings_value_color(info: &SettingsRowInfo) -> [f32; 4] {
     }
     match info.kind {
         SettingsRowKind::Toggle => {
-            if info.value == "[x]" {
+            if info.value == "On" {
                 [0.72, 0.93, 0.55, 1.0]
             } else {
                 [0.55, 0.60, 0.68, 1.0]
@@ -2711,6 +2714,10 @@ fn draw_controls_help(frame: &mut UiFrame, ui: &UiState, panel: UiRect, rects: &
         .map_or(panel.y + SETTINGS_CONTENT_TOP, |rect| rect.y + rect.h)
         + 8.0;
     let x = panel.x + SETTINGS_MARGIN;
+    // Only one note line fits between the last keybind row and the footer
+    // buttons at 960x540. Duplicate-bind errors already name the conflict in
+    // `binding_message`, so a second line would cover the buttons.
+    let conflicts = ui.settings.keybinds.conflict_lines();
     let (message, color) = if let Some(action) = ui.binding_action() {
         (
             format!("Press a key or mouse button for '{}' - Esc cancels.", action.label()),
@@ -2725,6 +2732,8 @@ fn draw_controls_help(frame: &mut UiFrame, ui: &UiState, panel: UiRect, rects: &
                 [0.72, 0.93, 0.55, 1.0]
             },
         )
+    } else if let Some(conflict) = conflicts.first() {
+        (conflict.clone(), [1.0, 0.66, 0.56, 1.0])
     } else {
         (
             "Bindings apply immediately and save automatically.".to_string(),
@@ -2739,10 +2748,6 @@ fn draw_controls_help(frame: &mut UiFrame, ui: &UiState, panel: UiRect, rects: &
         [0.19, 0.23, 0.29, 0.9],
     );
     frame.text(x, top, 1.0, color, &message);
-    let conflicts = ui.settings.keybinds.conflict_lines();
-    if !conflicts.is_empty() {
-        frame.text(x, top + 14.0, 1.0, [1.0, 0.66, 0.56, 1.0], &conflicts[0]);
-    }
 }
 
 fn draw_settings_buttons(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2]) {
@@ -3069,7 +3074,7 @@ pub fn draw_toasts(frame: &mut UiFrame, toasts: &ToastQueue, screen: [f32; 2]) {
     for (index, toast) in toasts.iter().rev().enumerate() {
         let fade = (toast.remaining / 0.5).clamp(0.0, 1.0);
         let alpha = fade * 0.95;
-        let y = first.y - 18.0 - index as f32 * line_step;
+        let y = first.y - 22.0 - index as f32 * line_step;
         let width = frame.text_width(scale, &toast.text);
         frame.rect(
             VITAL_MARGIN_X,
@@ -3156,8 +3161,18 @@ pub fn draw_death_screen_custom(
         frame.outline(rect.x, rect.y, rect.w, rect.h, if active { 2.0 } else { 1.0 }, border);
         frame.text_centered(rect.center().0, rect.y + 14.0, 2.0, [0.96, 0.92, 0.90, 1.0], label);
     }
-    let hint_y = rects[1].y + rects[1].h + 26.0;
-    frame.text_centered(centre_x, hint_y, 1.2, [0.86, 0.72, 0.72, 1.0], hint);
+    frame.text_centered(centre_x, death_hint_y(screen), 1.2, [0.86, 0.72, 0.72, 1.0], hint);
+}
+
+/// Y of the death-screen key hint, clamped above the health row at 960x540.
+pub fn death_hint_y(screen: [f32; 2]) -> f32 {
+    let rects = death_button_rects(screen);
+    let mut y = rects[1].y + rects[1].h + 26.0;
+    let (hearts, _) = vitals_layout(screen);
+    if let Some(first) = hearts.first() {
+        y = y.min(first.y - ob_render::line_height(1.2) - 4.0);
+    }
+    y
 }
 
 /// Facing label from a yaw in radians (0 faces -Z / north).
@@ -4497,6 +4512,25 @@ mod tests {
     }
 
     #[test]
+    fn death_hint_clears_the_vitals_row_at_960x540() {
+        for screen in [[1280.0_f32, 720.0], [960.0, 540.0]] {
+            let hint_y = death_hint_y(screen);
+            let (hearts, _) = vitals_layout(screen);
+            let hint_bottom = hint_y + ob_render::line_height(1.2);
+            assert!(
+                hint_bottom <= hearts[0].y,
+                "death hint overlaps hearts at {screen:?}: {hint_y}..{hint_bottom} vs {}",
+                hearts[0].y
+            );
+            let buttons = death_button_rects(screen);
+            assert!(
+                hint_y >= buttons[1].y + buttons[1].h + 4.0,
+                "death hint crowds the buttons at {screen:?}"
+            );
+        }
+    }
+
+    #[test]
     fn game_mode_row_shows_title_cased_labels() {
         let mut state = UiState::default();
         state.open_settings();
@@ -4651,7 +4685,7 @@ mod tests {
         assert!(state.settings.reduced_motion);
         assert_eq!(
             state.settings_row_value(SettingsRow::ReducedMotion, &SettingsInfo::default()),
-            "[x]"
+            "On"
         );
         assert_eq!(
             state.settings_activate(),

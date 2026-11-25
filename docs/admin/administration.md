@@ -211,6 +211,7 @@ interest radius, view distance and player behaviour.
   block_entities.txt     furnaces/chests
   equipment.txt          internal host armor
   network_players.txt    persisted network players
+  spawn.txt              persisted world-spawn point
 ```
 
 * Exactly **one server process per world**. There is no lock file; two processes

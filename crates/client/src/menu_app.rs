@@ -60,6 +60,8 @@ pub enum MenuScreenshot {
     Worlds,
     /// Multiplayer form with deterministic recent servers.
     Multiplayer,
+    /// Multiplayer form showing a deterministic validation error.
+    MultiplayerError,
     /// Host-optional settings screen as opened from the title.
     Settings,
 }
@@ -912,7 +914,8 @@ fn screenshot_menu_inner(
     // the caller explicitly selected another style.
     settings.texture_style = options.texture_style.unwrap_or(TextureStyle::Classic);
     settings.clamp();
-    let screen = [1280.0_f32, 720.0];
+    let (width, height) = crate::screenshot_dimensions(options);
+    let screen = [width as f32, height as f32];
     let mut ui = UiState::from_settings(settings.clone());
     ui.host_optional = true;
     let worlds = discover_worlds(data_dir);
@@ -951,15 +954,22 @@ fn screenshot_menu_inner(
             crate::ui_state::draw_settings_screen(&mut frame, &ui, &info, screen);
             detail = "host-optional settings".to_string();
         }
-        MenuScreenshot::Multiplayer => {
+        MenuScreenshot::Multiplayer | MenuScreenshot::MultiplayerError => {
             let mut form = MultiplayerForm::new();
             form.field = MultiplayerField::Address;
             form.recent_selected = 0;
             form.name = "player1234".to_string();
+            if mode == MenuScreenshot::MultiplayerError {
+                form.address = "play.example.com".to_string();
+                form.error = Some("Add a port, for example 127.0.0.1:25565.".to_string());
+                detail = "multiplayer validation error".to_string();
+            } else {
+                detail = format!("{} recent servers", ui.settings.recent_servers.len());
+            }
             frontend::draw_multiplayer_screen(&mut frame, &form, &ui.settings.recent_servers, cursor, screen);
-            detail = format!("{} recent servers", ui.settings.recent_servers.len());
         }
     }
+    crate::log_ui_frame(&format!("{mode:?}"), &frame);
     let (mut renderer, texture_source) = crate::create_offscreen_renderer(options, &settings)?;
     let environment = Environment::default();
     renderer.render_cached_scene(
@@ -971,8 +981,6 @@ fn screenshot_menu_inner(
         },
     )?;
     let rgba = renderer.read_rgba();
-    let width = 1280;
-    let height = 720;
     if rgba.len() != (width * height * 4) as usize {
         return Err(format!(
             "offscreen readback returned {} bytes, expected {}",
@@ -1009,6 +1017,12 @@ fn seed_screenshot_data() -> Result<PathBuf, std::io::Error> {
         ("creative", 14_336_u64, now - Duration::from_secs(3 * 86_400)),
         ("survival", 1_843_200, now - Duration::from_secs(2 * 3_600)),
         ("harbor", 5_662_310, now - Duration::from_secs(5 * 60)),
+        ("far harbor", 2_097_152, now - Duration::from_secs(86_400)),
+        (
+            "The Long World of Alexandria",
+            9_961_472,
+            now - Duration::from_secs(6 * 86_400),
+        ),
     ];
     for (name, size, modified) in worlds {
         let world = dir.join("worlds").join(name);
@@ -1067,7 +1081,16 @@ mod tests {
         let dir = seed_screenshot_data().expect("seed data");
         let worlds = discover_worlds(&dir);
         let names: Vec<&str> = worlds.iter().map(|world| world.name.as_str()).collect();
-        assert_eq!(names, vec!["harbor", "survival", "creative"]);
+        assert_eq!(
+            names,
+            vec![
+                "harbor",
+                "survival",
+                "far harbor",
+                "creative",
+                "The Long World of Alexandria"
+            ]
+        );
         let settings = load_settings(&dir);
         assert_eq!(settings.last_world.as_deref(), Some("harbor"));
         assert_eq!(settings.recent_servers.len(), 3);

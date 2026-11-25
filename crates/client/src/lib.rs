@@ -130,20 +130,30 @@ pub struct ClientOptions {
     pub game_mode: Option<SettingsGameMode>,
     /// Render the death screen in the offscreen screenshot frame.
     pub screenshot_dead: bool,
+    /// Use the network death wording (server keep-inventory, Disconnect).
+    pub screenshot_dead_network: bool,
     /// Render the settings screen in the offscreen screenshot frame.
     pub screenshot_settings: bool,
     /// Render the crafting screen in the offscreen screenshot frame.
     pub screenshot_crafting: bool,
+    /// Omit the nearby crafting table so the hand-crafting gate is visible.
+    pub screenshot_crafting_hand: bool,
     /// Render the survival HUD with the F3 debug overlay in the screenshot.
     pub screenshot_debug: bool,
     /// Seed the host with sample items and vitals for the offscreen screenshot.
     pub screenshot_items: bool,
-    /// Render a few spawned mob avatars with the HUD and F3 overlay.
+    /// Render a few spawned mob avatars with the HUD.
     pub screenshot_mobs: bool,
+    /// Keep the F3 mob counts overlay in the offscreen mob screenshot.
+    pub screenshot_mobs_f3: bool,
     /// Place and open a seeded furnace in the offscreen screenshot frame.
     pub screenshot_furnace: bool,
+    /// Furnace contents for the offscreen screenshot.
+    pub screenshot_furnace_demo: ContainerDemo,
     /// Place and open a seeded chest in the offscreen screenshot frame.
     pub screenshot_chest: bool,
+    /// Chest contents for the offscreen screenshot.
+    pub screenshot_chest_demo: ContainerDemo,
     /// Select the settings tab used by an offscreen settings screenshot.
     pub screenshot_settings_tab: Option<SettingsTab>,
     /// Do not open an audio device at all (headless/streaming setups).
@@ -163,10 +173,22 @@ pub struct ClientOptions {
     pub screenshot_worlds: bool,
     /// Render the multiplayer form offscreen with deterministic recent servers.
     pub screenshot_connect: bool,
+    /// Show a deterministic validation error on the offscreen multiplayer form.
+    pub screenshot_connect_error: bool,
     /// Render the new-world form offscreen.
     pub screenshot_new_world: bool,
     /// Render the host-optional settings screen offscreen.
     pub screenshot_settings_title: bool,
+    /// Render a network survival frame from an in-process loopback server.
+    pub screenshot_network: bool,
+    /// Render synthetic multiplayer name tags over a world.
+    pub screenshot_name_tags: bool,
+    /// Render a multiplayer loading/failure/roster overlay.
+    pub screenshot_net_ui: Option<NetUiKind>,
+    /// Width of offscreen screenshots in pixels (default 1280).
+    pub screenshot_width: u32,
+    /// Height of offscreen screenshots in pixels (default 720).
+    pub screenshot_height: u32,
     /// Whether `--world` was passed explicitly (the title is bypassed).
     pub saw_world: bool,
     /// Whether `--seed` was passed explicitly (the title is bypassed).
@@ -194,13 +216,18 @@ impl Default for ClientOptions {
             time_of_day: None,
             game_mode: None,
             screenshot_dead: false,
+            screenshot_dead_network: false,
             screenshot_settings: false,
             screenshot_crafting: false,
+            screenshot_crafting_hand: false,
             screenshot_debug: false,
             screenshot_items: false,
             screenshot_mobs: false,
+            screenshot_mobs_f3: true,
             screenshot_furnace: false,
+            screenshot_furnace_demo: ContainerDemo::Active,
             screenshot_chest: false,
+            screenshot_chest_demo: ContainerDemo::Full,
             screenshot_settings_tab: None,
             no_audio: false,
             mute: false,
@@ -210,8 +237,14 @@ impl Default for ClientOptions {
             screenshot_title: false,
             screenshot_worlds: false,
             screenshot_connect: false,
+            screenshot_connect_error: false,
             screenshot_new_world: false,
             screenshot_settings_title: false,
+            screenshot_network: false,
+            screenshot_name_tags: false,
+            screenshot_net_ui: None,
+            screenshot_width: SCREENSHOT_WIDTH,
+            screenshot_height: SCREENSHOT_HEIGHT,
             saw_world: false,
             saw_seed: false,
             saw_data_dir: false,
@@ -225,6 +258,24 @@ fn default_mesh_workers() -> usize {
         .map(|count| count.get().saturating_sub(1).max(1))
         .unwrap_or(1)
         .min(mesh_scheduler::MAX_MESH_WORKERS)
+}
+
+/// Offscreen screenshot dimensions, clamped to a sane range.
+pub(crate) fn screenshot_dimensions(options: &ClientOptions) -> (u32, u32) {
+    (
+        options.screenshot_width.clamp(320, 3840),
+        options.screenshot_height.clamp(240, 2160),
+    )
+}
+
+/// Logs UI geometry for offscreen audit captures.
+///
+/// The UI renderer batches by texture (solid, font, block icons), so the quad
+/// count is the meaningful per-screen workload and draw calls are at most the
+/// three texture batches.
+pub(crate) fn log_ui_frame(label: &str, frame: &UiFrame) {
+    let (vertices, quads) = frame.measure();
+    log::info!("ui frame {label}: {quads} quads, {vertices} vertices, <=3 texture draws");
 }
 
 /// Runs the client until the window closes, or writes a single screenshot and exits.
@@ -242,8 +293,26 @@ pub fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = &options.screenshot_inventory {
         return screenshot_with_mode(&options, path, ScreenshotMode::Inventory);
     }
+    if options.screenshot_network {
+        let path = options
+            .screenshot
+            .as_ref()
+            .ok_or("--screenshot-network requires --screenshot PATH")?;
+        let (width, height) = screenshot_dimensions(&options);
+        return screenshot_network_demo_at(path, None, options.seed, width, height);
+    }
+    if options.screenshot_name_tags {
+        let path = options
+            .screenshot
+            .as_ref()
+            .ok_or("--screenshot-name-tags requires --screenshot PATH")?;
+        let (width, height) = screenshot_dimensions(&options);
+        return screenshot_name_tags_demo_at(path, options.seed, width, height);
+    }
     if let Some(path) = &options.screenshot {
-        let mode = if options.screenshot_settings {
+        let mode = if let Some(kind) = options.screenshot_net_ui {
+            ScreenshotMode::NetUi(kind)
+        } else if options.screenshot_settings {
             ScreenshotMode::Settings
         } else if options.screenshot_crafting {
             ScreenshotMode::Crafting
@@ -285,6 +354,8 @@ fn build_event_loop(options: &ClientOptions) -> Result<EventLoop<()>, Box<dyn st
     }
     #[cfg(not(target_os = "linux"))]
     {
+        // The X11 override is Linux-only; keep the signature uniform.
+        let _ = options;
         Ok(EventLoop::builder().build()?)
     }
 }
@@ -326,6 +397,10 @@ pub fn menu_screenshot_mode(options: &ClientOptions) -> Option<menu_app::MenuScr
         (options.screenshot_title, menu_app::MenuScreenshot::Title),
         (options.screenshot_new_world, menu_app::MenuScreenshot::NewWorld),
         (options.screenshot_worlds, menu_app::MenuScreenshot::Worlds),
+        (
+            options.screenshot_connect_error,
+            menu_app::MenuScreenshot::MultiplayerError,
+        ),
         (options.screenshot_connect, menu_app::MenuScreenshot::Multiplayer),
         (options.screenshot_settings_title, menu_app::MenuScreenshot::Settings),
     ];
@@ -334,6 +409,54 @@ pub fn menu_screenshot_mode(options: &ClientOptions) -> Option<menu_app::MenuScr
         .filter_map(|(enabled, mode)| enabled.then_some(mode))
         .collect();
     selected.first().copied()
+}
+
+/// Which multiplayer overlay an audit screenshot should compose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetUiKind {
+    /// Connecting/loading panel with the spawn-area progress bar.
+    Loading,
+    /// Connection failure panel.
+    Failed,
+    /// Disconnected panel.
+    Disconnected,
+    /// Chat history and the Tab player roster over the HUD.
+    Roster,
+}
+
+impl NetUiKind {
+    /// Parses a `--screenshot-net-ui` value.
+    pub fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "loading" => Some(Self::Loading),
+            "failed" | "failure" | "error" => Some(Self::Failed),
+            "disconnected" | "disconnect" => Some(Self::Disconnected),
+            "roster" | "chat" | "players" => Some(Self::Roster),
+            _ => None,
+        }
+    }
+}
+
+/// Deterministic contents for a container audit screenshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerDemo {
+    /// In-progress furnace / full chest (the release default).
+    Active,
+    /// Empty slots.
+    Empty,
+    /// Full input/fuel/output (furnace) or every chest slot filled.
+    Full,
+}
+
+impl ContainerDemo {
+    fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "empty" => Some(Self::Empty),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
 }
 
 /// Which UI overlay an offscreen screenshot should compose.
@@ -357,6 +480,8 @@ enum ScreenshotMode {
     Furnace,
     /// Open, seeded chest screen.
     Chest,
+    /// Multiplayer loading/failure/roster overlay over a world.
+    NetUi(NetUiKind),
 }
 
 /// Renders one offscreen frame of the world and writes it as a PNG (RGBA8).
@@ -385,6 +510,18 @@ pub fn screenshot_network_demo(
     debug_path: Option<&Path>,
     seed: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    screenshot_network_demo_at(path, debug_path, seed, SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT)
+}
+
+/// Like [`screenshot_network_demo`] with an explicit target size.
+#[doc(hidden)]
+pub fn screenshot_network_demo_at(
+    path: &Path,
+    debug_path: Option<&Path>,
+    seed: u64,
+    width: u32,
+    height: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
     let registry = Arc::new(Registry::base());
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -392,7 +529,7 @@ pub fn screenshot_network_demo(
         .unwrap_or_default();
     let data_dir = std::env::temp_dir().join(format!("openblock-net-shot-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&data_dir)?;
-    let result = screenshot_network_demo_inner(path, debug_path, seed, &registry, &data_dir);
+    let result = screenshot_network_demo_inner(path, debug_path, seed, &registry, &data_dir, width, height);
     let _ = std::fs::remove_dir_all(&data_dir);
     result
 }
@@ -403,6 +540,17 @@ pub fn screenshot_network_demo(
 /// live connection. Used only by an ignored screenshot probe.
 #[doc(hidden)]
 pub fn screenshot_name_tags_demo(path: &Path, seed: u64) -> Result<(), Box<dyn std::error::Error>> {
+    screenshot_name_tags_demo_at(path, seed, SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT)
+}
+
+/// Like [`screenshot_name_tags_demo`] with an explicit target size.
+#[doc(hidden)]
+pub fn screenshot_name_tags_demo_at(
+    path: &Path,
+    seed: u64,
+    width: u32,
+    height: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
     let registry = Arc::new(Registry::base());
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -410,7 +558,7 @@ pub fn screenshot_name_tags_demo(path: &Path, seed: u64) -> Result<(), Box<dyn s
         .unwrap_or_default();
     let data_dir = std::env::temp_dir().join(format!("openblock-name-tags-shot-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&data_dir)?;
-    let result = screenshot_name_tags_demo_inner(path, seed, &registry, &data_dir);
+    let result = screenshot_name_tags_demo_inner(path, seed, &registry, &data_dir, width, height);
     let _ = std::fs::remove_dir_all(&data_dir);
     result
 }
@@ -420,6 +568,8 @@ fn screenshot_name_tags_demo_inner(
     seed: u64,
     registry: &Arc<Registry>,
     data_dir: &Path,
+    width: u32,
+    height: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut host = Host::open(
         Arc::clone(registry),
@@ -448,6 +598,8 @@ fn screenshot_name_tags_demo_inner(
         data_dir: Some(data_dir.to_path_buf()),
         no_audio: true,
         render_distance_chunks: 4,
+        screenshot_width: width,
+        screenshot_height: height,
         ..ClientOptions::default()
     };
     options.game_mode = Some(SettingsGameMode::Survival);
@@ -467,12 +619,22 @@ fn screenshot_name_tags_demo_inner(
         [x, y - 1.6, z]
     };
     let players = [
-        (1_u64, "alice", at(7.0, -2.2)),
-        (2, "bob", at(13.0, 2.6)),
-        (3, "carol", at(27.0, 0.6)),
-        (4, "dave_far", at(54.0, 0.0)),
+        (1_u64, "alice", at(7.0, -3.0)),
+        (2, "bob_the_builder", at(15.0, 4.4)),
+        (3, "carol", at(24.0, -4.6)),
+        (4, "dave_far", at(38.0, 5.0)),
     ];
-    let screen = [SCREENSHOT_WIDTH as f32, SCREENSHOT_HEIGHT as f32];
+    let avatars: Vec<crate::net::AvatarState> = players
+        .iter()
+        .map(|(id, name, feet)| crate::net::AvatarState {
+            id: *id,
+            name: (*name).to_string(),
+            pos: *feet,
+            yaw: 0.35,
+        })
+        .collect();
+    renderer.set_entities(&crate::net::avatar_instances(&avatars));
+    let screen = [width as f32, height as f32];
     let tags = name_tags::project_name_tags(&camera, screen, &players, name_tags::NAME_TAG_MAX_DISTANCE);
     let mut frame = UiFrame::new(screen[0], screen[1]);
     let centre_x = screen[0] / 2.0;
@@ -481,12 +643,11 @@ fn screenshot_name_tags_demo_inner(
     frame.rect(centre_x - 1.0, centre_y - 9.0, 2.0, 18.0, cross);
     frame.rect(centre_x - 9.0, centre_y - 1.0, 18.0, 2.0, cross);
     draw_vitals_for_mode(&mut frame, &UiState::from_settings(settings.clone()), &host, screen);
-    let mut ui = UiState::from_settings(settings.clone());
+    let ui = UiState::from_settings(settings.clone());
     draw_hotbar_for_mode(&mut frame, &ui, registry, &host, screen);
-    ui.toasts.push("Name tags: nearest-first, distance-faded");
-    ui_state::draw_toasts(&mut frame, &ui.toasts, screen);
     name_tags::draw_name_tags(&mut frame, &tags, screen);
     let environment = Environment::default();
+    log_ui_frame("name-tags", &frame);
     renderer.render_world_scene(
         host.world(),
         &camera,
@@ -497,10 +658,12 @@ fn screenshot_name_tags_demo_inner(
         },
     )?;
     let rgba = renderer.read_rgba();
-    write_png(path, SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT, &rgba)?;
+    write_png(path, width, height, &rgba)?;
     log::info!(
-        "name-tag screenshot written to {} ({} projected, {} culled by distance/overlap)",
+        "name-tag screenshot written to {} ({}x{}, {} projected, {} culled by distance/overlap)",
         path.display(),
+        width,
+        height,
         tags.len(),
         players.len().saturating_sub(tags.len())
     );
@@ -513,6 +676,8 @@ fn screenshot_network_demo_inner(
     seed: u64,
     registry: &Arc<Registry>,
     data_dir: &Path,
+    width: u32,
+    height: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut host = Host::open(
         Arc::clone(registry),
@@ -717,11 +882,13 @@ fn screenshot_network_demo_inner(
         data_dir: Some(data_dir.to_path_buf()),
         no_audio: true,
         render_distance_chunks: 4,
+        screenshot_width: width,
+        screenshot_height: height,
         ..ClientOptions::default()
     };
     let (settings, _) = effective_settings(&options);
     let (mut renderer, texture_source) = create_offscreen_renderer(&options, &settings)?;
-    let screen = [SCREENSHOT_WIDTH as f32, SCREENSHOT_HEIGHT as f32];
+    let screen = [width as f32, height as f32];
     let eye = client.player().eye();
     let mut camera = Camera::new(eye, client.player().yaw, client.player().pitch);
     camera.far = (client.render_radius() as f32 * 16.0 + 48.0).max(128.0);
@@ -746,7 +913,7 @@ fn screenshot_network_demo_inner(
         .unwrap_or_else(|| "empty".to_string());
     let held_durability = selected.and_then(|stack| inventory::stack_durability(registry, stack));
     let network_line = format!(
-        "Multiplayer survival | Net: {} ping {} players {}/{} | mobs {mobs} items {items}",
+        "Network {}  ping {}  players {}/{}  mobs {mobs}  items {items}",
         server.local_addr(),
         client
             .ping_ms()
@@ -773,7 +940,7 @@ fn screenshot_network_demo_inner(
         render_distance: client.render_radius(),
         loaded_chunks: client.loaded_chunks(),
         drawn_sections: render_stats.sections as usize,
-        cached_sections: 0,
+        cached_sections: renderer.cached_mesh_count(),
         triangles: render_stats.vertices / 3,
         draw_calls: render_stats.draw_calls as usize,
         mesh_workers: 0,
@@ -783,7 +950,7 @@ fn screenshot_network_demo_inner(
         heap_bytes: client.world().section_count().saturating_mul(8 * 1024),
         ticks: client.session_ticks(),
         adapter: format!("{} (offscreen demo)", renderer.adapter_summary()),
-        window: [SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT],
+        window: [width, height],
         fov_degrees: settings.fov_degrees,
         time_of_day,
         texture_source: describe_texture_source(&texture_source, renderer.texture_resolution()),
@@ -828,11 +995,15 @@ fn screenshot_network_demo_inner(
     );
     if let Some(stack) = selected {
         let label = inventory::item_display_name(registry, stack.item);
-        let y = ui
-            .hotbar_rects(screen)
-            .first()
-            .map(|slot| slot.y - 30.0)
-            .unwrap_or(screen[1] - 70.0);
+        let y = selected_name_y(screen, &ui.hotbar_rects(screen));
+        let width = frame.text_width(2.0, &label);
+        frame.rect(
+            screen[0] / 2.0 - width / 2.0 - 7.0,
+            y - 3.0,
+            width + 14.0,
+            ob_render::line_height(2.0) + 6.0,
+            [0.02, 0.03, 0.05, 0.62],
+        );
         frame.text_centered(screen[0] / 2.0, y, 2.0, [1.0, 1.0, 1.0, 1.0], &label);
     }
     ui_state::draw_toasts(&mut frame, &ui.toasts, screen);
@@ -846,23 +1017,24 @@ fn screenshot_network_demo_inner(
             };
             renderer.render_world_scene(client.world(), &camera, &scene)?;
             let rgba = renderer.read_rgba();
-            if rgba.len() != (SCREENSHOT_WIDTH * SCREENSHOT_HEIGHT * 4) as usize {
+            if rgba.len() != (width * height * 4) as usize {
                 return Err(format!(
                     "offscreen readback returned {} bytes, expected {}",
                     rgba.len(),
-                    SCREENSHOT_WIDTH * SCREENSHOT_HEIGHT * 4
+                    width * height * 4
                 )
                 .into());
             }
-            write_png(path, SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT, &rgba)?;
+            write_png(path, width, height, &rgba)?;
             Ok(())
         };
+    log_ui_frame("network-survival", &frame);
     render_and_write(&mut renderer, &frame, path)?;
     log::info!(
         "network survival screenshot written to {} ({}x{}, {mobs} mobs, {items} items, {} chunks, health {:.1}, hunger {:.1}, defence {})",
         path.display(),
-        SCREENSHOT_WIDTH,
-        SCREENSHOT_HEIGHT,
+        width,
+        height,
         client.loaded_chunks(),
         client.health(),
         client.hunger(),
@@ -908,11 +1080,12 @@ fn screenshot_with_mode(
                 | ScreenshotMode::Mobs
                 | ScreenshotMode::Furnace
                 | ScreenshotMode::Chest
+                | ScreenshotMode::NetUi(_)
         )
     {
         seed_screenshot_items(&mut host, &registry);
     }
-    if mode == ScreenshotMode::Crafting {
+    if mode == ScreenshotMode::Crafting && !options.screenshot_crafting_hand {
         seed_near_crafting_table(&mut host, &registry);
     }
     if mode == ScreenshotMode::Dead {
@@ -949,7 +1122,14 @@ fn screenshot_with_mode(
         }
         ScreenshotMode::Furnace => {
             if let Some(pos) = seed_screenshot_container(&mut host, &registry, "openblock:furnace") {
-                seed_screenshot_furnace(&mut host, &registry, pos);
+                if options.screenshot_furnace_demo != ContainerDemo::Empty {
+                    seed_screenshot_furnace(
+                        &mut host,
+                        &registry,
+                        pos,
+                        options.screenshot_furnace_demo == ContainerDemo::Full,
+                    );
+                }
                 screenshot_container = Some((ContainerKind::Furnace, pos));
             } else {
                 log::warn!("furnace screenshot: could not place a furnace");
@@ -957,7 +1137,9 @@ fn screenshot_with_mode(
         }
         ScreenshotMode::Chest => {
             if let Some(pos) = seed_screenshot_container(&mut host, &registry, "openblock:chest") {
-                seed_screenshot_chest(&mut host, &registry, pos);
+                if options.screenshot_chest_demo != ContainerDemo::Empty {
+                    seed_screenshot_chest(&mut host, &registry, pos);
+                }
                 screenshot_container = Some((ContainerKind::Chest, pos));
             } else {
                 log::warn!("chest screenshot: could not place a chest");
@@ -979,7 +1161,8 @@ fn screenshot_with_mode(
     // Compose a showcase frame: HUD, inventory or death screen over the world.
     // Screenshot mode is also the headless verification path for the UI
     // renderer, since it needs no window or surface.
-    let screen = [SCREENSHOT_WIDTH as f32, SCREENSHOT_HEIGHT as f32];
+    let (width, height) = screenshot_dimensions(options);
+    let screen = [width as f32, height as f32];
     let mut ui = UiState::from_settings(settings.clone());
     ui.active_texture_pack = active_texture_pack_label(&texture_source);
     ui.hotbar_selected = host.hotbar_selection();
@@ -1081,10 +1264,23 @@ fn screenshot_with_mode(
         }
         ScreenshotMode::Dead => {
             ui.open_death();
-            ui.death_cause = Some("Cause: lost all health".to_string());
             draw_vitals_for_mode(&mut frame, &ui, &host, screen);
             draw_hotbar_for_mode(&mut frame, &ui, &registry, &host, screen);
-            ui_state::draw_death_screen(&mut frame, &ui, screen);
+            if options.screenshot_dead_network {
+                ui.death_cause = Some("Cause: slain by a zombie".to_string());
+                ui_state::draw_death_screen_custom(
+                    &mut frame,
+                    &ui,
+                    ui.death_cause.as_deref(),
+                    ["Respawn", "Disconnect"],
+                    "The server keeps your inventory",
+                    "Enter/Click select   Up/Down choose   Esc focus buttons   F3 debug",
+                    screen,
+                );
+            } else {
+                ui.death_cause = Some("Cause: lost all health".to_string());
+                ui_state::draw_death_screen(&mut frame, &ui, screen);
+            }
         }
         ScreenshotMode::Settings => {
             ui.open_settings();
@@ -1092,7 +1288,15 @@ fn screenshot_with_mode(
                 ui.settings_select_tab(tab);
             }
             if ui.settings_tab == SettingsTab::Controls {
-                // Show the capture affordance rather than an idle list.
+                // Show the capture affordance on the row it belongs to rather
+                // than leaving Move forward highlighted while Jump captures.
+                if let Some(index) = ui
+                    .settings_rows()
+                    .iter()
+                    .position(|row| *row == SettingsRow::Keybind(Action::Jump))
+                {
+                    ui.settings_selected_row = index;
+                }
                 ui.begin_bind(Action::Jump);
             }
             let info = SettingsInfo {
@@ -1129,9 +1333,8 @@ fn screenshot_with_mode(
                 host.game_mode() == HostGameMode::Creative,
                 screen,
             );
-            if survival {
-                ui_state::draw_toasts(&mut frame, &ui.toasts, screen);
-            }
+            // The crafting panel is modal; toasts would sit on top of it.
+            let _ = survival;
             let sections: Vec<&str> =
                 rows.iter()
                     .map(|row| row.section.title())
@@ -1155,6 +1358,7 @@ fn screenshot_with_mode(
         }
         ScreenshotMode::Debug => {
             ui.block_name_seconds = ui_state::BLOCK_NAME_SECONDS;
+            ui.debug_overlay = true;
             let cross = [0.95, 0.97, 1.0, 0.85];
             frame.rect(centre_x - 1.0, centre_y - 9.0, 2.0, 18.0, cross);
             frame.rect(centre_x - 9.0, centre_y - 1.0, 18.0, 2.0, cross);
@@ -1186,33 +1390,44 @@ fn screenshot_with_mode(
         }
         ScreenshotMode::Mobs => {
             ui.block_name_seconds = ui_state::BLOCK_NAME_SECONDS;
+            ui.debug_overlay = options.screenshot_mobs_f3;
             let cross = [0.95, 0.97, 1.0, 0.85];
             frame.rect(centre_x - 1.0, centre_y - 9.0, 2.0, 18.0, cross);
             frame.rect(centre_x - 9.0, centre_y - 1.0, 18.0, 2.0, cross);
             draw_vitals_for_mode(&mut frame, &ui, &host, screen);
             draw_hotbar_for_mode(&mut frame, &ui, &registry, &host, screen);
             draw_selected_name(&mut frame, &ui, &registry, &host, screen);
-            if survival {
+            if survival && options.screenshot_mobs_f3 {
                 ui_state::draw_toasts(&mut frame, &ui.toasts, screen);
             }
-            let stats = screenshot_debug_stats(
-                &host,
-                &registry,
-                &renderer,
-                &settings,
-                options,
-                &texture_source,
-                debug_render_stats.unwrap_or_default(),
-            );
-            draw_debug_overlay(&mut frame, &stats, screen);
-            log::info!(
-                "mob screenshot: {} live mobs ({} passive, {} hostile), {} cubes, {} debug lines",
-                host.mob_count(),
-                host.passive_mob_count(),
-                host.hostile_mob_count(),
-                mobs::mob_instances(&registry, host.mobs(), 1.0).len(),
-                stats.left_lines().len(),
-            );
+            if options.screenshot_mobs_f3 {
+                let stats = screenshot_debug_stats(
+                    &host,
+                    &registry,
+                    &renderer,
+                    &settings,
+                    options,
+                    &texture_source,
+                    debug_render_stats.unwrap_or_default(),
+                );
+                draw_debug_overlay(&mut frame, &stats, screen);
+                log::info!(
+                    "mob screenshot: {} live mobs ({} passive, {} hostile), {} cubes, {} debug lines",
+                    host.mob_count(),
+                    host.passive_mob_count(),
+                    host.hostile_mob_count(),
+                    mobs::mob_instances(&registry, host.mobs(), 1.0).len(),
+                    stats.left_lines().len(),
+                );
+            } else {
+                log::info!(
+                    "mob screenshot (plain): {} live mobs ({} passive, {} hostile), {} cubes",
+                    host.mob_count(),
+                    host.passive_mob_count(),
+                    host.hostile_mob_count(),
+                    mobs::mob_instances(&registry, host.mobs(), 1.0).len(),
+                );
+            }
         }
         ScreenshotMode::Furnace | ScreenshotMode::Chest => {
             let (kind, pos) = screenshot_container.unwrap_or((
@@ -1280,14 +1495,92 @@ fn screenshot_with_mode(
                     );
                 }
             }
-            if survival {
-                ui_state::draw_toasts(&mut frame, &ui.toasts, screen);
+            // Containers are modal; keep the panel clear.
+            let _ = survival;
+        }
+        ScreenshotMode::NetUi(kind) => {
+            if kind == NetUiKind::Roster {
+                let cross = [0.95, 0.97, 1.0, 0.85];
+                frame.rect(centre_x - 1.0, centre_y - 9.0, 2.0, 18.0, cross);
+                frame.rect(centre_x - 9.0, centre_y - 1.0, 18.0, 2.0, cross);
+                draw_vitals_for_mode(&mut frame, &ui, &host, screen);
+                draw_hotbar_for_mode(&mut frame, &ui, &registry, &host, screen);
+                let mut chat = crate::net::ChatLog::default();
+                chat.push("alice", "hello from the network");
+                chat.push("bob_the_builder", "building a harbor at spawn");
+                chat.push("carol", "the furnace is ready");
+                crate::net_ui::draw_chat(&mut frame, &chat, None, screen);
+                let entries = [
+                    crate::net::PlayerEntry {
+                        id: 1,
+                        name: "alexandria_the_builder".to_string(),
+                        is_self: true,
+                    },
+                    crate::net::PlayerEntry {
+                        id: 2,
+                        name: "bob_the_builder".to_string(),
+                        is_self: false,
+                    },
+                    crate::net::PlayerEntry {
+                        id: 3,
+                        name: "carol".to_string(),
+                        is_self: false,
+                    },
+                    crate::net::PlayerEntry {
+                        id: 4,
+                        name: "dave_far".to_string(),
+                        is_self: false,
+                    },
+                ];
+                crate::net_ui::draw_player_list(&mut frame, &entries, 8, Some(23), screen);
+            } else {
+                let panel = match kind {
+                    NetUiKind::Loading => crate::net_ui::ConnectPanel {
+                        title: "Connecting",
+                        endpoint: "127.0.0.1:25565",
+                        player_name: "player1234",
+                        status: "Streaming the spawn area",
+                        spinner: "...",
+                        world_name: Some("openblock"),
+                        motd: Some("A self-hosted OpenBlock world"),
+                        players: Some((2, 8)),
+                        progress: Some((12, 49)),
+                        failure: None,
+                    },
+                    NetUiKind::Failed => crate::net_ui::ConnectPanel {
+                        title: "Connection failed",
+                        endpoint: "play.example.com:25565",
+                        player_name: "player1234",
+                        status: "The connection attempt failed.",
+                        spinner: "",
+                        world_name: None,
+                        motd: None,
+                        players: None,
+                        progress: None,
+                        failure: Some("server_full: 8/8 players"),
+                    },
+                    NetUiKind::Disconnected => crate::net_ui::ConnectPanel {
+                        title: "Disconnected",
+                        endpoint: "127.0.0.1:25565",
+                        player_name: "player1234",
+                        status: "The server closed the connection.",
+                        spinner: "",
+                        world_name: None,
+                        motd: None,
+                        players: None,
+                        progress: None,
+                        failure: Some("timeout: the server stopped responding"),
+                    },
+                    NetUiKind::Roster => unreachable!(),
+                };
+                crate::net_ui::draw_connect_panel(&mut frame, &panel, screen);
             }
         }
     }
     let mut entities = entity_instances_for(host.item_entities(), &registry, 0.8);
     entities.extend(mobs::mob_instances(&registry, host.mobs(), 1.0));
     renderer.set_entities(&entities);
+    log_ui_frame(&format!("{:?}", mode), &frame);
     let scene = SceneParams {
         environment,
         ui: Some(&frame),
@@ -1295,22 +1588,22 @@ fn screenshot_with_mode(
     };
     renderer.render_world_scene(host.world(), &camera, &scene)?;
     let rgba = renderer.read_rgba();
-    if rgba.len() != (SCREENSHOT_WIDTH * SCREENSHOT_HEIGHT * 4) as usize {
+    if rgba.len() != (width * height * 4) as usize {
         return Err(format!(
             "offscreen readback returned {} bytes, expected {}",
             rgba.len(),
-            SCREENSHOT_WIDTH * SCREENSHOT_HEIGHT * 4
+            width * height * 4
         )
         .into());
     }
 
-    write_png(path, SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT, &rgba)?;
+    write_png(path, width, height, &rgba)?;
 
     log::info!(
         "screenshot written to {} ({}x{}, GPU {}, mode {}, health {:.1}, hunger {:.1})",
         path.display(),
-        SCREENSHOT_WIDTH,
-        SCREENSHOT_HEIGHT,
+        width,
+        height,
         renderer.adapter_summary(),
         host.game_mode().name(),
         host.player().health,
@@ -1381,7 +1674,7 @@ fn screenshot_debug_stats(
         render_distance: host.render_distance_chunks(),
         loaded_chunks: host.world().chunk_count(),
         drawn_sections: render_stats.sections as usize,
-        cached_sections: host.world().chunk_count(),
+        cached_sections: renderer.cached_mesh_count(),
         triangles: render_stats.vertices / 3,
         draw_calls: render_stats.draw_calls as usize,
         mesh_workers: options.mesh_workers,
@@ -1391,7 +1684,7 @@ fn screenshot_debug_stats(
         heap_bytes: host.memory_bytes(),
         ticks: host.tick_count(),
         adapter: renderer.adapter_summary().to_string(),
-        window: [SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT],
+        window: [options.screenshot_width, options.screenshot_height],
         fov_degrees: settings.fov_degrees,
         time_of_day: Environment::from_ticks(host.tick_count() + DAY_LENGTH_TICKS / 4, DAY_LENGTH_TICKS).time_of_day,
         texture_source: describe_texture_source(texture_source, renderer.texture_resolution()),
@@ -1662,13 +1955,14 @@ fn seed_screenshot_container(host: &mut Host, registry: &Registry, block_name: &
 }
 
 /// Fills a screenshot furnace with a representative in-progress smelt.
-fn seed_screenshot_furnace(host: &mut Host, registry: &Registry, pos: BlockPos) {
+fn seed_screenshot_furnace(host: &mut Host, registry: &Registry, pos: BlockPos, full: bool) {
+    let (input_count, fuel_count) = if full { (64, 64) } else { (3, 8) };
     let input = registry
         .item_id("openblock:raw_iron")
-        .and_then(|item| host.make_stack(item, 3));
+        .and_then(|item| host.make_stack(item, input_count));
     let fuel = registry
         .item_id("openblock:coal")
-        .and_then(|item| host.make_stack(item, 8));
+        .and_then(|item| host.make_stack(item, fuel_count));
     if let Some(stack) = input {
         let replaced = host.put_furnace_slot(pos, FurnaceSlot::Input, stack);
         log::info!("furnace seed: input {:?}, replaced {:?}", stack, replaced);
@@ -1677,13 +1971,14 @@ fn seed_screenshot_furnace(host: &mut Host, registry: &Registry, pos: BlockPos) 
         let replaced = host.put_furnace_slot(pos, FurnaceSlot::Fuel, stack);
         log::info!("furnace seed: fuel {:?}, replaced {:?}", stack, replaced);
     }
+    let output_count = if full { 64 } else { 2 };
     let output = registry
         .item_id("openblock:iron_ingot")
-        .and_then(|item| host.make_stack(item, 2));
+        .and_then(|item| host.make_stack(item, output_count));
     if let Some(state) = host.furnace_at_mut(pos) {
-        state.burn_remaining = 800;
+        state.burn_remaining = if full { 1600 } else { 800 };
         state.burn_total = 1600;
-        state.cook_progress = 120;
+        state.cook_progress = if full { 199 } else { 120 };
         // The output is take-only through the slot API; seed it directly for
         // the demo so the screenshot shows a finished item.
         state.output = output;
@@ -1867,9 +2162,30 @@ fn draw_vitals_for_mode(frame: &mut UiFrame, _ui: &UiState, host: &Host, screen:
     }
 }
 
+/// Width below which the held-item label moves below the crosshair.
+///
+/// At 960x540 the centred label above the hotbar overlaps the armour row and
+/// `15 DEF`; the narrower fallback keeps it clear of every HUD element.
+pub(crate) const SELECTED_NAME_NARROW_WIDTH: f32 = 1100.0;
+
+/// Y position of the held-item label for a screen and hotbar.
+pub(crate) fn selected_name_y(screen: [f32; 2], hotbar: &[ui_state::UiRect]) -> f32 {
+    if screen[0] < SELECTED_NAME_NARROW_WIDTH {
+        screen[1] / 2.0 + 24.0
+    } else {
+        hotbar.first().map(|slot| slot.y - 30.0).unwrap_or(screen[1] - 70.0)
+    }
+}
+
 /// Draws the selected hotbar slot's display name, if the name timer is active.
 fn draw_selected_name(frame: &mut UiFrame, ui: &UiState, registry: &Registry, host: &Host, screen: [f32; 2]) {
     if ui.block_name_seconds <= 0.0 {
+        return;
+    }
+    // On narrow targets the fallback label sits below the crosshair, which is
+    // inside the F3 column; suppress it rather than drawing it under the debug
+    // text. Wide screens keep the label above the hotbar, clear of the panels.
+    if ui.debug_overlay && screen[0] < SELECTED_NAME_NARROW_WIDTH {
         return;
     }
     let label = if host.game_mode() == HostGameMode::Survival {
@@ -1880,11 +2196,15 @@ fn draw_selected_name(frame: &mut UiFrame, ui: &UiState, registry: &Registry, ho
             .map(|block| inventory::display_name(block.id))
     };
     if let Some(label) = label {
-        let y = ui
-            .hotbar_rects(screen)
-            .first()
-            .map(|slot| slot.y - 30.0)
-            .unwrap_or(screen[1] - 70.0);
+        let y = selected_name_y(screen, &ui.hotbar_rects(screen));
+        let width = frame.text_width(2.0, &label);
+        frame.rect(
+            screen[0] / 2.0 - width / 2.0 - 7.0,
+            y - 3.0,
+            width + 14.0,
+            ob_render::line_height(2.0) + 6.0,
+            [0.02, 0.03, 0.05, 0.62],
+        );
         frame.text_centered(screen[0] / 2.0, y, 2.0, [1.0, 1.0, 1.0, 1.0], &label);
     }
 }
@@ -3649,9 +3969,6 @@ impl GameState {
                 self.host.game_mode() == HostGameMode::Creative,
                 screen,
             );
-            if self.ui.hud_visible {
-                ui_state::draw_toasts(&mut frame, &self.ui.toasts, screen);
-            }
         }
 
         // --- Furnace / chest: modal block-entity screens ---
@@ -3676,9 +3993,6 @@ impl GameState {
                     self.ui.cursor,
                     screen,
                 ),
-            }
-            if self.ui.hud_visible {
-                ui_state::draw_toasts(&mut frame, &self.ui.toasts, screen);
             }
         }
 
@@ -4161,12 +4475,21 @@ fn draw_debug_overlay(frame: &mut UiFrame, stats: &DebugStats, screen: [f32; 2])
             [0.52, 0.59, 0.69, 0.9],
         );
     }
+    let footer_text = "F3 debug overlay   F1 HUD   F2 screenshot   Esc menu";
+    let footer_width = frame.text_width(ui_state::DEBUG_FOOTER_SCALE, footer_text);
+    frame.rect(
+        ui_state::DEBUG_MARGIN,
+        layout.footer_y - 3.0,
+        footer_width + 8.0,
+        ob_render::line_height(ui_state::DEBUG_FOOTER_SCALE) + 6.0,
+        [0.03, 0.04, 0.07, 0.76],
+    );
     frame.text(
         ui_state::DEBUG_MARGIN + 4.0,
         layout.footer_y,
         ui_state::DEBUG_FOOTER_SCALE,
-        [0.80, 0.86, 0.94, 0.9],
-        "F3 debug overlay   F1 HUD   F2 screenshot   Esc menu",
+        [0.86, 0.91, 0.98, 0.95],
+        footer_text,
     );
     if layout.columns == DebugColumns::Stacked {
         // Leave a trace in the logs so layout regressions at narrow sizes are
@@ -5179,7 +5502,8 @@ fn create_offscreen_renderer(
     settings: &Settings,
 ) -> Result<(OffscreenRenderer, TextureSource), ob_render::RenderError> {
     let source = resolve_texture_source(options, settings);
-    match OffscreenRenderer::new_with_source(SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT, source.clone()) {
+    let (width, height) = screenshot_dimensions(options);
+    match OffscreenRenderer::new_with_source(width, height, source.clone()) {
         Ok(renderer) => Ok((renderer, source)),
         Err(ob_render::RenderError::Texture(reason)) => {
             if let TextureSource::ResourcePack(path) = &source {
@@ -5189,7 +5513,7 @@ fn create_offscreen_renderer(
                     settings.texture_style.name()
                 );
                 let style = render_texture_style(settings.texture_style);
-                let renderer = OffscreenRenderer::new_with_style(SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT, style)?;
+                let renderer = OffscreenRenderer::new_with_style(width, height, style)?;
                 Ok((renderer, TextureSource::Style(style)))
             } else {
                 Err(ob_render::RenderError::Texture(reason))
@@ -5343,7 +5667,35 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
                 }
                 options.screenshot_inventory = Some(value.into());
             }
-            "screenshot-dead" => options.screenshot_dead = true,
+            "screenshot-size" => {
+                let (width, height) = value
+                    .split_once('x')
+                    .or_else(|| value.split_once('X'))
+                    .ok_or_else(|| "--screenshot-size must look like 1280x720".to_string())?;
+                let width: u32 = width
+                    .parse()
+                    .map_err(|_| format!("invalid --screenshot-size width '{width}'"))?;
+                let height: u32 = height
+                    .parse()
+                    .map_err(|_| format!("invalid --screenshot-size height '{height}'"))?;
+                if !(320..=3840).contains(&width) || !(240..=2160).contains(&height) {
+                    return Err("--screenshot-size width 320-3840, height 240-2160".into());
+                }
+                options.screenshot_width = width;
+                options.screenshot_height = height;
+            }
+            "screenshot-dead" => {
+                options.screenshot_dead = true;
+                match value.as_str() {
+                    "" | "local" => {}
+                    "network" => options.screenshot_dead_network = true,
+                    other => {
+                        return Err(format!(
+                            "unknown --screenshot-dead variant '{other}' (expected network)"
+                        ));
+                    }
+                }
+            }
             "screenshot-settings" => {
                 options.screenshot_settings = true;
                 if !value.is_empty() {
@@ -5359,11 +5711,47 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
                     Some(SettingsTab::from_name(value).ok_or_else(|| format!("unknown settings tab '{value}'"))?);
                 options.screenshot_settings = true;
             }
-            "screenshot-crafting" => options.screenshot_crafting = true,
+            "screenshot-crafting" => {
+                options.screenshot_crafting = true;
+                match value.as_str() {
+                    "" | "table" => {}
+                    "hand" => options.screenshot_crafting_hand = true,
+                    other => {
+                        return Err(format!(
+                            "unknown --screenshot-crafting variant '{other}' (expected hand)"
+                        ));
+                    }
+                }
+            }
             "screenshot-debug" => options.screenshot_debug = true,
-            "screenshot-mobs" => options.screenshot_mobs = true,
-            "screenshot-furnace" => options.screenshot_furnace = true,
-            "screenshot-chest" => options.screenshot_chest = true,
+            "screenshot-mobs" => {
+                options.screenshot_mobs = true;
+                match value.as_str() {
+                    "" | "debug" => options.screenshot_mobs_f3 = true,
+                    "plain" => options.screenshot_mobs_f3 = false,
+                    other => {
+                        return Err(format!(
+                            "unknown --screenshot-mobs variant '{other}' (expected debug or plain)"
+                        ));
+                    }
+                }
+            }
+            "screenshot-furnace" => {
+                options.screenshot_furnace = true;
+                if !value.is_empty() {
+                    options.screenshot_furnace_demo = ContainerDemo::from_name(value).ok_or_else(|| {
+                        format!("unknown --screenshot-furnace variant '{value}' (expected empty, active or full)")
+                    })?;
+                }
+            }
+            "screenshot-chest" => {
+                options.screenshot_chest = true;
+                if !value.is_empty() {
+                    options.screenshot_chest_demo = ContainerDemo::from_name(value).ok_or_else(|| {
+                        format!("unknown --screenshot-chest variant '{value}' (expected empty, active or full)")
+                    })?;
+                }
+            }
             "screenshot-items" => options.screenshot_items = true,
             "no-audio" => options.no_audio = true,
             "mute" => options.mute = true,
@@ -5372,9 +5760,31 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
             "title" | "menu" => options.force_title = true,
             "screenshot-title" => options.screenshot_title = true,
             "screenshot-worlds" => options.screenshot_worlds = true,
-            "screenshot-connect" => options.screenshot_connect = true,
+            "screenshot-connect" => {
+                options.screenshot_connect = true;
+                match value.as_str() {
+                    "" => {}
+                    "error" => options.screenshot_connect_error = true,
+                    other => {
+                        return Err(format!(
+                            "unknown --screenshot-connect variant '{other}' (expected error)"
+                        ));
+                    }
+                }
+            }
             "screenshot-new-world" => options.screenshot_new_world = true,
             "screenshot-settings-title" => options.screenshot_settings_title = true,
+            "screenshot-network" => options.screenshot_network = true,
+            "screenshot-name-tags" => options.screenshot_name_tags = true,
+            "screenshot-net-ui" => {
+                if value.is_empty() {
+                    return Err("--screenshot-net-ui requires loading, failed, disconnected or roster".into());
+                }
+                options.screenshot_net_ui = Some(
+                    NetUiKind::from_name(value)
+                        .ok_or_else(|| format!("unknown --screenshot-net-ui variant '{value}'"))?,
+                );
+            }
             "help" | "version" => {}
             other => return Err(format!("unknown option --{other}")),
         }
@@ -5394,6 +5804,9 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
         + usize::from(options.screenshot_mobs)
         + usize::from(options.screenshot_furnace)
         + usize::from(options.screenshot_chest)
+        + usize::from(options.screenshot_network)
+        + usize::from(options.screenshot_name_tags)
+        + usize::from(options.screenshot_net_ui.is_some())
         + usize::from(options.screenshot_inventory.is_some())
         + menu_screenshot_modes;
     if screenshot_modes > 1 {
@@ -5404,6 +5817,9 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
             "--screenshot-title/--screenshot-new-world/--screenshot-worlds/--screenshot-connect/--screenshot-settings-title require --screenshot PATH"
                 .into(),
         );
+    }
+    if options.screenshot_connect_error && !options.screenshot_connect {
+        return Err("--screenshot-connect=error requires --screenshot-connect".into());
     }
     if menu_screenshot_modes > 0 && options.screenshot_items {
         return Err("front-end screenshot flags cannot be combined with --screenshot-items".into());
@@ -5447,6 +5863,15 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
     if options.screenshot_chest && options.screenshot.is_none() {
         return Err("--screenshot-chest requires --screenshot PATH".into());
     }
+    if options.screenshot_network && options.screenshot.is_none() {
+        return Err("--screenshot-network requires --screenshot PATH".into());
+    }
+    if options.screenshot_name_tags && options.screenshot.is_none() {
+        return Err("--screenshot-name-tags requires --screenshot PATH".into());
+    }
+    if options.screenshot_net_ui.is_some() && options.screenshot.is_none() {
+        return Err("--screenshot-net-ui requires --screenshot PATH".into());
+    }
     if options.screenshot_items && options.screenshot.is_none() && options.screenshot_inventory.is_none() {
         return Err("--screenshot-items requires --screenshot or --screenshot-inventory PATH".into());
     }
@@ -5479,6 +5904,9 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
             || options.screenshot_mobs
             || options.screenshot_furnace
             || options.screenshot_chest
+            || options.screenshot_network
+            || options.screenshot_name_tags
+            || options.screenshot_net_ui.is_some()
             || options.screenshot_items
             || options.screenshot_title
             || options.screenshot_new_world
@@ -5556,6 +5984,23 @@ mod tests {
             .expect("valid menu screenshot flags");
             assert_eq!(menu_screenshot_mode(&options), Some(expected));
         }
+        let options = options_from_args(&[
+            ("screenshot".to_string(), "/tmp/menu.png".to_string()),
+            ("screenshot-connect".to_string(), "error".to_string()),
+        ])
+        .expect("error variant");
+        assert!(options.screenshot_connect);
+        assert!(options.screenshot_connect_error);
+        assert_eq!(
+            menu_screenshot_mode(&options),
+            Some(menu_app::MenuScreenshot::MultiplayerError)
+        );
+        let error = options_from_args(&[
+            ("screenshot".to_string(), "/tmp/menu.png".to_string()),
+            ("screenshot-connect".to_string(), "nope".to_string()),
+        ])
+        .expect_err("unknown variant");
+        assert!(error.contains("unknown --screenshot-connect variant"));
         let error = options_from_args(&[
             ("screenshot".to_string(), "/tmp/menu.png".to_string()),
             ("screenshot-title".to_string(), String::new()),
@@ -6243,6 +6688,124 @@ mod tests {
         assert_eq!(audio_material_for(&registry, BlockId::AIR), None);
         let water = registry.id("openblock:water").expect("water");
         assert_eq!(audio_material_for(&registry, water), None);
+    }
+
+    #[test]
+    fn network_and_name_tag_screenshots_are_offscreen_only_modes() {
+        for flag in ["screenshot-network", "screenshot-name-tags"] {
+            let error = options_from_args(&[(flag.to_string(), String::new())]).expect_err("needs a screenshot path");
+            assert!(error.contains("--screenshot PATH"), "{flag}: {error}");
+            let options = options_from_args(&[
+                ("screenshot".to_string(), "/tmp/net.png".to_string()),
+                (flag.to_string(), String::new()),
+            ])
+            .expect("valid offscreen mode");
+            assert!(options.screenshot.is_some());
+            assert_eq!(
+                usize::from(options.screenshot_network) + usize::from(options.screenshot_name_tags),
+                1
+            );
+        }
+        let error = options_from_args(&[
+            ("screenshot".to_string(), "/tmp/net.png".to_string()),
+            ("screenshot-network".to_string(), String::new()),
+            ("screenshot-name-tags".to_string(), String::new()),
+        ])
+        .expect_err("one mode only");
+        assert!(error.contains("cannot be combined"));
+    }
+
+    #[test]
+    fn net_ui_audit_variants_parse_and_require_a_path() {
+        for (name, expected) in [
+            ("loading", NetUiKind::Loading),
+            ("failed", NetUiKind::Failed),
+            ("disconnected", NetUiKind::Disconnected),
+            ("roster", NetUiKind::Roster),
+        ] {
+            let options = options_from_args(&[
+                ("screenshot".to_string(), "/tmp/net-ui.png".to_string()),
+                ("screenshot-net-ui".to_string(), name.to_string()),
+            ])
+            .expect("valid net ui mode");
+            assert_eq!(options.screenshot_net_ui, Some(expected));
+            let error = options_from_args(&[("screenshot-net-ui".to_string(), name.to_string())])
+                .expect_err("needs screenshot path");
+            assert!(error.contains("--screenshot PATH"));
+        }
+        let error = options_from_args(&[
+            ("screenshot".to_string(), "/tmp/net-ui.png".to_string()),
+            ("screenshot-net-ui".to_string(), "nope".to_string()),
+        ])
+        .expect_err("unknown variant");
+        assert!(error.contains("unknown --screenshot-net-ui variant"));
+    }
+
+    #[test]
+    fn container_demo_variants_parse_and_reject_unknown_values() {
+        let options = options_from_args(&[
+            ("screenshot".to_string(), "/tmp/furnace.png".to_string()),
+            ("screenshot-furnace".to_string(), "empty".to_string()),
+        ])
+        .expect("empty furnace");
+        assert_eq!(options.screenshot_furnace_demo, ContainerDemo::Empty);
+        let options = options_from_args(&[
+            ("screenshot".to_string(), "/tmp/chest.png".to_string()),
+            ("screenshot-chest".to_string(), "full".to_string()),
+        ])
+        .expect("full chest");
+        assert_eq!(options.screenshot_chest_demo, ContainerDemo::Full);
+        for flag in ["screenshot-furnace", "screenshot-chest"] {
+            let error = options_from_args(&[
+                ("screenshot".to_string(), "/tmp/container.png".to_string()),
+                (flag.to_string(), "nope".to_string()),
+            ])
+            .expect_err("unknown variant");
+            assert!(error.contains("unknown --") && error.contains("variant"));
+        }
+    }
+
+    #[test]
+    fn screenshot_size_parses_and_clamps_audit_captures() {
+        let options = options_from_args(&[
+            ("screenshot".to_string(), "/tmp/size.png".to_string()),
+            ("screenshot-size".to_string(), "960x540".to_string()),
+        ])
+        .expect("valid size");
+        assert_eq!(screenshot_dimensions(&options), (960, 540));
+        let error =
+            options_from_args(&[("screenshot-size".to_string(), "960".to_string())]).expect_err("missing height");
+        assert!(error.contains("1280x720"));
+        let error =
+            options_from_args(&[("screenshot-size".to_string(), "100x100".to_string())]).expect_err("too small");
+        assert!(error.contains("320-3840"));
+    }
+
+    #[test]
+    fn narrow_item_label_moves_below_the_crosshair_and_clears_the_hud() {
+        let screen = [960.0, 540.0];
+        let hotbar = UiState::default().hotbar_rects(screen);
+        let label_y = selected_name_y(screen, &hotbar);
+        let (hearts, hunger) = ui_state::vitals_layout(screen);
+        let armor = ui_state::armor_layout(screen);
+        let label_bottom = label_y + ob_render::line_height(2.0);
+        for rect in hearts.iter().chain(hunger.iter()).chain(armor.iter()) {
+            assert!(
+                label_bottom <= rect.y || label_y >= rect.y + rect.h,
+                "held-item label overlaps a vital row at {screen:?}"
+            );
+        }
+        assert!(
+            (260.0..=320.0).contains(&label_y),
+            "label stays near the crosshair at 960x540"
+        );
+        let wide = [1280.0, 720.0];
+        let hotbar = UiState::default().hotbar_rects(wide);
+        assert_eq!(
+            selected_name_y(wide, &hotbar),
+            hotbar[0].y - 30.0,
+            "wide screens keep the classic label position"
+        );
     }
 
     #[test]

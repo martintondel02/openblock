@@ -635,12 +635,12 @@ pub fn avatar_instances(avatars: &[AvatarState]) -> Vec<EntityInstance> {
         let torso_tint = [base[0] * 0.86, base[1] * 0.86, base[2] * 0.86];
         let leg_tint = [base[0] * 0.64, base[1] * 0.64, base[2] * 0.64];
 
-        // Head: 0.5 m cube whose base sits at 1.15 m, nudged forward slightly
-        // so the yaw orientation is readable.
+        // Head: 0.5 m cube whose base sits on the torso at 1.0 m, nudged
+        // forward slightly so the yaw orientation is readable.
         instances.push(EntityInstance {
             position: [
                 (x + forward[0] * 0.06) as f32,
-                (y + 1.15) as f32,
+                (y + 1.0) as f32,
                 (z + forward[2] * 0.06) as f32,
             ],
             scale: 0.5,
@@ -3143,7 +3143,7 @@ mod tests {
         }
         let first = &instances[..AVATAR_CUBES];
         assert_eq!(first[0].scale, 0.5, "head cube");
-        assert!((first[0].position[1] - 65.15).abs() < 1e-5);
+        assert!((first[0].position[1] - 65.0).abs() < 1e-5);
         assert_eq!(first[1].scale, 0.6, "torso cube");
         assert!((first[1].position[1] - 64.4).abs() < 1e-5);
         assert_eq!(first[2].scale, 0.4, "left leg");

@@ -27,9 +27,9 @@ use crate::ui_state::{HOTBAR_SLOTS, UiRect};
 /// Width of the furnace and chest modal panels.
 pub const CONTAINER_PANEL_WIDTH: f32 = 620.0;
 /// Height of the furnace modal panel.
-pub const FURNACE_PANEL_HEIGHT: f32 = 560.0;
+pub const FURNACE_PANEL_HEIGHT: f32 = 400.0;
 /// Height of the chest modal panel.
-pub const CHEST_PANEL_HEIGHT: f32 = 480.0;
+pub const CHEST_PANEL_HEIGHT: f32 = 410.0;
 /// Inner horizontal and vertical panel margin.
 pub const CONTAINER_MARGIN: f32 = 28.0;
 /// Edge length of a container slot at 1080p.
@@ -694,7 +694,9 @@ pub fn move_selection(layout: &ContainerLayout, current: SlotId, dx: i32, dy: i3
             continue;
         }
         let side = (delta.0 * direction.1 - delta.1 * direction.0).abs();
-        let score = forward + side * 2.0;
+        // Weight sideways drift heavily: a slot directly to the right must win
+        // over a hotbar slot that happens to sit just below and slightly right.
+        let score = forward + side * 4.0;
         if best.is_none_or(|(best_score, _)| score < best_score) {
             best = Some((score, slot.id));
         }
@@ -733,6 +735,9 @@ fn draw_slot(
     inventory::draw_slot_stack(frame, rect, registry, stack);
 }
 
+/// Key hint shown at the bottom of both container panels.
+pub const CONTAINER_KEY_HINT: &str = "LMB take/place   RMB half/one   Arrows   Enter use   E/Esc close";
+
 /// Draws the modal chrome, title and slot grid shared by both screens.
 fn draw_container_base(
     frame: &mut UiFrame,
@@ -745,11 +750,18 @@ fn draw_container_base(
 ) -> Option<SlotId> {
     frame.rect(0.0, 0.0, screen[0], screen[1], [0.0, 0.0, 0.0, 0.55]);
     frame.rect(
+        layout.panel.x + 6.0,
+        layout.panel.y + 8.0,
+        layout.panel.w,
+        layout.panel.h,
+        [0.0, 0.0, 0.0, 0.38],
+    );
+    frame.rect(
         layout.panel.x,
         layout.panel.y,
         layout.panel.w,
         layout.panel.h,
-        [0.07, 0.08, 0.11, 0.96],
+        [0.055, 0.068, 0.092, 0.985],
     );
     frame.outline(
         layout.panel.x,
@@ -757,21 +769,45 @@ fn draw_container_base(
         layout.panel.w,
         layout.panel.h,
         2.0,
-        [0.42, 0.48, 0.56, 1.0],
+        [0.43, 0.49, 0.58, 1.0],
     );
-    frame.text_centered(
-        layout.panel.x + layout.panel.w / 2.0,
-        layout.panel.y + 18.0,
-        2.5,
+    frame.outline(
+        layout.panel.x + 3.0,
+        layout.panel.y + 3.0,
+        layout.panel.w - 6.0,
+        layout.panel.h - 6.0,
+        1.0,
+        [0.15, 0.18, 0.24, 1.0],
+    );
+    frame.text(
+        layout.panel.x + CONTAINER_MARGIN,
+        layout.panel.y + 16.0,
+        2.6,
         [1.0, 1.0, 1.0, 1.0],
         session.kind.title(),
     );
-    frame.text_centered(
-        layout.panel.x + layout.panel.w / 2.0,
-        layout.panel.y + 48.0,
+    let version = format!("OpenBlock v{}", ob_core::VERSION);
+    let version_width = frame.text_width(1.0, &version);
+    frame.text(
+        layout.panel.x + layout.panel.w - CONTAINER_MARGIN - version_width,
+        layout.panel.y + 24.0,
+        1.0,
+        [0.64, 0.70, 0.79, 1.0],
+        &version,
+    );
+    frame.text(
+        layout.panel.x + CONTAINER_MARGIN,
+        layout.panel.y + 44.0,
         1.0,
         [0.70, 0.76, 0.84, 1.0],
         &format!("at {} {} {}", session.pos.x, session.pos.y, session.pos.z),
+    );
+    frame.rect(
+        layout.panel.x + CONTAINER_MARGIN,
+        layout.panel.y + 64.0,
+        layout.panel.w - 2.0 * CONTAINER_MARGIN,
+        1.0,
+        [0.24, 0.28, 0.35, 1.0],
     );
     let hovered = layout.hit_test(cursor.0, cursor.1);
     for slot in &layout.slots {
@@ -829,7 +865,7 @@ fn draw_container_footer(
         layout.panel.y + layout.panel.h - 14.0,
         1.0,
         [0.68, 0.74, 0.82, 1.0],
-        "LMB take/place  RMB half/one  Arrows select  Enter use  E/Esc close",
+        CONTAINER_KEY_HINT,
     );
 }
 
@@ -1031,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn furnace_layout_places_slots_inside_a_620_by_560_panel() {
+    fn furnace_layout_places_slots_inside_a_compact_panel() {
         let screen = [1280.0, 720.0];
         let layout = furnace_layout(screen);
         assert_eq!(layout.slots.len(), 3 + HOTBAR_SLOTS);
@@ -1320,6 +1356,20 @@ mod tests {
         let chest = chest_layout(screen);
         assert_eq!(move_selection(&chest, SlotId::Chest(0), 1, 0), SlotId::Chest(1));
         assert_eq!(move_selection(&chest, SlotId::Chest(0), 0, 1), SlotId::Chest(9));
+    }
+
+    #[test]
+    fn container_key_hint_fits_both_panels_at_960x540() {
+        let screen = [960.0, 540.0];
+        let frame = UiFrame::new(screen[0], screen[1]);
+        for layout in [furnace_layout(screen), chest_layout(screen)] {
+            let inner = layout.panel.w - 2.0 * CONTAINER_MARGIN;
+            assert!(
+                frame.text_width(1.0, CONTAINER_KEY_HINT) <= inner,
+                "hint is {} px, inner width {inner}",
+                frame.text_width(1.0, CONTAINER_KEY_HINT)
+            );
+        }
     }
 
     #[test]

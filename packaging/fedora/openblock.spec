@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           openblock
-Version:        0.2.0
+Version:        1.0.0
 Release:        1%{?dist}
 Summary:        Fast, deeply moddable, server-first voxel sandbox
 
@@ -151,6 +151,17 @@ update-desktop-database &>/dev/null || :
 %config(noreplace) %{_sysconfdir}/openblock/server.env.example
 
 %changelog
+* Sat Nov 25 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 1.0.0-1
+- OpenBlock 1.0.0 Early Access: survival core (worldgen caves/ores, mobs and
+  combat, crafting/recipe book, furnace smelting, iron tools and armor, chests,
+  item drops/pickup, death/respawn, persistence), self-hosted multiplayer alpha
+  with server-authoritative survival and protocol v2, procedural audio, title
+  screen/world browser/connect UI, key rebinding/accessibility, resource packs,
+  benchmarks/load gates and server operations tooling.
+- 1.0 hardening: full acceptance scenario, spawn safety/spawn.txt, dead-player
+  action guard, UI/UX audit fixes, macOS/Windows CI fixes, 8-player load gate
+  and 10-minute soak.
+
 * Sat Nov 25 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.2.0-1
 - Front-end: title screen with Continue/New World/Load World/Multiplayer/
   Settings/Quit, world creation and world browser with safe delete, direct-

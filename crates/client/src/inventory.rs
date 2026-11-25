@@ -26,13 +26,18 @@ pub const INVENTORY_TITLE_HEIGHT: f32 = 56.0;
 /// Vertical gap between the grid and the footer separator.
 pub const INVENTORY_GRID_GAP: f32 = 16.0;
 /// Space reserved for the hovered-name and crafting-hint footer below the grid.
-pub const INVENTORY_FOOTER_HEIGHT: f32 = 108.0;
+pub const INVENTORY_FOOTER_HEIGHT: f32 = 124.0;
 /// Minimum distance between the panel and the screen edge.
 pub const INVENTORY_MARGIN: f32 = 24.0;
 /// Horizontal padding inside the survival inventory panel.
 pub const SURVIVAL_PADDING: f32 = 26.0;
-/// Y offsets of the four footer lines, measured from the footer separator.
-pub const INVENTORY_FOOTER_LINES: [f32; 4] = [12.0, 38.0, 62.0, 82.0];
+/// Y offsets of the five footer lines, measured from the footer separator.
+pub const INVENTORY_FOOTER_LINES: [f32; 5] = [12.0, 36.0, 60.0, 82.0, 102.0];
+/// Control hints on the last two footer lines (kept short enough for 960x540).
+pub const INVENTORY_CONTROL_HINTS: [&str; 2] = [
+    "Click armor equip/unequip   Click/Enter select",
+    "Arrows/Wheel navigate   C crafting   E/Esc close",
+];
 /// Y offsets of the three creative-inventory footer lines.
 pub const INVENTORY_CREATIVE_FOOTER_LINES: [f32; 3] = [12.0, 40.0, 68.0];
 /// Smallest slot edge length used on very narrow windows.
@@ -821,7 +826,11 @@ pub fn draw_durability_bar(frame: &mut UiFrame, slot: UiRect, remaining: u16, ma
 
 /// Draws a stack's durability bar when it is a tool.
 pub fn draw_stack_durability(frame: &mut UiFrame, slot: UiRect, registry: &Registry, stack: ItemStack) {
-    if let Some((remaining, max)) = stack_durability(registry, stack) {
+    if let Some((remaining, max)) = stack_durability(registry, stack)
+        && remaining < max
+    {
+        // Undamaged gear keeps a clean icon; a full green bar on every tool
+        // looked like a selection/charge indicator.
         draw_durability_bar(frame, slot, remaining, max);
     }
 }
@@ -842,7 +851,9 @@ pub fn survival_layout(screen: [f32; 2]) -> SurvivalInventoryLayout {
         + ARMOR_ROW_GAP
         + slot_size
         + INVENTORY_GRID_GAP
-        + INVENTORY_FOOTER_HEIGHT;
+        + INVENTORY_FOOTER_HEIGHT
+        // The armour row starts 10 px lower to clear the header rule.
+        + 10.0;
     let panel = UiRect::new(
         (width - panel_width) / 2.0,
         (height - panel_height) / 2.0,
@@ -850,7 +861,7 @@ pub fn survival_layout(screen: [f32; 2]) -> SurvivalInventoryLayout {
         panel_height,
     );
     let grid_x = panel.x + SURVIVAL_PADDING;
-    let armor_top = panel.y + INVENTORY_TITLE_HEIGHT + 20.0;
+    let armor_top = panel.y + INVENTORY_TITLE_HEIGHT + 30.0;
     let armor_gap = 8.0;
     let armor_width = 4.0 * ARMOR_SLOT_SIZE + 3.0 * armor_gap;
     let armor_x = panel.x + (panel.w - armor_width) / 2.0;
@@ -1409,11 +1420,18 @@ pub fn draw_survival(
     let muted = [0.78, 0.83, 0.90, 1.0];
     frame.rect(0.0, 0.0, screen[0], screen[1], [0.0, 0.0, 0.0, 0.55]);
     frame.rect(
+        layout.panel.x + 6.0,
+        layout.panel.y + 8.0,
+        layout.panel.w,
+        layout.panel.h,
+        [0.0, 0.0, 0.0, 0.38],
+    );
+    frame.rect(
         layout.panel.x,
         layout.panel.y,
         layout.panel.w,
         layout.panel.h,
-        [0.07, 0.08, 0.11, 0.96],
+        [0.055, 0.068, 0.092, 0.985],
     );
     frame.outline(
         layout.panel.x,
@@ -1421,14 +1439,38 @@ pub fn draw_survival(
         layout.panel.w,
         layout.panel.h,
         2.0,
-        [0.42, 0.48, 0.56, 1.0],
+        [0.43, 0.49, 0.58, 1.0],
     );
-    frame.text_centered(
-        layout.panel.x + layout.panel.w / 2.0,
-        layout.panel.y + 18.0,
-        2.5,
+    frame.outline(
+        layout.panel.x + 3.0,
+        layout.panel.y + 3.0,
+        layout.panel.w - 6.0,
+        layout.panel.h - 6.0,
+        1.0,
+        [0.15, 0.18, 0.24, 1.0],
+    );
+    frame.text(
+        layout.panel.x + SURVIVAL_PADDING,
+        layout.panel.y + 16.0,
+        2.6,
         white,
         "Inventory",
+    );
+    let version = format!("OpenBlock v{}", ob_core::VERSION);
+    let version_width = frame.text_width(1.0, &version);
+    frame.text(
+        layout.panel.x + layout.panel.w - SURVIVAL_PADDING - version_width,
+        layout.panel.y + 24.0,
+        1.0,
+        [0.64, 0.70, 0.79, 1.0],
+        &version,
+    );
+    frame.rect(
+        layout.panel.x + SURVIVAL_PADDING,
+        layout.panel.y + 62.0,
+        layout.panel.w - 2.0 * SURVIVAL_PADDING,
+        1.0,
+        [0.24, 0.28, 0.35, 1.0],
     );
 
     // --- Armor row: four equip slots plus the defence total ---
@@ -1487,8 +1529,8 @@ pub fn draw_survival(
         frame.text(
             slot.x,
             slot.y + slot.h + 2.0,
-            0.8,
-            [0.60, 0.65, 0.72, 1.0],
+            0.9,
+            [0.68, 0.73, 0.80, 1.0],
             ARMOR_SHORT_LABELS[index],
         );
     }
@@ -1516,9 +1558,9 @@ pub fn draw_survival(
     );
     frame.text(
         defense_x,
-        layout.armor_top + 40.0,
-        0.8,
-        [0.60, 0.65, 0.72, 1.0],
+        layout.armor_top + 42.0,
+        0.9,
+        [0.68, 0.73, 0.80, 1.0],
         "click armor",
     );
 
@@ -1618,8 +1660,15 @@ pub fn draw_survival(
         layout.panel.x + layout.panel.w / 2.0,
         footer_top + INVENTORY_FOOTER_LINES[3],
         1.0,
-        [0.68, 0.74, 0.82, 1.0],
-        "Click armor equip/unequip   Click/Enter select   Arrows/Wheel navigate   E/Esc close",
+        [0.80, 0.85, 0.92, 1.0],
+        INVENTORY_CONTROL_HINTS[0],
+    );
+    frame.text_centered(
+        layout.panel.x + layout.panel.w / 2.0,
+        footer_top + INVENTORY_FOOTER_LINES[4],
+        1.0,
+        [0.80, 0.85, 0.92, 1.0],
+        INVENTORY_CONTROL_HINTS[1],
     );
 }
 
@@ -2447,6 +2496,39 @@ mod tests {
         draw_durability_bar(&mut frame, slot, 0, 131);
         let (_, quads) = frame.measure();
         assert_eq!(quads, 2, "an empty bar draws no fill cell");
+    }
+
+    #[test]
+    fn undamaged_tools_do_not_draw_a_durability_bar() {
+        let registry = Registry::base();
+        let pick = registry.item_id("openblock:iron_pickaxe").expect("pickaxe");
+        let stack = ItemStack::for_item(pick, registry.item(pick), 1);
+        let slot = UiRect::new(10.0, 10.0, 48.0, 48.0);
+        let mut frame = UiFrame::new(1280.0, 720.0);
+        draw_stack_durability(&mut frame, slot, &registry, stack);
+        let (_, quads) = frame.measure();
+        assert_eq!(quads, 0, "full durability keeps the icon clean");
+
+        let worn = stack.with_durability(Some(40));
+        let mut frame = UiFrame::new(1280.0, 720.0);
+        draw_stack_durability(&mut frame, slot, &registry, worn);
+        let (_, quads) = frame.measure();
+        assert!(quads >= 3, "damaged gear keeps the bar");
+    }
+
+    #[test]
+    fn survival_control_hints_fit_the_panel_at_960x540() {
+        let screen = [960.0, 540.0];
+        let panel = survival_layout(screen).panel;
+        let frame = UiFrame::new(screen[0], screen[1]);
+        let inner = panel.w - 2.0 * SURVIVAL_PADDING;
+        for hint in INVENTORY_CONTROL_HINTS {
+            assert!(
+                frame.text_width(1.0, hint) <= inner,
+                "{hint:?} is {} px wide, panel inner width {inner}",
+                frame.text_width(1.0, hint)
+            );
+        }
     }
 
     #[test]

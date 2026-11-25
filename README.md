@@ -1,540 +1,190 @@
 <p align="center">
   <h1 align="center">OpenBlock</h1>
-  <p align="center"><strong>A fast, deeply moddable, server-first voxel sandbox — written in Rust.</strong></p>
+  <p align="center"><strong>A fast, self-hostable voxel sandbox — written in Rust.</strong></p>
 </p>
 
 <p align="center">
   <a href=".github/workflows/ci.yml"><img alt="CI" src="https://github.com/martintondel02/openblock/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE-MIT"><img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a>
-  <img alt="Status" src="https://img.shields.io/badge/status-v0.0.1%20tech%20preview-orange.svg">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.0.0%20early%20access-orange.svg">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.100%2B-B7410E.svg?logo=rust">
   <img alt="Primary platform" src="https://img.shields.io/badge/platform-Fedora%2044%2F45%20%7C%20Linux-51A2DA.svg?logo=fedora">
 </p>
 
-OpenBlock is an open-source voxel sandbox: mine, build, explore and survive
-alone or with friends on servers you host yourself. It is designed around four
-promises:
+OpenBlock is an open-source voxel sandbox: mine, build, explore and survive alone
+or with friends on servers you host yourself. **1.0.0 is an Early Access
+release**: the core survival game and self-hosted multiplayer are playable and
+tested end-to-end, while crafting-grid, lighting, farming, weather and the
+modding track are explicitly post-1.0 (see [Known limitations](#known-limitations)).
 
-- **Performance by architecture** — GPU-driven rendering, paletted 16³
-  sections, parallel simulation, budgets enforced in CI. Target: 512-block
-  view distance at 120–144 FPS on mid-range hardware.
-- **Visuals that scale** — a modern forward+ pipeline with cascaded shadows,
-  AO, TAA, screen-space water, volumetric atmosphere, and a *contract-based*
-  shader-pack API instead of fragile bytecode patching.
-- **Moddability as a core feature** — data-driven content packs, sandboxed WASM
-  behaviour mods with a versioned host ABI, and opt-in native plugins. The base
-  game itself is built on the public API.
-- **Server-first multiplayer** — an authoritative, headless dedicated server
-  that runs on a GPU-less VPS, with self-signed identity, content-hash
-  verification and progressive world streaming.
+![OpenBlock 1.0 title screen](docs/img/v1.0.0-title.png)
 
-**Linux is the primary platform, and Fedora is the reference distribution** — the
-current + previous Fedora release at any ship date (44/45 at the time of writing),
-Wayland + Vulkan + PipeWire, Flathub Flatpak first, COPR RPM for native installs,
-and a hardened Fedora Server package for hosting. Windows and macOS ship as
-supported secondary platforms at 1.0.
+## What's in 1.0.0
 
-Minecraft Java Edition's feature set is the reference, delivered in stages: the
-**1.0 Early Access** release targets Tier-1 parity plus the platform (modding,
-multiplayer, visuals), and **2.0** targets full Tier-2 parity. Beyond parity,
-OpenBlock is designed to express content and systems Minecraft cannot:
-programmable logic blocks, first-class energy/fluid networks, scriptable mob
-AI, procedural dungeons, server-side minigames and more.
+- **Survival core** — procedural world with five biomes, caves/ravines and
+  coal/iron/copper ore veins; health/hunger, fall damage, starvation and
+  regeneration; mining with tool requirements, speeds and durability; block
+  drops as visible item entities with a pickup magnet; death/respawn with
+  persisted vitals and inventory.
+- **Progression** — 25 recipes (planks, sticks, crafting table, wooden/stone/
+  iron tools, leather/iron armor), furnace smelting with fuel, chests, 27-slot
+  container windows; iron tools and armor with real stat/durability changes.
+- **Mobs and combat** — cows, pigs, sheep, chickens and zombies with
+  deterministic AI, day/night/depth spawning, sun burn, melee combat, knockback,
+  armor mitigation (up to 80%), mob drops and client-side blocky avatars.
+- **Self-hosted multiplayer** — dedicated server with world streaming, chat,
+  player roster, avatars/name tags and **server-authoritative survival**
+  (inventories, vitals, equipment, actions, containers, death/respawn,
+  persistence); protocol v2 over TCP with strict limits. No TLS yet: use it on a
+  LAN, VPN or SSH tunnel.
+- **Audio** — 79 procedurally synthesized clips (material footsteps, break/place,
+  pickup, hurt/death, eat, craft, tool break, splash, UI) plus wind/music loops;
+  master/SFX/music volumes and mute in the Audio tab. Real output on Linux via
+  PulseAudio loaded at runtime; Windows/macOS build with a silent stub in 1.0.
+- **Front-end and accessibility** — title screen (Continue/New World/Load World/
+  Multiplayer/Settings/Quit), world browser, direct connect with recent servers,
+  interactive key rebinding for 17 actions, reduced motion, persisted HUD
+  visibility and readable spaced UI at 1280×720 and 960×540.
+- **Resource packs** — load Minecraft-format pack directories at runtime
+  (`--texture-pack PATH`), with biome tinting, animated first frames and
+  per-layer fallback. No third-party assets are bundled or redistributed.
+- **Server operations** — hardened systemd unit, dependency-free container image
+  + compose file, backup/restore scripts, load-test bots, metrics endpoint,
+  admin handbook and graceful SIGINT/SIGTERM saves.
 
-![OpenBlock v0.0.5 tech preview — desert and snowy mountain at day, with HUD](docs/img/v0.0.5-screenshot.png)
-
-<p align="center"><em>v0.0.5, seed 7, classic textures: desert dunes, a snowy mountain and forest, with the HUD (offscreen capture on Fedora 45, RADV).</em></p>
-
-> **Status: v0.0.5 tech preview.** A runnable single-player vertical slice now
-> exists: procedural terrain, chunk streaming, walk/fly physics, block
-> break/place, hotbar selection, save/load and a headless host with a
-> determinism smoke test. It is the first slice of MS-03, not a finished game:
-> multiplayer, UI text, audio and the GPU-driven render path are later
-> milestones. The full specification, research and plan live in
-> [`docs/`](docs/README.md); if you want to help, start with
-> [`CONTRIBUTING.md`](CONTRIBUTING.md) and
-> [`docs/plan/01-milestones.md`](docs/plan/01-milestones.md).
-
----
-
-## Table of contents
-
-- [Why another block game?](#why-another-block-game)
-- [What is planned](#what-is-planned)
-- [Documentation](#documentation)
-- [Architecture at a glance](#architecture-at-a-glance)
-- [Roadmap](#roadmap)
-- [Performance targets](#performance-targets)
-- [Frequently asked questions](#frequently-asked-questions)
-- [Contributing](#contributing)
-- [License and legal](#license-and-legal)
-
-## Why another block game?
-
-The genre's incumbent is fifteen years old, and the things players and server
-owners complain about are structural, not cosmetic:
-
-| Problem | OpenBlock's answer |
-| --- | --- |
-| FPS collapses with render distance and entity count | GPU-driven culling and submission, greedy meshing, paletted sections, budgeted streaming |
-| Shader packs are fragile and mutually exclusive | Render graph with declared pass contracts; packs are composed, validated, and cannot affect gameplay |
-| Mods break every version and can wreck servers | Three-tier modding with a versioned ABI, capabilities, quotas and content-hash verification |
-| Servers are expensive and hard to run | Deterministic parallel simulation, headless GPU-free server, one-command container deploy, metrics and backups |
-| Multiplayer UX is hostile | Self-hosted reference server, invite tickets, progressive join, no mandatory central account |
-
-Minecraft is a masterpiece and its design is why this genre exists. We are
-arguing that its implementation and extension model left room for a modern,
-open, performance-first engine — not that the game is bad.
-
-Read the full reasoning in [`docs/vision.md`](docs/vision.md).
-
-## What is planned
-
-**1.0 is an Early Access release** ([DEC-051](docs/decisions.md)): Tier-1 parity,
-the Tier-2 infrastructure, and the modding platform. Full Tier-2 parity is the
-**2.0** track. The split matters, so it is explicit here:
-
-| Area | 1.0 Early Access | 2.0 / post-1.0 |
-| --- | --- | --- |
-| **World** | Infinite deterministic terrain, climate-blended biomes, caves, aquifers, ores, villages and major structures, the underworld and terminus dimensions and portals, day/night, weather, flowing fluids | The remaining biomes, structures and dimensions content, full worldgen edge cases |
-| **Survival** | Health, hunger and XP; tools, armor and durability; crafting, smelting, brewing and enchanting basics, anvils and trading basics; common mobs with pathfinding; basic redstone; farming and breeding; boats and minecarts | Full Tier-2 mob set, full redstone, bosses and terminus progression, raids, potions, advancements/statistics, commands and game rules |
-| **Creative** | Unlimited palette, fast block picker, structure/clipboard tools, undo; spectator as a Tier-3 item delivered early | — |
-| **Multiplayer** | Authoritative dedicated server, LAN play, invite tickets, content-hash verification, interest-managed replication, prediction and reconciliation, anti-cheat validation, admin console and metrics; 50 **co-located** players at 20 TPS, with a separate distributed-player capacity row | Proxy/lobby, native-plugin servers, web client |
-| **Modding** | Content packs (blocks, items, recipes, loot, worldgen, biomes, sounds, models, UI, translations), server-side WASM mods with capabilities, hot reload, per-mod profiling; **1.0 clients run no mod code** ([DEC-049](docs/decisions.md)) | Client code tier (needs a new decision), native plugins |
-| **Visuals** | Render graph, CSM shadows, GTAO, TAA, water, volumetric atmosphere, shader-pack API, controller support | Far-terrain LOD at 1,024 blocks, ray-traced quality tier |
-| **Beyond Minecraft** | — | Programmable blocks, energy/fluid networks, scriptable AI, procedural dungeons, per-biome shaders and ambience, server-side minigame scripting |
-
-The specification is explicit about what is **not** planned: no Minecraft
-client/protocol compatibility at launch, no Minecraft assets or names in shipped
-content (base-pack dimensions are `openblock:underworld` and
-`openblock:terminus`), no paywall or marketplace, no blockchain. See the
-[non-goals](docs/vision.md#7-non-goals).
-
-## Documentation
-
-The repository is documentation-first: code follows the spec, not the other way
-around.
-
-| Start here | |
-| --- | --- |
-| [Vision](docs/vision.md) | The product, pillars, scope tiers, success metrics, non-goals |
-| [Decision register](docs/decisions.md) | Every binding technical decision (`DEC-xxx`) with rationale |
-| [Specification](docs/spec/00-conventions.md) | Terminology, then 25 chapters from architecture to performance budgets |
-| [Roadmap](docs/plan/00-roadmap.md) | Phases, releases, the two-track effort model and the critical path |
-| [Milestones](docs/plan/01-milestones.md) | `MS-00 … MS-16` for 1.0, `MS-17` for the 2.0 track, and the post-1.0 releases |
-| [Research](docs/research/01-weft-teardown.md) | Prior-art teardowns and technology surveys used to make the decisions |
-| [Server operations](docs/admin/README.md) | Dedicated server quickstart, configuration, security, backups and upgrades |
-
-Full document map: [`docs/README.md`](docs/README.md).
-
-## Architecture at a glance
-
-```
-Processes:  openblock (client + integrated server)   openblock-server (headless)
-            openblock-tools (asset/pack/world tools) xtask (build automation)
-
-Crates:     ob_core   app loop, scheduler, config, diagnostics, platform
-            ob_math   coordinates, AABBs, deterministic RNG, pinned math
-            ob_world  paletted 16³ sections, chunks, light, world queries
-            ob_worldgen  deterministic parallel terrain, biomes, structures
-            ob_content   registries, tags, content packs, validation
-            ob_sim    authoritative simulation: entities, physics, gameplay
-            ob_protocol  versioned bit-packed wire protocol
-            ob_net    QUIC transport, replication, interest management
-            ob_modding  content-pack runtime, WASM host, native ABI
-            ob_render  wgpu 30 renderer: render graph, voxel pipeline, post
-            ob_ui / ob_audio  retained UI, text, localization; sound engine
-            ob_client / ob_server / ob_tools  binaries
-
-Key decisions: Rust + wgpu 30 (not Bevy), 16×16×16 paletted sections with
-packed 4-bit light, 32³ default render mesh clusters, GPU-driven
-multi-draw-indirect submission, 20 Hz fixed tick, server-authoritative QUIC
-multiplayer, MIT OR Apache-2.0.
-```
-
-- [`spec/01-technical-architecture.md`](docs/spec/01-technical-architecture.md)
-- [`ADR-0002 — Rust and a purpose-built engine`](docs/adr/0002-rust-and-purpose-built-engine.md)
-- [`ADR-0003 — wgpu-first renderer`](docs/adr/0003-wgpu-first-renderer.md)
-- [`ADR-0005 — Server-authoritative QUIC multiplayer`](docs/adr/0005-server-authoritative-quic.md)
-
-## Roadmap
-
-| Phase | Releases | What you can do |
-| --- | --- | --- |
-| A | `0.0.1` | Walk around a generated world, break and place blocks, save and reload |
-| B | `0.1.0-alpha` | Play at 512 blocks of view with a real UI, inventory and content packs |
-| C | `0.2.0-alpha` | Play with friends on your own headless server |
-| D | `0.3.0-beta` | Survive: biomes, caves, structures, dimensions, crafting, hunger, combat |
-| E | `0.4`–`0.5` | Common mobs, basic redstone, enchanting and trading basics; WASM mods; shadows and audio |
-| F | `0.6`, `1.0-rc` | Tier-1 parity gate, parity-corpus infrastructure, 50 co-located players, anti-cheat, accessibility |
-| G | `1.0` | **Early Access** launch: signed installers, updater, docs, mod API 1.0 freeze |
-| H | `2.0` | Full Tier-2 parity on the funded post-1.0 track (`MS-17`, ~500–800 dev-weeks) |
-
-Nominal effort to **1.0 Early Access** is ~200–240 engineering dev-weeks plus
-content and QA — about 20–23 months for a three-person team (24–28 with the
-risk allowance), or roughly 4.5–5.5 years solo full-time before the
-risk-register delay. The 2.0 Tier-2 track is a further ~500–800 dev-weeks and
-needs a funded 6–10 person team for 2–3 years. The plan and its assumptions are
-public: [`docs/plan/00-roadmap.md`](docs/plan/00-roadmap.md).
-
-## Multiplayer load gate
-
-The dedicated server exposes lock-free tick metrics (`--metrics-json`, tick
-p50/p95/p99/max, overrun counters, bandwidth, chunk queue depth, RSS/thread/fd
-proxies) and CI runs an 8-bot load gate (`scripts/load-gate.py --quick`), with a
-full 8-client/60 s gate and a 10-minute soak available locally. Recent numbers on
-the reference workstation: 8/8 joins, all interest sets loaded in ~2.2 s,
-20.0 TPS, tick p50/p95/p99 0.061/0.124/0.163 ms, 0 overruns >35 ms, RSS
-22.3 MiB, ~28 KiB/s per client; 10-minute soak plateaued (+1.9 MiB after
-warm-up) with stable save/reload hash and no fd/thread leaks. The 4-vCPU
-reference-hardware capacity claim, 16/50-player rows and zero-autosave-pause
-require the known save-pause gap to be closed first (documented).
-
-## Performance targets
-
-Measured on the reference machine (8-core CPU, 32 GiB RAM, RTX 3060-class GPU,
-NVMe, 1080p) and enforced by benchmarks in CI:
-
-| Metric | Target |
-| --- | --- |
-| 512-block render radius (32 chunks), default quality | ≥ 120 FPS average, 1% low ≥ 90 FPS |
-| 512 blocks, performance mode | ≥ 144 FPS verified |
-| 1024-block render distance (post-1.0, `MS-20`) | ≥ 60 FPS |
-| CPU main-thread frame time | ≤ 2.0 ms |
-| Client memory at 512 blocks | ≤ 4 GiB |
-| Join time, pregenerated world | ≤ 5 s to playable |
-| Worldgen throughput (8 threads) | ≥ 250 columns/s |
-| Dedicated server, 50 **co-located** players (shared column cache), 256-block render/simulation distance | 20 TPS on 4 vCPU / 8 GiB |
-| Dedicated server, **distributed** players (each needs their own columns) | Separate, lower published row (`MS-15`) |
-
-Budgets and their enforcement: [`spec/25-performance-budgets.md`](docs/spec/25-performance-budgets.md).
-
-## Platforms
-
-| | Target |
-| --- | --- |
-| **Primary (launch)** | **Fedora Linux x86_64**, current + previous at ship time (44/45 now) — Wayland session, Vulkan (Mesa RADV/ANV or NVIDIA), PipeWire; **Flathub Flatpak** first, COPR RPM, AppImage/tarball fallbacks |
-| **Supported secondary (launch)** | Windows 10/11 x86_64 (DX12), macOS 12+ universal2 (Metal) |
-| **Best effort** | Other Linux distributions via Flatpak/AppImage; Linux aarch64 |
-| **Dedicated server — primary** | **Fedora Server** (current + previous) — RPM + hardened systemd unit + firewalld service; container image |
-| **Post-1.0** | Android, Steam Deck verification, WebGPU feasibility |
-
-The reference machine, CI gates and packaging order all follow Fedora ([DEC-054](docs/decisions.md)).
-Packaging sources (RPM spec, systemd unit, firewalld service, Flatpak manifest,
-AppStream metadata) live in [`packaging/`](packaging/README.md).
-
-## Running the v0.0.1 tech preview
-
-```sh
-# Client (single player; Fedora 44/45, Wayland, Vulkan)
-cargo run --release -p ob_client --bin openblock -- --seed 42
-
-# Headless host: generate, tick, save, reload and verify determinism
-cargo run --release -p ob_server --bin openblock-server -- --smoke --seed 42
-
-# Dedicated TCP server on loopback (interim JSON/TCP; no TLS/auth)
-cargo run --release -p ob_server --bin openblock-server -- \
-  --data-dir ./data --world demo --seed 42 --listen 127.0.0.1:25565
-
-# Headless render check / screenshot (works without a display; needs a Vulkan driver)
-cargo run --release -p ob_client --bin openblock -- --screenshot openblock.png --seed 42 --fly
-
-# Benchmark: cached-geometry render timing, JSON output, optional CI gate
-cargo run --release -p ob_tools --bin openblock-tools -- bench --frames 60 --seed 42 --render-distance 8 --json bench.json
-
-# Measure the real window for 10 seconds and print p50/p95/p99 frame times
-cargo run --release -p ob_client --bin openblock -- --seed 42 --fly --seconds 10
-```
-
-## Survival
-
-| Survival HUD | Inventory (survival) | Death screen |
-| --- | --- | --- |
-| ![Survival HUD](docs/img/v0.0.7-screenshot.png) | ![Survival inventory](docs/img/v0.0.7-inventory.png) | ![Death screen](docs/img/v0.0.7-death.png) |
-
-Mine blocks to fill the nine-slot item hotbar, eat apples dropped by leaves when
-hungry, and watch out for falls. Health and hunger regenerate or drain over time;
-at zero health a respawn screen appears. Creative mode (infinite blocks, no
-damage) remains available via `--creative` and the settings menu.
-
-## Front-end, controls and accessibility
-
-OpenBlock now launches into a proper title screen: **Continue** (last world),
-**New World** (validated name + seed), **Load World** (world browser with
-size/date and safe delete), **Multiplayer** (address/name + recent servers),
-**Settings** and **Quit**. Settings works from the title with host-optional
-rows, and every gameplay action can be rebound in **Controls** (click/Enter to
-capture, duplicates rejected, reset defaults, persisted immediately). A
-Reduced-motion option disables damage camera shake and the sprint FOV pump;
-HUD visibility persists; remote players get distance-faded name tags.
-
-| Title | New world | Load world | Multiplayer connect |
+| Survival | Crafting | Mobs | Multiplayer |
 | --- | --- | --- | --- |
-| ![Title](docs/img/v0.2.0-title.png) | ![New world](docs/img/v0.2.0-new-world.png) | ![Worlds](docs/img/v0.2.0-worlds.png) | ![Connect](docs/img/v0.2.0-connect.png) |
+| ![Survival HUD](docs/img/v1.0.0-survival.png) | ![Crafting](docs/img/v1.0.0-crafting.png) | ![Mobs](docs/img/v1.0.0-mobs.png) | ![Multiplayer](docs/img/v1.0.0-multiplayer.png) |
 
-| Controls rebinding | Multiplayer name tags |
-| --- | --- |
-| ![Controls](docs/img/v0.2.0-controls.png) | ![Name tags](docs/img/v0.2.0-name-tags.png) |
+More captures (new world, world browser, connect, controls, settings, furnace,
+chest, death, F3, name tags) are in [`docs/img/`](docs/img/README.md).
 
-## Multiplayer alpha
+## Quick start
 
-A dedicated server is included; it does not need a GPU or an audio device and
-ships with a systemd unit, container image and admin handbook.
+Build requirements: Rust 1.100+, a working Vulkan driver, and on Linux
+Wayland/X11 libraries. The repository's `./dev-cargo` wrapper pins a workspace
+`CARGO_HOME` and a Zig-based linker for systems without a C compiler; plain
+`cargo` works on normal Fedora/Ubuntu installs.
 
 ```sh
-# terminal 1: host a survival world
-cargo run --release -p ob_server --bin openblock-server -- \
-  --listen 0.0.0.0:25565 --world myworld --motd "My OpenBlock server"
+# single player (title screen)
+cargo run --release -p ob_client --bin openblock
 
-# terminal 2+: join
+# host a survival world (no GPU or audio device needed)
+cargo run --release -p ob_server --bin openblock-server -- \
+  --listen 0.0.0.0:25565 --world myworld --motd "My server"
+
+# join it
 cargo run --release -p ob_client --bin openblock -- \
   --connect 127.0.0.1:25565 --name alice
 ```
 
-The first player to join creates/continues the world; survival inventory/vitals
-persist by player name (no authentication yet). `T` opens chat, `Tab` shows the
-player roster, `Esc` opens settings while staying connected. The protocol is
-plain TCP/JSON without TLS: bind it to a trusted LAN, VPN or SSH tunnel, not the
-public internet. See [docs/admin](docs/admin/README.md) for configuration,
-backups, upgrades, container/systemd deployment and security guidance.
+Pre-built packages: see [packaging/](packaging/) (Flatpak for the client, COPR
+RPM for Fedora, systemd/container for servers) and
+[docs/admin/](docs/admin/README.md) for hosting, backups, upgrades and security.
 
-### Known multiplayer limits in 0.1.0
-- Movement is client-authoritative (server validates bounds/reach/rates but does
-  not run player collision physics); PvP and anti-cheat are post-1.0.
-- Crafting is local-mode only (not yet in the network protocol).
-- No TLS/authentication; treat names as labels.
-- Chunk data is streamed with interest sets but clients do not unload far chunks.
+## Controls
 
-## Mobs, ores and gear
+| Input | Action |
+| --- | --- |
+| WASD / mouse | move / look |
+| Space | jump (swim up in water) |
+| Shift | crouch/sneak (edge-safe, lower camera) |
+| Ctrl | sprint |
+| F | toggle flight |
+| Hold LMB | mine; attacks a mob under the crosshair |
+| RMB | place / eat / open furnace or chest / use |
+| 1–9, wheel | select hotbar slot |
+| E | inventory (armor slots included) |
+| C | crafting |
+| T / Tab | chat / player roster (multiplayer) |
+| F1 / F2 / F3 | hide HUD / screenshot / debug overlay |
+| Esc | settings (or back) |
 
-| Mobs and combat | Furnace | Chest | Armor |
-| --- | --- | --- | --- |
-| ![Mobs](docs/img/v0.1.0-mobs.png) | ![Furnace](docs/img/v0.1.0-furnace.png) | ![Chest](docs/img/v0.1.0-chest.png) | ![Armor](docs/img/v0.1.0-armor.png) |
+All gameplay keys can be rebound in **Settings → Controls**.
 
-Mine stone for cobblestone, find coal/iron/copper in caves and cliffs, build a
-furnace to smelt raw ores into ingots (coal/charcoal/planks are fuel), craft
-iron tools and leather/iron armor, and keep an eye on zombies at night. Armor
-mitigates damage up to 80% and wears down with hits; chests and furnaces are
-container windows with authoritative server state.
+## Multiplayer and servers
 
-## Multiplayer load gate
+The dedicated `openblock-server` ships with a flat `server.toml`, CLI flags,
+console commands (`help`, `list`, `say`, `kick`, `save`, `tps`, `stop`), a
+whitelist, autosave, per-player persistence by name and a metrics JSON stream
+(`--metrics-json`). The interim wire protocol is **plain TCP + JSON without
+TLS or authentication**, and movement is client-authoritative within server
+bounds/reach/rate checks — do not expose it directly to the public internet.
+Full guidance: [docs/admin/security.md](docs/admin/security.md).
 
-The dedicated server exposes lock-free tick metrics (`--metrics-json`, tick
-p50/p95/p99/max, overrun counters, bandwidth, chunk queue depth, RSS/thread/fd
-proxies) and CI runs an 8-bot load gate (`scripts/load-gate.py --quick`), with a
-full 8-client/60 s gate and a 10-minute soak available locally. Recent numbers on
-the reference workstation: 8/8 joins, all interest sets loaded in ~2.2 s,
-20.0 TPS, tick p50/p95/p99 0.061/0.124/0.163 ms, 0 overruns >35 ms, RSS
-22.3 MiB, ~28 KiB/s per client; 10-minute soak plateaued (+1.9 MiB after
-warm-up) with stable save/reload hash and no fd/thread leaks. The 4-vCPU
-reference-hardware capacity claim, 16/50-player rows and zero-autosave-pause
-require the known save-pause gap to be closed first (documented).
+The load gate in CI runs four bot clients on every push; the full 8-client load
+gate and a 10-minute soak are available locally:
+
+```sh
+python3 scripts/load-gate.py --quick     # CI profile
+python3 scripts/load-gate.py             # 8 clients, 60 s
+python3 scripts/load-gate.py --soak      # 8 clients, 10 min
+```
 
 ## Performance
 
 The benchmark suite (`worldgen_bench`, `server_bench`, `save_bench`, `soak`)
-covers generation, tick/save/load, and a 60,000-tick soak; quick profiles run in
-CI. Reference numbers are published in
+runs quick profiles in CI; measured reference numbers live in
 [docs/plan/08-measurements.md](docs/plan/08-measurements.md) and
-[docs/plan/09-benchmarks.md](docs/plan/09-benchmarks.md). Headline: worldgen
-~0.92 ms/chunk, server tick p99 ~0.03 ms for the single-player baseline, save
-~21 ms at 289 columns; the known gaps are whole-world synchronous saves at
-2,000+ columns and the not-yet-automated 8-player network load test.
+[docs/plan/09-benchmarks.md](docs/plan/09-benchmarks.md).
 
-## Debug overlay and settings
+- Worldgen: **0.92 ms/chunk** mean (p99 1.15), caves + ores included.
+- Server simulation: tick p99 **≤0.03 ms** single-player baseline; 8-client load
+  gate tick p99 **0.163 ms**, 20.0 TPS, RSS 22.3 MiB, 0 overruns >35 ms.
+- Saves: 21 ms at 289 columns, 156 ms at 2,025 columns (synchronous save is the
+  known pause gap below); v1–v4 migrations verified.
+- Test suite: 733+ tests (including adversarial protocol/save/pack tests,
+  network loopback survival tests, a full acceptance scenario and GPU probes).
 
-The F3 overlay is grouped and spaced for readability; it scales down and stacks
-its hardware column on smaller windows. The Esc settings screen uses explicit
-`<` / `>` controls on every range/choice row, so values can be raised and
-lowered with the mouse as well as with Left/Right or the scroll wheel. It has
-Game, Display, Audio, Controls and Textures tabs. **Audio** controls Sound,
-Master, SFX and Music volume; all sounds are synthesised in memory, so no sound
-files are downloaded or bundled. `--no-audio` disables output entirely and
-`--mute` starts muted.
+## Known limitations (1.0.0)
 
-| F3 debug overlay | Settings (Esc) |
-| --- | --- |
-| ![F3 debug overlay](docs/img/v0.0.9-debug.png) | ![Settings screen](docs/img/v0.0.9-settings.png) |
+- Crafting is **recipe-book based**; a spatial 3×3 grid is post-1.0.
+- No torches/block lighting, farming, weather, beds, dimensions or redstone;
+  mob spawning uses time-of-day and depth.
+- Multiplayer has no TLS/auth/anti-cheat and client-authoritative movement;
+  crafting is not yet available on servers (single-player only).
+- Windows/macOS audio is a silent stub in 1.0; Linux audio is real.
+- Whole-world saves are synchronous (autosave can cause a >50 ms tick spike on
+  large worlds; 2,025-column save ≈156 ms).
+- The 4-vCPU/8-GiB reference capacity claim, 16/50-player rows and async save are
+  planned for the 1.0.x hardening line.
+- Only the base 20 blocks / 52 items / 5 mobs / 25 recipes are shipped; the WASM
+  modding track, shader packs beyond the built-in styles and controller support
+  remain post-1.0.
 
-## Crafting, tools and dropped items
+The full 1.0 checklist, accepted limitations and audit results:
+[docs/plan/1.0-scope.md](docs/plan/1.0-scope.md),
+[docs/plan/1.0-acceptance.md](docs/plan/1.0-acceptance.md).
 
-| Crafting (C) | Settings (Esc) | Inventory |
-| --- | --- | --- |
-| ![Crafting screen](docs/img/v0.0.8-crafting.png) | ![Settings screen](docs/img/v0.0.8-settings.png) | ![Survival inventory](docs/img/v0.0.8-inventory.png) |
+## Documentation
 
-Mine blocks to collect visible drops, craft planks/sticks/table and tools, then
-use the right tool for each block: wooden pickaxes mine stone (dropping
-cobblestone) and stone pickaxes are faster; axes and shovels speed up wood and
-dirt/sand. Tools wear down and eventually break. Dropped items can also come from
-leaves (apples).
+- [docs/README.md](docs/README.md) — specification, research and project plan.
+- [docs/spec/01-technical-architecture.md](docs/spec/01-technical-architecture.md) — crate graph and architecture.
+- [docs/spec/18-networking-multiplayer.md](docs/spec/18-networking-multiplayer.md) — protocol v2 and multiplayer design.
+- [docs/admin/](docs/admin/README.md) — server quickstart, configuration, admin, security, backup, upgrade, troubleshooting.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — build, test and review workflow.
 
-## Day, dusk, night and inventory
+## Architecture at a glance
 
-| Dusk | Night |
-| --- | --- |
-| ![Dusk](docs/img/v0.0.5-dusk.png) | ![Night with stars](docs/img/v0.0.5-night.png) |
-
-![Inventory screen](docs/img/v0.0.5-inventory.png)
-
-`--time-of-day F` renders screenshots at any clock time (0 midnight, 0.25
-sunrise, 0.5 noon, 0.75 sunset); in game the clock advances with the simulation
-and starts at sunrise.
-
-## Resource packs (local)
-
-OpenBlock can load block textures from any Minecraft-format resource pack at
-runtime — useful for high-resolution or hand-painted packs:
-
-```sh
-cargo run --release -p ob_client --bin openblock -- \
-  --texture-pack "/path/to/resource pack"
-```
-
-- Accepts the pack root, its `assets/minecraft` directory, a `textures/block`
-  directory, or any directory holding block PNGs.
-- Uses standard Minecraft file names (`grass_block_top.png`, `stone.png`,
-  `oak_leaves.png`, …). Animated textures use their first frame; missing layers
-  (e.g. water) fall back to the procedural classic layer.
-- Applies Minecraft's vanilla biome tint to grayscale grass/leaves and composites
-  `grass_block_side_overlay.png` with the tinted fringe, so high-resolution packs
-  look as intended.
-- The choice is saved in `config.json` and can be toggled in
-  **Esc → Settings → Texture pack**. `--no-texture-pack` clears it.
-- **Licensing:** OpenBlock never bundles or redistributes pack assets; the loader
-  reads your local files. Use only packs whose licence allows your usage, and do
-  not redistribute screenshots or builds containing third-party textures unless
-  the pack's terms permit it.
-
-## Texture styles
-
-![Four OpenBlock texture styles: classic, painterly, lush and minimal](docs/img/v0.0.4-texture-styles.png)
-
-| Style | Resolution | Character |
-| --- | --- | --- |
-| `classic` | 16×16 | Minecraft-inspired: clean greens, warm dirt, calm stone, one muted flower, clustered leaf holes |
-| `painterly` | 32×32 | Hytale-inspired: muted warm palette, soft gradients and dithering, rounded pebbles, deep teal water |
-| `lush` | 32×32 | Detailed natural: layered foliage, mossy stone, bark knots, turquoise water with foam |
-| `minimal` | 16×16 | Clean modern: flat pastel tones, crisp 1 px accents, almost no noise |
-
-Select it in **Esc → Settings → Texture style** (changes immediately and is
-saved), or launch with `--texture-style painterly`. The styles are generated
-procedurally and deterministically, so no texture files are downloaded.
-
-Measured on the reference dev machine (Fedora 45, RADV integrated GPU,
-1280×720): **115 FPS at a 128-block radius, 135 FPS at a 192-block radius**
-(steady state, p95 ≤ 17 ms), and **0.62 ms p50** for a cached offscreen frame at
-1280×720. These are 720p integrated-GPU numbers, not the 512-block discrete-GPU
-gate. Full log: [`docs/plan/08-measurements.md`](docs/plan/08-measurements.md).
-
-Controls: mouse look (click to capture), `WASD` move, `Space` jump, `Shift`
-crouch/sneak, `Ctrl` sprint, `F` toggle fly, **hold left button to mine**, right
-click to place or eat, `1`–`9` or the mouse wheel select a hotbar slot, `E` opens
-the inventory, `F3` debug, `F1` HUD, `F2` screenshot, `C` crafting (single-player), `E` inventory,
-`T` chat and `Tab` roster in multiplayer, `Esc` settings.
-Game mode, controls and texture settings live in the Esc settings screen. `F3` toggles the debug overlay, `F1` toggles the HUD, `F2` saves
-a screenshot, `Esc` opens the pause/settings menu (render distance, FOV, mouse
-sensitivity, fullscreen, audio, HUD/debug toggles, save and quit). Settings are saved to
-`<data-dir>/config.json`; worlds live under
-`${XDG_DATA_HOME:-~/.local/share}/openblock/worlds/`.
-
-The client needs a Vulkan-capable GPU and driver (Fedora:
-`mesa-vulkan-drivers` for AMD/Intel, or the NVIDIA driver from RPM Fusion).
-On a machine without a display/GPU only the headless host runs — that is the
-target for dedicated servers.
-
-### Building on Fedora (for contributors)
-
-```sh
-sudo dnf install gcc gcc-c++ pkgconf-pkg-config git   wayland-devel libxkbcommon-devel   vulkan-loader-devel fontconfig-devel freetype-devel systemd-devel
-# Rust toolchain (the pinned stable channel is in rust-toolchain.toml)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-cargo check --workspace --all-targets
-```
-
-The workspace is a specification-stage scaffold today: it compiles and CI passes,
-but the playable client arrives at milestone `MS-03`. Fedora 44 and 45 container
-jobs are required CI entries.
-
-## Frequently asked questions
-
-**Is this a Minecraft clone?**
-It is a voxel sandbox in the Minecraft genre, aiming for feature parity as a
-baseline and going beyond it. It contains no Minecraft code, assets, names or
-data, and is not affiliated with Mojang or Microsoft.
-
-**Can I use my Minecraft worlds or play with vanilla clients?**
-Not planned for launch. World import and an optional compatibility gateway are
-post-1.0 community-style projects, never core features.
-
-**Why Rust?**
-Memory safety under adversarial input (network, saves, mods), no GC pauses in
-the 20 Hz simulation, and native-speed GPU/CPU work with a strong crate
-ecosystem. The alternatives are analysed in
-[`ADR-0002`](docs/adr/0002-rust-and-purpose-built-engine.md).
-
-**Why not use Bevy?**
-Bevy is excellent, but its renderer does not solve voxel streaming, LOD,
-visibility or GPU-driven submission, and its release cadence would add migration
-cost. We use a purpose-built engine on wgpu; see
-[`research/02`](docs/research/02-engine-and-render-stack.md).
-
-**What platforms will it run on?**
-Fedora Linux first (44/45, Wayland + Vulkan), then Windows and macOS at 1.0; a
-Flatpak will be the recommended install for players, with an RPM for native Fedora
-setups and a hardened RPM + systemd + firewalld package for servers.
-
-**When can I play?**
-The first playable tech preview (`0.0.1`) is the `MS-03` milestone. Until then
-the repository is the specification and plan. `1.0` is an **Early Access**
-release with Tier-1 parity; full Tier-2 parity is the `2.0` track.
-
-**Is 1.0 "all of Minecraft"?**
-No, and the plan no longer claims it. 1.0 ships Tier-1 parity, the Tier-2
-infrastructure and the modding platform; full Tier-2 parity is 2.0
-([DEC-051](docs/decisions.md)). The parity gate is two numbers — 100% of
-in-scope checks passing, and at least 85% vanilla behavioural coverage on a
-hand-authored checklist — and both are published with every release. 1.0 must
-pass its Tier-1 in-scope checklist and meet the 85% behavioural coverage floor;
-full Tier-2 content (every remaining block, mob, structure and command) is the
-2.0 promise.
-
-**Is it free? Can I run a server commercially?**
-Yes. Code is MIT OR Apache-2.0; self-hosting and commercial hosting are allowed.
-There will be no paywall, marketplace cut or required central account.
-
-**Can I contribute if I use AI tools?**
-Yes, under the same review, test and provenance standards as any contribution —
-see [`CONTRIBUTING.md`](CONTRIBUTING.md) and
-[`plan/04-team-and-process.md`](docs/plan/04-team-and-process.md).
+A Cargo workspace of 16 crates: `ob_math`/`ob_core` (foundation),
+`ob_content`/`ob_world`/`ob_worldgen`/`ob_sim`/`ob_protocol` (headless data and
+simulation), `ob_render`/`ob_audio` (presentation), `ob_server`/`ob_client`
+(hosts), `ob_tools` (benchmarks/soak), plus `xtask`. The dedicated server is
+GPU-free (enforced by the architecture guard and a CI dependency check); the
+client and renderer never run on the server.
 
 ## Contributing
 
-OpenBlock is at the stage where **specification and design contributions are as
-valuable as code**. Good entry points:
-
-- Review a spec chapter and open an issue with questions or contradictions.
-- Take a `good first issue` from the milestone board.
-- Improve the research documents with better evidence.
-- Write a content pack template or an example mod once the API exists.
-
-Read [`CONTRIBUTING.md`](CONTRIBUTING.md) and the
-[spec conventions](docs/spec/00-conventions.md) first. Participation is covered
-by our [Code of Conduct](CODE_OF_CONDUCT.md).
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md); the
+CI gates are `./dev-cargo fmt`, `clippy -D warnings`, workspace tests, rustdoc,
+the architecture guard and the docs checker (see the workflow for the exact
+commands). No third-party game assets may be committed; resource packs are
+loaded from user-owned files only.
 
 ## License and legal
 
-- **Code**: [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE), at your option.
-- **Original assets**: CC BY 4.0 (see [`docs/research/07-legal-licensing-and-ip.md`](docs/research/07-legal-licensing-and-ip.md)).
-- **Contributions**: inbound = outbound under DCO 1.1; no CLA.
-
-OpenBlock is not an official Minecraft product. It is not approved by or
-associated with Mojang Studios or Microsoft. OpenBlock contains no Minecraft
-code or assets, and does not read Minecraft worlds.
-
-The project is inspired by prior art, in particular the Rust voxel engine
-[Weft](https://github.com/Weft-Rust/Weft) (MPL-2.0), which is studied for ideas
-and measured numbers only — no Weft code is copied. See
-[`ADR-0008`](docs/adr/0008-license-and-provenance.md) for our provenance rules.
-
-"OpenBlock" is a working project name pending trademark clearance
-(DEC-037).
+OpenBlock is dual-licensed under MIT or Apache-2.0 (see `LICENSE-MIT` /
+`LICENSE-APACHE`). It is not affiliated with Mojang or Microsoft. Minecraft
+resource packs are read at runtime from local paths selected by the user and are
+never bundled or redistributed by OpenBlock; respect each pack's licence.
