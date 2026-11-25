@@ -444,3 +444,200 @@ The register settles the decisions this chapter depends on. Items that are still
 - Research: [feature inventory](../research/05-minecraft-feature-inventory.md) (item, recipe and station scope), [modding and content](../research/06-modding-and-content-system.md) (typed components, canonicalisation, host ABI), [networking SOTA](../research/04-networking-sota.md).
 - Chapters: [03](03-rendering.md), [09](09-entities-ai.md), [12](12-redstone-and-logic.md), [13](13-ui-and-ux.md), [15](15-content-system.md), [16](16-modding.md), [17](17-persistence.md), [18](18-networking-multiplayer.md), [20](20-security-and-anti-cheat.md), [25](25-performance-budgets.md).
 - External facts checked against the parity baseline: [Item components](https://minecraft.wiki/w/Data_component_format), [Crafting](https://minecraft.wiki/w/Crafting), [Recipe](https://minecraft.wiki/w/Recipe), [Smelting](https://minecraft.wiki/w/Smelting), [Enchanting](https://minecraft.wiki/w/Enchanting), [Anvil](https://minecraft.wiki/w/Anvil), [Brewing](https://minecraft.wiki/w/Brewing), [Trading](https://minecraft.wiki/w/Trading), [Loot table](https://minecraft.wiki/w/Loot_table), [Hopper](https://minecraft.wiki/w/Hopper).
+
+## Appendix A — Interim v0.x catalogue (pre-1.0)
+
+> Status: interim, code-defined in `ob_content`. This appendix records the v0.0.9
+> survival catalogue so host, client and render work can consume it. It does not
+> change the normative requirements above; item components, loot tables and the
+> data-driven pack pipeline replace these tables at MS-05/MS-10.
+
+**Append-only ids.** Block ids 0..=14 and item ids 0..=23 are frozen. The v0.0.9
+blocks append at ids 15..=19 and their block items at item ids 47..=51. The
+v0.0.9 non-block items occupy item ids 24..=46 in the order below, so no save or
+registry fingerprint shifts.
+
+### A.1 Blocks
+
+| Block id | Name | Hardness | Tool / tier | Drop |
+| --- | --- | --- | --- | --- |
+| 15 | `openblock:coal_ore` | 3.0 | Pickaxe / 1 | `openblock:coal` ×1 |
+| 16 | `openblock:iron_ore` | 3.0 | Pickaxe / 2 | `openblock:raw_iron` ×1 |
+| 17 | `openblock:copper_ore` | 3.0 | Pickaxe / 2 | `openblock:raw_copper` ×1 |
+| 18 | `openblock:furnace` | 3.5 | Axe / 0 | itself |
+| 19 | `openblock:chest` | 2.5 | Axe / 0 | itself |
+
+All five are solid, opaque, non-fluid and hand-breakable; ores need the listed
+pickaxe tier for a drop. Texture layers append after `crafting_table_side`:
+`coal_ore` (18), `iron_ore` (19), `copper_ore` (20), `furnace_top` (21),
+`furnace_side` (22), `furnace_front` (23), `chest_top` (24), `chest_side` (25),
+`chest_front` (26); the catalogue count is **27**.
+
+### A.2 Items, tools and armor
+
+Item ids 24..=46 append in this exact order: `coal`, `charcoal`, `raw_iron`,
+`iron_ingot`, `raw_copper`, `copper_ingot`, `iron_pickaxe`, `iron_axe`,
+`iron_shovel`, `iron_sword`, `leather_helmet`, `leather_chestplate`,
+`leather_leggings`, `leather_boots`, `iron_helmet`, `iron_chestplate`,
+`iron_leggings`, `iron_boots`, `raw_beef`, `cooked_beef`, `raw_porkchop`,
+`cooked_porkchop`, `leather` (all namespaced `openblock:`).
+
+| Item | Max stack | Stats |
+| --- | --- | --- |
+| `iron_pickaxe` / `iron_axe` / `iron_shovel` | 1 | tier 3, speed 6.0, attack 4.0, durability 251 |
+| `iron_sword` | 1 | tier 3, speed 1.0, attack 6.0, durability 251 |
+| `raw_beef` / `raw_porkchop` | 64 | food 3 |
+| `cooked_beef` / `cooked_porkchop` | 64 | food 8 |
+| ores, ingots, coal, charcoal, leather | 64 | none |
+
+| Armor | Slot | Defense | Durability |
+| --- | --- | --- | --- |
+| `leather_helmet` | Helmet | 1 | 55 |
+| `leather_chestplate` | Chestplate | 3 | 80 |
+| `leather_leggings` | Leggings | 2 | 75 |
+| `leather_boots` | Boots | 1 | 65 |
+| `iron_helmet` | Helmet | 2 | 165 |
+| `iron_chestplate` | Chestplate | 6 | 240 |
+| `iron_leggings` | Leggings | 5 | 225 |
+| `iron_boots` | Boots | 2 | 195 |
+
+Armor pieces are non-block, non-food and stack to 1. The host now equips,
+mitigates and wears them (Appendix A.6); the stats below are catalogue data.
+
+**Attack damage (v1.0 interim).** `ToolSpec` carries an `attack_damage` field
+used only by melee attacks against mobs; the hand and every non-tool item deal
+1.0. Tools keep their mining fields, so a pickaxe is both a slower weapon and a
+mining tool.
+
+| Selected item | Attack damage |
+| --- | ---: |
+| hand, block, food, ore, ingot, leather, armor | 1.0 |
+| wooden pickaxe / axe / shovel | 2.0 |
+| wooden sword | 4.0 |
+| stone pickaxe / axe / shovel | 3.0 |
+| stone sword | 5.0 |
+| iron pickaxe / axe / shovel | 4.0 |
+| iron sword | 6.0 |
+
+`Registry::attack_damage(Option<ItemId>)` is the lookup helper; an invalid or
+missing id falls back to 1.0. In survival a landed mob hit wears the selected
+tool by one durability and removes it at zero, using the same break path as a
+broken block; creative attacks deal damage without wear. See
+[09 Appendix A.4](09-entities-ai.md#a4-combat-and-daylight) for reach, mob
+attacks and drop resolution.
+
+### A.3 Smelting and fuel
+
+One input item smelts per **200 ticks** (20 ticks/s). The host implements the
+furnace block state and cooking (Appendix A.6); `ob_content` exposes the
+`smelt_recipes()`, `smelt_recipe_for(input)`, `smelt_result_for(input)`,
+`fuel_ticks(item)` and `is_smeltable`/`is_fuel` lookup tables.
+
+| Input | Output |
+| --- | --- |
+| `raw_iron` | `iron_ingot` ×1 |
+| `raw_copper` | `copper_ingot` ×1 |
+| `log` | `charcoal` ×1 |
+| `raw_beef` | `cooked_beef` ×1 |
+| `raw_porkchop` | `cooked_porkchop` ×1 |
+| `cobblestone` | `stone` ×1 |
+
+| Fuel | Burn ticks | Smelts |
+| --- | --- | --- |
+| `coal` | 1,600 | 8 |
+| `charcoal` | 1,600 | 8 |
+| `planks` | 300 | 1.5 |
+| `log` | 300 | 1.5 |
+| `stick` | 100 | 0.5 |
+
+### A.4 Recipes
+
+Recipe ids 11..=24 append after the eleven v0.0.8 recipes; all fourteen need a
+crafting table. Ingredient totals follow the interim simplification.
+
+| Recipe id | Output | Ingredients |
+| --- | --- | --- |
+| `openblock:furnace` | furnace ×1 | cobblestone ×8 |
+| `openblock:chest` | chest ×1 | planks ×8 |
+| `openblock:iron_pickaxe` | iron pickaxe ×1 | iron ingot ×3, stick ×2 |
+| `openblock:iron_axe` | iron axe ×1 | iron ingot ×3, stick ×2 |
+| `openblock:iron_shovel` | iron shovel ×1 | iron ingot ×1, stick ×2 |
+| `openblock:iron_sword` | iron sword ×1 | iron ingot ×2, stick ×1 |
+| `openblock:leather_helmet` | leather helmet ×1 | leather ×5 |
+| `openblock:leather_chestplate` | leather chestplate ×1 | leather ×8 |
+| `openblock:leather_leggings` | leather leggings ×1 | leather ×7 |
+| `openblock:leather_boots` | leather boots ×1 | leather ×4 |
+| `openblock:iron_helmet` | iron helmet ×1 | iron ingot ×5 |
+| `openblock:iron_chestplate` | iron chestplate ×1 | iron ingot ×8 |
+| `openblock:iron_leggings` | iron leggings ×1 | iron ingot ×7 |
+| `openblock:iron_boots` | iron boots ×1 | iron ingot ×4 |
+
+### A.5 Scope notes for 1.0
+
+- **No facing state.** Furnace and chest declare an interim `front` texture used
+  on the +Z face only. World placement rotation and a block facing state come
+  post-1.0; the current `BlockType` has one state per type.
+- **No glass.** `sand` is not smeltable in 1.0; glass blocks and glass items are
+  deferred.
+- **No farming or animal simulation.** Leather and raw meat exist as items and
+  drops/recipes, but mob spawning, drops and farming are later agent slices.
+- **No container UI yet.** Furnace/chest block entities, smelting, storage and
+  persistence exist on the host (Appendix A.6); the client screens and the
+  multiplayer container protocol are later work.
+- **Interim durability.** Tools wear per broken block and armor wears per
+  damaging hit (Appendix A.6). Enchanting, repairing and the full §3.14 durability
+  rules are later work.
+- **Code-defined drops and recipes.** The interim `block_drop`/`can_drop` rules
+  and the code-defined recipe/smelt tables are placeholders for block loot
+  tables and the MS-05 data-driven content pipeline.
+
+### A.6 Interim host implementation (v0.0.9)
+
+The host now implements furnaces, chests and armor without a client UI; block
+facing and lit block states remain out of scope.
+
+- **Furnace.** One `FurnaceState` (`input`, `fuel`, `output`, `burn_remaining`,
+  `burn_total`, `cook_progress`) per placed furnace. Every host tick (all stored
+  furnaces, including in unstreamed chunks): when the input smelts and the output
+  can accept the result, one fuel item starts a burn if unlit; a running burn
+  decrements; cooking advances one point; at 200 points one input is consumed and
+  the output merges up to its max stack. Progress pauses (never resets) without
+  input or output space, and idle furnaces do not burn fuel. Progress is not tied
+  to a recipe id, so a paused furnace resumes the same progress for the next
+  smeltable input.
+- **Chest.** 27 slots. Placing either block creates an empty record; breaking it
+  in survival spawns non-empty slots as item entities (furnace order
+  input/fuel/output, chest slots ascending). Creative breaks discard the
+  contents. Empty records are persisted so an empty container still opens after
+  a reload.
+- **Armor.** `equipment` has four slots in `ArmorSlot` order; equipping takes a
+  hotbar slot and swaps any existing piece back into the freed slot.
+  `armor_defense()` sums `ArmorSpec.defense` for living survival players only.
+  Incoming damage is `mitigated = amount * (1 - min(defense, 20) * 0.04)` (80%
+  cap), used by `Host::damage`, fall damage and starvation. Every equipped piece
+  loses one durability per damaging hit and is removed at zero (reported by
+  `DamageOutcome::armor_broke`). Creative and dead players take no damage and
+  wear nothing.
+- **Host API.** `furnace_at`/`furnace_at_mut`/`furnace_slot`,
+  `put_furnace_slot`/`take_furnace_slot`/`take_furnace_output`,
+  `insert_furnace_input`/`insert_furnace_fuel`; `chest_at`/`chest_at_mut`,
+  `put_chest_slot`/`take_chest_slot`; `equipment`/`equipment_slot`,
+  `equip_armor`/`unequip_armor`, `armor_defense`, `damage_with_outcome`. See
+  `crates/server/src/block_entities.rs`.
+- **Stack-preserving inventory API (1.0 interim).** `inventory_slot`,
+  `take_inventory_slot`, `set_inventory_slot`, `insert_inventory_stack` and
+  `give_stack` move an exact `ItemStack`: count and remaining tool/armor
+  durability are preserved, the item id and content max stack are validated, and
+  a partial insertion returns the leftover stack instead of repairing or
+  discarding it. `give_item(item, count)` remains the count-based convenience
+  wrapper and delegates to the same insertion path. Item-entity and
+  network-player pickup use `give_stack` / `give_network_stack`, so a dropped
+  damaged tool keeps its durability when it enters a hotbar. Container transfer
+  code should use the slot APIs rather than the selected-slot
+  `consume_selected` workaround.
+- **Limitations.** No open-window state, hopper/piston interaction, facing or lit
+  block state, and no container screens. The host slot APIs trust their caller
+  (reach, window ownership and alive state are not validated); a multiplayer
+  protocol must add those checks. Networked clients also need an interim protocol
+  extension (open container, slot deltas, cursor/transaction messages) before a
+  multiplayer UI can be authoritative.

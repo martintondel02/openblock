@@ -16,8 +16,13 @@ pub use log::{debug, error, info, warn};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Save format version understood by this build.
 pub const SAVE_FORMAT_VERSION: u16 = 4;
-/// Protocol version (no networking at v0.0.1; reserved for MS-06).
-pub const PROTOCOL_VERSION: u16 = 0;
+/// Interim wire protocol version implemented by `ob_protocol`.
+///
+/// `ob_core` is a foundation crate and cannot depend on `ob_protocol`, so this
+/// is a plain constant rather than a re-export. It must track
+/// `ob_protocol::PROTOCOL_VERSION`; the server integration tests assert that
+/// both values agree.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 struct SimpleLogger;
 
@@ -136,5 +141,11 @@ mod tests {
     #[test]
     fn version_banner_mentions_version() {
         assert!(version_banner("openblock").contains(VERSION));
+    }
+
+    #[test]
+    fn protocol_version_matches_the_implemented_wire_protocol() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+        assert!(version_banner("openblock").contains("protocol 2"));
     }
 }

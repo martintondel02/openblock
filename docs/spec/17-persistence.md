@@ -360,6 +360,36 @@ count, seed, loot seed, status — written before any of its blocks, REQ-SAVE-01
 `mods.lock.json` snapshot written for diagnostics only — the authoritative mod list
 is the one the session loads.
 
+**Interim v0.0.x sidecars.** The code-defined host writes flat text sidecars next
+to `world.obs`, each atomically replaced; a missing file loads as empty. In
+addition to `player.txt`, `inventory.txt` and `items.txt`, this slice adds:
+
+`block_entities.txt` — one record per furnace/chest, all furnaces first and then
+all chests, each group in ascending `(x, y, z)` order:
+
+```text
+furnace <x> <y> <z> <burn_remaining> <burn_total> <cook_progress> <input> <fuel> <output>
+chest <x> <y> <z> [<slot>:<stack> ...]
+```
+
+A `<stack>` is `-` when empty, otherwise `item,count` or `item,count,durability`;
+chest records list only non-empty slots in ascending slot order. Empty
+furnaces/chests are written (their record must survive a reload). Duplicate
+positions keep the first record, malformed furnace lines are skipped, a
+malformed chest slot token skips only that slot, and unknown items are dropped
+with a warning. On load and before each save, a record in a *loaded* chunk whose
+block is no longer the expected furnace/chest is removed with a warning; records
+in unloaded chunks are kept because the block cannot be inspected yet.
+
+`equipment.txt` — one `<slot> <item> <durability>` line per equipped armor
+piece, in helmet/chestplate/leggings/boots order; missing durability defaults to
+full and mismatched slots/items are skipped with a warning.
+
+The host state hash covers player state, inventory, item entities sorted by id,
+furnaces and chests sorted by position (all slots, empty markers included),
+equipment in slot order and world blocks; save/reload must therefore reproduce
+the hash exactly.
+
 ### 3.5 Write path
 
 ```mermaid
@@ -545,7 +575,10 @@ The files are rewritten atomically with the world in `Host::save`. A missing
 names are skipped with a warning, counts and positions are clamped on load, and
 entity ids are preserved so the next id is `max(id) + 1`. Dropped items are
 authoritative simulation state, so they are included in the state hash in id
-order with positions, velocities and age quantised to `1e-4`.
+order with positions, velocities and age quantised to `1e-4`. Pickup preserves
+the exact stack: the durability component is retained, so a damaged tool loaded
+from `items.txt` is never repaired by entering the hotbar, and the same
+stack-preserving path serves single-player and network-player pickup.
 
 ### 3.8 Backups, restore, import and export
 

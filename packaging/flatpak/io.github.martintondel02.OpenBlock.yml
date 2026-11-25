@@ -1,5 +1,9 @@
 # Flatpak manifest for OpenBlock — draft, built from milestone MS-16 onward.
 #
+# Client-only: the dedicated server is packaged separately as an RPM and a
+# container image (see packaging/systemd and packaging/container). Do not add a
+# server build or headless variant to this Flatpak.
+#
 # Flathub is the recommended install for Fedora and other Linux players
 # (DEC-054). Cargo dependencies are bundled as vendored sources, which is the
 # standard Flatpak model and avoids the Fedora Rust unbundling problem.
@@ -51,7 +55,7 @@ modules:
     sources:
       - type: git
         url: https://github.com/martintondel02/openblock.git
-        tag: v0.0.9
+        tag: v0.1.0
         commit: 0000000000000000000000000000000000000000   # pin at release time
       # - type: file
       #   path: cargo-sources.json

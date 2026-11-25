@@ -1,6 +1,6 @@
 [package]
 name = "ob_protocol"
-description = "The OpenBlock wire protocol: versioned messages shared by client and server."
+description = "The OpenBlock wire protocol: versioned messages and chunk snapshots shared by client and server."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,3 +13,12 @@ name = "ob_protocol"
 path = "src/lib.rs"
 
 [dependencies]
+ob_math.workspace = true
+ob_content.workspace = true
+ob_world.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+ob_worldgen.workspace = true

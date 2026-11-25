@@ -1,14 +1,23 @@
 //! Offline tooling: asset compiler, content pack compiler, world pregenerators, inspectors and
-//! the offscreen benchmark harness.
+//! the CPU benchmark/soak harnesses.
 //!
-//! The `openblock-tools` binary currently exposes `version`, `inspect-world` and `bench`; the
-//! asset and pack pipelines arrive with later milestones.
+//! The `openblock-tools` binary exposes `version`, `inspect-world` and the offscreen `bench`.
+//! The 1.0 CPU measurement tools are separate binaries:
 //!
+//! * `worldgen_bench` - deterministic chunk-generation throughput and content densities.
+//! * `server_bench` - authoritative `ob_server::Host` tick cost across idle, player, mob,
+//!   item, container and streaming workloads.
+//! * `save_bench` - world/sidecar save size, save and load latency, and legacy save migration.
+//! * `soak` - long headless scripted session with invariant, cap and save/reload checks.
+//!
+//! [`mod@measure`] holds the shared percentile, RSS and temp-directory helpers.
 //! [`mod@bench`] is a fixed-seed, CPU-timed synthetic frame loop that renders through
 //! [`ob_render::OffscreenRenderer`]. It needs a working GPU adapter but never opens a window.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+pub mod measure;
 
 pub mod bench {
     //! Reproducible offscreen benchmark harness behind `openblock-tools bench`.

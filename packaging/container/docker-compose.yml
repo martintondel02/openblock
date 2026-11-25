@@ -1,0 +1,67 @@
+# Reference Compose deployment for the OpenBlock dedicated server.
+#
+# This is a single-host example, not a production orchestration template. The
+# interim protocol has no TLS or authentication, so the published port is bound
+# to loopback by default. Reach it through an SSH tunnel, WireGuard/Tailscale or
+# a trusted LAN gateway; see docs/admin/security.md before changing the bind.
+#
+#   cd packaging/container
+#   docker compose up -d --build
+#   docker compose logs -f openblock
+#   docker compose exec openblock nc -z 127.0.0.1 25565
+#   docker compose down
+#
+# The named volume is pre-owned by UID/GID 10001 through the image's /data
+# directory. If you switch to a host bind mount, run:
+#   mkdir -p ./data && sudo chown 10001:10001 ./data
+services:
+  openblock:
+    build:
+      context: ../..
+      dockerfile: packaging/container/Dockerfile
+    image: openblock-server:local
+    container_name: openblock-server
+    restart: unless-stopped
+
+    # Loopback-only host publishing. Use "25565:25565/tcp" only after putting a
+    # trusted network/VPN in front of it.
+    ports:
+      - "127.0.0.1:25565:25565/tcp"
+
+    volumes:
+      - openblock-data:/data
+
+    # Runtime hardening. The Dockerfile already uses USER 10001:10001; these
+    # settings are repeated here so the example is self-documenting.
+    read_only: true
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # The interim server handles SIGINT gracefully (SIGTERM support is pending);
+    # do not remove this or `docker compose stop` may kill without a final save.
+    stop_signal: SIGINT
+    stop_grace_period: 40s
+
+    environment:
+      OPENBLOCK_LOG: info
+
+    healthcheck:
+      test: ["CMD", "nc", "-z", "-w", "2", "127.0.0.1", "25565"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # Optional: mount a flat server.toml and add
+    #   command: ["--config", "/data/server.toml"]
+    # The entrypoint already passes --data-dir /data and --listen 0.0.0.0:25565;
+    # CLI flags override values in the file, so listen stays 0.0.0.0 inside the
+    # container (publish restrictions happen at the host port mapping).
+    #
+    # Config changes require a container restart:
+    #   docker compose restart openblock
+
+volumes:
+  openblock-data:

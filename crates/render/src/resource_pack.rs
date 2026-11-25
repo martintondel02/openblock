@@ -423,6 +423,18 @@ fn candidate_files(name: &str) -> &'static [&'static str] {
         "cobblestone" => &["cobblestone.png"],
         "crafting_table_top" => &["crafting_table_top.png"],
         "crafting_table_side" => &["crafting_table_side.png"],
+        "coal_ore" => &["coal_ore.png"],
+        "iron_ore" => &["iron_ore.png"],
+        "copper_ore" => &["copper_ore.png"],
+        "furnace_top" => &["furnace_top.png"],
+        "furnace_side" => &["furnace_side.png"],
+        "furnace_front" => &["furnace_front.png"],
+        // Vanilla ships chest textures under `entity/chest`, not
+        // `textures/block`, so many packs simply have no file here and the
+        // chest faces fall back to the procedural Classic layers.
+        "chest_top" => &["chest_top.png"],
+        "chest_side" => &["chest_side.png"],
+        "chest_front" => &["chest_front.png"],
         // `debug` has no Minecraft equivalent and is procedural by design.
         _ => &[],
     }
@@ -802,7 +814,7 @@ mod tests {
     use super::*;
 
     /// Non-debug catalogue files and the NAMES index they feed, in pack order.
-    const PACK_FILES: [(&str, &str); 17] = [
+    const PACK_FILES: [(&str, &str); 26] = [
         ("grass_top", "grass_block_top.png"),
         ("grass_side", "grass_block_side.png"),
         ("dirt", "dirt.png"),
@@ -820,6 +832,15 @@ mod tests {
         ("cobblestone", "cobblestone.png"),
         ("crafting_table_top", "crafting_table_top.png"),
         ("crafting_table_side", "crafting_table_side.png"),
+        ("coal_ore", "coal_ore.png"),
+        ("iron_ore", "iron_ore.png"),
+        ("copper_ore", "copper_ore.png"),
+        ("furnace_top", "furnace_top.png"),
+        ("furnace_side", "furnace_side.png"),
+        ("furnace_front", "furnace_front.png"),
+        ("chest_top", "chest_top.png"),
+        ("chest_side", "chest_side.png"),
+        ("chest_front", "chest_front.png"),
     ];
 
     /// Scratch directory that is removed when the test finishes.
@@ -864,6 +885,125 @@ mod tests {
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().expect("write the test PNG header");
         writer.write_image_data(rgba).expect("write the test PNG pixels");
+    }
+
+    /// Writes a paletted PNG with optional tRNS (alpha per palette entry).
+    fn write_indexed_png(path: &Path, size: u32, palette: &[[u8; 3]], trns: Option<&[u8]>, indices: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create the texture directory");
+        }
+        let file = fs::File::create(path).expect("create the indexed test PNG");
+        let mut encoder = png::Encoder::new(io::BufWriter::new(file), size, size);
+        encoder.set_color(png::ColorType::Indexed);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut rgb = Vec::with_capacity(palette.len() * 3);
+        for colour in palette {
+            rgb.extend_from_slice(colour);
+        }
+        encoder.set_palette(rgb);
+        if let Some(alpha) = trns {
+            encoder.set_trns(alpha.to_vec());
+        }
+        let mut writer = encoder.write_header().expect("write indexed PNG header");
+        writer.write_image_data(indices).expect("write indexed PNG pixels");
+    }
+
+    #[test]
+    fn indexed_palette_and_trns_pngs_are_normalised() {
+        let pack = TempDir::new();
+        let block_dir = pack.block_dir();
+        write_standard_pack(&block_dir, 16, true);
+        // Leaves: palette entry 1 is fully transparent and entry 2 is
+        // semi-transparent; the cut-out rule turns both into 0/255.
+        let indices = vec![1u8; (16 * 16) as usize];
+        write_indexed_png(
+            &block_dir.join("oak_leaves.png"),
+            16,
+            &[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
+            Some(&[255, 0, 200]),
+            &indices,
+        );
+        // Stone: a semi-transparent palette entry must still become opaque.
+        let stone_indices = vec![2u8; (16 * 16) as usize];
+        write_indexed_png(
+            &block_dir.join("stone.png"),
+            16,
+            &[[255, 0, 0], [0, 255, 0], [0, 0, 255], [1, 2, 3]],
+            Some(&[255, 0, 200]),
+            &stone_indices,
+        );
+        let layers = load_resource_pack(&pack.path).expect("indexed PNGs must decode");
+        let leaves = layer_bytes(&layers.mips[0], 16, ob_content::textures::LEAVES.0 as usize);
+        for pixel in leaves.as_chunks::<4>().0 {
+            assert_eq!(pixel[3], 0, "transparent palette entry must be cut out");
+        }
+        let stone = layer_bytes(&layers.mips[0], 16, ob_content::textures::STONE.0 as usize);
+        for pixel in stone.as_chunks::<4>().0 {
+            assert_eq!(pixel[3], 255, "non-leaf palette alpha must be forced opaque");
+            assert_eq!(&pixel[..3], &[0, 0, 255]);
+        }
+
+        // A palette index beyond the table is a decoder error, never a panic.
+        let mut invalid = vec![0u8; (16 * 16) as usize];
+        invalid[0] = 5;
+        write_indexed_png(
+            &block_dir.join("stone.png"),
+            16,
+            &[[255, 0, 0], [0, 255, 0]],
+            None,
+            &invalid,
+        );
+        // The png crate normalises an out-of-range palette index rather than
+        // panicking; either a valid layer or a typed error is acceptable, but
+        // never a crash or an unbounded allocation.
+        if let Ok(layers) = load_resource_pack(&pack.path) {
+            assert_eq!(layers.size, 16);
+            for layer in &layers.mips {
+                assert!(!layer.is_empty());
+            }
+        }
+
+        // A truncated indexed PNG is a typed error.
+        write_solid(&block_dir.join("stone.png"), 16, [9, 9, 9, 255]);
+        let bytes = fs::read(block_dir.join("stone.png")).expect("read valid PNG");
+        fs::write(block_dir.join("stone.png"), &bytes[..bytes.len() / 2]).expect("truncate PNG");
+        assert!(load_resource_pack(&pack.path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pathological_pack_paths_do_not_escape_or_panic() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        // A self-referential symlink is not a directory and must not loop.
+        let loop_root = TempDir::new();
+        let link = loop_root.path.join("loop");
+        symlink(&link, &link).expect("create the symlink loop");
+        assert!(matches!(
+            load_resource_pack(&link),
+            Err(TextureLoadError::PackNotFound { .. })
+        ));
+
+        // Non-UTF-8 path components are legal on Unix and must load normally.
+        let root = TempDir::new();
+        let weird = root.path.join(OsString::from_vec(vec![b'p', 0x80, b'x']));
+        let block_dir = weird.join("assets/minecraft/textures/block");
+        write_standard_pack(&block_dir, 16, true);
+        let layers = load_resource_pack(&weird).expect("a non-UTF-8 path must load");
+        assert_eq!(layers.size, 16);
+        assert!(!layers.source.to_string_lossy().is_empty());
+
+        // `..` components resolve against the caller's path and stay inside the
+        // pack the caller named; no panic and no unexpected absolute path.
+        let parent = TempDir::new();
+        let pack = parent.path.join("pack");
+        write_standard_pack(&pack.join("assets/minecraft/textures/block"), 16, true);
+        let dotted = parent.path.join("pack/../pack");
+        let layers = load_resource_pack(&dotted).expect("a `..` path must resolve");
+        assert_eq!(layers.size, 16);
+        assert!(layers.block_dir.ends_with("assets/minecraft/textures/block"));
     }
 
     fn solid(size: u32, colour: [u8; 4]) -> Vec<u8> {
@@ -916,6 +1056,18 @@ mod tests {
     fn assert_solid_layer(layer: &[u8], edge: u32, colour: [u8; 4]) {
         for (index, pixel) in layer.as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(*pixel, colour, "texel {index} of a {edge}x{edge} layer differs");
+        }
+    }
+
+    #[test]
+    fn standard_pack_files_cover_every_non_debug_layer_in_order() {
+        assert_eq!(PACK_FILES.len(), COUNT - 1);
+        for (index, (name, file)) in PACK_FILES.iter().enumerate() {
+            assert_eq!(NAMES[index + 1], *name, "PACK_FILES must follow NAMES order");
+            assert!(
+                candidate_files(name).contains(file),
+                "{file} is not a candidate for {name}"
+            );
         }
     }
 
@@ -1224,6 +1376,36 @@ mod tests {
                 "crafting_table_side.png",
                 layer_colour(ob_content::textures::CRAFTING_TABLE_SIDE.0 as usize),
             ),
+            ("coal_ore.png", layer_colour(ob_content::textures::COAL_ORE.0 as usize)),
+            ("iron_ore.png", layer_colour(ob_content::textures::IRON_ORE.0 as usize)),
+            (
+                "copper_ore.png",
+                layer_colour(ob_content::textures::COPPER_ORE.0 as usize),
+            ),
+            (
+                "furnace_top.png",
+                layer_colour(ob_content::textures::FURNACE_TOP.0 as usize),
+            ),
+            (
+                "furnace_side.png",
+                layer_colour(ob_content::textures::FURNACE_SIDE.0 as usize),
+            ),
+            (
+                "furnace_front.png",
+                layer_colour(ob_content::textures::FURNACE_FRONT.0 as usize),
+            ),
+            (
+                "chest_top.png",
+                layer_colour(ob_content::textures::CHEST_TOP.0 as usize),
+            ),
+            (
+                "chest_side.png",
+                layer_colour(ob_content::textures::CHEST_SIDE.0 as usize),
+            ),
+            (
+                "chest_front.png",
+                layer_colour(ob_content::textures::CHEST_FRONT.0 as usize),
+            ),
         ];
         for (file, colour) in files {
             write_solid(&block_dir.join(file), 16, colour);
@@ -1263,6 +1445,15 @@ mod tests {
         assert_eq!(candidate_files("cobblestone"), &["cobblestone.png"]);
         assert_eq!(candidate_files("crafting_table_top"), &["crafting_table_top.png"]);
         assert_eq!(candidate_files("crafting_table_side"), &["crafting_table_side.png"]);
+        assert_eq!(candidate_files("coal_ore"), &["coal_ore.png"]);
+        assert_eq!(candidate_files("iron_ore"), &["iron_ore.png"]);
+        assert_eq!(candidate_files("copper_ore"), &["copper_ore.png"]);
+        assert_eq!(candidate_files("furnace_top"), &["furnace_top.png"]);
+        assert_eq!(candidate_files("furnace_side"), &["furnace_side.png"]);
+        assert_eq!(candidate_files("furnace_front"), &["furnace_front.png"]);
+        assert_eq!(candidate_files("chest_top"), &["chest_top.png"]);
+        assert_eq!(candidate_files("chest_side"), &["chest_side.png"]);
+        assert_eq!(candidate_files("chest_front"), &["chest_front.png"]);
         // The debug layer keeps no Minecraft file; every other catalogue name
         // must have at least one candidate.
         for name in NAMES {
@@ -1525,10 +1716,14 @@ mod tests {
             );
             eprintln!("  fallback layers ({}): {:?}", fallbacks.len(), fallbacks);
 
-            // The reference pack is 128x128 and ships every mapped layer except
-            // animated water; the debug layer is procedural by design.
+            // The reference pack is 128x128. It ships the v1.0 ore and furnace
+            // faces but keeps chest textures under `entity/chest` (outside the
+            // block atlas), and has no still water; those layers fall back.
             assert_eq!(layers.size, 128, "unexpected reference-pack resolution");
-            assert_eq!(fallbacks, vec!["debug", "water"]);
+            assert_eq!(
+                fallbacks,
+                vec!["debug", "water", "chest_top", "chest_side", "chest_front"]
+            );
             for (label, index) in [
                 ("leaves", LEAVES.0 as usize),
                 ("grass_top", GRASS_TOP.0 as usize),
@@ -1537,6 +1732,12 @@ mod tests {
                 ("cobblestone", COBBLESTONE.0 as usize),
                 ("crafting_table_top", CRAFTING_TABLE_TOP.0 as usize),
                 ("crafting_table_side", CRAFTING_TABLE_SIDE.0 as usize),
+                ("coal_ore", ob_content::textures::COAL_ORE.0 as usize),
+                ("iron_ore", ob_content::textures::IRON_ORE.0 as usize),
+                ("copper_ore", ob_content::textures::COPPER_ORE.0 as usize),
+                ("furnace_top", ob_content::textures::FURNACE_TOP.0 as usize),
+                ("furnace_side", ob_content::textures::FURNACE_SIDE.0 as usize),
+                ("furnace_front", ob_content::textures::FURNACE_FRONT.0 as usize),
             ] {
                 assert!(
                     !layers.fallback_layers.contains(&index),
@@ -1547,6 +1748,16 @@ mod tests {
                 layers.fallback_layers.contains(&(WATER.0 as usize)),
                 "the reference pack has no water texture, so water must fall back"
             );
+            for (label, index) in [
+                ("chest_top", ob_content::textures::CHEST_TOP.0 as usize),
+                ("chest_side", ob_content::textures::CHEST_SIDE.0 as usize),
+                ("chest_front", ob_content::textures::CHEST_FRONT.0 as usize),
+            ] {
+                assert!(
+                    layers.fallback_layers.contains(&index),
+                    "{label} lives under entity/chest in the reference pack, so it must fall back"
+                );
+            }
         }
     }
 

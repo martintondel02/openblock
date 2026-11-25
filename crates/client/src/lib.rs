@@ -1,25 +1,34 @@
-//! The game client: window, input, chunk streaming, integrated host and renderer.
+//! The game client: window, input, chunk streaming, renderer and multiplayer.
 //!
-//! v0.0.1 is a single-player tech preview: the client owns an [`ob_server::Host`]
-//! directly (the same authoritative simulation the dedicated server uses) and
-//! renders its world through the wgpu renderer.
+//! The single-player runtime owns an [`ob_server::Host`] directly (the same
+//! authoritative simulation the dedicated server uses) and renders its world
+//! through the wgpu renderer. `--connect HOST:PORT` selects the separate
+//! network runtime: it replicates the dedicated server's world
+//! with [`net::NetworkClient`], simulates only the local player, mirrors the
+//! server's survival HUD, inventory, equipment, container windows and
+//! mobs/dropped items, relays chat and never opens or saves a local host.
 
 #![allow(missing_docs)] // TODO(MS-04): re-enable once the v0.0.1 API surface settles
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ob_content::{BlockId, Registry};
+use ob_audio::{AudioEngine, Material as AudioMaterial, Sfx as AudioSfx};
+use ob_content::{ArmorSlot, BlockId, MobKind, Registry};
 use ob_core::config::{GameMode as SettingsGameMode, Settings, TextureStyle, load_settings, save_settings};
 use ob_math::{BlockPos, ChunkPos, SEA_LEVEL, SectionPos, WorldVec};
 use ob_render::{
     BlockOutline, Camera, DAY_LENGTH_TICKS, EntityInstance, Environment, OffscreenRenderer, Renderer, SceneParams,
     TextureSource, UiFrame,
 };
-use ob_server::{GameMode as HostGameMode, Host, HostConfig, ItemEntity};
+use ob_server::{
+    CHEST_SLOTS, DedicatedServer, FurnaceSlot, GameMode as HostGameMode, Host, HostConfig, ItemEntity, ItemStack,
+    MOB_ATTACK_REACH, NetConfig,
+};
 use ob_sim::{BlockAction, PlayerInput, REACH};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -28,25 +37,37 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
+pub mod containers;
 pub mod crafting;
 pub mod inventory;
 pub mod mesh_scheduler;
 pub mod mining;
+pub mod mobs;
+pub mod net;
+mod net_app;
+pub mod net_state;
+mod net_ui;
 pub mod ui_state;
 
+use containers::{ClickButton, ContainerAction, ContainerKind, ContainerSession, ContainerSnapshot};
 use crafting::{CraftingRow, crafting_rows};
 use inventory::inventory_blocks;
 use mesh_scheduler::MeshScheduler;
 use mining::MiningState;
+use mobs::MobRenderCache;
 use ui_state::{
-    DamageFlash, DeathAction, DebugColumns, DebugStats, Screen, SettingsAction, SettingsInfo, SettingsRow, UiState,
-    facing_label,
+    DamageFlash, DeathAction, DebugColumns, DebugStats, Screen, SettingsAction, SettingsInfo, SettingsRow, SettingsTab,
+    UiState, facing_label,
 };
 
 /// One fixed simulation tick (20 Hz, DEC-038).
 const TICK: Duration = Duration::from_millis(50);
 /// Cooldown between right-click block placements.
 const PLACE_COOLDOWN: Duration = Duration::from_millis(200);
+/// Cooldown between two melee attacks at a mob.
+const ATTACK_COOLDOWN: Duration = Duration::from_millis(400);
+/// Peak camera pitch offset, in radians, after the player takes damage.
+const DAMAGE_SHAKE_RADIANS: f32 = 0.05;
 /// Maximum dirty sections handed to the mesh scheduler per frame. The rest are
 /// re-marked dirty so they are retried on the next frame.
 const MAX_MESH_SUBMISSIONS_PER_FRAME: usize = 32;
@@ -112,6 +133,22 @@ pub struct ClientOptions {
     pub screenshot_debug: bool,
     /// Seed the host with sample items and vitals for the offscreen screenshot.
     pub screenshot_items: bool,
+    /// Render a few spawned mob avatars with the HUD and F3 overlay.
+    pub screenshot_mobs: bool,
+    /// Place and open a seeded furnace in the offscreen screenshot frame.
+    pub screenshot_furnace: bool,
+    /// Place and open a seeded chest in the offscreen screenshot frame.
+    pub screenshot_chest: bool,
+    /// Select the settings tab used by an offscreen settings screenshot.
+    pub screenshot_settings_tab: Option<SettingsTab>,
+    /// Do not open an audio device at all (headless/streaming setups).
+    pub no_audio: bool,
+    /// Start muted for this run without changing the persisted setting.
+    pub mute: bool,
+    /// Multiplayer endpoint (`HOST:PORT`); mutually exclusive with local worlds.
+    pub connect: Option<String>,
+    /// Requested multiplayer player name; `None` chooses `playerNNNN` at start.
+    pub name: Option<String>,
 }
 
 impl Default for ClientOptions {
@@ -137,6 +174,14 @@ impl Default for ClientOptions {
             screenshot_crafting: false,
             screenshot_debug: false,
             screenshot_items: false,
+            screenshot_mobs: false,
+            screenshot_furnace: false,
+            screenshot_chest: false,
+            screenshot_settings_tab: None,
+            no_audio: false,
+            mute: false,
+            connect: None,
+            name: None,
         }
     }
 }
@@ -151,6 +196,9 @@ fn default_mesh_workers() -> usize {
 
 /// Runs the client until the window closes, or writes a single screenshot and exits.
 pub fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
+    if options.connect.is_some() {
+        return net_app::run(options);
+    }
     if let Some(path) = &options.screenshot_inventory {
         return screenshot_with_mode(&options, path, ScreenshotMode::Inventory);
     }
@@ -163,6 +211,12 @@ pub fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
             ScreenshotMode::Dead
         } else if options.screenshot_debug {
             ScreenshotMode::Debug
+        } else if options.screenshot_mobs {
+            ScreenshotMode::Mobs
+        } else if options.screenshot_furnace {
+            ScreenshotMode::Furnace
+        } else if options.screenshot_chest {
+            ScreenshotMode::Chest
         } else {
             ScreenshotMode::Hud
         };
@@ -200,6 +254,12 @@ enum ScreenshotMode {
     Crafting,
     /// Survival HUD with the F3 debug overlay and deterministic statistics.
     Debug,
+    /// Spawned mob avatars with the survival HUD and F3 mob counts.
+    Mobs,
+    /// Open, seeded furnace screen.
+    Furnace,
+    /// Open, seeded chest screen.
+    Chest,
 }
 
 /// Renders one offscreen frame of the world and writes it as a PNG (RGBA8).
@@ -208,6 +268,410 @@ enum ScreenshotMode {
 /// verify the GPU pipeline on headless hosts.
 pub fn screenshot(options: &ClientOptions, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     screenshot_with_mode(options, path, ScreenshotMode::Hud)
+}
+
+/// Renders one offscreen protocol v2 survival frame from an in-process server.
+///
+/// This is the documentation/demo probe for the network runtime. It opens a
+/// temporary world, installs a small survival scene (mobs, dropped items and a
+/// server-authoritative hotbar/armor set), starts a real [`DedicatedServer`] on
+/// loopback, connects the real [`crate::net::NetworkClient`] and renders one
+/// frame with the same HUD helpers the windowed client uses. It needs a Vulkan
+/// adapter but no window and never opens a local single-player Host.
+///
+/// The normal client entry points do not call this function; it exists so a
+/// one-off probe can produce a network screenshot without weakening the
+/// `--connect` or `--screenshot` CLI contract.
+#[doc(hidden)]
+pub fn screenshot_network_demo(
+    path: &Path,
+    debug_path: Option<&Path>,
+    seed: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let registry = Arc::new(Registry::base());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let data_dir = std::env::temp_dir().join(format!("openblock-net-shot-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&data_dir)?;
+    let result = screenshot_network_demo_inner(path, debug_path, seed, &registry, &data_dir);
+    let _ = std::fs::remove_dir_all(&data_dir);
+    result
+}
+
+fn screenshot_network_demo_inner(
+    path: &Path,
+    debug_path: Option<&Path>,
+    seed: u64,
+    registry: &Arc<Registry>,
+    data_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut host = Host::open(
+        Arc::clone(registry),
+        HostConfig {
+            seed,
+            world_name: "network-demo".to_string(),
+            data_dir: Some(data_dir.to_path_buf()),
+            render_distance_chunks: 4,
+            generate_budget: 8,
+        },
+    )?;
+    for _ in 0..128 {
+        if host.ensure_streaming(16) == 0 {
+            break;
+        }
+    }
+    host.set_game_mode(HostGameMode::Survival);
+    let spawn = host.spawn();
+    // A readable line-up in front of the default camera (yaw zero faces -Z).
+    let mut seeded_mobs: Vec<u64> = Vec::new();
+    for (kind, dx, dz) in [
+        (MobKind::Cow, -2.4, -5.2),
+        (MobKind::Pig, 1.8, -5.8),
+        (MobKind::Sheep, 3.8, -4.6),
+        (MobKind::Chicken, 0.2, -3.8),
+    ] {
+        let mut spawned = None;
+        for dy in [0.6, 1.6, 2.6] {
+            let pos = WorldVec::new(spawn.x + dx, spawn.y + dy, spawn.z + dz);
+            if let Some(id) = host.spawn_mob(kind, pos) {
+                spawned = Some(id);
+                seeded_mobs.push(id);
+                break;
+            }
+        }
+        if spawned.is_none() {
+            log::warn!("network demo: could not spawn {kind:?} near the camera");
+        }
+    }
+    for (item_name, dx, dz, count) in [
+        ("openblock:raw_iron", -2.0, -5.0, 2),
+        ("openblock:apple", 1.6, -5.4, 3),
+        ("openblock:stone", 0.2, -4.6, 12),
+    ] {
+        if let Some(item) = registry.item_id(item_name) {
+            host.spawn_item_entity(
+                WorldVec::new(spawn.x + dx, spawn.y + 0.6, spawn.z + dz),
+                ItemStack::new(item, count),
+            );
+        }
+    }
+    let server = DedicatedServer::start(
+        host,
+        NetConfig {
+            listen: "127.0.0.1:0".parse::<SocketAddr>()?,
+            max_players: 8,
+            motd: "OpenBlock survival demo".to_string(),
+            interest_radius_chunks: 4,
+            chunks_per_tick: 16,
+            save_interval_seconds: 0,
+            whitelist: Vec::new(),
+            game_mode: HostGameMode::Survival,
+        },
+    )?;
+    let mut client = crate::net::NetworkClient::connect(crate::net::ConnectOptions::new(
+        server.local_addr().to_string(),
+        "survivor",
+        4,
+        Arc::clone(registry),
+    ))?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        client.poll();
+        client.maintain_chunks(8);
+        if client.state().is_playing()
+            && client.survival().vitals_received
+            && client.survival().inventory_received
+            && client.entities().mob_count() >= 3
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !client.state().is_playing() {
+        client.shutdown();
+        let _ = server.stop();
+        return Err("network demo client did not reach Playing".into());
+    }
+    for (item_name, count) in [
+        ("openblock:iron_pickaxe", 1),
+        ("openblock:iron_sword", 1),
+        ("openblock:apple", 3),
+        ("openblock:dirt", 12),
+        ("openblock:iron_helmet", 1),
+        ("openblock:iron_chestplate", 1),
+        ("openblock:iron_leggings", 1),
+        ("openblock:iron_boots", 1),
+    ] {
+        if !server.give_network_item(client.local_id(), item_name, count) {
+            log::warn!("network demo: could not give {item_name}");
+        }
+    }
+    let wait_until = |client: &mut crate::net::NetworkClient, seconds: u64| {
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        while Instant::now() < deadline {
+            client.poll();
+            client.maintain_chunks(4);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    wait_until(&mut client, 1);
+    // Equip the full iron set through the authoritative equip intent.
+    for item_name in [
+        "openblock:iron_helmet",
+        "openblock:iron_chestplate",
+        "openblock:iron_leggings",
+        "openblock:iron_boots",
+    ] {
+        let Some(item) = registry.item_id(item_name) else {
+            continue;
+        };
+        let Some(slot) = client
+            .inventory()
+            .iter()
+            .position(|stack| stack.is_some_and(|stack| stack.item == item))
+        else {
+            continue;
+        };
+        if client.send_equip(slot) {
+            wait_until(&mut client, 1);
+        }
+    }
+    let pickaxe = registry.item_id("openblock:iron_pickaxe");
+    if let Some(slot) = pickaxe.and_then(|item| {
+        client
+            .inventory()
+            .iter()
+            .position(|stack| stack.is_some_and(|stack| stack.item == item))
+    }) {
+        let _ = client.select_slot(slot);
+        wait_until(&mut client, 1);
+    }
+    let _ = server.broadcast_chat("Survival is server-authoritative: mobs, items and containers sync live");
+    let _ = server.broadcast_chat("HUD: hearts, hunger, armor, hotbar counts and durability");
+    wait_until(&mut client, 1);
+    // Aim the demo camera at the nearest replicated mob so the frame always
+    // shows a real server mob, not only terrain.
+    let now = Instant::now();
+    let eye = client.player().eye();
+    let mut candidates: Vec<(f64, WorldVec, MobKind, u64)> = Vec::new();
+    for id in client.entities().ids() {
+        let Some(crate::net_state::ReplicatedKind::Mob(kind)) = client.entities().kind(id) else {
+            continue;
+        };
+        let Some(pos) = client.entities().position(id, now) else {
+            continue;
+        };
+        candidates.push((eye.distance(pos), pos, *kind, id));
+    }
+    // Prefer one of the mobs seeded before the server started, then any
+    // medium-distance quadruped. A chicken that walked up to the camera would
+    // fill the frame with its head, so it is the last fallback.
+    let seeded = |candidate: &&(f64, WorldVec, MobKind, u64)| seeded_mobs.contains(&candidate.3);
+    let target = candidates
+        .iter()
+        .filter(|candidate| {
+            seeded(candidate)
+                && candidate.0 >= 3.0
+                && matches!(candidate.2, MobKind::Cow | MobKind::Pig | MobKind::Sheep)
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .or_else(|| {
+            candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.0 >= 3.0 && matches!(candidate.2, MobKind::Cow | MobKind::Pig | MobKind::Sheep)
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+        })
+        .or_else(|| {
+            candidates
+                .iter()
+                .filter(|candidate| candidate.0 >= 3.0)
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+        })
+        .or_else(|| candidates.iter().min_by(|a, b| a.0.total_cmp(&b.0)));
+    if let Some((distance, target, _, _)) = target {
+        let delta = *target + WorldVec::new(0.0, 0.85, 0.0) - eye;
+        if *distance > 0.1 {
+            let horizontal = (delta.x * delta.x + delta.z * delta.z).sqrt();
+            client.player_mut().yaw = (-delta.x).atan2(-delta.z) as f32;
+            client.player_mut().pitch = delta.y.atan2(horizontal) as f32;
+        }
+    } else {
+        client.player_mut().yaw = 0.0;
+        client.player_mut().pitch = -0.04;
+    }
+    wait_until(&mut client, 1);
+
+    let options = ClientOptions {
+        seed,
+        data_dir: Some(data_dir.to_path_buf()),
+        no_audio: true,
+        render_distance_chunks: 4,
+        ..ClientOptions::default()
+    };
+    let (settings, _) = effective_settings(&options);
+    let (mut renderer, texture_source) = create_offscreen_renderer(&options, &settings)?;
+    let screen = [SCREENSHOT_WIDTH as f32, SCREENSHOT_HEIGHT as f32];
+    let eye = client.player().eye();
+    let mut camera = Camera::new(eye, client.player().yaw, client.player().pitch);
+    camera.far = (client.render_radius() as f32 * 16.0 + 48.0).max(128.0);
+    let environment = Environment::from_ticks(client.server_tick() + DAY_LENGTH_TICKS / 4, DAY_LENGTH_TICKS);
+    let now = Instant::now();
+    let entities = client.entity_instances(now);
+    let (mobs, items) = client.entity_counts();
+    renderer.set_entities(&entities);
+    renderer.render_world_scene(
+        client.world(),
+        &camera,
+        &SceneParams {
+            environment,
+            ui: None,
+            outline: None,
+        },
+    )?;
+    let render_stats = renderer.stats();
+    let selected = client.selected_stack();
+    let held = selected
+        .map(|stack| inventory::item_display_name(registry, stack.item))
+        .unwrap_or_else(|| "empty".to_string());
+    let held_durability = selected.and_then(|stack| inventory::stack_durability(registry, stack));
+    let network_line = format!(
+        "Multiplayer survival | Net: {} ping {} players {}/{} | mobs {mobs} items {items}",
+        server.local_addr(),
+        client
+            .ping_ms()
+            .map(|millis| format!("{millis}ms"))
+            .unwrap_or_else(|| "--".to_string()),
+        client.player_count(),
+        client.server_info().max_players,
+    );
+    let time_of_day = environment.time_of_day;
+    let stats = DebugStats {
+        version: ob_core::VERSION.to_string(),
+        fps: 60,
+        frame_p50_ms: 16.67,
+        frame_p95_ms: 17.42,
+        position: [eye.x, eye.y, eye.z],
+        chunk: [
+            (eye.x.floor() as i32).div_euclid(16),
+            (eye.y.floor() as i32).div_euclid(16),
+            (eye.z.floor() as i32).div_euclid(16),
+        ],
+        facing: facing_label(client.player().yaw),
+        target: None,
+        seed,
+        render_distance: client.render_radius(),
+        loaded_chunks: client.loaded_chunks(),
+        drawn_sections: render_stats.sections as usize,
+        cached_sections: 0,
+        triangles: render_stats.vertices / 3,
+        draw_calls: render_stats.draw_calls as usize,
+        mesh_workers: 0,
+        mesh_in_flight: 0,
+        mesh_completed: 0,
+        mesh_backlog: 0,
+        heap_bytes: client.world().section_count().saturating_mul(8 * 1024),
+        ticks: client.session_ticks(),
+        adapter: format!("{} (offscreen demo)", renderer.adapter_summary()),
+        window: [SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT],
+        fov_degrees: settings.fov_degrees,
+        time_of_day,
+        texture_source: describe_texture_source(&texture_source, renderer.texture_resolution()),
+        game_mode: "survival",
+        health: client.health(),
+        hunger: client.hunger(),
+        movement: "walk",
+        held,
+        held_durability,
+        mining_speed: 1.0,
+        audio: "off (headless demo)".to_string(),
+        network: Some(network_line),
+        mobs_total: mobs,
+        mobs_passive: client.entities().passive_mob_count(registry),
+        mobs_hostile: client.entities().hostile_mob_count(registry),
+        day_phase: client.server_tick() % 24_000,
+        day: time_of_day > 0.25 && time_of_day < 0.75,
+        defense: client.armor_defense(),
+    };
+
+    let mut ui = UiState::from_settings(settings.clone());
+    ui.hotbar_selected = client.selected_slot();
+    ui.block_name_seconds = ui_state::BLOCK_NAME_SECONDS;
+    ui.toasts.push("Picked up Raw Iron x2");
+    ui.toasts.push("Picked up Apple x3");
+    ui.toasts.push_success("Equipped Iron Armor");
+    let mut frame = UiFrame::new(screen[0], screen[1]);
+    let centre_x = screen[0] / 2.0;
+    let centre_y = screen[1] / 2.0;
+    let cross = [0.95, 0.97, 1.0, 0.85];
+    frame.rect(centre_x - 1.0, centre_y - 9.0, 2.0, 18.0, cross);
+    frame.rect(centre_x - 9.0, centre_y - 1.0, 18.0, 2.0, cross);
+    ui_state::draw_vitals(&mut frame, screen, client.health(), client.hunger());
+    ui_state::draw_armor(&mut frame, screen, client.armor_defense());
+    inventory::draw_survival_hotbar(
+        &mut frame,
+        &ui,
+        registry,
+        client.inventory(),
+        client.selected_slot(),
+        screen,
+    );
+    if let Some(stack) = selected {
+        let label = inventory::item_display_name(registry, stack.item);
+        let y = ui
+            .hotbar_rects(screen)
+            .first()
+            .map(|slot| slot.y - 30.0)
+            .unwrap_or(screen[1] - 70.0);
+        frame.text_centered(screen[0] / 2.0, y, 2.0, [1.0, 1.0, 1.0, 1.0], &label);
+    }
+    ui_state::draw_toasts(&mut frame, &ui.toasts, screen);
+    crate::net_ui::draw_chat(&mut frame, client.chat_log(), None, screen);
+    let render_and_write =
+        |renderer: &mut OffscreenRenderer, frame: &UiFrame, path: &Path| -> Result<(), Box<dyn std::error::Error>> {
+            let scene = SceneParams {
+                environment,
+                ui: Some(frame),
+                outline: None,
+            };
+            renderer.render_world_scene(client.world(), &camera, &scene)?;
+            let rgba = renderer.read_rgba();
+            if rgba.len() != (SCREENSHOT_WIDTH * SCREENSHOT_HEIGHT * 4) as usize {
+                return Err(format!(
+                    "offscreen readback returned {} bytes, expected {}",
+                    rgba.len(),
+                    SCREENSHOT_WIDTH * SCREENSHOT_HEIGHT * 4
+                )
+                .into());
+            }
+            write_png(path, SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT, &rgba)?;
+            Ok(())
+        };
+    render_and_write(&mut renderer, &frame, path)?;
+    log::info!(
+        "network survival screenshot written to {} ({}x{}, {mobs} mobs, {items} items, {} chunks, health {:.1}, hunger {:.1}, defence {})",
+        path.display(),
+        SCREENSHOT_WIDTH,
+        SCREENSHOT_HEIGHT,
+        client.loaded_chunks(),
+        client.health(),
+        client.hunger(),
+        client.armor_defense(),
+    );
+    if let Some(debug_path) = debug_path {
+        draw_debug_overlay(&mut frame, &stats, screen);
+        render_and_write(&mut renderer, &frame, debug_path)?;
+        log::info!(
+            "network survival F3 screenshot written to {} ({mobs} mobs, {items} items)",
+            debug_path.display()
+        );
+    }
+    client.shutdown();
+    let _ = server.stop();
+    Ok(())
 }
 
 fn screenshot_with_mode(
@@ -229,7 +693,16 @@ fn screenshot_with_mode(
     let mut host = Host::open(Arc::clone(&registry), config)?;
     host.set_game_mode(map_game_mode(settings.game_mode));
     log::info!("game mode: {}", host.game_mode().name());
-    if options.screenshot_items || matches!(mode, ScreenshotMode::Crafting | ScreenshotMode::Debug) {
+    if options.screenshot_items
+        || matches!(
+            mode,
+            ScreenshotMode::Crafting
+                | ScreenshotMode::Debug
+                | ScreenshotMode::Mobs
+                | ScreenshotMode::Furnace
+                | ScreenshotMode::Chest
+        )
+    {
         seed_screenshot_items(&mut host, &registry);
     }
     if mode == ScreenshotMode::Crafting {
@@ -253,6 +726,39 @@ fn screenshot_with_mode(
         }
     }
 
+    // Demo-only world seeding needs loaded chunks for mob collision checks and
+    // block placement raycasts, so it runs after the first full stream.
+    let mut screenshot_container: Option<(ContainerKind, BlockPos)> = None;
+    match mode {
+        ScreenshotMode::Mobs => {
+            let count = seed_screenshot_mobs(&mut host, &registry);
+            log::info!(
+                "mob screenshot: {} mobs spawned ({} passive, {} hostile), {} avatar cubes",
+                count,
+                host.passive_mob_count(),
+                host.hostile_mob_count(),
+                mobs::mob_instances(&registry, host.mobs(), 1.0).len(),
+            );
+        }
+        ScreenshotMode::Furnace => {
+            if let Some(pos) = seed_screenshot_container(&mut host, &registry, "openblock:furnace") {
+                seed_screenshot_furnace(&mut host, &registry, pos);
+                screenshot_container = Some((ContainerKind::Furnace, pos));
+            } else {
+                log::warn!("furnace screenshot: could not place a furnace");
+            }
+        }
+        ScreenshotMode::Chest => {
+            if let Some(pos) = seed_screenshot_container(&mut host, &registry, "openblock:chest") {
+                seed_screenshot_chest(&mut host, &registry, pos);
+                screenshot_container = Some((ContainerKind::Chest, pos));
+            } else {
+                log::warn!("chest screenshot: could not place a chest");
+            }
+        }
+        _ => {}
+    }
+
     let (eye, yaw, pitch) = {
         let player = host.player();
         (player.eye(), player.yaw, player.pitch)
@@ -270,7 +776,16 @@ fn screenshot_with_mode(
     let mut ui = UiState::from_settings(settings.clone());
     ui.active_texture_pack = active_texture_pack_label(&texture_source);
     ui.hotbar_selected = host.hotbar_selection();
-    if options.screenshot_items || matches!(mode, ScreenshotMode::Crafting | ScreenshotMode::Debug) {
+    if options.screenshot_items
+        || matches!(
+            mode,
+            ScreenshotMode::Crafting
+                | ScreenshotMode::Debug
+                | ScreenshotMode::Mobs
+                | ScreenshotMode::Furnace
+                | ScreenshotMode::Chest
+        )
+    {
         ui.toasts.push("Picked up Cobblestone x8");
         ui.toasts.push("Picked up Apple x3");
         ui.toasts.push_warning("Inventory full - dropped Log x2");
@@ -280,7 +795,7 @@ fn screenshot_with_mode(
     // The debug screenshot reports real world counters. Render the world once
     // without the overlay to fill `RenderStats` deterministically, then compose
     // the final frame with the HUD and F3 overlay on top.
-    let debug_render_stats = if mode == ScreenshotMode::Debug {
+    let debug_render_stats = if matches!(mode, ScreenshotMode::Debug | ScreenshotMode::Mobs) {
         renderer.render_world_scene(
             host.world(),
             &camera,
@@ -314,16 +829,36 @@ fn screenshot_with_mode(
         ScreenshotMode::Inventory => {
             ui.open_inventory();
             if survival {
-                ui.inventory.selected = host.hotbar_selection();
-                ui.inventory.hovered = Some(host.hotbar_selection());
+                // Hover the equipped chestplate so the footer shows its
+                // slot/defence/durability line; the hotbar keeps the held iron
+                // tool selected. With `--screenshot-items` a full iron set is
+                // equipped, so the armor row shows four pieces and 15 defence.
+                let focus = host.hotbar_selection();
+                ui.inventory.selected = focus;
+                ui.inventory.hovered = Some(focus);
+                ui.inventory.armor_hovered = Some(ArmorSlot::Chestplate);
                 inventory::draw_survival(
                     &mut frame,
                     &ui,
                     &registry,
-                    host.inventory(),
-                    host.hotbar_selection(),
-                    host.near_crafting_table(),
+                    &inventory::SurvivalInventoryView {
+                        inventory: host.inventory(),
+                        equipment: host.equipment(),
+                        defense: host.armor_defense(),
+                        selected: host.hotbar_selection(),
+                        near_table: host.near_crafting_table(),
+                        craft_hint: None,
+                    },
                     screen,
+                );
+                log::info!(
+                    "inventory screenshot: focus slot {} item {}, armor {:?}, defence {}",
+                    focus,
+                    host.inventory()[focus]
+                        .map(|stack| inventory::item_display_name(&registry, stack.item))
+                        .unwrap_or_else(|| "empty".to_string()),
+                    host.equipment(),
+                    host.armor_defense(),
                 );
             } else {
                 let items = inventory_blocks(&registry);
@@ -339,18 +874,23 @@ fn screenshot_with_mode(
         }
         ScreenshotMode::Dead => {
             ui.open_death();
+            ui.death_cause = Some("Cause: lost all health".to_string());
             draw_vitals_for_mode(&mut frame, &ui, &host, screen);
             draw_hotbar_for_mode(&mut frame, &ui, &registry, &host, screen);
             ui_state::draw_death_screen(&mut frame, &ui, screen);
         }
         ScreenshotMode::Settings => {
             ui.open_settings();
+            if let Some(tab) = options.screenshot_settings_tab {
+                ui.settings_select_tab(tab);
+            }
             let info = SettingsInfo {
                 health: host.player().health,
                 hunger: host.player().hunger,
                 texture_source: texture_source.label(),
                 texture_resolution: renderer.texture_resolution(),
                 mesh_workers: options.mesh_workers,
+                audio_status: "off (headless screenshot)".to_string(),
             };
             ui_state::draw_settings_screen(&mut frame, &ui, &info, screen);
             log::info!(
@@ -364,7 +904,7 @@ fn screenshot_with_mode(
         ScreenshotMode::Crafting => {
             ui.open_crafting();
             let rows = crafting_rows_for_host(&host, &registry);
-            if let Some(index) = rows.iter().position(|row| row.output_name == "Stone Pickaxe") {
+            if let Some(index) = rows.iter().position(|row| row.output_name == "Iron Pickaxe") {
                 ui.crafting.selected = index;
             }
             ui.crafting.ensure_visible(screen, &rows);
@@ -381,13 +921,24 @@ fn screenshot_with_mode(
             if survival {
                 ui_state::draw_toasts(&mut frame, &ui.toasts, screen);
             }
+            let sections: Vec<&str> =
+                rows.iter()
+                    .map(|row| row.section.title())
+                    .fold(Vec::new(), |mut sections, title| {
+                        if sections.last().copied() != Some(title) {
+                            sections.push(title);
+                        }
+                        sections
+                    });
             log::info!(
-                "crafting screenshot: {} recipes, near table {}, selected {}, mode {}",
+                "crafting screenshot: {} recipes, sections {:?}, near table {}, selected {}, scroll {}, mode {}",
                 rows.len(),
+                sections,
                 host.near_crafting_table(),
                 rows.get(ui.crafting.selected)
                     .map(|row| row.output_name.as_str())
                     .unwrap_or("none"),
+                ui.crafting.scroll,
                 host.game_mode().name(),
             );
         }
@@ -422,8 +973,109 @@ fn screenshot_with_mode(
                 layout.left.panel.h,
             );
         }
+        ScreenshotMode::Mobs => {
+            ui.block_name_seconds = ui_state::BLOCK_NAME_SECONDS;
+            let cross = [0.95, 0.97, 1.0, 0.85];
+            frame.rect(centre_x - 1.0, centre_y - 9.0, 2.0, 18.0, cross);
+            frame.rect(centre_x - 9.0, centre_y - 1.0, 18.0, 2.0, cross);
+            draw_vitals_for_mode(&mut frame, &ui, &host, screen);
+            draw_hotbar_for_mode(&mut frame, &ui, &registry, &host, screen);
+            draw_selected_name(&mut frame, &ui, &registry, &host, screen);
+            if survival {
+                ui_state::draw_toasts(&mut frame, &ui.toasts, screen);
+            }
+            let stats = screenshot_debug_stats(
+                &host,
+                &registry,
+                &renderer,
+                &settings,
+                options,
+                &texture_source,
+                debug_render_stats.unwrap_or_default(),
+            );
+            draw_debug_overlay(&mut frame, &stats, screen);
+            log::info!(
+                "mob screenshot: {} live mobs ({} passive, {} hostile), {} cubes, {} debug lines",
+                host.mob_count(),
+                host.passive_mob_count(),
+                host.hostile_mob_count(),
+                mobs::mob_instances(&registry, host.mobs(), 1.0).len(),
+                stats.left_lines().len(),
+            );
+        }
+        ScreenshotMode::Furnace | ScreenshotMode::Chest => {
+            let (kind, pos) = screenshot_container.unwrap_or((
+                if mode == ScreenshotMode::Furnace {
+                    ContainerKind::Furnace
+                } else {
+                    ContainerKind::Chest
+                },
+                BlockPos::new(0, 0, 0),
+            ));
+            let mut session = ContainerSession::new(kind, pos);
+            let mut view = container_snapshot(&host, kind, pos);
+            view.inventory = *host.inventory();
+            let demo_slot = match kind {
+                ContainerKind::Furnace => containers::SlotId::FurnaceOutput,
+                ContainerKind::Chest => containers::SlotId::Chest(0),
+            };
+            if let Some(rect) = session.layout(screen).slot_rect(demo_slot) {
+                session.selected = demo_slot;
+                ui.cursor = rect.center();
+            }
+            ui.screen = match kind {
+                ContainerKind::Furnace => Screen::Furnace,
+                ContainerKind::Chest => Screen::Chest,
+            };
+            match kind {
+                ContainerKind::Furnace => {
+                    let state = host.furnace_at(pos).cloned();
+                    containers::draw_furnace(
+                        &mut frame,
+                        &registry,
+                        &session,
+                        state.as_ref(),
+                        &view,
+                        ui.cursor,
+                        screen,
+                    );
+                    log::info!(
+                        "furnace screenshot: pos {:?}, cursor {:?}, input {:?}, fuel {:?}, output {:?}, lit {}",
+                        pos,
+                        ui.cursor,
+                        state.as_ref().and_then(|state| state.input),
+                        state.as_ref().and_then(|state| state.fuel),
+                        state.as_ref().and_then(|state| state.output),
+                        state.as_ref().is_some_and(|state| state.is_lit()),
+                    );
+                }
+                ContainerKind::Chest => {
+                    let state = host.chest_at(pos).cloned();
+                    containers::draw_chest(
+                        &mut frame,
+                        &registry,
+                        &session,
+                        state.as_ref(),
+                        &view,
+                        ui.cursor,
+                        screen,
+                    );
+                    log::info!(
+                        "chest screenshot: pos {:?}, cursor {:?}, filled {} of {} slots",
+                        pos,
+                        ui.cursor,
+                        state.as_ref().map_or(0, |state| state.contents().len()),
+                        CHEST_SLOTS,
+                    );
+                }
+            }
+            if survival {
+                ui_state::draw_toasts(&mut frame, &ui.toasts, screen);
+            }
+        }
     }
-    let entities = entity_instances_for(host.item_entities(), &registry, 0.8);
+    let mut entities = entity_instances_for(host.item_entities(), &registry, 0.8);
+    entities.extend(mobs::mob_instances(&registry, host.mobs(), 1.0));
     renderer.set_entities(&entities);
     let scene = SceneParams {
         environment,
@@ -530,7 +1182,7 @@ fn screenshot_debug_stats(
         adapter: renderer.adapter_summary().to_string(),
         window: [SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT],
         fov_degrees: settings.fov_degrees,
-        time_of_day: 0.5,
+        time_of_day: Environment::from_ticks(host.tick_count() + DAY_LENGTH_TICKS / 4, DAY_LENGTH_TICKS).time_of_day,
         texture_source: describe_texture_source(texture_source, renderer.texture_resolution()),
         game_mode: host.game_mode().name(),
         health: player.health,
@@ -539,31 +1191,40 @@ fn screenshot_debug_stats(
         held,
         held_durability,
         mining_speed,
+        audio: "off (screenshot)".to_string(),
+        network: None,
+        mobs_total: host.mob_count(),
+        mobs_passive: host.passive_mob_count(),
+        mobs_hostile: host.hostile_mob_count(),
+        day_phase: host.day_phase(),
+        day: host.is_day(),
+        defense: host.armor_defense(),
     }
 }
 
-/// Gives the screenshot host a small, deterministic inventory and wounded vitals.
+/// Gives the screenshot host a deterministic, representative inventory and
+/// wounded vitals.
 ///
-/// Tools are worn by breaking a few leaves so the HUD/inventory screenshots
-/// show a partially filled durability bar. This uses only the public host API;
-/// the leaves are restored to the block that was there before seeding.
+/// The nine hotbar slots are chosen to exercise the expanded catalogue: an iron
+/// tool (held, so the F3 line reports `251/251 speed 6.0`), iron armor, cooked
+/// food, coal, an ingot, raw ore and enough planks/sticks/cobblestone for the
+/// crafting availability colours. This uses only the public host API.
 fn seed_screenshot_items(host: &mut Host, registry: &Registry) {
-    for (name, count) in [
-        ("openblock:stone", 8_u8),
-        ("openblock:apple", 3),
-        ("openblock:log", 2),
-        ("openblock:planks", 16),
-        ("openblock:stick", 8),
-        ("openblock:cobblestone", 16),
-        ("openblock:crafting_table", 1),
-    ] {
+    // Equip a full iron set first: `equip_armor` frees the source hotbar slot,
+    // leaving room for the tool/food/material showcase below. Armor icons and
+    // the durability bars are the point of the survival inventory screenshot.
+    let armor_names = [
+        "openblock:iron_helmet",
+        "openblock:iron_chestplate",
+        "openblock:iron_leggings",
+        "openblock:iron_boots",
+    ];
+    for name in armor_names {
         if let Some(item) = registry.item_id(name) {
-            host.give_item(item, count);
-        }
-    }
-    for name in ["openblock:wooden_pickaxe", "openblock:stone_pickaxe"] {
-        if let Some(item) = registry.item_id(name) {
-            host.give_item(item, 1);
+            let leftover = host.give_item(item, 1);
+            if leftover > 0 {
+                log::warn!("screenshot items: {name} did not fit");
+            }
         }
     }
     let slot_of = |host: &Host, name: &str| {
@@ -572,25 +1233,47 @@ fn seed_screenshot_items(host: &mut Host, registry: &Registry) {
             .iter()
             .position(|stack| stack.is_some_and(|stack| stack.item == item))
     };
-    let wood_slot = slot_of(host, "openblock:wooden_pickaxe");
-    let stone_slot = slot_of(host, "openblock:stone_pickaxe");
-    let leaves = registry.id_or_air("openblock:leaves");
-    if leaves != BlockId::AIR {
-        if let Some(slot) = wood_slot {
-            wear_tool_on_leaves(host, leaves, slot, 7);
-        }
-        if let Some(slot) = stone_slot {
-            wear_tool_on_leaves(host, leaves, slot, 13);
+    let mut equipped = 0usize;
+    for name in armor_names {
+        let Some(slot) = slot_of(host, name) else {
+            continue;
+        };
+        if host.equip_armor(slot) {
+            equipped += 1;
         }
     }
-    host.set_hotbar_selection(stone_slot.unwrap_or(0));
     log::info!(
-        "screenshot items: selected slot {} held {:?}",
+        "screenshot armor: {} equipped pieces, defence {}",
+        equipped,
+        host.armor_defense()
+    );
+    for (name, count) in [
+        ("openblock:iron_pickaxe", 1_u8),
+        ("openblock:iron_sword", 1),
+        ("openblock:cooked_beef", 3),
+        ("openblock:coal", 8),
+        ("openblock:iron_ingot", 8),
+        ("openblock:planks", 16),
+        ("openblock:stick", 8),
+        ("openblock:cobblestone", 16),
+    ] {
+        if let Some(item) = registry.item_id(name) {
+            let leftover = host.give_item(item, count);
+            if leftover > 0 {
+                log::warn!("screenshot items: {name} x{leftover} did not fit");
+            }
+        }
+    }
+    let iron_slot = slot_of(host, "openblock:iron_pickaxe");
+    host.set_hotbar_selection(iron_slot.unwrap_or(0));
+    log::info!(
+        "screenshot items: selected slot {} held {:?}, armor {:?}",
         host.hotbar_selection(),
-        host.selected_stack()
+        host.selected_stack(),
+        host.equipment(),
     );
     // A few deterministic dropped-item entities in front of the player show
-    // the entity renderer in the HUD screenshots.
+    // the entity renderer and the new item tints in the HUD screenshots.
     let eye = host.player().eye();
     let forward = host.player().forward();
     let base = WorldVec::new(
@@ -599,9 +1282,9 @@ fn seed_screenshot_items(host: &mut Host, registry: &Registry) {
         eye.z + forward[2] * 3.0,
     );
     for (index, (name, count)) in [
-        ("openblock:planks", 2_u8),
-        ("openblock:stick", 1),
-        ("openblock:stone_pickaxe", 1),
+        ("openblock:coal", 2_u8),
+        ("openblock:iron_ingot", 1),
+        ("openblock:cooked_beef", 1),
     ]
     .into_iter()
     .enumerate()
@@ -618,52 +1301,257 @@ fn seed_screenshot_items(host: &mut Host, registry: &Registry) {
     player.dead = false;
 }
 
-/// Wears one durability point per successful leaf break without leaving a hole.
-fn wear_tool_on_leaves(host: &mut Host, leaves: BlockId, slot: usize, breaks: usize) {
-    if breaks == 0 {
+/// Aims the player camera at a world-space point (demo screenshots only).
+fn aim_player_at(host: &mut Host, target: WorldVec) {
+    let eye = host.player().eye();
+    let direction = (target - eye).normalize_or_zero();
+    if direction.length_squared() <= f64::EPSILON {
         return;
     }
-    let saved_yaw = host.player().yaw;
-    let saved_pitch = host.player().pitch;
-    {
-        let player = host.player_mut();
-        player.yaw = 0.0;
-        player.pitch = -1.5533;
-    }
-    let eye = host.player().eye();
-    let forward = host.player().forward();
-    let target = host
-        .world()
-        .raycast(eye, forward, REACH)
-        .map(|hit| hit.block)
-        .or_else(|| {
-            Some(BlockPos::new(
-                eye.x.floor() as i32,
-                (eye.y - 1.0).floor() as i32,
-                eye.z.floor() as i32,
-            ))
-        });
-    if let Some(pos) = target {
-        let original = host.world().get_block(pos);
-        host.set_hotbar_selection(slot);
-        for _ in 0..breaks {
-            host.world_mut().set_block(pos, leaves);
-            let action = BlockAction {
-                break_block: true,
-                place_block: false,
-                place: BlockId::AIR,
-            };
-            if !host.apply_action_with_outcome(&action).changed {
-                break;
+    let yaw = (-direction.x).atan2(-direction.z) as f32;
+    let pitch = direction.y.clamp(-1.0, 1.0).asin() as f32;
+    let player = host.player_mut();
+    player.yaw = yaw;
+    player.pitch = pitch;
+}
+
+/// Spawns a fan of passive and hostile mobs in front of the screenshot player.
+fn seed_screenshot_mobs(host: &mut Host, registry: &Registry) -> usize {
+    let _ = host.ensure_streaming(SCREENSHOT_STREAM_BUDGET);
+    let player = host.player().clone();
+    // Spawn the fan south of the player and look south so the camera sees the
+    // mobs' fronts (their yaw zero faces -Z) instead of their backs.
+    let forward = WorldVec::new(0.0, 0.0, 1.0);
+    let right = WorldVec::new(-1.0, 0.0, 0.0);
+    // Close enough that the upper bodies clear the F3 panel, with a slight
+    // rightward camera offset so the tall zombie is not hidden by the overlay.
+    let specs = [
+        (ob_content::MobKind::Cow, 4.8_f64, -1.0_f64),
+        (ob_content::MobKind::Pig, 4.6, -0.4),
+        (ob_content::MobKind::Sheep, 5.2, 0.3),
+        (ob_content::MobKind::Chicken, 4.2, 0.9),
+        (ob_content::MobKind::Zombie, 5.6, 1.6),
+        (ob_content::MobKind::Cow, 6.2, 2.3),
+    ];
+    let mut spawned = Vec::new();
+    for (kind, distance, side) in specs {
+        'placement: for dy in [0.0_f64, 0.05, 0.25, 0.5, -0.05] {
+            for extra in [0.0_f64, 0.8, -0.8, 1.6] {
+                let pos = WorldVec::new(
+                    player.pos.x + forward.x * (distance + extra) + right.x * side,
+                    player.pos.y + dy,
+                    player.pos.z + forward.z * (distance + extra) + right.z * side,
+                );
+                if host.spawn_mob(kind, pos).is_some() {
+                    spawned.push(pos);
+                    break 'placement;
+                }
             }
         }
-        if original != BlockId::AIR {
-            host.world_mut().set_block(pos, original);
+    }
+    if !spawned.is_empty() {
+        let mut centre = WorldVec::ZERO;
+        for pos in &spawned {
+            centre += *pos;
+        }
+        centre /= spawned.len() as f64;
+        aim_player_at(host, centre + WorldVec::new(0.0, 0.9, 0.0));
+        let player = host.player_mut();
+        // Nearly horizontal view puts feet and bodies below the F3 panel, and
+        // the yaw offset moves the group clear of its right edge.
+        player.pitch = -0.03;
+        // Put the whole group to the right of the wide F3 panel.
+        player.yaw += 0.5;
+    }
+    log::info!(
+        "mob screenshot: spawned {} of {} requested avatars around {:?}",
+        spawned.len(),
+        specs.len(),
+        player.pos,
+    );
+    if host.mob_count() != spawned.len() {
+        log::warn!(
+            "mob screenshot: {} mobs live after spawning {} demo mobs",
+            host.mob_count(),
+            spawned.len()
+        );
+    }
+    let _ = registry;
+    host.mob_count()
+}
+
+/// Places a furnace/chest block in front of the player through the normal
+/// survival placement path, so the host registers the block entity.
+fn seed_screenshot_container(host: &mut Host, registry: &Registry, block_name: &str) -> Option<BlockPos> {
+    let block = registry.id_or_air(block_name);
+    if block == BlockId::AIR {
+        log::warn!("screenshot container: {block_name} is not in the registry");
+        return None;
+    }
+    let item = registry.item_for_block(block)?;
+    let mut last_target = None;
+    for pitch in [-0.55_f32, -0.35, -0.75, -0.9, -0.2] {
+        {
+            let player = host.player_mut();
+            player.pitch = pitch;
+        }
+        let player = host.player();
+        let Some(hit) = host.world().raycast(player.eye(), player.forward(), REACH) else {
+            continue;
+        };
+        let target = hit.block.offset(hit.normal.x, hit.normal.y, hit.normal.z);
+        if host.world().get_block(target) != BlockId::AIR {
+            continue;
+        }
+        // Keep the placed block out of the player's own collision box.
+        let dx = f64::from(target.x) + 0.5 - player.pos.x;
+        let dz = f64::from(target.z) + 0.5 - player.pos.z;
+        if dx * dx + dz * dz < 1.44 {
+            continue;
+        }
+        last_target = Some(target);
+        if host.give_item(item, 2) > 0 {
+            log::warn!("screenshot container: {block_name} did not fit in the hotbar");
+        }
+        let Some(slot) = host
+            .inventory()
+            .iter()
+            .position(|stack| stack.is_some_and(|stack| stack.item == item))
+        else {
+            continue;
+        };
+        host.set_hotbar_selection(slot);
+        let action = BlockAction {
+            break_block: false,
+            place_block: true,
+            place: block,
+        };
+        let outcome = host.apply_action_with_outcome(&action);
+        if host.world().get_block(target) == block {
+            log::info!(
+                "screenshot container: placed {} at {:?} (action changed {})",
+                block_name,
+                target,
+                outcome.changed
+            );
+            aim_player_at(
+                host,
+                WorldVec::new(
+                    f64::from(target.x) + 0.5,
+                    f64::from(target.y) + 0.5,
+                    f64::from(target.z) + 0.5,
+                ),
+            );
+            return Some(target);
+        }
+        log::warn!("screenshot container: placement action did not fill {target:?}");
+    }
+    let _ = last_target;
+    None
+}
+
+/// Fills a screenshot furnace with a representative in-progress smelt.
+fn seed_screenshot_furnace(host: &mut Host, registry: &Registry, pos: BlockPos) {
+    let input = registry
+        .item_id("openblock:raw_iron")
+        .and_then(|item| host.make_stack(item, 3));
+    let fuel = registry
+        .item_id("openblock:coal")
+        .and_then(|item| host.make_stack(item, 8));
+    if let Some(stack) = input {
+        let replaced = host.put_furnace_slot(pos, FurnaceSlot::Input, stack);
+        log::info!("furnace seed: input {:?}, replaced {:?}", stack, replaced);
+    }
+    if let Some(stack) = fuel {
+        let replaced = host.put_furnace_slot(pos, FurnaceSlot::Fuel, stack);
+        log::info!("furnace seed: fuel {:?}, replaced {:?}", stack, replaced);
+    }
+    let output = registry
+        .item_id("openblock:iron_ingot")
+        .and_then(|item| host.make_stack(item, 2));
+    if let Some(state) = host.furnace_at_mut(pos) {
+        state.burn_remaining = 800;
+        state.burn_total = 1600;
+        state.cook_progress = 120;
+        // The output is take-only through the slot API; seed it directly for
+        // the demo so the screenshot shows a finished item.
+        state.output = output;
+        log::info!(
+            "furnace seed: lit {} burn {}/{} cook {}/200",
+            state.is_lit(),
+            state.burn_remaining,
+            state.burn_total,
+            state.cook_progress
+        );
+    }
+}
+
+/// Fills all 27 screenshot chest slots with a deterministic variety of items.
+fn seed_screenshot_chest(host: &mut Host, registry: &Registry, pos: BlockPos) {
+    let entries = [
+        ("openblock:cobblestone", 64_u8),
+        ("openblock:planks", 32),
+        ("openblock:coal", 16),
+        ("openblock:iron_ingot", 8),
+        ("openblock:raw_iron", 12),
+        ("openblock:raw_copper", 9),
+        ("openblock:stick", 24),
+        ("openblock:apple", 5),
+        ("openblock:cooked_beef", 3),
+        ("openblock:leather", 6),
+        ("openblock:iron_pickaxe", 1),
+        ("openblock:stone_sword", 1),
+        ("openblock:iron_helmet", 1),
+        ("openblock:iron_chestplate", 1),
+        ("openblock:iron_leggings", 1),
+        ("openblock:iron_boots", 1),
+        ("openblock:furnace", 1),
+        ("openblock:chest", 1),
+        ("openblock:crafting_table", 1),
+        ("openblock:stone", 64),
+        ("openblock:dirt", 64),
+        ("openblock:sand", 48),
+        ("openblock:gravel", 40),
+        ("openblock:snow", 32),
+        ("openblock:log", 24),
+        ("openblock:clay", 16),
+        ("openblock:leaves", 8),
+    ];
+    let pickaxe = registry.item_id("openblock:iron_pickaxe");
+    let mut filled = 0usize;
+    for slot in 0..CHEST_SLOTS {
+        let (name, count) = entries[slot % entries.len()];
+        let Some(stack) = registry.item_id(name).and_then(|item| host.make_stack(item, count)) else {
+            continue;
+        };
+        let stack = if Some(stack.item) == pickaxe {
+            stack.with_durability(Some(117))
+        } else {
+            stack
+        };
+        let _ = host.put_chest_slot(pos, slot, stack);
+        if host.chest_at(pos).is_some_and(|state| state.slots[slot].is_some()) {
+            filled += 1;
         }
     }
-    let player = host.player_mut();
-    player.yaw = saved_yaw;
-    player.pitch = saved_pitch;
+    log::info!("chest seed: filled {} of {} slots at {:?}", filled, CHEST_SLOTS, pos);
+}
+
+/// Snapshot used by container drawing and click decisions.
+fn container_snapshot(host: &Host, kind: ContainerKind, pos: BlockPos) -> ContainerSnapshot {
+    let mut snapshot = ContainerSnapshot {
+        inventory: *host.inventory(),
+        ..ContainerSnapshot::default()
+    };
+    match kind {
+        ContainerKind::Furnace => {
+            snapshot.furnace = host.furnace_at(pos).cloned();
+        }
+        ContainerKind::Chest => {
+            snapshot.chest = host.chest_at(pos).map_or([None; CHEST_SLOTS], |state| state.slots);
+        }
+    }
+    snapshot
 }
 
 /// Places a hidden crafting table below the screenshot player so the 3x3
@@ -681,13 +1569,27 @@ fn seed_near_crafting_table(host: &mut Host, registry: &Registry) {
 /// Builds the renderer instance for one dropped item entity.
 ///
 /// Block items sample the block's top texture layer (matching the mesher/HUD
-/// mapping), while non-block items use a flat tint: red apple, wood-brown
-/// stick, brown wooden tools and grey stone tools. Position adds the requested
-/// 0.15 m bob and the yaw spins deterministically with time and entity id.
+/// mapping), while non-block items use the representative icon tint from
+/// [`inventory::item_tint_for`]. Position adds the requested 0.15 m bob and the
+/// yaw spins deterministically with time and entity id.
 pub fn entity_instance_for(entity: &ItemEntity, registry: &Registry, elapsed: f32) -> EntityInstance {
-    let position = [entity.pos.x as f32, entity.pos.y as f32 + 0.15, entity.pos.z as f32];
-    let yaw = elapsed * 1.8 + entity.id as f32 * 0.7;
-    let stack = entity.stack;
+    item_entity_instance(entity.id, entity.pos, entity.stack, registry, elapsed)
+}
+
+/// Builds the renderer instance for one replicated dropped item.
+///
+/// This is the network counterpart of [`entity_instance_for`]: the client
+/// only knows the opaque wire id, the interpolated base position and the
+/// authoritative stack, so velocity and age are not needed for presentation.
+pub fn item_entity_instance(
+    id: u64,
+    pos: WorldVec,
+    stack: ItemStack,
+    registry: &Registry,
+    elapsed: f32,
+) -> EntityInstance {
+    let position = [pos.x as f32, pos.y as f32 + 0.15, pos.z as f32];
+    let yaw = elapsed * 1.8 + id as f32 * 0.7;
     if stack.item.0 as usize >= registry.item_len() {
         return EntityInstance {
             position,
@@ -723,24 +1625,7 @@ pub fn entity_instance_for(entity: &ItemEntity, registry: &Registry, elapsed: f3
 
 /// Flat colour used when a non-block dropped item is rendered as a cube.
 fn entity_item_tint(registry: &Registry, item: ob_content::ItemId) -> [f32; 3] {
-    if item.0 as usize >= registry.item_len() {
-        return [0.80, 0.80, 0.80];
-    }
-    let item_type = registry.item(item);
-    if item_type.id == "openblock:apple" {
-        return [0.78, 0.16, 0.12];
-    }
-    if item_type.id == "openblock:stick" {
-        return [0.55, 0.36, 0.18];
-    }
-    if let Some(spec) = item_type.tool {
-        return if spec.tier <= 1 {
-            [0.62, 0.43, 0.22]
-        } else {
-            [0.55, 0.56, 0.58]
-        };
-    }
-    [0.80, 0.80, 0.80]
+    inventory::item_tint_for(registry, item).unwrap_or([0.80, 0.80, 0.80])
 }
 
 /// Maps every dropped entity to a renderer instance, preserving host order.
@@ -767,6 +1652,7 @@ fn draw_vitals_for_mode(frame: &mut UiFrame, _ui: &UiState, host: &Host, screen:
     if host.game_mode() == HostGameMode::Survival {
         let player = host.player();
         ui_state::draw_vitals(frame, screen, player.health, player.hunger);
+        ui_state::draw_armor(frame, screen, host.armor_defense());
     }
 }
 
@@ -777,7 +1663,7 @@ fn draw_selected_name(frame: &mut UiFrame, ui: &UiState, registry: &Registry, ho
     }
     let label = if host.game_mode() == HostGameMode::Survival {
         host.selected_stack()
-            .map(|stack| inventory::display_name(registry.item(stack.item).id))
+            .map(|stack| inventory::item_display_name(registry, stack.item))
     } else {
         ui.hotbar_block(registry, ui.hotbar_selected)
             .map(|block| inventory::display_name(block.id))
@@ -890,13 +1776,127 @@ struct GameState {
     window_size: (f32, f32),
     debug_stats: DebugStats,
     screenshot_requested: bool,
+    /// Audio engine, or `None` when silenced/unavailable.
+    audio: Option<AudioEngine>,
+    /// One-line status shown by F3 and the Audio settings tab.
+    audio_status: String,
+    /// Last health value observed for hurt/death sound edges.
+    last_audio_health: f32,
+    /// Horizontal ground distance accumulated for the next footstep.
+    footstep_distance: f64,
+    /// Water state from the previous frame (splash edge detection).
+    was_in_water: bool,
+    /// Saved `audio_enabled` when `--mute` overrode it for this run.
+    audio_enabled_before_mute: Option<bool>,
+    /// Whether the user changed the Sound row after a `--mute` launch.
+    audio_setting_touched: bool,
+    /// Open furnace/chest screen state, if any.
+    container: Option<ContainerSession>,
+    /// Per-mob tick interpolation cache for smooth avatar movement.
+    mob_render: MobRenderCache,
+    /// Earliest instant the next melee attack is allowed.
+    attack_ready: Option<Instant>,
+    /// Decaying camera pitch offset after taking damage.
+    camera_shake: f32,
 }
 
 impl GameState {
     fn persist_settings(&self) {
-        if let Err(err) = save_settings(&self.data_dir, &self.ui.settings) {
+        let mut settings = self.ui.settings.clone();
+        if let Some(saved) = self.audio_enabled_before_mute
+            && !self.audio_setting_touched
+        {
+            // `--mute` is a run-only override until the player actually edits
+            // the Sound row.
+            settings.audio_enabled = saved;
+        }
+        if let Err(err) = save_settings(&self.data_dir, &settings) {
             log::warn!("could not save settings: {err}");
         }
+    }
+
+    /// Pushes the persisted audio settings into the live engine.
+    fn sync_audio_settings(&mut self) {
+        if let Some(engine) = &mut self.audio {
+            apply_audio_settings(engine, &self.ui.settings);
+        }
+    }
+
+    /// Plays a quiet UI tick or confirmation chime.
+    fn play_ui_sound(&mut self, confirm: bool) {
+        if let Some(engine) = &mut self.audio {
+            engine.play_sfx(if confirm {
+                AudioSfx::UiConfirm
+            } else {
+                AudioSfx::UiClick
+            });
+        }
+    }
+
+    /// Plays a block event at the target position, with distance attenuation
+    /// and a yaw-relative pan. Sound is advisory: a missing engine is a no-op.
+    fn play_block_sfx(&mut self, sfx: AudioSfx, position: BlockPos) {
+        if self.audio.is_none() {
+            return;
+        }
+        let player = self.host.player();
+        let eye = player.eye();
+        let dx = position.x as f64 + 0.5 - eye.x;
+        let dz = position.z as f64 + 0.5 - eye.z;
+        let distance = (dx * dx + dz * dz).sqrt();
+        let gain = (1.0 - distance / 24.0).clamp(0.0, 1.0) as f32;
+        if gain <= 0.0 {
+            return;
+        }
+        let right = dx * f64::from(player.yaw).cos() - dz * f64::from(player.yaw).sin();
+        let pan = if distance > 0.25 {
+            (right / distance * 0.8).clamp(-1.0, 1.0) as f32
+        } else {
+            0.0
+        };
+        if let Some(engine) = &mut self.audio {
+            engine.play_sfx_at(sfx, gain, Some(pan));
+        }
+    }
+
+    /// Updates footstep, splash, hurt and listener state for this frame.
+    fn update_audio_state(&mut self, dt: f32) {
+        let playing = self.ui.screen == Screen::Playing && !self.host.is_dead();
+        let survival = self.host.game_mode() == HostGameMode::Survival;
+        let player = self.host.player();
+        let health = player.health;
+        let on_ground = playing && player.on_ground && !player.flying;
+        let feet = BlockPos::new(
+            player.pos.x.floor() as i32,
+            player.pos.y.floor() as i32,
+            player.pos.z.floor() as i32,
+        );
+        let below = BlockPos::new(feet.x, (player.pos.y - 0.1).floor() as i32, feet.z);
+        let below_block = self.host.world().get_block(below);
+        let material = audio_material_for(&self.registry, below_block).unwrap_or(AudioMaterial::Grass);
+        let in_water = player_in_water(&self.host, &self.registry);
+        let distance = std::mem::take(&mut self.footstep_distance) as f32;
+        let yaw = player.yaw;
+        let listener_eye = player.eye();
+        let listener = [listener_eye.x as f32, listener_eye.y as f32, listener_eye.z as f32];
+
+        if let Some(engine) = &mut self.audio {
+            engine.tick(dt);
+            engine.set_listener(listener, yaw);
+            if playing && in_water && !self.was_in_water {
+                engine.play_sfx(AudioSfx::Splash);
+            }
+            engine.update_footsteps(
+                if playing && !in_water { distance } else { 0.0 },
+                material,
+                on_ground && !in_water,
+            );
+            if survival && playing && health + 0.01 < self.last_audio_health {
+                engine.play_sfx(AudioSfx::Hurt);
+            }
+        }
+        self.was_in_water = in_water;
+        self.last_audio_health = health;
     }
 
     fn window_screen(&self) -> [f32; 2] {
@@ -939,6 +1939,7 @@ impl GameState {
                 // settings.
                 self.close_crafting();
             }
+            Screen::Furnace | Screen::Chest => self.close_container(),
             Screen::Settings => {
                 self.ui.close_settings();
                 self.capture_pointer();
@@ -946,6 +1947,11 @@ impl GameState {
             Screen::Death => {
                 // Focus the buttons instead of opening settings.
                 self.ui.focus_death_buttons();
+            }
+            Screen::Connecting => {
+                // The single-player client never connects; keep the pointer
+                // released if this screen is ever forced externally.
+                self.release_pointer();
             }
         }
         self.persist_settings();
@@ -958,9 +1964,17 @@ impl GameState {
         }
         self.cancel_mining();
         self.keys = [false; 8];
+        if self.ui.container_open() {
+            self.flush_container_cursor();
+            self.container = None;
+        }
         self.ui.open_death();
+        self.ui.death_cause = Some("Cause: lost all health".to_string());
         self.release_pointer();
         self.damage_flash.observe(self.host.player().health);
+        if let Some(engine) = &mut self.audio {
+            engine.play_sfx(AudioSfx::Death);
+        }
     }
 
     /// Respawn action from the death screen.
@@ -977,6 +1991,13 @@ impl GameState {
         self.current_eye = player.eye();
         self.accumulator = Duration::ZERO;
         self.damage_flash.reset();
+        self.camera_shake = 0.0;
+        self.attack_ready = None;
+        self.container = None;
+        self.mob_render.sync(self.host.mobs(), 0.0);
+        self.last_audio_health = self.host.player().health;
+        self.footstep_distance = 0.0;
+        self.was_in_water = player_in_water(&self.host, &self.registry);
         self.capture_pointer();
         self.update_title();
     }
@@ -1014,6 +2035,8 @@ impl GameState {
             self.damage_flash.observe(self.host.player().health);
         }
         log::info!("game mode: {}", mode.name());
+        self.last_audio_health = self.host.player().health;
+        self.footstep_distance = 0.0;
         self.update_title();
     }
 
@@ -1085,6 +2108,300 @@ impl GameState {
         }
     }
 
+    /// Opens a furnace or chest modal screen for the authoritative block
+    /// entity at `pos`.
+    fn open_container(&mut self, kind: ContainerKind, pos: BlockPos) {
+        if self.ui.screen != Screen::Playing || self.host.is_dead() {
+            return;
+        }
+        let exists = match kind {
+            ContainerKind::Furnace => self.host.furnace_at(pos).is_some(),
+            ContainerKind::Chest => self.host.chest_at(pos).is_some(),
+        };
+        if !exists {
+            self.ui.toasts.push_warning("That container is no longer there");
+            return;
+        }
+        self.cancel_mining();
+        self.keys = [false; 8];
+        self.container = Some(ContainerSession::new(kind, pos));
+        match kind {
+            ContainerKind::Furnace => self.ui.open_furnace(),
+            ContainerKind::Chest => self.ui.open_chest(),
+        }
+        self.release_pointer();
+    }
+
+    /// Closes the open container, returning any cursor stack to the inventory.
+    fn close_container(&mut self) {
+        self.flush_container_cursor();
+        self.container = None;
+        self.ui.close_container();
+        self.capture_pointer();
+    }
+
+    /// Verifies that the open container still exists; closes it otherwise.
+    ///
+    /// Breaking the block is handled explicitly in [`GameState::break_block`],
+    /// but a host edit from any other path must not leave a stale modal open.
+    fn validate_container(&mut self) {
+        let Some(session) = &self.container else {
+            return;
+        };
+        let exists = match session.kind {
+            ContainerKind::Furnace => self.host.furnace_at(session.pos).is_some(),
+            ContainerKind::Chest => self.host.chest_at(session.pos).is_some(),
+        };
+        if !exists {
+            self.flush_container_cursor();
+            self.container = None;
+            self.ui.close_container();
+            self.capture_pointer();
+            self.ui.toasts.push_warning("The container was removed");
+        }
+    }
+
+    /// Read-only snapshot backing container drawing and click decisions.
+    fn container_snapshot(&self) -> ContainerSnapshot {
+        match &self.container {
+            Some(session) => container_snapshot(&self.host, session.kind, session.pos),
+            None => ContainerSnapshot::default(),
+        }
+    }
+
+    /// Puts the cursor stack back into the inventory, dropping it when the
+    /// count-based API would silently repair a damaged tool or armor piece.
+    fn deposit_cursor_stack(&mut self, stack: ItemStack, context: &str) {
+        if stack.count == 0 {
+            return;
+        }
+        let item = stack.item;
+        if item.0 as usize >= self.registry.item_len() {
+            return;
+        }
+        let max_durability = self
+            .registry
+            .item(item)
+            .tool
+            .map(|spec| spec.durability)
+            .or_else(|| self.registry.item(item).armor.map(|spec| spec.durability));
+        let damaged = stack
+            .durability
+            .zip(max_durability)
+            .is_some_and(|(remaining, max)| remaining < max);
+        let name = inventory::item_display_name(&self.registry, item);
+        if damaged {
+            self.drop_cursor_stack(stack);
+            self.ui
+                .toasts
+                .push_warning(format!("Dropped {name} to keep its durability"));
+            return;
+        }
+        let leftover = self.host.give_item(item, stack.count);
+        if leftover > 0 {
+            let mut rest = stack;
+            rest.count = leftover;
+            self.drop_cursor_stack(rest);
+            self.ui
+                .toasts
+                .push_warning(format!("Inventory full - dropped {name} x{leftover}"));
+        }
+        let _ = context;
+    }
+
+    /// Spawns a dropped item entity at the player's feet.
+    fn drop_cursor_stack(&mut self, stack: ItemStack) {
+        let pos = self.host.player().pos;
+        self.host
+            .spawn_item_entity(WorldVec::new(pos.x, pos.y + 0.4, pos.z), stack);
+    }
+
+    /// Returns the cursor stack to the inventory and clears it.
+    fn flush_container_cursor(&mut self) {
+        let Some(session) = &mut self.container else {
+            return;
+        };
+        if let Some(stack) = session.cursor.take() {
+            self.deposit_cursor_stack(stack, "container close");
+        }
+    }
+
+    /// Removes `count` items from a hotbar slot through the selected-slot
+    /// consume API, restoring the previous selection.
+    ///
+    /// The interim host exposes no general "take from inventory" call; this is
+    /// the only public route that removes an exact stack while preserving its
+    /// durability. It is survival-only, so creative containers keep the
+    /// cursor/deposit direction only.
+    fn take_hotbar_stack(&mut self, slot: usize, count: u8) -> Option<ItemStack> {
+        if self.host.game_mode() != HostGameMode::Survival || count == 0 {
+            return None;
+        }
+        let source = self.host.inventory().get(slot).copied().flatten()?;
+        if source.count < count {
+            return None;
+        }
+        let previous = self.host.hotbar_selection();
+        self.host.set_hotbar_selection(slot);
+        let consumed = self.host.consume_selected(count);
+        self.host.set_hotbar_selection(previous);
+        if !consumed {
+            return None;
+        }
+        let mut stack = source;
+        stack.count = count;
+        Some(stack)
+    }
+
+    /// Applies one container click to the authoritative host.
+    fn apply_container_action(&mut self, action: ContainerAction) -> bool {
+        match action {
+            ContainerAction::TakeFurnace { pos, slot, count } => {
+                if self.host.furnace_at(pos).is_none() {
+                    return false;
+                }
+                let Some(mut whole) = self.host.take_furnace_slot(pos, slot) else {
+                    return false;
+                };
+                if count < whole.count {
+                    if slot == FurnaceSlot::Output {
+                        // The output slot has no writable host API; restore the
+                        // whole stack rather than silently overfilling the
+                        // cursor. Normal clicks never request a partial output.
+                        if let Some(state) = self.host.furnace_at_mut(pos) {
+                            state.output = Some(whole);
+                        }
+                        return false;
+                    }
+                    let remainder = whole.count - count;
+                    whole.count = remainder;
+                    // A successful put returns the previous slot content, which
+                    // is `None` here because the whole stack was just taken.
+                    let _ = self.host.put_furnace_slot(pos, slot, whole);
+                }
+                true
+            }
+            ContainerAction::PutFurnace { pos, slot, stack } => {
+                if slot == FurnaceSlot::Output || self.host.furnace_at(pos).is_none() {
+                    return false;
+                }
+                let _ = self.host.put_furnace_slot(pos, slot, stack);
+                true
+            }
+            ContainerAction::TakeChest { pos, slot, count } => {
+                if self.host.chest_at(pos).is_none() {
+                    return false;
+                }
+                let Some(mut whole) = self.host.take_chest_slot(pos, slot) else {
+                    return false;
+                };
+                if count < whole.count {
+                    let remainder = whole.count - count;
+                    whole.count = remainder;
+                    let _ = self.host.put_chest_slot(pos, slot, whole);
+                }
+                true
+            }
+            ContainerAction::PutChest { pos, slot, stack } => {
+                if self.host.chest_at(pos).is_none() {
+                    return false;
+                }
+                let _ = self.host.put_chest_slot(pos, slot, stack);
+                true
+            }
+            ContainerAction::TakeHotbar { slot, count } => self.take_hotbar_stack(slot, count).is_some(),
+            ContainerAction::GiveInventory { stack } => {
+                self.deposit_cursor_stack(stack, "container click");
+                true
+            }
+        }
+    }
+
+    /// Handles a left/right click on the currently hovered container slot.
+    ///
+    /// A click outside every slot returns the cursor stack to the inventory,
+    /// matching the documented close behaviour.
+    fn container_click(&mut self, button: ClickButton) {
+        if !self.ui.container_open() {
+            return;
+        }
+        let Some(session) = self.container.clone() else {
+            return;
+        };
+        let layout = session.layout(self.window_screen());
+        let Some(slot) = layout.hit_test(self.ui.cursor.0, self.ui.cursor.1) else {
+            self.flush_container_cursor();
+            return;
+        };
+        let view = self.container_snapshot();
+        let outcome = session.click(&self.registry, &view, slot, button);
+        if let Some(message) = outcome.message {
+            self.ui.toasts.push(message);
+            self.play_ui_sound(false);
+            return;
+        }
+        let Some(action) = outcome.action else {
+            return;
+        };
+        if matches!(action, ContainerAction::TakeHotbar { .. }) && self.host.game_mode() != HostGameMode::Survival {
+            self.ui
+                .toasts
+                .push_warning("Taking from the hotbar needs survival mode");
+            return;
+        }
+        if self.apply_container_action(action) {
+            if let Some(session) = &mut self.container {
+                session.cursor = outcome.cursor_after;
+            }
+            self.play_ui_sound(false);
+        } else {
+            self.ui.toasts.push_warning("That slot cannot accept the item");
+        }
+    }
+
+    /// Activates the keyboard-selected container slot.
+    fn activate_container_slot(&mut self) {
+        let Some(session) = &self.container else {
+            return;
+        };
+        let slot = session.selected;
+        let layout = session.layout(self.window_screen());
+        if layout.slot_rect(slot).is_none() {
+            return;
+        }
+        let view = self.container_snapshot();
+        let outcome = session.click(&self.registry, &view, slot, ClickButton::Left);
+        if let Some(message) = outcome.message {
+            self.ui.toasts.push(message);
+            return;
+        }
+        let Some(action) = outcome.action else {
+            return;
+        };
+        if matches!(action, ContainerAction::TakeHotbar { .. }) && self.host.game_mode() != HostGameMode::Survival {
+            self.ui
+                .toasts
+                .push_warning("Taking from the hotbar needs survival mode");
+            return;
+        }
+        if self.apply_container_action(action) {
+            if let Some(session) = &mut self.container {
+                session.cursor = outcome.cursor_after;
+            }
+            self.play_ui_sound(true);
+        }
+    }
+
+    /// Moves container focus with the arrow keys.
+    fn move_container_selection(&mut self, dx: i32, dy: i32) {
+        let screen = self.window_screen();
+        let Some(session) = &mut self.container else {
+            return;
+        };
+        let layout = session.layout(screen);
+        session.selected = containers::move_selection(&layout, session.selected, dx, dy);
+    }
+
     /// Sends the selected recipe to the authoritative host and reports the
     /// outcome in the HUD toast queue.
     fn craft_selected(&mut self) {
@@ -1099,6 +2416,95 @@ impl GameState {
             // Failure messages are normal info text (`inventory full`,
             // `needs a crafting table`, `need 2 more planks`).
             self.ui.toasts.push(outcome.message);
+        }
+        if let Some(engine) = &mut self.audio {
+            engine.play_sfx(if outcome.crafted {
+                AudioSfx::Craft
+            } else {
+                AudioSfx::CraftFail
+            });
+        }
+        self.update_title();
+    }
+
+    /// Plays a world sound at `position` with distance attenuation and pan.
+    fn play_world_sfx(&mut self, sfx: AudioSfx, position: WorldVec, gain_scale: f32) {
+        if self.audio.is_none() {
+            return;
+        }
+        let player = self.host.player();
+        let eye = player.eye();
+        let dx = position.x - eye.x;
+        let dz = position.z - eye.z;
+        let distance = (dx * dx + dz * dz).sqrt();
+        let gain = ((1.0 - distance / 24.0).clamp(0.0, 1.0) as f32) * gain_scale.clamp(0.0, 1.0);
+        if gain <= 0.0 {
+            return;
+        }
+        let right = dx * f64::from(player.yaw).cos() - dz * f64::from(player.yaw).sin();
+        let pan = if distance > 0.25 {
+            (right / distance * 0.8).clamp(-1.0, 1.0) as f32
+        } else {
+            0.0
+        };
+        if let Some(engine) = &mut self.audio {
+            engine.play_sfx_at(sfx, gain, Some(pan));
+        }
+    }
+
+    /// Sends one melee attack to the host, respecting the 0.4 s cooldown.
+    ///
+    /// The crosshair mob is selected by the same AABB raycast the host uses for
+    /// validation. The first-person hit marker and red hurt tint come from the
+    /// server-side hurt timer; the toasts report the damage/kill.
+    fn try_attack_mob(&mut self, id: u64) {
+        if self.host.is_dead() || self.ui.screen != Screen::Playing {
+            return;
+        }
+        if self.attack_ready.is_some_and(|ready| ready > Instant::now()) {
+            return;
+        }
+        let Some(entity) = self.host.mob_entity(id) else {
+            return;
+        };
+        let kind = entity.mob.kind;
+        let position = entity.mob.pos;
+        let name = self.registry.mob(kind).display_name;
+        let outcome = self.host.attack_mob(id);
+        if !outcome.hit {
+            return;
+        }
+        self.attack_ready = Some(Instant::now() + ATTACK_COOLDOWN);
+        self.ui.flash_mob_hit();
+        self.ui
+            .toasts
+            .push(format!("Hit {name} for {:.1}", outcome.damage.max(0.0)));
+        self.play_world_sfx(AudioSfx::Hurt, position, 0.45);
+        if outcome.killed {
+            self.ui.toasts.push_success(format!("Killed {name}"));
+            self.play_world_sfx(AudioSfx::Death, position, 0.35);
+            if !outcome.drops.is_empty() {
+                let drops = outcome
+                    .drops
+                    .iter()
+                    .map(|drop| {
+                        format!(
+                            "{} x{}",
+                            inventory::item_display_name(&self.registry, drop.item),
+                            drop.count
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.ui.toasts.push(format!("Dropped {drops}"));
+            }
+        }
+        if let Some(item) = outcome.tool_broke {
+            let name = inventory::item_display_name(&self.registry, item);
+            self.ui.toasts.push_warning(format!("Your {name} broke!"));
+            self.play_world_sfx(AudioSfx::ToolBreak, position, 1.0);
+            self.mouse_left = false;
+            self.mining.stop();
         }
         self.update_title();
     }
@@ -1118,8 +2524,11 @@ impl GameState {
             if stack.count == 0 || stack.item.0 as usize >= self.registry.item_len() {
                 continue;
             }
-            let name = inventory::display_name(self.registry.item(stack.item).id);
+            let name = inventory::item_display_name(&self.registry, stack.item);
             self.ui.toasts.push(format!("Picked up {name} x{}", stack.count));
+            if let Some(engine) = &mut self.audio {
+                engine.play_sfx(AudioSfx::Pickup);
+            }
         }
     }
 
@@ -1142,6 +2551,13 @@ impl GameState {
                 self.set_active_texture_style(style);
             }
             SettingsRow::TexturePack => self.toggle_texture_pack(),
+            SettingsRow::AudioEnabled => {
+                self.audio_setting_touched = true;
+                self.sync_audio_settings();
+            }
+            SettingsRow::MasterVolume | SettingsRow::SfxVolume | SettingsRow::MusicVolume => {
+                self.sync_audio_settings();
+            }
             SettingsRow::ShowHud
             | SettingsRow::DebugOverlay
             | SettingsRow::Fov
@@ -1320,6 +2736,7 @@ impl GameState {
             held,
             held_durability,
             mining_speed,
+            network: None,
             movement: if player.flying {
                 "fly"
             } else if player.sprinting {
@@ -1329,6 +2746,13 @@ impl GameState {
             } else {
                 "walk"
             },
+            audio: self.audio_status.clone(),
+            mobs_total: self.host.mob_count(),
+            mobs_passive: self.host.passive_mob_count(),
+            mobs_hostile: self.host.hostile_mob_count(),
+            day_phase: self.host.day_phase(),
+            day: self.host.is_day(),
+            defense: self.host.armor_defense(),
         };
     }
 
@@ -1351,6 +2775,7 @@ impl GameState {
             texture_source: self.texture_source.label(),
             texture_resolution: self.renderer.texture_resolution(),
             mesh_workers: self.mesh_scheduler.workers(),
+            audio_status: self.audio_status.clone(),
         }
     }
 
@@ -1360,7 +2785,7 @@ impl GameState {
         let block = if survival {
             self.host
                 .selected_stack()
-                .map(|stack| inventory::display_name(self.registry.item(stack.item).id))
+                .map(|stack| inventory::item_display_name(&self.registry, stack.item))
                 .unwrap_or_else(|| "empty".to_string())
         } else {
             self.ui
@@ -1378,8 +2803,11 @@ impl GameState {
             }
             Screen::Inventory => " | INVENTORY (E/Esc to close)",
             Screen::Crafting => " | CRAFTING (C/Esc to close)",
+            Screen::Furnace => " | FURNACE (E/Esc to close)",
+            Screen::Chest => " | CHEST (E/Esc to close)",
             Screen::Settings => " | SETTINGS (Esc to resume)",
             Screen::Death => " | DEAD (Enter respawn)",
+            Screen::Connecting => " | CONNECTING",
         };
         let movement = if player.flying {
             "fly"
@@ -1592,8 +3020,13 @@ impl GameState {
         input.sneak = self.keys[5];
         input.sprint = self.keys[6];
         self.prev_eye = self.host.player().eye();
+        let before = self.host.player().pos;
         self.host.tick(&input);
+        let after = self.host.player().pos;
         self.current_eye = self.host.player().eye();
+        let dx = after.x - before.x;
+        let dz = after.z - before.z;
+        self.footstep_distance += (dx * dx + dz * dz).sqrt();
         if self.host.tick_count().is_multiple_of(20) {
             self.stream_and_mesh();
         }
@@ -1637,14 +3070,30 @@ impl GameState {
             self.accumulator = Duration::ZERO;
         }
         self.drain_pickup_events();
-        if self.host.game_mode() == HostGameMode::Survival {
-            self.damage_flash.observe(self.host.player().health);
+        self.validate_container();
+        let damaged = if self.host.game_mode() == HostGameMode::Survival {
+            self.damage_flash.observe(self.host.player().health)
         } else {
             self.damage_flash.reset();
+            false
+        };
+        if damaged {
+            self.camera_shake = DAMAGE_SHAKE_RADIANS;
+        }
+        self.camera_shake *= (-dt.as_secs_f32() * 9.0).exp();
+        if self.camera_shake < 0.0002 {
+            self.camera_shake = 0.0;
         }
         self.damage_flash.tick(dt.as_secs_f32());
         self.update_mining(dt);
+        self.update_audio_state(dt.as_secs_f32());
         self.ui.tick(dt.as_secs_f32());
+        let simulation_dt = if self.ui.screen == Screen::Playing && !self.host.is_dead() {
+            dt.as_secs_f32()
+        } else {
+            0.0
+        };
+        self.mob_render.sync(self.host.mobs(), simulation_dt);
         self.rolling_frame_ms.push(dt.as_secs_f32() * 1000.0);
         if self.rolling_frame_ms.len() > 120 {
             self.rolling_frame_ms.drain(..60);
@@ -1652,7 +3101,12 @@ impl GameState {
         let alpha = (self.accumulator.as_secs_f32() / TICK.as_secs_f32()).clamp(0.0, 1.0);
         let eye = self.prev_eye.lerp(self.current_eye, alpha as f64);
         let player = self.host.player();
-        let mut camera = Camera::new(eye, player.yaw, player.pitch);
+        let shake = if self.camera_shake > 0.0 {
+            (self.started.elapsed().as_secs_f32() * 72.0).sin() * self.camera_shake
+        } else {
+            0.0
+        };
+        let mut camera = Camera::new(eye, player.yaw, (player.pitch + shake).clamp(-1.5533, 1.5533));
         // Sprinting slightly widens the FOV; crouching leaves it alone.
         let target_fov = self.ui.settings.fov_degrees * if player.sprinting { 1.10 } else { 1.0 };
         let blend = 1.0 - (-dt.as_secs_f32() * 12.0).exp();
@@ -1668,7 +3122,8 @@ impl GameState {
         let environment = Environment::from_ticks(self.host.tick_count() + DAY_LENGTH_TICKS / 4, DAY_LENGTH_TICKS);
         self.refresh_debug_stats();
         let elapsed = self.started.elapsed().as_secs_f32();
-        let entity_instances = entity_instances_for(self.host.item_entities(), &self.registry, elapsed);
+        let mut entity_instances = entity_instances_for(self.host.item_entities(), &self.registry, elapsed);
+        entity_instances.extend(self.mob_render.instances(&self.registry, alpha));
         self.renderer.set_entities(&entity_instances);
         let ui_frame = self.build_ui_frame();
         let outline = self
@@ -1726,7 +3181,8 @@ impl GameState {
             None
         };
         let elapsed = self.started.elapsed().as_secs_f32();
-        let entities = entity_instances_for(self.host.item_entities(), &self.registry, elapsed);
+        let mut entities = entity_instances_for(self.host.item_entities(), &self.registry, elapsed);
+        entities.extend(mobs::mob_instances(&self.registry, self.host.mobs(), elapsed));
         renderer.set_entities(&entities);
         let scene = SceneParams {
             environment: *environment,
@@ -1755,6 +3211,7 @@ impl GameState {
         let playing = self.ui.screen == Screen::Playing;
         let inventory_open = self.ui.screen == Screen::Inventory;
         let crafting_open = self.ui.screen == Screen::Crafting;
+        let container_open = self.ui.container_open();
         let death_open = self.ui.screen == Screen::Death;
         let survival = self.host.game_mode() == HostGameMode::Survival;
         let show_hotbar = (playing || inventory_open || death_open) && self.ui.hud_visible;
@@ -1767,6 +3224,7 @@ impl GameState {
             && !settings_open
             && !inventory_open
             && !crafting_open
+            && !container_open
             && !death_open
         {
             return None;
@@ -1780,9 +3238,14 @@ impl GameState {
                     &mut frame,
                     &self.ui,
                     &self.registry,
-                    self.host.inventory(),
-                    self.host.hotbar_selection(),
-                    self.host.near_crafting_table(),
+                    &inventory::SurvivalInventoryView {
+                        inventory: self.host.inventory(),
+                        equipment: self.host.equipment(),
+                        defense: self.host.armor_defense(),
+                        selected: self.host.hotbar_selection(),
+                        near_table: self.host.near_crafting_table(),
+                        craft_hint: None,
+                    },
                     screen,
                 );
             } else {
@@ -1800,6 +3263,14 @@ impl GameState {
                 frame.rect(centre_x - 9.0, centre_y - 1.0, 18.0, 2.0, cross);
                 if self.mining.is_mining() {
                     mining::draw_progress(&mut frame, (centre_x, centre_y), self.mining.progress());
+                }
+                if self.ui.hit_marker_seconds > 0.0 {
+                    let alpha = (self.ui.hit_marker_seconds / 0.22).clamp(0.0, 1.0);
+                    let marker = [1.0, 0.42, 0.36, alpha];
+                    for (dx, dy) in [(-14.0, -14.0), (14.0, -14.0), (-14.0, 14.0), (14.0, 14.0)] {
+                        frame.rect(centre_x + dx - 3.0, centre_y + dy - 1.0, 6.0, 2.0, marker);
+                        frame.rect(centre_x + dx - 1.0, centre_y + dy - 3.0, 2.0, 6.0, marker);
+                    }
                 }
                 if self.ui.break_flash_seconds > 0.0
                     && let Some(name) = &self.ui.break_flash
@@ -1852,6 +3323,34 @@ impl GameState {
             }
         }
 
+        // --- Furnace / chest: modal block-entity screens ---
+        if container_open && let Some(session) = &self.container {
+            let view = self.container_snapshot();
+            match session.kind {
+                ContainerKind::Furnace => containers::draw_furnace(
+                    &mut frame,
+                    &self.registry,
+                    session,
+                    self.host.furnace_at(session.pos),
+                    &view,
+                    self.ui.cursor,
+                    screen,
+                ),
+                ContainerKind::Chest => containers::draw_chest(
+                    &mut frame,
+                    &self.registry,
+                    session,
+                    self.host.chest_at(session.pos),
+                    &view,
+                    self.ui.cursor,
+                    screen,
+                ),
+            }
+            if self.ui.hud_visible {
+                ui_state::draw_toasts(&mut frame, &self.ui.toasts, screen);
+            }
+        }
+
         // --- Tabbed settings screen: modal, with the F3 overlay still on top ---
         if settings_open {
             let info = self.settings_info();
@@ -1881,6 +3380,16 @@ impl GameState {
             return;
         }
         let player = self.host.player();
+        // Mobs take priority over blocks: while a mob is under the crosshair,
+        // hold-to-mine is cancelled and each click is a melee attack.
+        let mob_target = self
+            .host
+            .mob_hit_by_ray(player.eye(), player.forward(), MOB_ATTACK_REACH);
+        if let Some(id) = mob_target {
+            self.mining.stop();
+            self.try_attack_mob(id);
+            return;
+        }
         let current = self
             .host
             .world()
@@ -1919,12 +3428,16 @@ impl GameState {
 
     /// Sends one break action for the completed mining target.
     fn break_block(&mut self, pos: BlockPos) {
-        let name = {
-            let block = self.registry.block(self.host.world().get_block(pos));
+        let (name, break_sfx) = {
+            let block_id = self.host.world().get_block(pos);
+            let block = self.registry.block(block_id);
             if block.id == "openblock:air" {
                 return;
             }
-            inventory::display_name(block.id)
+            (
+                inventory::display_name(block.id),
+                audio_material_for(&self.registry, block_id).map(AudioSfx::BlockBreak),
+            )
         };
         let action = BlockAction {
             break_block: true,
@@ -1934,18 +3447,27 @@ impl GameState {
         let survival = self.host.game_mode() == HostGameMode::Survival;
         let outcome = self.host.apply_action_with_outcome(&action);
         if outcome.changed {
+            if let Some(sfx) = break_sfx {
+                self.play_block_sfx(sfx, pos);
+            }
             if survival && !outcome.drops.is_empty() {
                 // Survival breaks spawn item entities; this is only a subtle
                 // acknowledgement, not a pickup (pickup toasts come from the
                 // host's drained pickup events).
                 for drop in &outcome.drops {
-                    let name = inventory::display_name(self.registry.item(drop.item).id);
+                    let name = inventory::item_display_name(&self.registry, drop.item);
                     self.ui.toasts.push(format!("Dropped {name} x{}", drop.count));
                 }
             }
+            if self.container.as_ref().is_some_and(|session| session.pos == pos) {
+                self.close_container();
+            }
             if let Some(item) = outcome.tool_broke {
-                let name = inventory::display_name(self.registry.item(item).id);
+                let name = inventory::item_display_name(&self.registry, item);
                 self.ui.toasts.push_warning(format!("Your {name} broke!"));
+                if let Some(engine) = &mut self.audio {
+                    engine.play_sfx(AudioSfx::ToolBreak);
+                }
                 // The host removed the tool; stop the current hold so the
                 // player must click again rather than silently mining by hand.
                 self.mouse_left = false;
@@ -1962,6 +3484,14 @@ impl GameState {
         }
         self.mouse_left = true;
         let player = self.host.player();
+        if let Some(id) = self
+            .host
+            .mob_hit_by_ray(player.eye(), player.forward(), MOB_ATTACK_REACH)
+        {
+            self.mining.stop();
+            self.try_attack_mob(id);
+            return;
+        }
         let Some(hit) = self.host.world().raycast(player.eye(), player.forward(), REACH) else {
             self.mining.stop();
             return;
@@ -1989,20 +3519,35 @@ impl GameState {
         // crafting table opens the crafting screen; every other block keeps
         // the normal eat/place rules below.
         let player = self.host.player();
-        if let Some(hit) = self.host.world().raycast(player.eye(), player.forward(), REACH)
-            && self.registry.block(self.host.world().get_block(hit.block)).id == "openblock:crafting_table"
-        {
-            self.open_crafting();
-            return;
+        if let Some(hit) = self.host.world().raycast(player.eye(), player.forward(), REACH) {
+            let block = self.host.world().get_block(hit.block);
+            match self.registry.block(block).id {
+                "openblock:crafting_table" => {
+                    self.open_crafting();
+                    return;
+                }
+                "openblock:furnace" => {
+                    self.open_container(ContainerKind::Furnace, hit.block);
+                    return;
+                }
+                "openblock:chest" => {
+                    self.open_container(ContainerKind::Chest, hit.block);
+                    return;
+                }
+                _ => {}
+            }
         }
         if self.host.game_mode() == HostGameMode::Survival {
             let stack = self.host.selected_stack();
             if inventory::should_eat(&self.registry, stack, self.host.player().hunger) {
                 let name = stack
-                    .map(|stack| inventory::display_name(self.registry.item(stack.item).id))
+                    .map(|stack| inventory::item_display_name(&self.registry, stack.item))
                     .unwrap_or_else(|| "item".to_string());
                 if self.host.eat_selected() {
                     self.ui.toasts.push(format!("Ate {name}"));
+                    if let Some(engine) = &mut self.audio {
+                        engine.play_sfx(AudioSfx::Eat);
+                    }
                     return;
                 }
             }
@@ -2028,6 +3573,10 @@ impl GameState {
             let outcome = self.host.apply_action_with_outcome(&action);
             if !outcome.changed {
                 self.ui.toasts.push("Cannot place there");
+            } else if let Some(material) = audio_material_for(&self.registry, block)
+                && let Some(engine) = &mut self.audio
+            {
+                engine.play_sfx(AudioSfx::BlockPlace(material));
             }
             return;
         }
@@ -2049,7 +3598,13 @@ impl GameState {
             place_block: true,
             place: block,
         };
-        let _ = self.host.apply_action_with_outcome(&action);
+        let outcome = self.host.apply_action_with_outcome(&action);
+        if outcome.changed
+            && let Some(material) = audio_material_for(&self.registry, block)
+            && let Some(engine) = &mut self.audio
+        {
+            engine.play_sfx(AudioSfx::BlockPlace(material));
+        }
     }
 
     /// Number of registry-backed inventory entries (every block except air).
@@ -2062,10 +3617,52 @@ impl GameState {
         let screen = self.window_screen();
         if self.host.game_mode() == HostGameMode::Survival {
             self.ui.inventory.hovered = inventory::survival_hit_test(screen, self.ui.cursor.0, self.ui.cursor.1);
+            self.ui.inventory.armor_hovered =
+                inventory::survival_armor_hit_test(screen, self.ui.cursor.0, self.ui.cursor.1);
         } else {
+            self.ui.inventory.armor_hovered = None;
             let item_count = self.inventory_item_count();
             self.ui.update_inventory_hover(screen, item_count);
         }
+    }
+
+    /// Equips the armor stack in a hotbar slot and reports the result.
+    fn equip_armor_slot(&mut self, slot: usize) {
+        let Some(stack) = self.host.inventory().get(slot).copied().flatten() else {
+            return;
+        };
+        if self.registry.item(stack.item).armor.is_none() {
+            return;
+        }
+        let name = inventory::item_display_name(&self.registry, stack.item);
+        if self.host.equip_armor(slot) {
+            self.play_ui_sound(true);
+            self.ui.toasts.push_success(format!("Equipped {name}"));
+        } else {
+            self.ui.toasts.push_warning(format!("Could not equip {name}"));
+        }
+        self.update_inventory_hover();
+        self.update_title();
+    }
+
+    /// Unequips one armor slot and reports the result.
+    fn unequip_armor_slot(&mut self, slot: ArmorSlot) {
+        let Some(stack) = self.host.equipment_slot(slot) else {
+            self.ui.toasts.push(format!(
+                "Empty {} slot",
+                inventory::armor_slot_label(slot).to_lowercase()
+            ));
+            return;
+        };
+        let name = inventory::item_display_name(&self.registry, stack.item);
+        if self.host.unequip_armor(slot) {
+            self.play_ui_sound(false);
+            self.ui.toasts.push(format!("Unequipped {name}"));
+        } else {
+            self.ui.toasts.push_warning("Inventory full - cannot unequip");
+        }
+        self.update_inventory_hover();
+        self.update_title();
     }
 
     /// Moves the inventory selection with the arrow keys.
@@ -2107,6 +3704,17 @@ impl GameState {
         if self.host.game_mode() == HostGameMode::Survival {
             let slot = self.ui.inventory.selected.min(ui_state::HOTBAR_SLOTS - 1);
             self.ui.inventory.selected = slot;
+            if self
+                .host
+                .inventory()
+                .get(slot)
+                .copied()
+                .flatten()
+                .is_some_and(|stack| self.registry.item(stack.item).armor.is_some())
+            {
+                self.equip_armor_slot(slot);
+                return true;
+            }
             self.select_hotbar_slot(slot);
             self.ui.close_inventory();
             self.capture_pointer();
@@ -2126,10 +3734,28 @@ impl GameState {
     /// activates it. Clicks outside keep the inventory open.
     fn inventory_click(&mut self) {
         self.update_inventory_hover();
+        if self.host.game_mode() == HostGameMode::Survival
+            && let Some(slot) = self.ui.inventory.armor_hovered
+        {
+            self.unequip_armor_slot(slot);
+            return;
+        }
         let Some(index) = self.ui.inventory.hovered else {
             return;
         };
         self.ui.inventory.selected = index;
+        if self.host.game_mode() == HostGameMode::Survival
+            && self
+                .host
+                .inventory()
+                .get(index)
+                .copied()
+                .flatten()
+                .is_some_and(|stack| self.registry.item(stack.item).armor.is_some())
+        {
+            self.equip_armor_slot(index);
+            return;
+        }
         self.assign_inventory_selection();
     }
 
@@ -2149,6 +3775,16 @@ impl GameState {
         let rows = crafting_rows_for_host(&self.host, &self.registry);
         let screen = self.window_screen();
         self.ui.crafting.scroll_by(steps, screen, &rows);
+    }
+
+    /// Moves the crafting selection by one viewport page (PageUp/PageDown).
+    fn page_crafting(&mut self, direction: i32) {
+        if direction == 0 {
+            return;
+        }
+        let rows = crafting_rows_for_host(&self.host, &self.registry);
+        let screen = self.window_screen();
+        self.ui.crafting.page_by(direction, screen, &rows);
     }
 
     /// Updates the crafting hover from the last cursor position.
@@ -2306,6 +3942,14 @@ impl ApplicationHandler for App {
             let player = host.player();
             (player.eye(), player.yaw, player.pitch)
         };
+        let audio_enabled_before_mute = if self.options.mute {
+            Some(load_settings(&data_dir).audio_enabled)
+        } else {
+            None
+        };
+        let (audio, audio_status) = open_audio(&self.options, &ui.settings);
+        let was_in_water = player_in_water(&host, &registry);
+        let last_audio_health = host.player().health;
         let mut state = GameState {
             window,
             renderer,
@@ -2347,6 +3991,17 @@ impl ApplicationHandler for App {
             window_size,
             debug_stats: DebugStats::default(),
             screenshot_requested: false,
+            audio,
+            audio_status,
+            last_audio_health,
+            footstep_distance: 0.0,
+            was_in_water,
+            audio_enabled_before_mute,
+            audio_setting_touched: false,
+            container: None,
+            mob_render: MobRenderCache::new(),
+            attack_ready: None,
+            camera_shake: 0.0,
         };
         if state.fly_toggle {
             let player = state.host.player_mut();
@@ -2399,7 +4054,8 @@ impl ApplicationHandler for App {
                             Screen::Playing if !state.host.is_dead() => state.open_inventory(),
                             Screen::Inventory => state.close_inventory(),
                             Screen::Crafting => state.close_crafting(),
-                            Screen::Settings | Screen::Death => {}
+                            Screen::Furnace | Screen::Chest => state.close_container(),
+                            Screen::Settings | Screen::Death | Screen::Connecting => {}
                             Screen::Playing => {}
                         },
                         KeyCode::KeyC if pressed => state.toggle_crafting(),
@@ -2423,22 +4079,36 @@ impl ApplicationHandler for App {
                                     state.ui.settings_tab_next();
                                 }
                             }
-                            Screen::Playing | Screen::Inventory | Screen::Crafting | Screen::Death => {}
+                            Screen::Playing
+                            | Screen::Inventory
+                            | Screen::Crafting
+                            | Screen::Furnace
+                            | Screen::Chest
+                            | Screen::Death
+                            | Screen::Connecting => {}
                         },
                         KeyCode::ArrowUp if pressed => match state.ui.screen {
                             Screen::Death => state.ui.move_death_selection(-1),
                             Screen::Inventory => state.move_inventory_selection(0, -1),
                             Screen::Settings => state.ui.settings_row_up(),
                             Screen::Crafting => state.move_crafting_selection(-1),
-                            Screen::Playing => {}
+                            Screen::Furnace | Screen::Chest => state.move_container_selection(0, -1),
+                            Screen::Playing | Screen::Connecting => {}
                         },
                         KeyCode::ArrowDown if pressed => match state.ui.screen {
                             Screen::Death => state.ui.move_death_selection(1),
                             Screen::Inventory => state.move_inventory_selection(0, 1),
                             Screen::Settings => state.ui.settings_row_down(),
                             Screen::Crafting => state.move_crafting_selection(1),
-                            Screen::Playing => {}
+                            Screen::Furnace | Screen::Chest => state.move_container_selection(0, 1),
+                            Screen::Playing | Screen::Connecting => {}
                         },
+                        KeyCode::PageUp if pressed && state.ui.screen == Screen::Crafting => {
+                            state.page_crafting(-1);
+                        }
+                        KeyCode::PageDown if pressed && state.ui.screen == Screen::Crafting => {
+                            state.page_crafting(1);
+                        }
                         KeyCode::ArrowLeft if pressed => match state.ui.screen {
                             Screen::Death => state.ui.move_death_selection(-1),
                             Screen::Inventory => state.move_inventory_selection(-1, 0),
@@ -2448,7 +4118,8 @@ impl ApplicationHandler for App {
                                 }
                             }
                             Screen::Crafting => state.move_crafting_selection(-1),
-                            Screen::Playing => {}
+                            Screen::Furnace | Screen::Chest => state.move_container_selection(-1, 0),
+                            Screen::Playing | Screen::Connecting => {}
                         },
                         KeyCode::ArrowRight if pressed => match state.ui.screen {
                             Screen::Death => state.ui.move_death_selection(1),
@@ -2459,7 +4130,8 @@ impl ApplicationHandler for App {
                                 }
                             }
                             Screen::Crafting => state.move_crafting_selection(1),
-                            Screen::Playing => {}
+                            Screen::Furnace | Screen::Chest => state.move_container_selection(1, 0),
+                            Screen::Playing | Screen::Connecting => {}
                         },
                         KeyCode::Enter if pressed => match state.ui.screen {
                             Screen::Death => {
@@ -2474,15 +4146,21 @@ impl ApplicationHandler for App {
                                 state.assign_inventory_selection();
                             }
                             Screen::Settings => {
-                                if let Some(action) = state.ui.settings_activate()
-                                    && state.handle_settings_action(action)
-                                {
-                                    state.persist_settings();
-                                    event_loop.exit();
+                                let action = state.ui.settings_activate();
+                                if let Some(action) = action {
+                                    state.play_ui_sound(matches!(
+                                        action,
+                                        SettingsAction::Resume | SettingsAction::SaveAndQuit
+                                    ));
+                                    if state.handle_settings_action(action) {
+                                        state.persist_settings();
+                                        event_loop.exit();
+                                    }
                                 }
                             }
                             Screen::Crafting => state.craft_selected(),
-                            Screen::Playing => {}
+                            Screen::Furnace | Screen::Chest => state.activate_container_slot(),
+                            Screen::Playing | Screen::Connecting => {}
                         },
                         KeyCode::Digit1
                         | KeyCode::Digit2
@@ -2537,7 +4215,17 @@ impl ApplicationHandler for App {
                     Screen::Settings => {
                         if button == MouseButton::Left {
                             let screen = state.window_screen();
-                            if let Some(action) = state.ui.settings_click(screen)
+                            let action = state.ui.settings_click(screen);
+                            let interactive = state.ui.settings_hovered_tab.is_some()
+                                || state.ui.settings_hovered_row.is_some()
+                                || state.ui.settings_hovered_button.is_some();
+                            if interactive {
+                                state.play_ui_sound(matches!(
+                                    action,
+                                    Some(SettingsAction::Resume | SettingsAction::SaveAndQuit)
+                                ));
+                            }
+                            if let Some(action) = action
                                 && state.handle_settings_action(action)
                             {
                                 state.persist_settings();
@@ -2552,6 +4240,15 @@ impl ApplicationHandler for App {
                         }
                         return;
                     }
+                    Screen::Furnace | Screen::Chest => {
+                        match button {
+                            MouseButton::Left => state.container_click(ClickButton::Left),
+                            MouseButton::Right => state.container_click(ClickButton::Right),
+                            _ => {}
+                        }
+                        return;
+                    }
+                    Screen::Connecting => return,
                     Screen::Playing => {}
                 }
                 if state.host.is_dead() {
@@ -2577,11 +4274,12 @@ impl ApplicationHandler for App {
                         state.ui.settings_hover(screen);
                     }
                     Screen::Crafting => state.update_crafting_hover(),
+                    Screen::Furnace | Screen::Chest => {}
                     Screen::Death => {
                         let screen = state.window_screen();
                         state.ui.update_death_hover(screen);
                     }
-                    Screen::Playing => {}
+                    Screen::Playing | Screen::Connecting => {}
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -2681,6 +4379,78 @@ fn digit_slot(code: KeyCode) -> Option<usize> {
     }
 }
 
+/// Opens the audio engine unless `--no-audio` was given.
+///
+/// A missing device is an expected state: it logs exactly one line and returns
+/// `None`, and every later sound call is skipped. This is what keeps headless
+/// screenshots and CI hosts independent of the audio stack.
+fn open_audio(options: &ClientOptions, settings: &Settings) -> (Option<AudioEngine>, String) {
+    if options.no_audio {
+        log::info!("audio: disabled by --no-audio");
+        return (None, "off (--no-audio)".to_string());
+    }
+    match AudioEngine::new() {
+        Ok(mut engine) => {
+            apply_audio_settings(&mut engine, settings);
+            let status = engine.status().description();
+            log::info!(
+                "audio: {status} ({} clips, {:.1} ms synthesis)",
+                engine.status().clip_count,
+                engine.status().synthesis_ms,
+            );
+            (Some(engine), status)
+        }
+        Err(error) => {
+            log::info!("audio: unavailable ({error}); continuing silently");
+            (None, format!("off ({error})"))
+        }
+    }
+}
+
+/// Applies every persisted audio setting to a live engine.
+fn apply_audio_settings(engine: &mut AudioEngine, settings: &Settings) {
+    engine.set_master_volume(settings.master_volume);
+    engine.set_sfx_volume(settings.sfx_volume);
+    engine.set_music_volume(settings.music_volume);
+    engine.set_enabled(settings.audio_enabled);
+}
+
+/// Whether the player's feet or waist are inside a fluid block.
+fn player_in_water(host: &Host, registry: &Registry) -> bool {
+    let player = host.player();
+    let feet = BlockPos::new(
+        player.pos.x.floor() as i32,
+        player.pos.y.floor() as i32,
+        player.pos.z.floor() as i32,
+    );
+    let waist = BlockPos::new(feet.x, feet.y + 1, feet.z);
+    [feet, waist].into_iter().any(|position| {
+        let block = host.world().get_block(position);
+        registry.block(block).fluid
+    })
+}
+
+/// Maps a block id to the procedural material family.
+///
+/// Water and air have no material; callers use the `None` to skip block audio
+/// (splashes are handled separately).
+fn audio_material_for(registry: &Registry, block: BlockId) -> Option<AudioMaterial> {
+    let block_type = registry.block(block);
+    if block_type.fluid || block_type.id == "openblock:air" {
+        return None;
+    }
+    Some(match block_type.id {
+        "openblock:grass" | "openblock:leaves" => AudioMaterial::Grass,
+        "openblock:dirt" => AudioMaterial::Dirt,
+        "openblock:stone" | "openblock:cobblestone" | "openblock:bedrock" => AudioMaterial::Stone,
+        "openblock:sand" => AudioMaterial::Sand,
+        "openblock:snow" => AudioMaterial::Snow,
+        "openblock:log" | "openblock:planks" | "openblock:crafting_table" => AudioMaterial::Wood,
+        "openblock:gravel" => AudioMaterial::Gravel,
+        _ => AudioMaterial::Stone,
+    })
+}
+
 /// Resolves persisted settings, with explicit CLI flags taking precedence.
 fn effective_settings(options: &ClientOptions) -> (Settings, PathBuf) {
     let data_dir = options.data_dir.clone().unwrap_or_else(ob_core::data_dir);
@@ -2693,6 +4463,9 @@ fn effective_settings(options: &ClientOptions) -> (Settings, PathBuf) {
     }
     if let Some(mode) = options.game_mode {
         settings.game_mode = mode;
+    }
+    if options.mute {
+        settings.audio_enabled = false;
     }
     if options.screenshot_dead || options.screenshot_crafting || options.screenshot_debug || options.screenshot_items {
         settings.game_mode = SettingsGameMode::Survival;
@@ -2912,10 +4685,36 @@ fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> Re
 /// Parses client CLI options; returns `Err` with a message for bad input.
 pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, String> {
     let mut options = ClientOptions::default();
+    let mut saw_world = false;
+    let mut saw_seed = false;
     for (name, value) in flags {
         match name.as_str() {
-            "seed" => options.seed = value.parse().map_err(|_| format!("invalid --seed value '{value}'"))?,
-            "world" => options.world = value.clone(),
+            "seed" => {
+                options.seed = value.parse().map_err(|_| format!("invalid --seed value '{value}'"))?;
+                saw_seed = true;
+            }
+            "world" => {
+                options.world = value.clone();
+                saw_world = true;
+            }
+            "connect" => {
+                if value.is_empty() {
+                    return Err("--connect requires HOST:PORT".into());
+                }
+                options.connect = Some(value.clone());
+            }
+            "server-password" => {
+                return Err("--server-password is not supported by the interim protocol".into());
+            }
+            "name" => {
+                if value.is_empty() {
+                    return Err("--name requires a player name".into());
+                }
+                if let Err(error) = ob_protocol::validate_player_name(value) {
+                    return Err(format!("invalid --name value '{value}': {error}"));
+                }
+                options.name = Some(value.clone());
+            }
             "data-dir" => options.data_dir = Some(value.into()),
             "render-distance" => {
                 options.render_distance_chunks = value
@@ -2978,10 +4777,29 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
                 options.screenshot_inventory = Some(value.into());
             }
             "screenshot-dead" => options.screenshot_dead = true,
-            "screenshot-settings" => options.screenshot_settings = true,
+            "screenshot-settings" => {
+                options.screenshot_settings = true;
+                if !value.is_empty() {
+                    options.screenshot_settings_tab =
+                        Some(SettingsTab::from_name(value).ok_or_else(|| format!("unknown settings tab '{value}'"))?);
+                }
+            }
+            "screenshot-settings-tab" => {
+                if value.is_empty() {
+                    return Err("--screenshot-settings-tab requires a tab name".into());
+                }
+                options.screenshot_settings_tab =
+                    Some(SettingsTab::from_name(value).ok_or_else(|| format!("unknown settings tab '{value}'"))?);
+                options.screenshot_settings = true;
+            }
             "screenshot-crafting" => options.screenshot_crafting = true,
             "screenshot-debug" => options.screenshot_debug = true,
+            "screenshot-mobs" => options.screenshot_mobs = true,
+            "screenshot-furnace" => options.screenshot_furnace = true,
+            "screenshot-chest" => options.screenshot_chest = true,
             "screenshot-items" => options.screenshot_items = true,
+            "no-audio" => options.no_audio = true,
+            "mute" => options.mute = true,
             "survival" => options.game_mode = Some(SettingsGameMode::Survival),
             "creative" => options.game_mode = Some(SettingsGameMode::Creative),
             "help" | "version" => {}
@@ -2995,20 +4813,33 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
         + usize::from(options.screenshot_settings)
         + usize::from(options.screenshot_crafting)
         + usize::from(options.screenshot_debug)
+        + usize::from(options.screenshot_mobs)
+        + usize::from(options.screenshot_furnace)
+        + usize::from(options.screenshot_chest)
         + usize::from(options.screenshot_inventory.is_some());
     if screenshot_modes > 1 {
         return Err("--screenshot screen modes cannot be combined".into());
     }
     if options.screenshot_settings
-        && (options.screenshot_dead || options.screenshot_crafting || options.screenshot_inventory.is_some())
+        && (options.screenshot_dead
+            || options.screenshot_crafting
+            || options.screenshot_mobs
+            || options.screenshot_furnace
+            || options.screenshot_chest
+            || options.screenshot_inventory.is_some())
+    {
+        return Err("--screenshot-settings cannot be combined with another screenshot screen mode".into());
+    }
+    if (options.screenshot_crafting
+        || options.screenshot_mobs
+        || options.screenshot_furnace
+        || options.screenshot_chest)
+        && (options.screenshot_dead || options.screenshot_inventory.is_some())
     {
         return Err(
-            "--screenshot-settings cannot be combined with --screenshot-dead, --screenshot-crafting or --screenshot-inventory"
+            "--screenshot-crafting/--screenshot-mobs/--screenshot-furnace/--screenshot-chest cannot be combined with --screenshot-dead or --screenshot-inventory"
                 .into(),
         );
-    }
-    if options.screenshot_crafting && (options.screenshot_dead || options.screenshot_inventory.is_some()) {
-        return Err("--screenshot-crafting cannot be combined with --screenshot-dead or --screenshot-inventory".into());
     }
     if options.screenshot_settings && options.screenshot.is_none() {
         return Err("--screenshot-settings requires --screenshot PATH".into());
@@ -3019,16 +4850,51 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
     if options.screenshot_debug && options.screenshot.is_none() {
         return Err("--screenshot-debug requires --screenshot PATH".into());
     }
+    if options.screenshot_mobs && options.screenshot.is_none() {
+        return Err("--screenshot-mobs requires --screenshot PATH".into());
+    }
+    if options.screenshot_furnace && options.screenshot.is_none() {
+        return Err("--screenshot-furnace requires --screenshot PATH".into());
+    }
+    if options.screenshot_chest && options.screenshot.is_none() {
+        return Err("--screenshot-chest requires --screenshot PATH".into());
+    }
     if options.screenshot_items && options.screenshot.is_none() && options.screenshot_inventory.is_none() {
         return Err("--screenshot-items requires --screenshot or --screenshot-inventory PATH".into());
     }
-    if (options.screenshot_dead || options.screenshot_crafting || options.screenshot_debug || options.screenshot_items)
+    if (options.screenshot_dead
+        || options.screenshot_crafting
+        || options.screenshot_debug
+        || options.screenshot_mobs
+        || options.screenshot_furnace
+        || options.screenshot_chest
+        || options.screenshot_items)
         && options.game_mode == Some(SettingsGameMode::Creative)
     {
         return Err(
-            "--screenshot-dead, --screenshot-crafting, --screenshot-debug and --screenshot-items require survival mode"
+            "--screenshot-dead, --screenshot-crafting, --screenshot-debug, --screenshot-mobs, --screenshot-furnace, --screenshot-chest and --screenshot-items require survival mode"
                 .into(),
         );
+    }
+    if options.connect.is_some() {
+        if saw_world || saw_seed {
+            return Err(
+                "--connect cannot be combined with --world or --seed (multiplayer uses the server world)".into(),
+            );
+        }
+        let screenshot = options.screenshot.is_some()
+            || options.screenshot_inventory.is_some()
+            || options.screenshot_dead
+            || options.screenshot_settings
+            || options.screenshot_crafting
+            || options.screenshot_debug
+            || options.screenshot_mobs
+            || options.screenshot_furnace
+            || options.screenshot_chest
+            || options.screenshot_items;
+        if screenshot {
+            return Err("--connect is windowed only; offscreen screenshots are supported for local worlds".into());
+        }
     }
     Ok(options)
 }
@@ -3073,6 +4939,59 @@ mod tests {
         }
         assert_eq!(digit_slot(KeyCode::Digit0), None);
         assert_eq!(digit_slot(KeyCode::KeyE), None);
+    }
+
+    #[test]
+    fn multiplayer_connect_flags_parse_and_are_mutually_exclusive() {
+        let options = options_from_args(&[
+            ("connect".to_string(), "example.com:25565".to_string()),
+            ("name".to_string(), "alice".to_string()),
+        ])
+        .expect("valid connect flags");
+        assert_eq!(options.connect.as_deref(), Some("example.com:25565"));
+        assert_eq!(options.name.as_deref(), Some("alice"));
+
+        let error = options_from_args(&[("connect".to_string(), String::new())]).expect_err("empty endpoint must fail");
+        assert!(error.contains("--connect requires"));
+
+        let error = options_from_args(&[
+            ("connect".to_string(), "127.0.0.1:25565".to_string()),
+            ("name".to_string(), "not valid".to_string()),
+        ])
+        .expect_err("invalid name must fail");
+        assert!(error.contains("invalid --name"));
+
+        let error = options_from_args(&[
+            ("connect".to_string(), "127.0.0.1:25565".to_string()),
+            ("world".to_string(), "local".to_string()),
+        ])
+        .expect_err("connect cannot open a local world");
+        assert!(error.contains("--world"));
+
+        let error = options_from_args(&[
+            ("connect".to_string(), "127.0.0.1:25565".to_string()),
+            ("seed".to_string(), "7".to_string()),
+        ])
+        .expect_err("connect cannot use a local seed");
+        assert!(error.contains("--seed"));
+
+        let error = options_from_args(&[
+            ("connect".to_string(), "127.0.0.1:25565".to_string()),
+            ("screenshot".to_string(), "/tmp/net.png".to_string()),
+        ])
+        .expect_err("network screenshots are not supported");
+        assert!(error.contains("windowed only"));
+
+        // Explicit game mode flags are accepted for launcher compatibility, but
+        // the server owns the mode; they must not be interpreted as world
+        // selection.
+        let options = options_from_args(&[
+            ("connect".to_string(), "127.0.0.1:25565".to_string()),
+            ("survival".to_string(), String::new()),
+        ])
+        .expect("survival flag is harmless with connect");
+        assert!(options.connect.is_some());
+        assert_eq!(options.game_mode, Some(SettingsGameMode::Survival));
     }
 
     #[test]
@@ -3399,17 +5318,36 @@ mod tests {
         };
         let apple = instance("openblock:apple", 1);
         assert!(!apple.textured);
-        assert_eq!(apple.tint, [0.78, 0.16, 0.12]);
+        assert_eq!(apple.tint, [0.82, 0.14, 0.17]);
         assert_eq!(apple.layer, 0);
         let stick = instance("openblock:stick", 2);
-        assert_eq!(stick.tint, [0.55, 0.36, 0.18]);
+        assert_eq!(stick.tint, [0.61, 0.42, 0.21]);
         let wooden = instance("openblock:wooden_pickaxe", 3);
-        assert_eq!(wooden.tint, [0.62, 0.43, 0.22]);
+        assert_eq!(wooden.tint, [0.67, 0.47, 0.25]);
         assert!(!wooden.textured);
         let stone = instance("openblock:stone_axe", 4);
-        assert_eq!(stone.tint, [0.55, 0.56, 0.58]);
+        assert_eq!(stone.tint, [0.54, 0.55, 0.58]);
         assert_eq!(stone.scale, 0.22);
         assert_eq!(stone.layer, 0);
+        let iron = instance("openblock:iron_pickaxe", 5);
+        assert_eq!(iron.tint, [0.70, 0.73, 0.78]);
+        // Every new catalogue item gets a representative non-default tint.
+        for (name, expected) in [
+            ("openblock:coal", [0.10, 0.10, 0.12]),
+            ("openblock:raw_iron", [0.76, 0.66, 0.50]),
+            ("openblock:iron_ingot", [0.62, 0.65, 0.69]),
+            ("openblock:raw_copper", [0.82, 0.48, 0.24]),
+            ("openblock:copper_ingot", [0.79, 0.45, 0.22]),
+            ("openblock:iron_chestplate", [0.62, 0.65, 0.69]),
+            ("openblock:leather", [0.64, 0.44, 0.23]),
+            ("openblock:cooked_beef", [0.45, 0.22, 0.14]),
+        ] {
+            let item = registry.item_id(name).expect("item");
+            assert_eq!(inventory::item_tint_for(&registry, item), Some(expected), "{name}");
+            let entity = instance(name, 10);
+            assert_eq!(entity.tint, expected, "{name} entity tint");
+            assert!(!entity.textured);
+        }
     }
 
     #[test]
@@ -3483,6 +5421,168 @@ mod tests {
             "debug screenshots must not rewrite the saved mode"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn audio_flags_parse_and_mute_does_not_persist() {
+        let options = options_from_args(&[
+            ("no-audio".to_string(), String::new()),
+            ("mute".to_string(), String::new()),
+        ])
+        .expect("audio flags");
+        assert!(options.no_audio);
+        assert!(options.mute);
+
+        let dir = std::env::temp_dir().join(format!(
+            "openblock-client-audio-flags-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        save_settings(&dir, &Settings::default()).expect("save seed settings");
+        let options = ClientOptions {
+            data_dir: Some(dir.clone()),
+            mute: true,
+            ..ClientOptions::default()
+        };
+        let (settings, _) = effective_settings(&options);
+        assert!(!settings.audio_enabled, "mute applies to this run");
+        assert!(
+            load_settings(&dir).audio_enabled,
+            "mute must not rewrite the saved setting"
+        );
+        let no_audio = ClientOptions {
+            data_dir: Some(dir.clone()),
+            no_audio: true,
+            ..ClientOptions::default()
+        };
+        let (settings, _) = effective_settings(&no_audio);
+        assert!(settings.audio_enabled, "no-audio leaves the persisted setting alone");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn no_audio_skips_the_engine_and_says_so() {
+        let options = ClientOptions {
+            no_audio: true,
+            ..ClientOptions::default()
+        };
+        let (engine, status) = open_audio(&options, &Settings::default());
+        assert!(engine.is_none());
+        assert!(status.contains("--no-audio"), "status was {status}");
+    }
+
+    #[test]
+    fn screenshot_settings_tab_parses_and_rejects_unknown_names() {
+        let path = PathBuf::from("/tmp/audio-settings.png");
+        let options = options_from_args(&[
+            ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+            ("screenshot-settings".to_string(), "audio".to_string()),
+        ])
+        .expect("audio settings screenshot");
+        assert!(options.screenshot_settings);
+        assert_eq!(options.screenshot_settings_tab, Some(SettingsTab::Audio));
+
+        let options = options_from_args(&[
+            ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+            ("screenshot-settings-tab".to_string(), "textures".to_string()),
+        ])
+        .expect("explicit tab flag");
+        assert!(options.screenshot_settings);
+        assert_eq!(options.screenshot_settings_tab, Some(SettingsTab::Textures));
+
+        let error = options_from_args(&[
+            ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+            ("screenshot-settings".to_string(), "nope".to_string()),
+        ])
+        .expect_err("unknown tab");
+        assert!(error.contains("unknown settings tab"));
+
+        let error = options_from_args(&[("screenshot-settings-tab".to_string(), String::new())])
+            .expect_err("tab name is required");
+        assert!(error.contains("requires a tab name"));
+
+        // `--screenshot-settings=audio` goes through the shared split-on-`=`
+        // argument parser as a single token.
+        let (flags, free) = ob_core::parse_args(
+            ["--screenshot-settings=audio", "--screenshot", "/tmp/alias.png"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert!(free.is_empty());
+        let options = options_from_args(&flags).expect("equals-form audio screenshot");
+        assert_eq!(options.screenshot_settings_tab, Some(SettingsTab::Audio));
+        assert_eq!(options.screenshot.as_deref(), Some(Path::new("/tmp/alias.png")));
+    }
+
+    #[test]
+    fn audio_material_mapping_covers_gameplay_blocks() {
+        let registry = Registry::base();
+        let material = |name: &str| {
+            let block = registry.id(name).expect("block exists");
+            audio_material_for(&registry, block).expect("material")
+        };
+        assert_eq!(material("openblock:grass"), AudioMaterial::Grass);
+        assert_eq!(material("openblock:leaves"), AudioMaterial::Grass);
+        assert_eq!(material("openblock:dirt"), AudioMaterial::Dirt);
+        assert_eq!(material("openblock:stone"), AudioMaterial::Stone);
+        assert_eq!(material("openblock:cobblestone"), AudioMaterial::Stone);
+        assert_eq!(material("openblock:sand"), AudioMaterial::Sand);
+        assert_eq!(material("openblock:snow"), AudioMaterial::Snow);
+        assert_eq!(material("openblock:log"), AudioMaterial::Wood);
+        assert_eq!(material("openblock:planks"), AudioMaterial::Wood);
+        assert_eq!(material("openblock:gravel"), AudioMaterial::Gravel);
+        assert_eq!(audio_material_for(&registry, BlockId::AIR), None);
+        let water = registry.id("openblock:water").expect("water");
+        assert_eq!(audio_material_for(&registry, water), None);
+    }
+
+    #[test]
+    fn screenshot_ui_demo_flags_parse_and_require_survival() {
+        let path = PathBuf::from("/tmp/ui-demo.png");
+        for flag in ["screenshot-mobs", "screenshot-furnace", "screenshot-chest"] {
+            let options = options_from_args(&[
+                ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+                (flag.to_string(), String::new()),
+            ])
+            .expect("valid UI demo screenshot");
+            assert!(options.screenshot.is_some());
+            match flag {
+                "screenshot-mobs" => assert!(options.screenshot_mobs),
+                "screenshot-furnace" => assert!(options.screenshot_furnace),
+                "screenshot-chest" => assert!(options.screenshot_chest),
+                _ => unreachable!(),
+            }
+            let error = options_from_args(&[
+                ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+                (flag.to_string(), String::new()),
+                ("creative".to_string(), String::new()),
+            ])
+            .expect_err("UI demo screenshots need survival");
+            assert!(error.contains("survival mode"));
+
+            let error =
+                options_from_args(&[(flag.to_string(), String::new())]).expect_err("UI demo screenshots need a path");
+            assert!(error.contains("--screenshot PATH"));
+        }
+
+        let error = options_from_args(&[
+            ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+            ("screenshot-mobs".to_string(), String::new()),
+            ("screenshot-furnace".to_string(), String::new()),
+        ])
+        .expect_err("UI demo modes cannot be combined");
+        assert!(error.contains("cannot be combined"));
+
+        let error = options_from_args(&[
+            ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+            ("screenshot-chest".to_string(), String::new()),
+            ("screenshot-dead".to_string(), String::new()),
+        ])
+        .expect_err("UI demo modes cannot combine with the death screen");
+        assert!(error.contains("cannot be combined"));
     }
 
     #[test]

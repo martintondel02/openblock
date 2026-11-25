@@ -851,6 +851,426 @@ fn punch_leaf_holes(canvas: &mut Canvas, seed: u32, percent: u32) {
     }
 }
 
+/// Fills an inclusive wrapped rectangle.
+fn fill_rect(canvas: &mut Canvas, x0: i32, y0: i32, x1: i32, y1: i32, color: [u8; 3]) {
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            canvas.set(x, y, color);
+        }
+    }
+}
+
+/// Palette and chunk size of an ore overlay painted on a style's stone base.
+struct OreLook {
+    /// Shadowed rim and dark mineral body.
+    dark: [u8; 3],
+    /// Main mineral colour.
+    mid: [u8; 3],
+    /// Lit metallic facet.
+    light: [u8; 3],
+    /// Secondary mineral colour (the teal patina on copper ore).
+    accent: Option<[u8; 3]>,
+    /// Number of large mineral chunks per tile.
+    clusters: u32,
+    /// Base chunk radius in texels.
+    radius: i32,
+    /// Soft-edge feather in texels; 0 keeps hard pixel-art edges.
+    soft: i32,
+}
+
+/// Paints rounded mineral chunks and loose flecks over an existing stone canvas.
+fn paint_ore(canvas: &mut Canvas, seed: u32, look: &OreLook) {
+    let size = canvas.size;
+    let span = size.saturating_sub(2).max(1);
+    for cluster in 0..look.clusters {
+        let hash = hash_noise(seed ^ 0x0f, cluster, 1);
+        let cx = 1 + (hash % span) as i32;
+        let cy = 1 + (hash_noise(seed ^ 0x0f, cluster, 2) % span) as i32;
+        let radius = look.radius + (hash_noise(seed ^ 0x0f, cluster, 3) % 2) as i32;
+        // A dark rim below and to the right grounds the chunk in the stone.
+        paint_ellipse(canvas, cx + 1, cy + 1, radius + 1, radius, look.dark, look.soft);
+        let body = if hash & 0x100 == 0 { look.mid } else { look.dark };
+        paint_ellipse(canvas, cx, cy, radius, radius, body, look.soft);
+        // A small lit facet reads as a metallic glint.
+        paint_ellipse(
+            canvas,
+            cx - 1,
+            cy - 1,
+            (radius / 2).max(1),
+            (radius / 2).max(1),
+            look.light,
+            look.soft,
+        );
+        if let Some(accent) = look.accent {
+            // The secondary mineral creeps out along the lower edge.
+            let half = (radius * 2 + 1).max(1) as u32;
+            for speck in 0..3u32 {
+                let dx = (hash_noise(seed ^ 0x2c, cluster, speck) % half) as i32 - radius;
+                let dy = radius + (hash_noise(seed ^ 0x2d, cluster, speck) % 2) as i32;
+                canvas.set(cx + dx, cy + dy, accent);
+            }
+        }
+        // One or two loose flecks around each chunk.
+        for fleck in 0..2u32 {
+            let dx = (hash_noise(seed ^ 0x3e, cluster, fleck) % 5) as i32 - 2;
+            let dy = (hash_noise(seed ^ 0x3f, cluster, fleck) % 5) as i32 - 2;
+            canvas.set(cx + dx, cy + dy + radius, look.light);
+        }
+    }
+    // Isolated single-texel flecks keep the host stone from reading as plain rock.
+    for fleck in 0..look.clusters * 3 {
+        let x = (hash_noise(seed ^ 0x5a, fleck, 0) % size) as i32;
+        let y = (hash_noise(seed ^ 0x5b, fleck, 0) % size) as i32;
+        let color = if fleck & 1 == 0 { look.mid } else { look.dark };
+        canvas.set(x, y, color);
+    }
+}
+
+/// Colours shared by the three furnace faces, supplied per texture style.
+struct FurnaceLook {
+    /// Slab edge in shadow (bottom and right).
+    edge_dark: [u8; 3],
+    /// Slab edge catching light (top and left).
+    edge_light: [u8; 3],
+    /// Recessed masonry seam.
+    seam: [u8; 3],
+    /// Clean iron vent and rivets.
+    metal: [u8; 3],
+    /// Shaded iron.
+    metal_dark: [u8; 3],
+    /// Dark firebox opening.
+    opening: [u8; 3],
+    /// Deepest part of the firebox.
+    opening_inner: [u8; 3],
+    /// Smouldering ember shadow.
+    ember_dark: [u8; 3],
+    /// Ember body.
+    ember: [u8; 3],
+    /// Hottest ember highlight.
+    ember_hot: [u8; 3],
+    /// Border thickness in texels.
+    trim: i32,
+    /// Soft arch feather in texels; 0 keeps a crisp pixel-art opening.
+    soft: i32,
+    /// Per-texel dither amount; 0 for crisp styles.
+    dither: i32,
+    /// Whether the style draws raised corner rivets.
+    rivets: bool,
+}
+
+/// Paints the light/shadow border shared by the three furnace faces.
+fn paint_furnace_border(canvas: &mut Canvas, look: &FurnaceLook) {
+    let size = canvas.size as i32;
+    let trim = look.trim.max(1);
+    for y in 0..size {
+        for x in 0..size {
+            if x >= trim && y >= trim && x < size - trim && y < size - trim {
+                continue;
+            }
+            let color = if x < trim || y < trim {
+                look.edge_light
+            } else {
+                look.edge_dark
+            };
+            let color = if look.dither == 0 {
+                color
+            } else {
+                offset(color, dither(x as u32, y as u32, look.dither))
+            };
+            canvas.set(x, y, color);
+        }
+    }
+}
+
+/// Paints four raised metal rivets just inside the furnace border.
+fn paint_furnace_rivets(canvas: &mut Canvas, look: &FurnaceLook) {
+    if !look.rivets {
+        return;
+    }
+    let size = canvas.size as i32;
+    let inset = look.trim.max(1) + 1;
+    for (x, y) in [
+        (inset, inset),
+        (size - inset - 1, inset),
+        (inset, size - inset - 1),
+        (size - inset - 1, size - inset - 1),
+    ] {
+        canvas.set(x, y, look.metal);
+        canvas.set(x + 1, y + 1, look.metal_dark);
+    }
+}
+
+/// Paints a furnace top: a bordered stone slab with a recessed iron vent.
+fn furnace_top_from(mut canvas: Canvas, seed: u32, look: &FurnaceLook) -> Canvas {
+    paint_furnace_border(&mut canvas, look);
+    let size = canvas.size as i32;
+    let slot_w = (size * 10 / 16).max(6);
+    let slot_h = (size * 3 / 16).max(2);
+    let x0 = (size - slot_w) / 2;
+    let y0 = (size - slot_h) / 2;
+    // Lit upper lip and shadowed lower lip make the vent read as recessed.
+    for x in x0..x0 + slot_w {
+        canvas.set(x, y0 - 1, look.edge_light);
+        canvas.set(x, y0 + slot_h, look.edge_dark);
+    }
+    fill_rect(&mut canvas, x0, y0, x0 + slot_w - 1, y0 + slot_h - 1, look.opening);
+    // Iron grate bars split the vent into readable slots.
+    let bars = if size >= 32 { 4 } else { 2 };
+    for bar in 1..=bars {
+        let bar_x = x0 + slot_w * bar / (bars + 1);
+        for y in y0..y0 + slot_h {
+            canvas.set(bar_x, y, look.metal_dark);
+            canvas.set(bar_x + 1, y, look.metal);
+        }
+    }
+    for x in x0..x0 + slot_w {
+        canvas.blend(x, y0 + slot_h - 1, look.metal_dark, 120);
+    }
+    // One worn spot on the vent lip varies with the layer seed.
+    let wear = x0 + (hash_noise(seed ^ 0x5d, 0, 0) % slot_w.max(1) as u32) as i32;
+    canvas.set(wear, y0, look.edge_light);
+    paint_furnace_rivets(&mut canvas, look);
+    canvas
+}
+
+/// Paints a furnace side: riveted stone courses with a chiselled panel frame.
+fn furnace_side_from(mut canvas: Canvas, _seed: u32, look: &FurnaceLook) -> Canvas {
+    paint_furnace_border(&mut canvas, look);
+    let size = canvas.size as i32;
+    let trim = look.trim.max(1);
+    let inner = size - trim;
+    let course_height = ((size - 2 * trim) / 2).max(3);
+    // Two masonry courses with staggered vertical joints.
+    let y = trim + course_height;
+    for x in trim..inner {
+        canvas.set(x, y, look.seam);
+        canvas.blend(x, y + 1, look.edge_light, 90);
+    }
+    for course in 0..2 {
+        let top = trim + course * course_height;
+        let bottom = (top + course_height).min(inner);
+        let joint_x = if course == 0 { size / 3 } else { size * 2 / 3 };
+        for joint_y in top + 1..bottom {
+            canvas.set(joint_x, joint_y, look.seam);
+        }
+        let short_x = if course == 0 { size * 2 / 3 } else { size / 3 };
+        for joint_y in top + 1..(top + course_height / 2).min(bottom) {
+            canvas.set(short_x, joint_y, look.seam);
+        }
+    }
+    // Chiselled panel trim just inside the riveted frame.
+    for x in trim + 1..inner - 1 {
+        canvas.blend(x, trim + 1, look.edge_light, 60);
+        canvas.blend(x, inner - 2, look.edge_dark, 80);
+    }
+    paint_furnace_rivets(&mut canvas, look);
+    canvas
+}
+
+/// Paints a furnace front: a stone face with an arched firebox and ember glow.
+fn furnace_front_from(mut canvas: Canvas, seed: u32, look: &FurnaceLook) -> Canvas {
+    paint_furnace_border(&mut canvas, look);
+    let size = canvas.size as i32;
+    let trim = look.trim.max(1);
+    let cx = size / 2;
+    let half = ((size * 5) / 16).max(3);
+    let spring = (size * 9) / 16;
+    let bottom = size - trim - 2;
+    let arch_ry = (half * 3 / 4).max(2);
+    let left = cx - half;
+    let right = cx + half - 1;
+    // A masonry joint above the arch keeps the face from reading as a hole.
+    for x in trim..size - trim {
+        canvas.blend(x, spring - arch_ry - 2, look.seam, 110);
+    }
+    // Rectangular firebox mouth with a rounded arch on top.
+    fill_rect(&mut canvas, left, spring, right, bottom, look.opening);
+    paint_ellipse(&mut canvas, cx, spring, half, arch_ry, look.opening, look.soft);
+    paint_ellipse(
+        &mut canvas,
+        cx,
+        spring - arch_ry / 2,
+        (half - 1).max(1),
+        (arch_ry / 2).max(1),
+        look.opening_inner,
+        look.soft,
+    );
+    // Embers banked against the firebox floor; purely visual, no light source.
+    for x in left + 1..right {
+        let hash = hash_noise(seed ^ 0x71, (x - left) as u32, 1);
+        canvas.blend(x, bottom - 2, look.ember_dark, 60 + (hash % 70));
+        canvas.blend(x, bottom - 1, look.ember_dark, 110 + (hash % 100));
+        canvas.set(
+            x,
+            bottom,
+            match hash % 5 {
+                0 => look.ember_hot,
+                1 | 2 => look.ember,
+                _ => look.ember_dark,
+            },
+        );
+        if hash.is_multiple_of(7) {
+            canvas.set(x, bottom - 1, look.ember);
+        }
+        if hash.is_multiple_of(19) {
+            canvas.set(x, bottom - 2, look.ember_hot);
+        }
+    }
+    // One iron fire bar crosses the firebox mouth.
+    for x in left..=right {
+        canvas.set(x, bottom - 3, look.metal_dark);
+    }
+    for x in (left + 2..right).step_by(4) {
+        canvas.set(x, bottom - 3, look.metal);
+    }
+    // A lit stone lip catches the ember glow above the arch.
+    for x in left..=right {
+        canvas.blend(x, spring - arch_ry - 1, look.edge_light, 80);
+    }
+    paint_furnace_rivets(&mut canvas, look);
+    canvas
+}
+
+/// Colours shared by the three chest faces, supplied per texture style.
+struct ChestLook {
+    /// Dark seam between lid and body.
+    seam: [u8; 3],
+    /// Lit plank edge below the seam.
+    seam_light: [u8; 3],
+    /// Clean iron band.
+    metal: [u8; 3],
+    /// Shaded iron band.
+    metal_dark: [u8; 3],
+    /// Lit iron edge.
+    metal_light: [u8; 3],
+    /// Keyhole shadow.
+    keyhole: [u8; 3],
+    /// Border thickness in texels.
+    trim: i32,
+    /// Per-texel dither amount; 0 for crisp styles.
+    dither: i32,
+}
+
+/// Width of a chest's iron bands in texels.
+fn chest_band_width(size: i32) -> i32 {
+    (size / 10).max(2)
+}
+
+/// Paints one vertical iron strap with a lit inner edge and rivets.
+fn paint_chest_band(canvas: &mut Canvas, x0: i32, x1: i32, top: i32, bottom: i32, look: &ChestLook) {
+    fill_rect(canvas, x0, top, x1, bottom, look.metal_dark);
+    fill_rect(canvas, x0, top, x1 - 1, bottom, look.metal);
+    for y in top..=bottom {
+        let color = if look.dither == 0 {
+            look.metal_light
+        } else {
+            offset(look.metal_light, dither(x0 as u32, y as u32, look.dither))
+        };
+        canvas.set(x0, y, color);
+    }
+    // Rivets march down the middle of the strap.
+    let step = ((bottom - top) / 4).max(3);
+    let rivet_x = (x0 + x1) / 2;
+    let mut y = top + step / 2;
+    while y <= bottom {
+        canvas.set(rivet_x, y, look.metal_light);
+        canvas.set(rivet_x, y + 1, look.metal_dark);
+        y += step;
+    }
+}
+
+/// Paints a chest top: planks, a lid seam and iron straps running across it.
+fn chest_top_from(mut canvas: Canvas, _seed: u32, look: &ChestLook) -> Canvas {
+    let size = canvas.size as i32;
+    let trim = look.trim.max(1);
+    let band = chest_band_width(size);
+    let seam_y = (size * 5 / 16).max(3);
+    for x in 0..size {
+        canvas.set(x, seam_y, look.seam);
+        if seam_y + 1 < size {
+            canvas.set(x, seam_y + 1, look.seam_light);
+        }
+    }
+    for left in [trim - 1, size - trim - band + 1] {
+        paint_chest_band(&mut canvas, left, left + band - 1, 0, size - 1, look);
+    }
+    for x in 0..size {
+        canvas.blend(x, 0, look.seam, 140);
+        canvas.blend(x, size - 1, look.seam, 140);
+    }
+    for y in 0..size {
+        canvas.blend(0, y, look.seam, 140);
+        canvas.blend(size - 1, y, look.seam, 140);
+    }
+    canvas
+}
+
+/// Paints a chest side: planks with a lid lip and full-height corner straps.
+fn chest_side_from(mut canvas: Canvas, _seed: u32, look: &ChestLook) -> Canvas {
+    let size = canvas.size as i32;
+    let trim = look.trim.max(1);
+    let band = chest_band_width(size);
+    // Lid lip at the top and a plain trim board at the bottom.
+    for x in 0..size {
+        canvas.set(x, trim - 1, look.seam);
+        canvas.set(x, trim, look.seam_light);
+        canvas.set(x, size - trim, look.seam);
+    }
+    for y in trim..size - trim {
+        canvas.set(trim - 1, y, look.seam);
+        canvas.set(size - trim, y, look.seam);
+    }
+    for left in [trim, size - trim - band] {
+        paint_chest_band(&mut canvas, left, left + band - 1, 0, size - 1, look);
+    }
+    canvas
+}
+
+/// Paints a chest front: lid seam, corner straps, centre latch and keyhole.
+fn chest_front_from(mut canvas: Canvas, _seed: u32, look: &ChestLook) -> Canvas {
+    let size = canvas.size as i32;
+    let trim = look.trim.max(1);
+    let band = chest_band_width(size);
+    let seam_y = (size * 5 / 16).max(3);
+    for x in 0..size {
+        canvas.set(x, seam_y, look.seam);
+        if seam_y + 1 < size {
+            canvas.set(x, seam_y + 1, look.seam_light);
+        }
+    }
+    for left in [trim, size - trim - band] {
+        paint_chest_band(&mut canvas, left, left + band - 1, 0, size - 1, look);
+    }
+    // A metal latch plate straddles the lid seam.
+    let latch_w = (size / 5).max(3);
+    let latch_h = (size / 4).max(4);
+    let lx = size / 2 - latch_w / 2;
+    let ly = seam_y - latch_h / 2;
+    fill_rect(&mut canvas, lx, ly, lx + latch_w - 1, ly + latch_h - 1, look.metal_dark);
+    fill_rect(
+        &mut canvas,
+        lx + 1,
+        ly + 1,
+        lx + latch_w - 2,
+        ly + latch_h - 2,
+        look.metal,
+    );
+    for x in lx + 1..lx + latch_w - 1 {
+        canvas.set(x, ly + 1, look.metal_light);
+        canvas.set(x, ly + latch_h - 2, look.metal_dark);
+    }
+    // Keyhole below the seam, with a shadowed escutcheon.
+    let key_x = size / 2;
+    canvas.set(key_x, seam_y + 1, look.keyhole);
+    canvas.set(key_x, seam_y + 2, look.keyhole);
+    canvas.set(key_x - 1, seam_y + 2, look.metal_dark);
+    canvas.set(key_x + 1, seam_y + 2, look.metal_dark);
+    // One rivet on each latch cheek.
+    canvas.set(lx + 1, ly + latch_h / 2, look.metal_light);
+    canvas.set(lx + latch_w - 2, ly + latch_h / 2, look.metal_light);
+    canvas
+}
+
 /// Classic 16² pixel-art pack: close to the genre default, saturated but soft.
 mod classic {
     use super::*;
@@ -939,6 +1359,61 @@ mod classic {
     const TOOL_METAL: [u8; 3] = [126, 131, 140];
     const TOOL_METAL_DARK: [u8; 3] = [93, 98, 107];
 
+    // v1.0 ore, furnace and chest palettes.
+    const COAL_LOOK: OreLook = OreLook {
+        dark: [30, 30, 34],
+        mid: [50, 50, 56],
+        light: [78, 78, 84],
+        accent: None,
+        clusters: 4,
+        radius: 2,
+        soft: 0,
+    };
+    const IRON_LOOK: OreLook = OreLook {
+        dark: [124, 93, 60],
+        mid: [181, 145, 104],
+        light: [217, 183, 140],
+        accent: None,
+        clusters: 4,
+        radius: 2,
+        soft: 0,
+    };
+    const COPPER_LOOK: OreLook = OreLook {
+        dark: [116, 63, 39],
+        mid: [190, 104, 64],
+        light: [226, 145, 98],
+        accent: Some([77, 140, 118]),
+        clusters: 4,
+        radius: 2,
+        soft: 0,
+    };
+    const FURNACE_LOOK: FurnaceLook = FurnaceLook {
+        edge_dark: [104, 104, 111],
+        edge_light: [170, 170, 176],
+        seam: [92, 92, 99],
+        metal: [151, 154, 160],
+        metal_dark: [95, 98, 104],
+        opening: [36, 33, 32],
+        opening_inner: [22, 21, 22],
+        ember_dark: [137, 58, 25],
+        ember: [224, 116, 36],
+        ember_hot: [249, 191, 76],
+        trim: 1,
+        soft: 0,
+        dither: 0,
+        rivets: true,
+    };
+    const CHEST_LOOK: ChestLook = ChestLook {
+        seam: [84, 56, 31],
+        seam_light: [199, 158, 106],
+        metal: [139, 142, 148],
+        metal_dark: [92, 95, 101],
+        metal_light: [190, 193, 198],
+        keyhole: [30, 28, 27],
+        trim: 1,
+        dither: 0,
+    };
+
     /// Generates one classic layer.
     pub(super) fn layer(index: u32, name: &str, size: u32) -> Canvas {
         let seed = super::layer_seed(TexturePackStyle::Classic, index);
@@ -960,6 +1435,15 @@ mod classic {
             "cobblestone" => cobblestone(size, seed),
             "crafting_table_top" => crafting_table_top(size, seed),
             "crafting_table_side" => crafting_table_side(size, seed),
+            "coal_ore" => coal_ore(size, seed),
+            "iron_ore" => iron_ore(size, seed),
+            "copper_ore" => copper_ore(size, seed),
+            "furnace_top" => furnace_top(size, seed),
+            "furnace_side" => furnace_side(size, seed),
+            "furnace_front" => furnace_front(size, seed),
+            "chest_top" => chest_top(size, seed),
+            "chest_side" => chest_side(size, seed),
+            "chest_front" => chest_front(size, seed),
             _ => debug(size),
         }
     }
@@ -1477,6 +1961,48 @@ mod classic {
         canvas
     }
 
+    fn coal_ore(size: u32, seed: u32) -> Canvas {
+        let mut canvas = stone(size, seed ^ 0x41);
+        paint_ore(&mut canvas, seed ^ 0x51, &COAL_LOOK);
+        canvas
+    }
+
+    fn iron_ore(size: u32, seed: u32) -> Canvas {
+        let mut canvas = stone(size, seed ^ 0x42);
+        paint_ore(&mut canvas, seed ^ 0x52, &IRON_LOOK);
+        canvas
+    }
+
+    fn copper_ore(size: u32, seed: u32) -> Canvas {
+        let mut canvas = stone(size, seed ^ 0x43);
+        paint_ore(&mut canvas, seed ^ 0x53, &COPPER_LOOK);
+        canvas
+    }
+
+    fn furnace_top(size: u32, seed: u32) -> Canvas {
+        furnace_top_from(stone(size, seed ^ 0x61), seed, &FURNACE_LOOK)
+    }
+
+    fn furnace_side(size: u32, seed: u32) -> Canvas {
+        furnace_side_from(stone(size, seed ^ 0x62), seed, &FURNACE_LOOK)
+    }
+
+    fn furnace_front(size: u32, seed: u32) -> Canvas {
+        furnace_front_from(stone(size, seed ^ 0x63), seed, &FURNACE_LOOK)
+    }
+
+    fn chest_top(size: u32, seed: u32) -> Canvas {
+        chest_top_from(planks(size, seed ^ 0x71), seed, &CHEST_LOOK)
+    }
+
+    fn chest_side(size: u32, seed: u32) -> Canvas {
+        chest_side_from(planks(size, seed ^ 0x72), seed, &CHEST_LOOK)
+    }
+
+    fn chest_front(size: u32, seed: u32) -> Canvas {
+        chest_front_from(planks(size, seed ^ 0x73), seed, &CHEST_LOOK)
+    }
+
     fn debug(size: u32) -> Canvas {
         Canvas::from_fn(size, |x, y| {
             if (x / 4 + y / 4).is_multiple_of(2) {
@@ -1579,6 +2105,61 @@ mod painterly {
     const TOOL_METAL: [u8; 3] = [124, 128, 132];
     const TOOL_METAL_DARK: [u8; 3] = [94, 98, 103];
 
+    // v1.0 ore, furnace and chest palettes.
+    const COAL_LOOK: OreLook = OreLook {
+        dark: [47, 43, 42],
+        mid: [70, 64, 60],
+        light: [96, 89, 82],
+        accent: None,
+        clusters: 3,
+        radius: 4,
+        soft: 3,
+    };
+    const IRON_LOOK: OreLook = OreLook {
+        dark: [120, 94, 68],
+        mid: [170, 137, 100],
+        light: [205, 173, 132],
+        accent: None,
+        clusters: 3,
+        radius: 4,
+        soft: 3,
+    };
+    const COPPER_LOOK: OreLook = OreLook {
+        dark: [128, 73, 53],
+        mid: [190, 112, 78],
+        light: [219, 150, 110],
+        accent: Some([116, 158, 134]),
+        clusters: 3,
+        radius: 4,
+        soft: 3,
+    };
+    const FURNACE_LOOK: FurnaceLook = FurnaceLook {
+        edge_dark: [112, 107, 98],
+        edge_light: [181, 176, 164],
+        seam: [102, 97, 89],
+        metal: [132, 128, 121],
+        metal_dark: [90, 87, 82],
+        opening: [44, 38, 34],
+        opening_inner: [27, 24, 23],
+        ember_dark: [150, 68, 31],
+        ember: [219, 122, 49],
+        ember_hot: [246, 185, 93],
+        trim: 2,
+        soft: 2,
+        dither: 2,
+        rivets: true,
+    };
+    const CHEST_LOOK: ChestLook = ChestLook {
+        seam: [91, 66, 44],
+        seam_light: [203, 168, 122],
+        metal: [135, 131, 124],
+        metal_dark: [92, 89, 84],
+        metal_light: [180, 175, 165],
+        keyhole: [29, 25, 22],
+        trim: 2,
+        dither: 2,
+    };
+
     /// Generates one painterly layer.
     pub(super) fn layer(index: u32, name: &str, size: u32) -> Canvas {
         let seed = super::layer_seed(TexturePackStyle::Painterly, index);
@@ -1600,6 +2181,15 @@ mod painterly {
             "cobblestone" => cobblestone(size, seed),
             "crafting_table_top" => crafting_table_top(size, seed),
             "crafting_table_side" => crafting_table_side(size, seed),
+            "coal_ore" => coal_ore(size, seed),
+            "iron_ore" => iron_ore(size, seed),
+            "copper_ore" => copper_ore(size, seed),
+            "furnace_top" => furnace_top(size, seed),
+            "furnace_side" => furnace_side(size, seed),
+            "furnace_front" => furnace_front(size, seed),
+            "chest_top" => chest_top(size, seed),
+            "chest_side" => chest_side(size, seed),
+            "chest_front" => chest_front(size, seed),
             _ => debug(size),
         }
     }
@@ -2055,6 +2645,48 @@ mod painterly {
         canvas
     }
 
+    fn coal_ore(size: u32, seed: u32) -> Canvas {
+        let mut canvas = stone(size, seed ^ 0x41);
+        paint_ore(&mut canvas, seed ^ 0x51, &COAL_LOOK);
+        canvas
+    }
+
+    fn iron_ore(size: u32, seed: u32) -> Canvas {
+        let mut canvas = stone(size, seed ^ 0x42);
+        paint_ore(&mut canvas, seed ^ 0x52, &IRON_LOOK);
+        canvas
+    }
+
+    fn copper_ore(size: u32, seed: u32) -> Canvas {
+        let mut canvas = stone(size, seed ^ 0x43);
+        paint_ore(&mut canvas, seed ^ 0x53, &COPPER_LOOK);
+        canvas
+    }
+
+    fn furnace_top(size: u32, seed: u32) -> Canvas {
+        furnace_top_from(stone(size, seed ^ 0x61), seed, &FURNACE_LOOK)
+    }
+
+    fn furnace_side(size: u32, seed: u32) -> Canvas {
+        furnace_side_from(stone(size, seed ^ 0x62), seed, &FURNACE_LOOK)
+    }
+
+    fn furnace_front(size: u32, seed: u32) -> Canvas {
+        furnace_front_from(stone(size, seed ^ 0x63), seed, &FURNACE_LOOK)
+    }
+
+    fn chest_top(size: u32, seed: u32) -> Canvas {
+        chest_top_from(planks(size, seed ^ 0x71), seed, &CHEST_LOOK)
+    }
+
+    fn chest_side(size: u32, seed: u32) -> Canvas {
+        chest_side_from(planks(size, seed ^ 0x72), seed, &CHEST_LOOK)
+    }
+
+    fn chest_front(size: u32, seed: u32) -> Canvas {
+        chest_front_from(planks(size, seed ^ 0x73), seed, &CHEST_LOOK)
+    }
+
     fn debug(size: u32) -> Canvas {
         Canvas::from_fn(size, |x, y| {
             let cell = (x / 8 + y / 8).is_multiple_of(2);
@@ -2158,6 +2790,61 @@ mod lush {
     const TOOL_METAL: [u8; 3] = [126, 132, 136];
     const TOOL_METAL_DARK: [u8; 3] = [91, 97, 102];
 
+    // v1.0 ore, furnace and chest palettes.
+    const COAL_LOOK: OreLook = OreLook {
+        dark: [48, 50, 54],
+        mid: [76, 79, 84],
+        light: [105, 108, 112],
+        accent: None,
+        clusters: 4,
+        radius: 5,
+        soft: 2,
+    };
+    const IRON_LOOK: OreLook = OreLook {
+        dark: [118, 88, 54],
+        mid: [184, 142, 94],
+        light: [223, 182, 129],
+        accent: None,
+        clusters: 4,
+        radius: 5,
+        soft: 2,
+    };
+    const COPPER_LOOK: OreLook = OreLook {
+        dark: [151, 70, 38],
+        mid: [211, 106, 54],
+        light: [238, 150, 88],
+        accent: Some([80, 158, 122]),
+        clusters: 4,
+        radius: 5,
+        soft: 2,
+    };
+    const FURNACE_LOOK: FurnaceLook = FurnaceLook {
+        edge_dark: [94, 104, 96],
+        edge_light: [176, 186, 170],
+        seam: [86, 96, 88],
+        metal: [138, 148, 150],
+        metal_dark: [94, 102, 104],
+        opening: [33, 34, 33],
+        opening_inner: [21, 23, 23],
+        ember_dark: [156, 65, 22],
+        ember: [233, 119, 35],
+        ember_hot: [252, 200, 90],
+        trim: 2,
+        soft: 1,
+        dither: 1,
+        rivets: true,
+    };
+    const CHEST_LOOK: ChestLook = ChestLook {
+        seam: [76, 48, 22],
+        seam_light: [219, 170, 103],
+        metal: [134, 144, 146],
+        metal_dark: [91, 99, 101],
+        metal_light: [184, 194, 196],
+        keyhole: [28, 24, 19],
+        trim: 2,
+        dither: 1,
+    };
+
     /// Generates one lush layer.
     pub(super) fn layer(index: u32, name: &str, size: u32) -> Canvas {
         let seed = super::layer_seed(TexturePackStyle::Lush, index);
@@ -2179,6 +2866,15 @@ mod lush {
             "cobblestone" => cobblestone(size, seed),
             "crafting_table_top" => crafting_table_top(size, seed),
             "crafting_table_side" => crafting_table_side(size, seed),
+            "coal_ore" => coal_ore(size, seed),
+            "iron_ore" => iron_ore(size, seed),
+            "copper_ore" => copper_ore(size, seed),
+            "furnace_top" => furnace_top(size, seed),
+            "furnace_side" => furnace_side(size, seed),
+            "furnace_front" => furnace_front(size, seed),
+            "chest_top" => chest_top(size, seed),
+            "chest_side" => chest_side(size, seed),
+            "chest_front" => chest_front(size, seed),
             _ => debug(size),
         }
     }
@@ -2767,6 +3463,48 @@ mod lush {
         canvas
     }
 
+    fn coal_ore(size: u32, seed: u32) -> Canvas {
+        let mut canvas = stone(size, seed ^ 0x41);
+        paint_ore(&mut canvas, seed ^ 0x51, &COAL_LOOK);
+        canvas
+    }
+
+    fn iron_ore(size: u32, seed: u32) -> Canvas {
+        let mut canvas = stone(size, seed ^ 0x42);
+        paint_ore(&mut canvas, seed ^ 0x52, &IRON_LOOK);
+        canvas
+    }
+
+    fn copper_ore(size: u32, seed: u32) -> Canvas {
+        let mut canvas = stone(size, seed ^ 0x43);
+        paint_ore(&mut canvas, seed ^ 0x53, &COPPER_LOOK);
+        canvas
+    }
+
+    fn furnace_top(size: u32, seed: u32) -> Canvas {
+        furnace_top_from(stone(size, seed ^ 0x61), seed, &FURNACE_LOOK)
+    }
+
+    fn furnace_side(size: u32, seed: u32) -> Canvas {
+        furnace_side_from(stone(size, seed ^ 0x62), seed, &FURNACE_LOOK)
+    }
+
+    fn furnace_front(size: u32, seed: u32) -> Canvas {
+        furnace_front_from(stone(size, seed ^ 0x63), seed, &FURNACE_LOOK)
+    }
+
+    fn chest_top(size: u32, seed: u32) -> Canvas {
+        chest_top_from(planks(size, seed ^ 0x71), seed, &CHEST_LOOK)
+    }
+
+    fn chest_side(size: u32, seed: u32) -> Canvas {
+        chest_side_from(planks(size, seed ^ 0x72), seed, &CHEST_LOOK)
+    }
+
+    fn chest_front(size: u32, seed: u32) -> Canvas {
+        chest_front_from(planks(size, seed ^ 0x73), seed, &CHEST_LOOK)
+    }
+
     fn debug(size: u32) -> Canvas {
         Canvas::from_fn(size, |x, y| {
             let cell = (x / 4 + y / 4).is_multiple_of(2);
@@ -2845,6 +3583,39 @@ mod minimal {
     const TABLE_CELL: [u8; 3] = [180, 139, 85];
     const TOOL_METAL: [u8; 3] = [158, 160, 168];
 
+    // v1.0 ore, furnace and chest palettes.
+    const COAL_LOOK: [u8; 3] = [55, 57, 62];
+    const IRON_LOOK: [u8; 3] = [191, 156, 110];
+    const IRON_SHADE: [u8; 3] = [160, 122, 82];
+    const COPPER_LOOK: [u8; 3] = [219, 127, 78];
+    const COPPER_PATINA: [u8; 3] = [98, 164, 142];
+    const FURNACE_LOOK: FurnaceLook = FurnaceLook {
+        edge_dark: [151, 153, 160],
+        edge_light: [214, 216, 222],
+        seam: [151, 153, 160],
+        metal: [160, 162, 170],
+        metal_dark: [126, 128, 136],
+        opening: [67, 69, 76],
+        opening_inner: [48, 50, 56],
+        ember_dark: [214, 124, 52],
+        ember: [244, 166, 66],
+        ember_hot: [255, 214, 112],
+        trim: 1,
+        soft: 0,
+        dither: 0,
+        rivets: true,
+    };
+    const CHEST_LOOK: ChestLook = ChestLook {
+        seam: [147, 107, 65],
+        seam_light: [211, 171, 116],
+        metal: [160, 162, 170],
+        metal_dark: [126, 128, 136],
+        metal_light: [199, 201, 207],
+        keyhole: [95, 68, 45],
+        trim: 1,
+        dither: 0,
+    };
+
     /// Generates one minimal layer.
     pub(super) fn layer(index: u32, name: &str, size: u32) -> Canvas {
         let seed = super::layer_seed(TexturePackStyle::Minimal, index);
@@ -2866,7 +3637,51 @@ mod minimal {
             "cobblestone" => cobblestone(size, seed),
             "crafting_table_top" => crafting_table_top(size, seed),
             "crafting_table_side" => crafting_table_side(size, seed),
+            "coal_ore" => coal_ore(size, seed),
+            "iron_ore" => iron_ore(size, seed),
+            "copper_ore" => copper_ore(size, seed),
+            "furnace_top" => furnace_top(size, seed),
+            "furnace_side" => furnace_side(size, seed),
+            "furnace_front" => furnace_front(size, seed),
+            "chest_top" => chest_top(size, seed),
+            "chest_side" => chest_side(size, seed),
+            "chest_front" => chest_front(size, seed),
             _ => debug(size),
+        }
+    }
+
+    /// Scatters flat single- and double-texel mineral patches over stone.
+    ///
+    /// Minimal deliberately avoids soft blobs: the ore read comes from a handful
+    /// of crisp black/gold/copper pixels and the occasional patina accent.
+    fn flat_ore(canvas: &mut Canvas, seed: u32, patches: u32, color: [u8; 3], accent: Option<[u8; 3]>) {
+        let size = canvas.size;
+        let span = size.saturating_sub(2).max(1);
+        for patch in 0..patches {
+            let hash = hash_noise(seed ^ 0x11, patch, 0);
+            let x = 1 + (hash % span) as i32;
+            let y = 1 + (hash_noise(seed ^ 0x12, patch, 1) % span) as i32;
+            canvas.set(x, y, color);
+            match hash % 3 {
+                0 => {
+                    canvas.set(x + 1, y, color);
+                    canvas.set(x, y + 1, color);
+                }
+                1 => canvas.set(x, y + 1, color),
+                _ => canvas.set(x + 1, y, color),
+            }
+            if let Some(accent) = accent
+                && hash.is_multiple_of(2)
+            {
+                canvas.set(x + 2, y + 1, accent);
+                canvas.set(x + 1, y + 2, accent);
+            }
+        }
+        // A few lone flecks bridge the flat patches.
+        for fleck in 0..patches {
+            let x = (hash_noise(seed ^ 0x21, fleck, 0) % size) as i32;
+            let y = (hash_noise(seed ^ 0x22, fleck, 0) % size) as i32;
+            canvas.set(x, y, accent.unwrap_or(color));
         }
     }
 
@@ -3239,6 +4054,48 @@ mod minimal {
         canvas
     }
 
+    fn coal_ore(size: u32, seed: u32) -> Canvas {
+        let mut canvas = stone(size, seed ^ 0x41);
+        flat_ore(&mut canvas, seed ^ 0x51, 7, COAL_LOOK, None);
+        canvas
+    }
+
+    fn iron_ore(size: u32, seed: u32) -> Canvas {
+        let mut canvas = stone(size, seed ^ 0x42);
+        flat_ore(&mut canvas, seed ^ 0x52, 6, IRON_LOOK, Some(IRON_SHADE));
+        canvas
+    }
+
+    fn copper_ore(size: u32, seed: u32) -> Canvas {
+        let mut canvas = stone(size, seed ^ 0x43);
+        flat_ore(&mut canvas, seed ^ 0x53, 6, COPPER_LOOK, Some(COPPER_PATINA));
+        canvas
+    }
+
+    fn furnace_top(size: u32, seed: u32) -> Canvas {
+        furnace_top_from(stone(size, seed ^ 0x61), seed, &FURNACE_LOOK)
+    }
+
+    fn furnace_side(size: u32, seed: u32) -> Canvas {
+        furnace_side_from(stone(size, seed ^ 0x62), seed, &FURNACE_LOOK)
+    }
+
+    fn furnace_front(size: u32, seed: u32) -> Canvas {
+        furnace_front_from(stone(size, seed ^ 0x63), seed, &FURNACE_LOOK)
+    }
+
+    fn chest_top(size: u32, seed: u32) -> Canvas {
+        chest_top_from(planks(size, seed ^ 0x71), seed, &CHEST_LOOK)
+    }
+
+    fn chest_side(size: u32, seed: u32) -> Canvas {
+        chest_side_from(planks(size, seed ^ 0x72), seed, &CHEST_LOOK)
+    }
+
+    fn chest_front(size: u32, seed: u32) -> Canvas {
+        chest_front_from(planks(size, seed ^ 0x73), seed, &CHEST_LOOK)
+    }
+
     fn debug(size: u32) -> Canvas {
         Canvas::from_fn(size, |x, y| {
             if (x / 4 + y / 4).is_multiple_of(2) {
@@ -3564,23 +4421,137 @@ mod tests {
     }
 
     #[test]
-    fn new_block_layers_do_not_use_the_debug_fallback() {
-        let new_layers = [
-            catalogue::PLANKS.0 as usize,
-            catalogue::COBBLESTONE.0 as usize,
-            catalogue::CRAFTING_TABLE_TOP.0 as usize,
-            catalogue::CRAFTING_TABLE_SIDE.0 as usize,
-        ];
+    fn every_catalogue_layer_differs_from_debug_in_every_style() {
         for style in TexturePackStyle::ALL {
             let pack = generate_texture_pack(style);
             let debug = pack.layer(0, catalogue::DEBUG.0 as usize).expect("debug layer");
-            for layer in new_layers {
+            for layer in 1..LAYER_COUNT {
                 assert_ne!(
-                    pack.layer(0, layer).expect("new layer"),
+                    pack.layer(0, layer).expect("catalogue layer"),
                     debug,
-                    "{style:?} layer {} fell back to the debug checkerboard",
+                    "{style:?} layer {layer} ({}) fell back to the debug checkerboard",
                     catalogue::NAMES[layer]
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn ore_furnace_and_chest_layers_read_as_intended() {
+        /// Counts texels matching a predicate.
+        fn count(pack: &TexturePack, layer: usize, predicate: impl Fn([u8; 4]) -> bool) -> usize {
+            pack.layer(0, layer)
+                .expect("layer exists")
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|texel| predicate(**texel))
+                .count()
+        }
+
+        for style in TexturePackStyle::ALL {
+            let pack = generate_texture_pack(style);
+            let stone = mean_color(&pack, catalogue::STONE.0 as usize);
+            let coal = mean_color(&pack, catalogue::COAL_ORE.0 as usize);
+
+            // Coal is a dark mineral on the same stone base; the mean luma drop
+            // proves the chunks cover enough of the tile to read at a distance.
+            assert!(
+                luma(coal) + 4.0 < luma(stone),
+                "{style:?} coal ore ({:.1}) should be darker than stone ({:.1})",
+                luma(coal),
+                luma(stone)
+            );
+
+            // Iron and copper add warm mineral flecks; coal has none. Counting
+            // texels is more robust than a mean for the very flat Minimal style.
+            let warm = |layer: usize| count(&pack, layer, |texel| i32::from(texel[0]) > i32::from(texel[2]) + 20);
+            assert!(
+                warm(catalogue::IRON_ORE.0 as usize) >= 10,
+                "{style:?} iron ore has no warm beige/brown flecks"
+            );
+            assert!(
+                warm(catalogue::COPPER_ORE.0 as usize) >= 10,
+                "{style:?} copper ore has no warm orange flecks"
+            );
+            assert_eq!(
+                warm(catalogue::COAL_ORE.0 as usize),
+                0,
+                "{style:?} coal ore must stay neutral black, not warm"
+            );
+            let patina = count(&pack, catalogue::COPPER_ORE.0 as usize, |texel| {
+                i32::from(texel[1]) > i32::from(texel[0]) + 20 && i32::from(texel[1]) > i32::from(texel[2]) + 10
+            });
+            assert!(patina >= 2, "{style:?} copper ore has no teal-green patina pixels");
+
+            // The furnace front is a dark firebox with warm embers at the bottom.
+            let front = catalogue::FURNACE_FRONT.0 as usize;
+            let dark = count(&pack, front, |texel| {
+                let luma = 0.2126 * f64::from(texel[0]) + 0.7152 * f64::from(texel[1]) + 0.0722 * f64::from(texel[2]);
+                luma < 80.0
+            });
+            let embers = count(&pack, front, |texel| {
+                i32::from(texel[0]) > i32::from(texel[1]) + 40 && i32::from(texel[1]) > i32::from(texel[2]) + 15
+            });
+            assert!(
+                dark >= 4,
+                "{style:?} furnace front has no dark arched opening ({dark} dark texels)"
+            );
+            assert!(
+                embers >= 2,
+                "{style:?} furnace front has no warm ember glow ({embers} ember texels)"
+            );
+            let furnace_faces = [
+                catalogue::FURNACE_TOP.0 as usize,
+                catalogue::FURNACE_SIDE.0 as usize,
+                catalogue::FURNACE_FRONT.0 as usize,
+            ];
+            for (index, &first) in furnace_faces.iter().enumerate() {
+                for &second in &furnace_faces[index + 1..] {
+                    assert_ne!(
+                        pack.layer(0, first),
+                        pack.layer(0, second),
+                        "{style:?} furnace faces {} and {} must differ",
+                        catalogue::NAMES[first],
+                        catalogue::NAMES[second]
+                    );
+                }
+            }
+
+            // Chests stay wooden while their iron bands read as cool grey metal.
+            let chest_faces = [
+                catalogue::CHEST_TOP.0 as usize,
+                catalogue::CHEST_SIDE.0 as usize,
+                catalogue::CHEST_FRONT.0 as usize,
+            ];
+            for &face in &chest_faces {
+                let mean = mean_color(&pack, face);
+                assert!(
+                    mean[0] > mean[1] && mean[1] > mean[2] && mean[0] - mean[2] > 25.0,
+                    "{style:?} {} is not warm wood: {mean:?}",
+                    catalogue::NAMES[face]
+                );
+                let metal = count(&pack, face, |texel| {
+                    let max = texel[0].max(texel[1]).max(texel[2]);
+                    let min = texel[0].min(texel[1]).min(texel[2]);
+                    max - min <= 18 && texel[3] == 255
+                });
+                assert!(
+                    metal >= 2,
+                    "{style:?} {} has no iron band pixels ({metal} grey texels)",
+                    catalogue::NAMES[face]
+                );
+            }
+            for (index, &first) in chest_faces.iter().enumerate() {
+                for &second in &chest_faces[index + 1..] {
+                    assert_ne!(
+                        pack.layer(0, first),
+                        pack.layer(0, second),
+                        "{style:?} chest faces {} and {} must differ",
+                        catalogue::NAMES[first],
+                        catalogue::NAMES[second]
+                    );
+                }
             }
         }
     }
@@ -3776,11 +4747,11 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         };
         eprintln!("texture pack preview GPU: {summary}");
 
-        // Five columns by four rows: all eighteen layers fit on one sheet.
+        // Six columns by five rows: all twenty-seven layers fit on one sheet.
         const WIDTH: u32 = 540;
-        const HEIGHT: u32 = 432;
-        const COLUMNS: u32 = 5;
-        const ROWS: u32 = 4;
+        const HEIGHT: u32 = 450;
+        const COLUMNS: u32 = 6;
+        const ROWS: u32 = 5;
         const CELL: u32 = WIDTH / COLUMNS;
         const GAP: u32 = 8;
         const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;

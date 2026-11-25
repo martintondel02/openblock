@@ -123,6 +123,7 @@ around.
 | [Roadmap](docs/plan/00-roadmap.md) | Phases, releases, the two-track effort model and the critical path |
 | [Milestones](docs/plan/01-milestones.md) | `MS-00 … MS-16` for 1.0, `MS-17` for the 2.0 track, and the post-1.0 releases |
 | [Research](docs/research/01-weft-teardown.md) | Prior-art teardowns and technology surveys used to make the decisions |
+| [Server operations](docs/admin/README.md) | Dedicated server quickstart, configuration, security, backups and upgrades |
 
 Full document map: [`docs/README.md`](docs/README.md).
 
@@ -218,8 +219,9 @@ cargo run --release -p ob_client --bin openblock -- --seed 42
 # Headless host: generate, tick, save, reload and verify determinism
 cargo run --release -p ob_server --bin openblock-server -- --smoke --seed 42
 
-# Dedicated host (no networking yet; MS-06)
-cargo run --release -p ob_server --bin openblock-server -- --world demo --seed 42
+# Dedicated TCP server on loopback (interim JSON/TCP; no TLS/auth)
+cargo run --release -p ob_server --bin openblock-server -- \
+  --data-dir ./data --world demo --seed 42 --listen 127.0.0.1:25565
 
 # Headless render check / screenshot (works without a display; needs a Vulkan driver)
 cargo run --release -p ob_client --bin openblock -- --screenshot openblock.png --seed 42 --fly
@@ -242,12 +244,68 @@ hungry, and watch out for falls. Health and hunger regenerate or drain over time
 at zero health a respawn screen appears. Creative mode (infinite blocks, no
 damage) remains available via `--creative` and the settings menu.
 
+## Multiplayer alpha
+
+A dedicated server is included; it does not need a GPU or an audio device and
+ships with a systemd unit, container image and admin handbook.
+
+```sh
+# terminal 1: host a survival world
+cargo run --release -p ob_server --bin openblock-server -- \
+  --listen 0.0.0.0:25565 --world myworld --motd "My OpenBlock server"
+
+# terminal 2+: join
+cargo run --release -p ob_client --bin openblock -- \
+  --connect 127.0.0.1:25565 --name alice
+```
+
+The first player to join creates/continues the world; survival inventory/vitals
+persist by player name (no authentication yet). `T` opens chat, `Tab` shows the
+player roster, `Esc` opens settings while staying connected. The protocol is
+plain TCP/JSON without TLS: bind it to a trusted LAN, VPN or SSH tunnel, not the
+public internet. See [docs/admin](docs/admin/README.md) for configuration,
+backups, upgrades, container/systemd deployment and security guidance.
+
+### Known multiplayer limits in 0.1.0
+- Movement is client-authoritative (server validates bounds/reach/rates but does
+  not run player collision physics); PvP and anti-cheat are post-1.0.
+- Crafting is local-mode only (not yet in the network protocol).
+- No TLS/authentication; treat names as labels.
+- Chunk data is streamed with interest sets but clients do not unload far chunks.
+
+## Mobs, ores and gear
+
+| Mobs and combat | Furnace | Chest | Armor |
+| --- | --- | --- | --- |
+| ![Mobs](docs/img/v0.1.0-mobs.png) | ![Furnace](docs/img/v0.1.0-furnace.png) | ![Chest](docs/img/v0.1.0-chest.png) | ![Armor](docs/img/v0.1.0-armor.png) |
+
+Mine stone for cobblestone, find coal/iron/copper in caves and cliffs, build a
+furnace to smelt raw ores into ingots (coal/charcoal/planks are fuel), craft
+iron tools and leather/iron armor, and keep an eye on zombies at night. Armor
+mitigates damage up to 80% and wears down with hits; chests and furnaces are
+container windows with authoritative server state.
+
+## Performance
+
+The benchmark suite (`worldgen_bench`, `server_bench`, `save_bench`, `soak`)
+covers generation, tick/save/load, and a 60,000-tick soak; quick profiles run in
+CI. Reference numbers are published in
+[docs/plan/08-measurements.md](docs/plan/08-measurements.md) and
+[docs/plan/09-benchmarks.md](docs/plan/09-benchmarks.md). Headline: worldgen
+~0.92 ms/chunk, server tick p99 ~0.03 ms for the single-player baseline, save
+~21 ms at 289 columns; the known gaps are whole-world synchronous saves at
+2,000+ columns and the not-yet-automated 8-player network load test.
+
 ## Debug overlay and settings
 
 The F3 overlay is grouped and spaced for readability; it scales down and stacks
 its hardware column on smaller windows. The Esc settings screen uses explicit
 `<` / `>` controls on every range/choice row, so values can be raised and
-lowered with the mouse as well as with Left/Right or the scroll wheel.
+lowered with the mouse as well as with Left/Right or the scroll wheel. It has
+Game, Display, Audio, Controls and Textures tabs. **Audio** controls Sound,
+Master, SFX and Music volume; all sounds are synthesised in memory, so no sound
+files are downloaded or bundled. `--no-audio` disables output entirely and
+`--mute` starts muted.
 
 | F3 debug overlay | Settings (Esc) |
 | --- | --- |
@@ -326,10 +384,11 @@ gate. Full log: [`docs/plan/08-measurements.md`](docs/plan/08-measurements.md).
 Controls: mouse look (click to capture), `WASD` move, `Space` jump, `Shift`
 crouch/sneak, `Ctrl` sprint, `F` toggle fly, **hold left button to mine**, right
 click to place or eat, `1`–`9` or the mouse wheel select a hotbar slot, `E` opens
-the inventory, `F3` debug, `F1` HUD, `F2` screenshot, `C` crafting, `Esc` settings.
+the inventory, `F3` debug, `F1` HUD, `F2` screenshot, `C` crafting (single-player), `E` inventory,
+`T` chat and `Tab` roster in multiplayer, `Esc` settings.
 Game mode, controls and texture settings live in the Esc settings screen. `F3` toggles the debug overlay, `F1` toggles the HUD, `F2` saves
 a screenshot, `Esc` opens the pause/settings menu (render distance, FOV, mouse
-sensitivity, fullscreen, HUD/debug toggles, save and quit). Settings are saved to
+sensitivity, fullscreen, audio, HUD/debug toggles, save and quit). Settings are saved to
 `<data-dir>/config.json`; worlds live under
 `${XDG_DATA_HOME:-~/.local/share}/openblock/worlds/`.
 
@@ -341,7 +400,7 @@ target for dedicated servers.
 ### Building on Fedora (for contributors)
 
 ```sh
-sudo dnf install gcc gcc-c++ pkgconf-pkg-config git   alsa-lib-devel wayland-devel libxkbcommon-devel   vulkan-loader-devel fontconfig-devel freetype-devel systemd-devel
+sudo dnf install gcc gcc-c++ pkgconf-pkg-config git   wayland-devel libxkbcommon-devel   vulkan-loader-devel fontconfig-devel freetype-devel systemd-devel
 # Rust toolchain (the pinned stable channel is in rust-toolchain.toml)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 cargo check --workspace --all-targets

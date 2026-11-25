@@ -1,6 +1,6 @@
 [package]
 name = "ob_audio"
-description = "Audio: sound event bus, spatial mixing and music."
+description = "Procedural audio engine: deterministic synthesis, mixing and a runtime-loaded PulseAudio output backend."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,3 +13,4 @@ name = "ob_audio"
 path = "src/lib.rs"
 
 [dependencies]
+log.workspace = true

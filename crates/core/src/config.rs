@@ -116,6 +116,10 @@ pub const MIN_MOUSE_SENSITIVITY: f32 = 0.05;
 pub const MAX_MOUSE_SENSITIVITY: f32 = 3.0;
 /// Longest accepted persisted resource-pack path, in bytes.
 pub const MAX_TEXTURE_PACK_PATH_BYTES: usize = 4096;
+/// Lowest volume accepted by the audio settings, as a linear gain.
+pub const MIN_AUDIO_VOLUME: f32 = 0.0;
+/// Highest volume accepted by the audio settings, as a linear gain.
+pub const MAX_AUDIO_VOLUME: f32 = 1.0;
 
 /// Persistent user settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -141,6 +145,14 @@ pub struct Settings {
     pub texture_pack: Option<String>,
     /// Gameplay mode: survival (default) or creative.
     pub game_mode: GameMode,
+    /// Whether the audio engine produces sound. Defaults to on.
+    pub audio_enabled: bool,
+    /// Master output volume in `0.0..=1.0`.
+    pub master_volume: f32,
+    /// Sound-effect bus volume in `0.0..=1.0`.
+    pub sfx_volume: f32,
+    /// Music and ambience bus volume in `0.0..=1.0`.
+    pub music_volume: f32,
 }
 
 impl Default for Settings {
@@ -155,6 +167,10 @@ impl Default for Settings {
             texture_style: TextureStyle::Classic,
             texture_pack: None,
             game_mode: GameMode::Survival,
+            audio_enabled: true,
+            master_volume: 0.8,
+            sfx_volume: 1.0,
+            music_volume: 0.55,
         }
     }
 }
@@ -179,6 +195,9 @@ impl Settings {
         if let Some(workers) = self.mesh_workers {
             self.mesh_workers = Some(workers.clamp(1, 16));
         }
+        self.master_volume = clamp_volume(self.master_volume, Settings::default().master_volume);
+        self.sfx_volume = clamp_volume(self.sfx_volume, Settings::default().sfx_volume);
+        self.music_volume = clamp_volume(self.music_volume, Settings::default().music_volume);
         before != *self
     }
 
@@ -270,7 +289,19 @@ fn sanitised(settings: &Settings) -> Settings {
     if !copy.mouse_sensitivity.is_finite() {
         copy.mouse_sensitivity = Settings::default().mouse_sensitivity;
     }
+    copy.master_volume = clamp_volume(copy.master_volume, Settings::default().master_volume);
+    copy.sfx_volume = clamp_volume(copy.sfx_volume, Settings::default().sfx_volume);
+    copy.music_volume = clamp_volume(copy.music_volume, Settings::default().music_volume);
     copy
+}
+
+/// Clamps a volume to `0.0..=1.0`, replacing non-finite values with `fallback`.
+fn clamp_volume(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(MIN_AUDIO_VOLUME, MAX_AUDIO_VOLUME)
+    } else {
+        fallback
+    }
 }
 
 #[cfg(test)]
@@ -492,6 +523,102 @@ mod tests {
         let loaded = load_settings(&dir);
         assert_eq!(loaded.game_mode, GameMode::Survival);
         assert_eq!(loaded.render_distance_chunks, 8);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn audio_defaults_are_sensible_and_old_configs_load_them() {
+        let defaults = Settings::default();
+        assert!(defaults.audio_enabled);
+        assert_eq!(defaults.master_volume, 0.8);
+        assert_eq!(defaults.sfx_volume, 1.0);
+        assert_eq!(defaults.music_volume, 0.55);
+
+        let dir = temp_dir("audio-old-config");
+        fs::write(settings_path(&dir), br#"{"render_distance_chunks": 8}"#).expect("write");
+        let loaded = load_settings(&dir);
+        assert!(loaded.audio_enabled);
+        assert_eq!(loaded.master_volume, defaults.master_volume);
+        assert_eq!(loaded.sfx_volume, defaults.sfx_volume);
+        assert_eq!(loaded.music_volume, defaults.music_volume);
+        assert_eq!(loaded.render_distance_chunks, 8);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn audio_settings_round_trip() {
+        let dir = temp_dir("audio-roundtrip");
+        let settings = Settings {
+            audio_enabled: false,
+            master_volume: 0.35,
+            sfx_volume: 0.65,
+            music_volume: 0.2,
+            ..Settings::default()
+        };
+        save_settings(&dir, &settings).expect("save");
+        assert_eq!(load_settings(&dir), settings);
+        let text = fs::read_to_string(settings_path(&dir)).expect("read");
+        for needle in [
+            "\"audio_enabled\": false",
+            "\"master_volume\": 0.35",
+            "\"sfx_volume\": 0.65",
+            "\"music_volume\": 0.2",
+        ] {
+            assert!(text.contains(needle), "missing {needle} in:\n{text}");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn audio_volumes_are_clamped_and_non_finite_values_recover() {
+        let dir = temp_dir("audio-clamp");
+        fs::write(
+            settings_path(&dir),
+            br#"{"master_volume": 9.0, "sfx_volume": -3.0, "music_volume": "not a number"}"#,
+        )
+        .expect("write");
+        // A malformed JSON type makes the whole document fall back to defaults,
+        // which is also a valid safe recovery. Test finite out-of-range values
+        // separately below.
+        assert_eq!(load_settings(&dir), Settings::default());
+
+        fs::write(
+            settings_path(&dir),
+            br#"{"master_volume": 9.0, "sfx_volume": -3.0, "music_volume": 2.0}"#,
+        )
+        .expect("write");
+        let loaded = load_settings(&dir);
+        assert_eq!(loaded.master_volume, MAX_AUDIO_VOLUME);
+        assert_eq!(loaded.sfx_volume, MIN_AUDIO_VOLUME);
+        assert_eq!(loaded.music_volume, MAX_AUDIO_VOLUME);
+
+        let mut settings = Settings {
+            master_volume: f32::NAN,
+            sfx_volume: f32::INFINITY,
+            music_volume: f32::NEG_INFINITY,
+            ..Settings::default()
+        };
+        assert!(settings.clamp());
+        assert_eq!(settings.master_volume, Settings::default().master_volume);
+        assert_eq!(settings.sfx_volume, Settings::default().sfx_volume);
+        assert_eq!(settings.music_volume, Settings::default().music_volume);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn saving_sanitises_non_finite_audio_volumes() {
+        let dir = temp_dir("audio-nan");
+        let settings = Settings {
+            master_volume: f32::NAN,
+            sfx_volume: f32::NEG_INFINITY,
+            music_volume: f32::INFINITY,
+            ..Settings::default()
+        };
+        save_settings(&dir, &settings).expect("save");
+        let loaded = load_settings(&dir);
+        assert_eq!(loaded.master_volume, Settings::default().master_volume);
+        assert_eq!(loaded.sfx_volume, Settings::default().sfx_volume);
+        assert_eq!(loaded.music_volume, Settings::default().music_volume);
         let _ = fs::remove_dir_all(dir);
     }
 

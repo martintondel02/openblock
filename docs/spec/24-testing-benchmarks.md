@@ -296,6 +296,17 @@ The release gate is a 24 h campaign per target with no new crash
 ([MS-15](../plan/01-milestones.md) exit criterion); corpora are pruned only when
 a seed no longer reaches new coverage, and the manifest records the pruning.
 
+**Interim v1.0 adversarial tier.** Until the QUIC/TLS transport lands, the
+JSON/TCP stack and its persistence and pack inputs are covered by
+`crates/server/tests/net_abuse.rs`, `net_fd_leak.rs` (Linux descriptor/thread
+leak), `save_robustness.rs`, and unit-test matrices in `ob_protocol`
+(framing/JSON), `ob_world` (save), `ob_content` (pack), `ob_render` (resource
+pack) and `ob_audio` (dlopen FFI). They run in the existing
+`cargo test --workspace --all-targets` PR tier, are deterministic and
+loopback-only, and the slowest case is the 10 s handshake-timeout regression
+(~11 s for the whole server integration binary). Known gaps are listed in
+[20 §7.5](20-security-and-anti-cheat.md#75-interim-v10-adversarial-test-coverage-and-known-limitations).
+
 ### 3.11 Benchmark scenes and the runner
 
 [Chapter 25](25-performance-budgets.md) owns the budget numbers, gate classes,

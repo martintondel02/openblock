@@ -1,6 +1,6 @@
 # 20 — Security and Anti-Cheat
 
-> Status: normative - Last updated: 2026-11-24
+> Status: normative - Last updated: 2026-11-25
 > Depends on: [DEC-008](../decisions.md), [DEC-020](../decisions.md), [DEC-023](../decisions.md), [DEC-024](../decisions.md), [DEC-026](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md), [DEC-038](../decisions.md), [DEC-040](../decisions.md), [DEC-041](../decisions.md), [DEC-042](../decisions.md), [DEC-044](../decisions.md), [DEC-045](../decisions.md), [DEC-049](../decisions.md), [DEC-050](../decisions.md); [conventions](00-conventions.md), [architecture](01-technical-architecture.md), [gameplay](08-gameplay-survival.md), [inventory](11-inventory-crafting-items.md), [modding](16-modding.md), [persistence](17-persistence.md), [networking](18-networking-multiplayer.md), [server administration](19-server-administration.md)
 > Implements: MS-06 (transport hardening, validation hooks), MS-09 (sandbox policy), MS-13 (untrusted data), MS-15 (anti-cheat, moderation, abuse), MS-16 (disclosure)
 
@@ -784,6 +784,55 @@ the merge and the release. A nightly build runs the cheat corpus, the fuzzers
 and a two-hour soak with 50 bots. A negative control asserts a deliberately
 disabled validator is caught by the cheat corpus, so the corpus cannot silently
 stop testing anything.
+
+### 7.5 Interim v1.0 adversarial test coverage and known limitations
+
+The interim JSON/TCP transport (§18 §3.13) is not the QUIC/TLS target, so the
+requirements above are enforced only in the subset that exists today. The
+regression suite runs in the normal `cargo test --workspace --all-targets` PR
+tier; no separate workflow step is required.
+
+| Area | Tests | What they prove |
+| --- | --- | --- |
+| Framing and JSON | `crates/protocol/src/frame.rs`, `message.rs`, `crates/server/tests/net_abuse.rs` | Truncated prefix/payload, zero length, >2 MiB declared length, invalid UTF-8/JSON, unknown or out-of-phase tags, missing and duplicate fields, integer overflow and non-finite numbers, deep nesting, 1 MB name/chat: every case closes or drops with a reason and never panics. A partial frame is a typed `TruncatedFrame`, not a silent EOF. |
+| Admission and rates | `net_abuse.rs` | `max_players`, the 32-handshake cap and its cleanup after an idle flood, the 10 s handshake timeout (slowloris), 10,000-frame spam, and ping/chat/move/edit/chunk burst limits; the server survives and accepts a new client afterwards. |
+| FDs and threads | `crates/server/tests/net_fd_leak.rs` (Linux) | 16 abrupt and clean reconnects return `/proc/self/fd` and `/proc/self/task` to the pre-storm baseline. |
+| Survival authority | `net_abuse.rs`, `net_players.rs` unit tests, `net_survival.rs` | Invalid slots/counts/revisions, per-connection window ownership, take-only furnace output, dead actions, fake/far attack ids and finite-but-absurd positions; a 120-move loopback fuzz and a 2,000-move host-level fuzz assert per-item conservation and stack/durability bounds. |
+| Entity replication | `net_abuse.rs` | A mob near one player is never replicated to a player 1,000 m away, a client naming `entity_spawn` is disconnected, and fake/far ids cannot spawn or damage entities. |
+| Saves and sidecars | `crates/world/src/save.rs`, `crates/server/tests/save_robustness.rs` | v1–v4 corrupt/truncated/version/CRC/fingerprint errors, zstd frame-size check before allocation, structural payload mutations, sparse >512 MiB file rejection, hostile/NaN/unknown sidecars, unexpected files and symlink loops, and a failed save leaves the previous snapshot intact. |
+| Packs | `resource_pack.rs`, `content/src/pack.rs` | Palette/tRNS and truncated PNGs, symlink loops, non-UTF-8 and `..` paths, deep JSON, the 8 MiB/4,096 schema caps, unknown fields/ids/colours/hardness and non-UTF-8 input. |
+| Audio FFI | `pulse.rs` tests | Every required symbol is checked and the handle released on failure, the handle lifetime across `Arc` clones, repeated shutdown, and real `dlopen`/`dlsym`/`dlclose` against libc plus a missing library. Review found no double-free or UB path: `pa_simple` is owned by one writer thread, its pointer is zeroed after `pa_simple_free`, and `dlclose` runs only after the stream is freed. |
+
+Fixes from this pass: typed partial-frame rejection; zstd frame content-size
+validation before allocating the declared 256 MiB payload; a 512 MiB on-disk
+`world.obs` cap with a metadata pre-check; an 8 MiB cap on every sidecar read;
+clamping and normalising a saved single-player position and look angles; and
+enforcing the furnace output as hotbar-take-only (a window swap could previously
+move an unrelated item into the output slot); dropping remote-address fields
+from server log lines (REQ-SEC-030); and keeping chat content out of the default
+info log (20 §3.14).
+
+Known interim limitations: there is still no TLS, player identity/authentication
+or per-IP/per-subnet admission. A name is not a credential; only the global
+`max_players` and 32-concurrent-handshake caps exist. An idle authenticated
+connection holds its player slot for the 120 s read timeout, and a stalled
+handshake holds one of the 32 handshake threads for 10 s. A stalled reader can
+also hold one declared frame buffer of up to 2 MiB until the timeout, so a
+500-player configuration has a theoretical worst case near 1 GiB of frame
+buffers; the default cap of 8 players keeps this small. Movement remains
+client-authoritative with bounds and speed checks only, so a modified client can
+still move within those generous limits. JSON decoding can allocate up to the
+2 MiB frame limit (plus serde value overhead) per connection. `world.obs` is a
+single-file interim format, not the region-file target of chapter 17; the 256 MiB
+decompressed and 512 MiB on-disk caps are hard interim limits, and the 200:1
+decompression-ratio cap is not implemented yet (the fixed size caps still bound
+the allocation). The tick loop does not wrap per-handler work in `catch_unwind`,
+so a handler panic remains fatal to the simulation thread (REQ-SEC-042 is still
+open for this transport). Resource-pack paths are local user-chosen directories
+where symlinks are followed (archive import is not implemented), and
+content-pack ids are interned for the process lifetime. No `cargo-fuzz` target
+is committed yet: the deterministic mutation loops are the PR substitute and the
+fuzz targets remain a pre-release requirement.
 
 ## 8. Open questions
 

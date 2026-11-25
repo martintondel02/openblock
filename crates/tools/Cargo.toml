@@ -1,6 +1,6 @@
 [package]
 name = "ob_tools"
-description = "Offline tooling: asset compiler, world tools and inspectors."
+description = "Offline tooling: asset compiler, world tools, inspectors and CPU benchmark/soak harnesses."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,9 +16,28 @@ path = "src/lib.rs"
 name = "openblock-tools"
 path = "src/bin/openblock_tools.rs"
 
+[[bin]]
+name = "worldgen_bench"
+path = "src/bin/worldgen_bench.rs"
+
+[[bin]]
+name = "server_bench"
+path = "src/bin/server_bench.rs"
+
+[[bin]]
+name = "save_bench"
+path = "src/bin/save_bench.rs"
+
+[[bin]]
+name = "soak"
+path = "src/bin/soak.rs"
+
 [dependencies]
 ob_core.workspace = true
 ob_content.workspace = true
+ob_math.workspace = true
 ob_world.workspace = true
+ob_worldgen.workspace = true
+ob_sim.workspace = true
 ob_server.workspace = true
 ob_render.workspace = true

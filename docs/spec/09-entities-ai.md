@@ -498,3 +498,137 @@ The AI fixture is the central artefact: fixed seed, 10 mobs, a scripted player p
 - Chapters: [00](00-conventions.md), [01](01-technical-architecture.md), [02](02-engine-core.md), [05](05-world-model.md), [06](06-worldgen.md), [07](07-light-and-weather.md), [08](08-gameplay-survival.md), [10](10-physics-and-collision.md), [11](11-inventory-crafting-items.md), [12](12-redstone-and-logic.md), [15](15-content-system.md), [17](17-persistence.md), [18](18-networking-multiplayer.md), [25](25-performance-budgets.md).
 - Research: [Minecraft feature inventory](../research/05-minecraft-feature-inventory.md) §3.4–§3.5 (entity/mob counts, villager and boss scope, AI LOD and the 1–2 ms/200-mob suggestion); [Weft teardown](../research/01-weft-teardown.md) §8 and §10 lesson 4 (entry/component registries, no privileged base content).
 - External: Hart, Nilsson & Raphael, "A Formal Basis for the Heuristic Determination of Minimum Cost Paths", *IEEE Transactions on Systems Science and Cybernetics* 4(2), 1968 — <https://doi.org/10.1109/TSSC.1968.300136>; Amit Patel, "A* Pathfinding" — <https://theory.stanford.edu/~amitp/GameProgramming/>; RFC 9562, "Universally Unique IDentifiers (UUIDs)" — <https://www.rfc-editor.org/rfc/rfc9562>; Minecraft Wiki, "Spawn" and "Mob AI" — external parity facts for caps, spawn rules and despawn distances: <https://minecraft.wiki/w/Spawn>, <https://minecraft.wiki/w/Mob_AI>.
+
+## Appendix A — Interim 1.0 mob slice (pre-1.0)
+
+> Status: interim, code-defined in `ob_content`/`ob_sim`/`ob_server`. This
+> appendix records the combat/AI slice shipped for 1.0 so client, network and
+> content work can consume it. It does not change the normative requirements
+> above; the data-driven entity pipeline and the goal/sensor/navigation systems
+> replace these tables after 1.0.
+
+The interim catalogue is five species: cow, pig, sheep and chicken are passive;
+the zombie is the only hostile mob. Mobs have no pathfinding, line of sight,
+memory, projectiles, breeding, taming, leashing, villagers, bosses, status
+effects or XP. They still obey world collision, gravity, water and loaded-chunk
+rules, and their decisions are a pure hash of species, position, age and a
+purpose salt (no RNG state, wall clock or allocation address).
+
+### A.1 Catalogue
+
+| Kind | Health | Speed (m/s) | Hitbox W×H (m) | Hostile | Drops (fixed) |
+| --- | ---: | ---: | --- | --- | --- |
+| `openblock:cow` | 10 | 1.4 | 0.9 × 1.3 | no | `raw_beef` ×1, `leather` ×1 |
+| `openblock:pig` | 10 | 1.4 | 0.9 × 0.9 | no | `raw_porkchop` ×1 |
+| `openblock:sheep` | 8 | 1.4 | 0.9 × 1.3 | no | `leather` ×1 |
+| `openblock:chicken` | 4 | 1.5 | 0.4 × 0.7 | no | none |
+| `openblock:zombie` | 20 | 2.2 | 0.6 × 1.8 | yes | none |
+
+`MobKind::name()` returns the namespaced id, `MobKind::from_name` is the
+save-facing parser, and `Registry::mob(kind)` returns the `MobSpec`. Drop
+entries resolve when the registry is built; a custom block pack that lacks an
+item simply omits that drop rather than invalidating the kind.
+
+### A.2 Movement and AI
+
+Mobs use a swept AABB per axis in Y/X/Z order, gravity `28 m/s²`, a terminal
+speed of `78.4 m/s` and 0.45 m collision sub-steps, so a fall cannot tunnel
+through a floor. There is **no step-up**: a one-block ledge blocks a mob.
+
+| State | Behaviour |
+| --- | --- |
+| `Idle` | Chooses a deterministic `Wander` leg on the next tick. |
+| `Wander` | Walks to a point 2–8 m from the current position for 2–7 s. A passive mob probes 0.6 m ahead and cancels a step without solid support, so it stops at cliff and shore edges. |
+| `Flee` | A passive mob that was hurt runs directly away from the player for the remaining hurt reaction (`MOB_HURT_FLEE_TIME` = 4 s), then resumes idling/wandering. |
+| `Chase` | A zombie moves straight toward a living player within 16 m. Distance only: there is no line-of-sight or path search. |
+| `Despawn` | The host should remove the mob (age, distance or the void). |
+
+Water is not a barrier once a mob is in it: buoyancy (`34 m/s²`, stronger than
+gravity) plus drag floats it back to the surface and swimming uses half speed.
+A mob on land refuses a step without solid support, which also keeps it out of
+deep water. There is no drowning, lava or fire damage in this slice.
+
+### A.3 Natural spawning, caps and despawn
+
+The day phase is `tick_count % 24_000`: day is `0..12_000`, night is
+`13_000..23_000`, and the two 1,000-tick dusk/dawn bands spawn no hostiles.
+
+| Category | Cap | When | Distance | Floor |
+| --- | ---: | --- | --- | --- |
+| Passive | 10 | day | 12–40 m | grass top, two air cells |
+| Hostile | 8 | night, or any time while the player is below Y=40 | 16–48 m | solid surface (night) or a cave floor within ±16 Y of an underground player |
+
+Every 20 ticks the host makes two deterministic attempts per eligible category.
+Each attempt hashes the world seed, tick and attempt to choose an angle and
+distance, requires a loaded chunk column, no candidate within 8 m of the
+player, two air cells above the floor and a collision-free species AABB.
+Hostiles are always zombies; passive species are picked deterministically from
+the same hash. Natural spawning does not create a mob inside a solid block or
+in an unloaded column.
+
+Mobs are frozen when their chunk column is not resident: no step, AI, ageing,
+attack or despawn until the column streams back in. Their state remains in the
+save and the state hash. A mob despawns when `age > 600 s`, when it is more
+than 64 m from the player, or when it falls below Y=-64. Despawn is a silent
+removal with no drops and no event. There is no per-player attribution or
+persistent/named-mob exemption in this slice.
+
+### A.4 Combat and daylight
+
+- **Player attacks.** The host checks the distance from the player's eye to the
+  mob AABB; a hit needs at most `MOB_ATTACK_REACH = REACH + 0.5 = 5.5 m`.
+  Damage is `Registry::attack_damage(selected item)` (hand or non-tool = 1.0;
+  table in [11 Appendix A.2](11-inventory-crafting-items.md#a2-items-tools-and-armor)).
+  A hit sets the mob's hurt timer, applies knockback and, in survival, wears a
+  selected tool by one durability (the tool is removed at zero). Creative
+  attacks deal damage but never wear tools. A kill resolves the fixed drop table
+  exactly once, spawns one item entity per entry at the mob centre and removes
+  the mob.
+- **Mob attacks.** A zombie in range (feet-to-feet distance ≤ 1.6 m) with a
+  ready cooldown deals 3 HP through the existing armor mitigation
+  (`damage_with_outcome`) and adds a horizontal knockback plus a small upward
+  impulse to the player. The cooldown is 1 s. Creative players are treated as
+  non-targets; dead players are not chased or attacked.
+- **Selection.** `ob_sim::raycast_mob` performs a slab test against every
+  species AABB, returns the nearest id and breaks equal distances by ascending
+  id. `Host::mob_hit_by_ray` exposes it against the live population; the host
+  still validates reach and damage in `Host::attack_mob`.
+- **Daylight.** A hostile zombie exposed to the sky during the day loses
+  1 health per second. A burn death uses the normal (empty) zombie drop table;
+  there is no cooked-food conversion. A roof blocks the burn because exposure
+  is tested against the column's highest non-air block.
+
+### A.5 Host API and persistence
+
+`Host::mobs()` returns `&[MobEntity]` in ascending id order (each entity has
+`id` and a `mob: ob_sim::Mob` with position, velocity, yaw, health, `MobAi`,
+age, attack cooldown, `on_ground` and hurt timer). `Host::mob_count`,
+`passive_mob_count`, `hostile_mob_count`, `mob_entity`, `mob_hit_by_ray`,
+`attack_mob` and `spawn_mob` (command/debug entry point that bypasses natural
+rules) are the client-facing surface. `AttackOutcome` reports `hit`, `damage`,
+`killed`, the spawned `drops` and any `tool_broke`.
+
+`mobs.txt` is a header-free sidecar with one row per mob:
+
+```
+id kind x y z yaw health age
+```
+
+Rows are sorted by id; floats use the full-precision `Debug` form. Missing files
+load as an empty population, and malformed rows, unknown kinds, duplicate ids,
+non-finite values and non-positive health are skipped with a warning. Health
+clamps to the species maximum. AI intent, velocity, hurt timer, attack cooldown
+and `on_ground` are transient and restart at idle/full cooldown after a load.
+The state hash covers id, kind, quantised position, yaw, health and age, so a
+save/reload reproduces the hash exactly; spawn counters are not persisted.
+
+### A.6 Scope notes and post-1.0 work
+
+Deferred: pathfinding/navigation, sight and hearing, memory, goal graphs and
+priority interrupts, per-player caps and spawn attribution, persistent/named
+mobs, spawn eggs, breeding/taming/leashing/mounts, villagers/trading, bosses,
+projectiles, status effects, XP, loot tables with random counts, equipment,
+line-of-sight checks for attacks, step-up, lava/fire damage, mob-to-mob
+collision, mob merging/despawning rules tied to daylight (beyond zombie burn),
+network replication and client prediction. The interim state hash and save
+format are not the normative entity record of §4.2.

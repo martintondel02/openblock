@@ -1,0 +1,28 @@
+# OpenBlock dedicated server configuration (interim 1.0 build).
+#
+# Installed as /etc/openblock/server.toml by the openblock-server package.
+# This is a FLAT key = value subset, not a full TOML document: table headers
+# such as [server] are rejected, strings must be quoted, and unknown keys fail
+# at start-up with a line number and exit code 2.
+#
+# Resolution order: CLI flag > this file > built-in default.
+# Every change requires: systemctl restart openblock-server
+# Full reference: docs/admin/configuration.md
+
+world = "world"
+# Omit seed to generate one on first start. An existing world keeps its seed.
+# seed = 42
+data_dir = "/var/lib/openblock"
+listen = "0.0.0.0:25565"
+max_players = 8
+motd = "A self-hosted OpenBlock world"
+render_distance = 6
+interest_radius = 6
+save_interval_seconds = 60
+
+# Empty list = no whitelist (any name may join). Names are case-insensitive
+# labels, not authenticated identities; see docs/admin/security.md.
+whitelist = []
+# "survival" (default) or "creative". --survival/--creative override this on
+# the command line. This option may be extended by the server work in progress.
+game_mode = "survival"

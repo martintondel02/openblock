@@ -509,6 +509,30 @@ mod tests {
             .collect()
     }
 
+    /// Texture layer of the single quad lying on an axis-aligned cube plane.
+    fn layer_on_plane(mesh: &MeshData, axis: usize, value: f32) -> u32 {
+        let quads: Vec<&[Vertex]> = mesh
+            .vertices
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .filter(|quad| quad.iter().all(|vertex| (vertex.position[axis] - value).abs() < 1e-5))
+            .map(|quad| &quad[..])
+            .collect();
+        assert_eq!(
+            quads.len(),
+            1,
+            "expected exactly one quad on axis {axis} at {value}, found {}",
+            quads.len()
+        );
+        let layer = quads[0][0].layer;
+        assert!(
+            quads[0].iter().all(|vertex| vertex.layer == layer),
+            "one quad must use one texture layer"
+        );
+        layer
+    }
+
     #[test]
     fn single_textured_block_emits_six_quads() {
         let mut world = world_with_chunk(ChunkPos::new(0, 0));
@@ -537,6 +561,45 @@ mod tests {
                     vertex.light,
                 );
             }
+        }
+    }
+
+    #[test]
+    fn fronted_blocks_use_the_front_layer_only_on_the_positive_z_face() {
+        let cases = [
+            ("openblock:furnace", Some(textures::FURNACE_FRONT)),
+            ("openblock:chest", Some(textures::CHEST_FRONT)),
+            ("openblock:crafting_table", None),
+        ];
+        for (name, expected_front) in cases {
+            let mut world = world_with_chunk(ChunkPos::new(0, 0));
+            let id = block(&world, name);
+            assert!(world.set_block(BlockPos::new(0, 0, 0), id));
+            let faces = world.registry().block(id).textures;
+            let (mesh, stats) = mesh_section_with_stats(&world, section());
+            assert_eq!(stats.faces, 6, "{name} must emit six faces");
+
+            // +Z is the interim front face and selects `front` (or `side` when
+            // the block declares no front texture).
+            assert_eq!(
+                layer_on_plane(&mesh, 2, 1.0),
+                u32::from(faces.front_texture().0),
+                "{name} +Z must use the front layer"
+            );
+            if let Some(front) = expected_front {
+                assert_eq!(layer_on_plane(&mesh, 2, 1.0), u32::from(front.0));
+            }
+            // The other three side faces keep the ordinary side layer.
+            for (axis, value) in [(0, 1.0), (0, 0.0), (2, 0.0)] {
+                assert_eq!(
+                    layer_on_plane(&mesh, axis, value),
+                    u32::from(faces.side.0),
+                    "{name} side face on axis {axis} at {value} must use the side layer"
+                );
+            }
+            // Top and bottom keep their dedicated layers.
+            assert_eq!(layer_on_plane(&mesh, 1, 1.0), u32::from(faces.top.0));
+            assert_eq!(layer_on_plane(&mesh, 1, 0.0), u32::from(faces.bottom.0));
         }
     }
 

@@ -43,6 +43,12 @@ pub const VITAL_ICON_SIZE: f32 = 16.0;
 pub const VITAL_ICON_GAP: f32 = 2.0;
 /// Left margin of the survival vitals rows.
 pub const VITAL_MARGIN_X: f32 = 14.0;
+/// Number of armor pips drawn next to the hunger row.
+pub const ARMOR_ICON_COUNT: usize = 10;
+/// Each armor pip represents this many defence points.
+pub const ARMOR_POINTS_PER_ICON: f32 = 2.0;
+/// Horizontal gap between the hunger row and the armor pips.
+pub const ARMOR_ROW_GAP: f32 = 14.0;
 /// Seconds the red damage vignette remains visible.
 pub const DAMAGE_FLASH_SECONDS: f32 = 0.35;
 /// Seconds a pickup or hint toast remains visible.
@@ -127,6 +133,8 @@ pub const SETTINGS_MIN_MOUSE_SENSITIVITY: f32 = 0.2;
 pub const SETTINGS_MAX_MOUSE_SENSITIVITY: f32 = 3.0;
 /// Mouse-sensitivity step applied by Left/Right and Enter.
 pub const SETTINGS_SENSITIVITY_STEP: f32 = 0.1;
+/// Volume step applied by Left/Right, Enter and the mouse wheel.
+pub const SETTINGS_VOLUME_STEP: f32 = 0.05;
 /// Footer hint lines, split so they fit the panel at the 8x8 font.
 pub const SETTINGS_HINT_LINES: [&str; 2] = [
     "Tab: switch   Up/Down: select   Left/Right or scroll: change",
@@ -134,6 +142,41 @@ pub const SETTINGS_HINT_LINES: [&str; 2] = [
 ];
 /// Note shown on the Controls tab.
 pub const SETTINGS_PERSISTENCE_NOTE: &str = "Settings save automatically";
+/// Audio help shown below the Controls reference.
+pub const SETTINGS_AUDIO_NOTE: &str = "Audio: Esc > Audio (Sound, Master, SFX, Music)";
+
+/// Clamps a settings volume to `0.0..=1.0`, substituting the default for
+/// non-finite persisted values.
+fn settings_volume(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        fallback
+    }
+}
+
+/// Percent label used by the three volume rows.
+fn volume_percent(value: f32, fallback: f32) -> String {
+    format!("{:.0}%", settings_volume(value, fallback) * 100.0)
+}
+
+/// Whether another `delta` step would change a volume row.
+fn volume_can_adjust(value: f32, delta: i32, fallback: f32) -> bool {
+    let value = settings_volume(value, fallback);
+    if delta < 0 { value > 0.0 } else { value < 1.0 }
+}
+
+/// Applies one step to a settings volume, rounded to whole percent.
+fn adjust_volume(value: &mut f32, delta: i32, fallback: f32) -> bool {
+    let current = settings_volume(*value, fallback);
+    let next = ((current + SETTINGS_VOLUME_STEP * delta.signum() as f32).clamp(0.0, 1.0) * 100.0).round() / 100.0;
+    if (next - *value).abs() > 0.0001 {
+        *value = next;
+        true
+    } else {
+        false
+    }
+}
 
 /// Which screen currently owns input.
 ///
@@ -150,8 +193,18 @@ pub enum Screen {
     Settings,
     /// Modal crafting screen; gameplay input is blocked.
     Crafting,
+    /// Modal furnace screen; gameplay input is blocked while the host is
+    /// authoritative for the slots.
+    Furnace,
+    /// Modal chest screen; gameplay input is blocked.
+    Chest,
     /// Modal death screen; gameplay input is blocked.
     Death,
+    /// Connecting to a multiplayer server or loading its spawn area.
+    ///
+    /// The normal single-player client never enters this screen; the network
+    /// client uses it for both loading progress and connection failures.
+    Connecting,
 }
 
 /// One tab of the settings screen, in display order.
@@ -162,6 +215,8 @@ pub enum SettingsTab {
     Game,
     /// Render distance, FOV, sensitivity, fullscreen and mesh workers.
     Display,
+    /// Sound on/off and the master/SFX/music volumes.
+    Audio,
     /// Read-only keyboard and mouse reference.
     Controls,
     /// Procedural texture style and external resource pack.
@@ -170,9 +225,10 @@ pub enum SettingsTab {
 
 impl SettingsTab {
     /// All tabs, in display order.
-    pub const ALL: [SettingsTab; 4] = [
+    pub const ALL: [SettingsTab; 5] = [
         SettingsTab::Game,
         SettingsTab::Display,
+        SettingsTab::Audio,
         SettingsTab::Controls,
         SettingsTab::Textures,
     ];
@@ -182,9 +238,15 @@ impl SettingsTab {
         match self {
             SettingsTab::Game => "Game",
             SettingsTab::Display => "Display",
+            SettingsTab::Audio => "Audio",
             SettingsTab::Controls => "Controls",
             SettingsTab::Textures => "Textures",
         }
+    }
+
+    /// Parses a tab name case-insensitively (CLI screenshot selection).
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tab| tab.name().eq_ignore_ascii_case(name))
     }
 
     /// Next tab, wrapping from Textures to Game.
@@ -238,6 +300,14 @@ pub enum SettingsRow {
     TextureStyle,
     /// External resource pack toggle.
     TexturePack,
+    /// Global sound on/off.
+    AudioEnabled,
+    /// Master output volume.
+    MasterVolume,
+    /// Sound-effect bus volume.
+    SfxVolume,
+    /// Music and ambience bus volume.
+    MusicVolume,
 }
 
 impl SettingsRow {
@@ -254,6 +324,10 @@ impl SettingsRow {
             SettingsRow::MeshWorkers => "Mesh workers",
             SettingsRow::TextureStyle => "Texture style",
             SettingsRow::TexturePack => "Texture pack",
+            SettingsRow::AudioEnabled => "Sound",
+            SettingsRow::MasterVolume => "Master volume",
+            SettingsRow::SfxVolume => "SFX volume",
+            SettingsRow::MusicVolume => "Music volume",
         }
     }
 
@@ -261,8 +335,15 @@ impl SettingsRow {
     pub fn kind(self) -> SettingsRowKind {
         match self {
             SettingsRow::GameMode | SettingsRow::TextureStyle => SettingsRowKind::Choice,
-            SettingsRow::ShowHud | SettingsRow::DebugOverlay | SettingsRow::Fullscreen => SettingsRowKind::Toggle,
-            SettingsRow::RenderDistance | SettingsRow::Fov | SettingsRow::MouseSensitivity => SettingsRowKind::Range,
+            SettingsRow::ShowHud | SettingsRow::DebugOverlay | SettingsRow::Fullscreen | SettingsRow::AudioEnabled => {
+                SettingsRowKind::Toggle
+            }
+            SettingsRow::RenderDistance
+            | SettingsRow::Fov
+            | SettingsRow::MouseSensitivity
+            | SettingsRow::MasterVolume
+            | SettingsRow::SfxVolume
+            | SettingsRow::MusicVolume => SettingsRowKind::Range,
             SettingsRow::TexturePack => SettingsRowKind::Action,
             SettingsRow::MeshWorkers => SettingsRowKind::ReadOnly,
         }
@@ -393,6 +474,8 @@ pub struct SettingsInfo {
     pub texture_resolution: u32,
     /// Mesh worker-thread count.
     pub mesh_workers: usize,
+    /// One-line audio output description, or `off` when unavailable.
+    pub audio_status: String,
 }
 
 impl Default for SettingsInfo {
@@ -403,6 +486,7 @@ impl Default for SettingsInfo {
             texture_source: "classic".to_string(),
             texture_resolution: 16,
             mesh_workers: 1,
+            audio_status: "off (headless)".to_string(),
         }
     }
 }
@@ -566,6 +650,15 @@ impl DamageFlash {
         dropped
     }
 
+    /// Starts the damage vignette without a health comparison.
+    ///
+    /// The network client uses this for authoritative `damage_event` frames,
+    /// where health may be restored by the same tick and a drop is not a
+    /// reliable signal.
+    pub fn trigger(&mut self) {
+        self.remaining = DAMAGE_FLASH_SECONDS;
+    }
+
     /// Advances the flash timer.
     pub fn tick(&mut self, dt_seconds: f32) {
         if !dt_seconds.is_finite() || dt_seconds <= 0.0 {
@@ -690,6 +783,22 @@ pub struct DebugStats {
     pub held_durability: Option<(u16, u16)>,
     /// Effective mining speed against the targeted block (1.0 for hand).
     pub mining_speed: f32,
+    /// One-line audio output description (`off`, `headless`, or a device).
+    pub audio: String,
+    /// Optional multiplayer status line (`Net: connected host:port ping Nms ...`).
+    pub network: Option<String>,
+    /// Total live mobs.
+    pub mobs_total: usize,
+    /// Live passive mobs.
+    pub mobs_passive: usize,
+    /// Live hostile mobs.
+    pub mobs_hostile: usize,
+    /// Day/night phase (`tick_count % 24_000`).
+    pub day_phase: u64,
+    /// Whether the phase is daylight.
+    pub day: bool,
+    /// Armor defence points (0 in creative).
+    pub defense: u8,
 }
 
 impl DebugStats {
@@ -717,7 +826,10 @@ impl DebugStats {
                 "XYZ {:.3} / {:.3} / {:.3}",
                 self.position[0], self.position[1], self.position[2]
             ),
-            format!("Vitals: {:.1} / 20 HP, {:.1} / 20 hunger", self.health, self.hunger),
+            format!(
+                "Vitals: {:.1} / 20 HP, {:.1} / 20 hunger, {} def",
+                self.health, self.hunger, self.defense
+            ),
             format!(
                 "Chunk {} {} {}   Facing {}",
                 self.chunk[0], self.chunk[1], self.chunk[2], self.facing
@@ -760,9 +872,14 @@ impl DebugStats {
                 self.mesh_workers, self.mesh_in_flight, self.mesh_backlog, self.mesh_completed
             ),
             format!(
-                "Heap {:.1} MiB   Ticks {}",
+                "Heap {:.1} MiB  Ticks {}  Mobs {} ({}P/{}H)  {} {}t",
                 self.heap_bytes as f64 / (1024.0 * 1024.0),
-                self.ticks
+                self.ticks,
+                self.mobs_total,
+                self.mobs_passive,
+                self.mobs_hostile,
+                if self.day { "Day" } else { "Night" },
+                self.day_phase,
             ),
         ];
         if lines.len() < 15 {
@@ -788,11 +905,15 @@ impl DebugStats {
     /// left column at 1280x720. Every character is preserved.
     pub fn right_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
+        if let Some(network) = &self.network {
+            lines.extend(wrap_words(network, DEBUG_RIGHT_WRAP_COLUMNS));
+        }
         for text in [
             format!("GPU {}", self.adapter),
             format!("Window {}x{}", self.window[0], self.window[1]),
             "Renderer wgpu (Vulkan)".to_string(),
             "Mesh pipeline: greedy + AO".to_string(),
+            format!("Audio {}", if self.audio.is_empty() { "off" } else { &self.audio }),
         ] {
             lines.extend(wrap_words(&text, DEBUG_RIGHT_WRAP_COLUMNS));
         }
@@ -1176,6 +1297,10 @@ pub struct UiState {
     pub death_selected: usize,
     /// Hovered death-screen button, if any.
     pub death_hovered: Option<usize>,
+    /// Remaining seconds of the crosshair hit marker after a mob hit.
+    pub hit_marker_seconds: f32,
+    /// Optional cause hint shown on the death screen.
+    pub death_cause: Option<String>,
 }
 
 impl Default for UiState {
@@ -1203,6 +1328,8 @@ impl Default for UiState {
             toasts: ToastQueue::default(),
             death_selected: 0,
             death_hovered: None,
+            hit_marker_seconds: 0.0,
+            death_cause: None,
         }
     }
 }
@@ -1221,6 +1348,7 @@ impl UiState {
     /// Advances timers.
     pub fn tick(&mut self, dt_seconds: f32) {
         self.block_name_seconds = (self.block_name_seconds - dt_seconds).max(0.0);
+        self.hit_marker_seconds = (self.hit_marker_seconds - dt_seconds).max(0.0);
         self.break_flash_seconds = (self.break_flash_seconds - dt_seconds).max(0.0);
         if self.break_flash_seconds <= 0.0 {
             self.break_flash = None;
@@ -1278,7 +1406,12 @@ impl UiState {
         match self.screen {
             Screen::Playing => self.open_inventory(),
             Screen::Inventory => self.close_inventory(),
-            Screen::Settings | Screen::Crafting | Screen::Death => {}
+            Screen::Settings
+            | Screen::Crafting
+            | Screen::Furnace
+            | Screen::Chest
+            | Screen::Death
+            | Screen::Connecting => {}
         }
     }
 
@@ -1304,8 +1437,43 @@ impl UiState {
         match self.screen {
             Screen::Playing => self.open_crafting(),
             Screen::Crafting => self.close_crafting(),
-            Screen::Inventory | Screen::Settings | Screen::Death => {}
+            Screen::Inventory
+            | Screen::Settings
+            | Screen::Furnace
+            | Screen::Chest
+            | Screen::Death
+            | Screen::Connecting => {}
         }
+    }
+
+    /// Opens the furnace modal screen from gameplay.
+    pub fn open_furnace(&mut self) {
+        if self.screen != Screen::Playing {
+            return;
+        }
+        self.screen = Screen::Furnace;
+        self.settings_clear_hover();
+    }
+
+    /// Opens the chest modal screen from gameplay.
+    pub fn open_chest(&mut self) {
+        if self.screen != Screen::Playing {
+            return;
+        }
+        self.screen = Screen::Chest;
+        self.settings_clear_hover();
+    }
+
+    /// Leaves a furnace or chest screen and returns to gameplay.
+    pub fn close_container(&mut self) {
+        if matches!(self.screen, Screen::Furnace | Screen::Chest) {
+            self.screen = Screen::Playing;
+        }
+    }
+
+    /// Whether a container screen currently owns input.
+    pub fn container_open(&self) -> bool {
+        matches!(self.screen, Screen::Furnace | Screen::Chest)
     }
 
     /// Opens the full settings screen directly from gameplay.
@@ -1333,6 +1501,7 @@ impl UiState {
     /// Closes menus and returns to gameplay.
     pub fn resume(&mut self) {
         self.screen = Screen::Playing;
+        self.death_cause = None;
         self.settings_clear_hover();
     }
 
@@ -1364,6 +1533,12 @@ impl UiState {
                 SettingsRow::MouseSensitivity,
                 SettingsRow::Fullscreen,
                 SettingsRow::MeshWorkers,
+            ],
+            SettingsTab::Audio => vec![
+                SettingsRow::AudioEnabled,
+                SettingsRow::MasterVolume,
+                SettingsRow::SfxVolume,
+                SettingsRow::MusicVolume,
             ],
             SettingsTab::Controls => Vec::new(),
             SettingsTab::Textures => vec![SettingsRow::TextureStyle, SettingsRow::TexturePack],
@@ -1472,10 +1647,21 @@ impl UiState {
                     value < SETTINGS_MAX_MOUSE_SENSITIVITY
                 }
             }
-            SettingsRow::GameMode | SettingsRow::TextureStyle => true,
-            SettingsRow::ShowHud | SettingsRow::DebugOverlay | SettingsRow::Fullscreen | SettingsRow::TexturePack => {
-                true
+            SettingsRow::MasterVolume => {
+                volume_can_adjust(self.settings.master_volume, delta, Settings::default().master_volume)
             }
+            SettingsRow::SfxVolume => {
+                volume_can_adjust(self.settings.sfx_volume, delta, Settings::default().sfx_volume)
+            }
+            SettingsRow::MusicVolume => {
+                volume_can_adjust(self.settings.music_volume, delta, Settings::default().music_volume)
+            }
+            SettingsRow::GameMode | SettingsRow::TextureStyle => true,
+            SettingsRow::ShowHud
+            | SettingsRow::DebugOverlay
+            | SettingsRow::Fullscreen
+            | SettingsRow::TexturePack
+            | SettingsRow::AudioEnabled => true,
             SettingsRow::MeshWorkers => false,
         }
     }
@@ -1538,6 +1724,10 @@ impl UiState {
                     "built-in only".to_string()
                 }
             }
+            SettingsRow::AudioEnabled => checkbox(self.settings.audio_enabled),
+            SettingsRow::MasterVolume => volume_percent(self.settings.master_volume, Settings::default().master_volume),
+            SettingsRow::SfxVolume => volume_percent(self.settings.sfx_volume, Settings::default().sfx_volume),
+            SettingsRow::MusicVolume => volume_percent(self.settings.music_volume, Settings::default().music_volume),
         }
     }
 
@@ -1577,6 +1767,21 @@ impl UiState {
                 self.settings.mouse_sensitivity,
                 SETTINGS_MIN_MOUSE_SENSITIVITY,
                 SETTINGS_MAX_MOUSE_SENSITIVITY,
+            )),
+            SettingsRow::MasterVolume => Some(range_fraction(
+                settings_volume(self.settings.master_volume, Settings::default().master_volume),
+                0.0,
+                1.0,
+            )),
+            SettingsRow::SfxVolume => Some(range_fraction(
+                settings_volume(self.settings.sfx_volume, Settings::default().sfx_volume),
+                0.0,
+                1.0,
+            )),
+            SettingsRow::MusicVolume => Some(range_fraction(
+                settings_volume(self.settings.music_volume, Settings::default().music_volume),
+                0.0,
+                1.0,
             )),
             _ => None,
         }
@@ -1676,6 +1881,21 @@ impl UiState {
             SettingsRow::Fullscreen => {
                 self.settings.fullscreen = !self.settings.fullscreen;
                 true
+            }
+            SettingsRow::AudioEnabled => {
+                self.settings.audio_enabled = !self.settings.audio_enabled;
+                true
+            }
+            SettingsRow::MasterVolume => adjust_volume(
+                &mut self.settings.master_volume,
+                delta,
+                Settings::default().master_volume,
+            ),
+            SettingsRow::SfxVolume => {
+                adjust_volume(&mut self.settings.sfx_volume, delta, Settings::default().sfx_volume)
+            }
+            SettingsRow::MusicVolume => {
+                adjust_volume(&mut self.settings.music_volume, delta, Settings::default().music_volume)
             }
             SettingsRow::MeshWorkers => false,
             SettingsRow::TextureStyle => {
@@ -1801,7 +2021,13 @@ impl UiState {
         self.screen = Screen::Death;
         self.death_selected = 0;
         self.death_hovered = None;
+        self.death_cause = None;
         self.settings_clear_hover();
+    }
+
+    /// Shows the crosshair hit marker for a landed mob attack.
+    pub fn flash_mob_hit(&mut self) {
+        self.hit_marker_seconds = 0.22;
     }
 
     /// Leaves the death screen if it is open.
@@ -1809,6 +2035,7 @@ impl UiState {
         if self.screen == Screen::Death {
             self.screen = Screen::Playing;
         }
+        self.death_cause = None;
     }
 
     /// Keeps keyboard focus on the death buttons without opening settings.
@@ -1954,10 +2181,11 @@ pub fn settings_panel_rect(screen: [f32; 2]) -> UiRect {
     UiRect::new((screen[0] - width) / 2.0, (screen[1] - height) / 2.0, width, height)
 }
 
-/// Bounds of the four tab buttons.
-pub fn settings_tab_rects(screen: [f32; 2]) -> [UiRect; 4] {
+/// Bounds of the settings tab buttons.
+pub fn settings_tab_rects(screen: [f32; 2]) -> [UiRect; 5] {
     let panel = settings_panel_rect(screen);
-    let width = (panel.w - SETTINGS_MARGIN * 2.0 - SETTINGS_TAB_GAP * 3.0) / 4.0;
+    let count = SettingsTab::ALL.len() as f32;
+    let width = (panel.w - SETTINGS_MARGIN * 2.0 - SETTINGS_TAB_GAP * (count - 1.0)) / count;
     std::array::from_fn(|index| {
         UiRect::new(
             panel.x + SETTINGS_MARGIN + index as f32 * (width + SETTINGS_TAB_GAP),
@@ -2026,6 +2254,10 @@ pub fn draw_settings_screen(frame: &mut UiFrame, ui: &UiState, info: &SettingsIn
             draw_game_summary(frame, ui, info, panel, rows.len());
         }
         SettingsTab::Display => draw_settings_rows(frame, ui, &rows, &row_rects, screen),
+        SettingsTab::Audio => {
+            draw_settings_rows(frame, ui, &rows, &row_rects, screen);
+            draw_audio_status(frame, info, panel, rows.len());
+        }
         SettingsTab::Controls => draw_controls_reference(frame, panel),
         SettingsTab::Textures => {
             draw_settings_rows(frame, ui, &rows, &row_rects, screen);
@@ -2245,6 +2477,37 @@ fn draw_texture_source(frame: &mut UiFrame, info: &SettingsInfo, panel: UiRect, 
     frame.text(x, y, 1.2, [0.80, 0.86, 0.94, 1.0], &text);
 }
 
+fn draw_audio_status(frame: &mut UiFrame, info: &SettingsInfo, panel: UiRect, row_count: usize) {
+    let x = panel.x + SETTINGS_MARGIN;
+    let y = panel.y + SETTINGS_CONTENT_TOP + row_count as f32 * SETTINGS_ROW_STEP + SETTINGS_SUMMARY_GAP;
+    let status = if info.audio_status.is_empty() {
+        "off"
+    } else {
+        info.audio_status.as_str()
+    };
+    frame.rect(
+        x,
+        y - 10.0,
+        panel.w - SETTINGS_MARGIN * 2.0,
+        1.0,
+        [0.19, 0.23, 0.29, 0.9],
+    );
+    frame.text(
+        x,
+        y,
+        1.2,
+        [0.80, 0.86, 0.94, 1.0],
+        &format!("Output: {}", shorten(status, 66)),
+    );
+    frame.text(
+        x,
+        y + 18.0,
+        1.1,
+        [0.62, 0.68, 0.76, 1.0],
+        "Volumes apply immediately; 5% steps with Left/Right or the wheel.",
+    );
+}
+
 fn draw_controls_reference(frame: &mut UiFrame, panel: UiRect) {
     let columns = controls_reference_columns();
     let top = panel.y + SETTINGS_CONTENT_TOP;
@@ -2278,6 +2541,13 @@ fn draw_controls_reference(frame: &mut UiFrame, panel: UiRect) {
         1.2,
         [0.96, 0.80, 0.42, 1.0],
         SETTINGS_PERSISTENCE_NOTE,
+    );
+    frame.text(
+        panel.x + SETTINGS_MARGIN,
+        note_y + 16.0,
+        1.2,
+        [0.72, 0.84, 0.98, 1.0],
+        SETTINGS_AUDIO_NOTE,
     );
 }
 
@@ -2420,6 +2690,83 @@ pub fn draw_vitals(frame: &mut UiFrame, screen: [f32; 2], health: f32, hunger: f
     }
 }
 
+/// Positions of the ten armor pips to the right of the hunger row.
+pub fn armor_layout(screen: [f32; 2]) -> Vec<UiRect> {
+    let (_, hunger) = vitals_layout(screen);
+    let Some(first_hunger) = hunger.first() else {
+        return Vec::new();
+    };
+    let x = first_hunger.x + VITAL_ICON_COUNT as f32 * (VITAL_ICON_SIZE + VITAL_ICON_GAP) + ARMOR_ROW_GAP;
+    (0..ARMOR_ICON_COUNT)
+        .map(|index| {
+            UiRect::new(
+                x + index as f32 * (VITAL_ICON_SIZE + VITAL_ICON_GAP),
+                first_hunger.y,
+                VITAL_ICON_SIZE,
+                VITAL_ICON_SIZE,
+            )
+        })
+        .collect()
+}
+
+/// Pixel-art shield shape: broad shoulders tapering to a point.
+fn shield_shape(rect: UiRect) -> [UiRect; 5] {
+    let u = rect.w / 8.0;
+    let v = rect.h / 8.0;
+    [
+        UiRect::new(rect.x + u, rect.y, 6.0 * u, v),
+        UiRect::new(rect.x, rect.y + v, 8.0 * u, 3.0 * v),
+        UiRect::new(rect.x + u, rect.y + 4.0 * v, 6.0 * u, 2.0 * v),
+        UiRect::new(rect.x + 2.0 * u, rect.y + 6.0 * v, 4.0 * u, v),
+        UiRect::new(rect.x + 3.0 * u, rect.y + 7.0 * v, 2.0 * u, v),
+    ]
+}
+
+/// Draws the survival armor points next to the hunger row.
+///
+/// Ten pips represent up to 20 defence points (two per pip), so odd defence
+/// totals show a half shield. The numeric value follows the row. A zero-defence
+/// player still sees the dim empty row so the HUD layout never jumps when a
+/// chestplate is equipped.
+pub fn draw_armor(frame: &mut UiFrame, screen: [f32; 2], defense: u8) {
+    let rects = armor_layout(screen);
+    let Some(first) = rects.first() else {
+        return;
+    };
+    let points = f32::from(defense);
+    for (index, rect) in rects.iter().enumerate() {
+        let fill = (points - index as f32 * ARMOR_POINTS_PER_ICON) / ARMOR_POINTS_PER_ICON;
+        let state = if fill >= 1.0 {
+            VitalFill::Full
+        } else if fill >= 0.5 {
+            VitalFill::Half
+        } else {
+            VitalFill::Empty
+        };
+        let shape = shield_shape(*rect);
+        for part in shape {
+            frame.rect(part.x, part.y, part.w, part.h, [0.10, 0.12, 0.16, 0.92]);
+        }
+        let steel = [0.70, 0.78, 0.88, 1.0];
+        let half_x = rect.x + rect.w / 2.0;
+        for part in shape {
+            match state {
+                VitalFill::Full => frame.rect(part.x, part.y, part.w, part.h, steel),
+                VitalFill::Half => {
+                    let right = (part.x + part.w).min(half_x);
+                    if right > part.x {
+                        frame.rect(part.x, part.y, right - part.x, part.h, steel);
+                    }
+                }
+                VitalFill::Empty => {}
+            }
+        }
+    }
+    let label = format!("{defense} DEF");
+    let label_x = first.x + ARMOR_ICON_COUNT as f32 * (VITAL_ICON_SIZE + VITAL_ICON_GAP) + 6.0;
+    frame.text(label_x, first.y + 3.0, 1.2, [0.82, 0.88, 0.96, 1.0], &label);
+}
+
 /// Pixel-art heart shape: two top bumps, a wide body and a tapering tip.
 fn heart_shape(rect: UiRect) -> [UiRect; 5] {
     let u = rect.w / 7.0;
@@ -2558,15 +2905,43 @@ pub fn death_button_rects(screen: [f32; 2]) -> [UiRect; 2] {
 
 /// Draws the modal death screen over the world and HUD.
 pub fn draw_death_screen(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2]) {
+    draw_death_screen_custom(
+        frame,
+        ui,
+        ui.death_cause.as_deref(),
+        ["Respawn", "Save & quit"],
+        DEATH_NOTE,
+        "Enter/Click select   Up/Down choose   Esc focus buttons   F3 debug",
+        screen,
+    );
+}
+
+/// Draws the death screen with caller-provided button labels and wording.
+///
+/// The network client reuses the same geometry, colours and keyboard focus as
+/// single-player but offers `Disconnect` instead of `Save & quit` and shows the
+/// server's kill cause.
+pub fn draw_death_screen_custom(
+    frame: &mut UiFrame,
+    ui: &UiState,
+    cause: Option<&str>,
+    labels: [&str; 2],
+    note: &str,
+    hint: &str,
+    screen: [f32; 2],
+) {
     let [width, height] = screen;
     frame.rect(0.0, 0.0, width, height, [0.16, 0.01, 0.02, 0.68]);
     frame.rect(0.0, 0.0, width, height, [0.35, 0.02, 0.03, 0.20]);
     let centre_x = width / 2.0;
     let centre_y = height / 2.0;
     frame.text_centered(centre_x, centre_y - 142.0, 4.0, [1.0, 0.88, 0.86, 1.0], "You died");
-    frame.text_centered(centre_x, centre_y - 84.0, 1.5, [0.95, 0.82, 0.80, 1.0], DEATH_NOTE);
+    if let Some(cause) = cause {
+        frame.text_centered(centre_x, centre_y - 104.0, 1.2, [0.98, 0.74, 0.66, 1.0], cause);
+    }
+    frame.text_centered(centre_x, centre_y - 84.0, 1.5, [0.95, 0.82, 0.80, 1.0], note);
     let rects = death_button_rects(screen);
-    for (index, (rect, label)) in rects.iter().zip(["Respawn", "Save & quit"]).enumerate() {
+    for (index, (rect, label)) in rects.iter().zip(labels).enumerate() {
         let active = index == ui.death_selected || ui.death_hovered == Some(index);
         let background = if active {
             [0.30, 0.06, 0.07, 0.98]
@@ -2583,13 +2958,7 @@ pub fn draw_death_screen(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2]) {
         frame.text_centered(rect.center().0, rect.y + 14.0, 2.0, [0.96, 0.92, 0.90, 1.0], label);
     }
     let hint_y = rects[1].y + rects[1].h + 26.0;
-    frame.text_centered(
-        centre_x,
-        hint_y,
-        1.2,
-        [0.86, 0.72, 0.72, 1.0],
-        "Enter/Click select   Up/Down choose   Esc focus buttons   F3 debug",
-    );
+    frame.text_centered(centre_x, hint_y, 1.2, [0.86, 0.72, 0.72, 1.0], hint);
 }
 
 /// Facing label from a yaw in radians (0 faces -Z / north).
@@ -2650,6 +3019,14 @@ mod tests {
             held_durability: Some((129, 131)),
             mining_speed: 4.0,
             movement: "walk",
+            audio: "test output / 48000 Hz / 2 ch / 10.7 ms".into(),
+            network: None,
+            mobs_total: 3,
+            mobs_passive: 2,
+            mobs_hostile: 1,
+            day_phase: 6000,
+            day: true,
+            defense: 5,
         }
     }
 
@@ -2738,6 +3115,25 @@ mod tests {
     }
 
     #[test]
+    fn hit_marker_expires_and_death_cause_is_optional() {
+        let mut state = UiState::default();
+        assert_eq!(state.hit_marker_seconds, 0.0);
+        state.flash_mob_hit();
+        assert!(state.hit_marker_seconds > 0.0);
+        state.tick(0.1);
+        assert!(state.hit_marker_seconds > 0.0);
+        state.tick(1.0);
+        assert_eq!(state.hit_marker_seconds, 0.0);
+
+        state.open_death();
+        assert_eq!(state.death_cause, None, "open_death resets the cause");
+        state.death_cause = Some("Cause: lost all health".into());
+        state.clear_death();
+        assert_eq!(state.screen, Screen::Playing);
+        assert_eq!(state.death_cause, None);
+    }
+
+    #[test]
     fn break_flash_expires_with_the_ui_clock() {
         let mut state = UiState::default();
         state.flash_broken_block("Log");
@@ -2801,6 +3197,8 @@ mod tests {
         assert_eq!(state.settings_tab, SettingsTab::Display);
         assert_eq!(state.settings_selected_row, 0, "tab changes reset the row");
         state.settings_tab_next();
+        assert_eq!(state.settings_tab, SettingsTab::Audio);
+        state.settings_tab_next();
         assert_eq!(state.settings_tab, SettingsTab::Controls);
         state.settings_tab_next();
         assert_eq!(state.settings_tab, SettingsTab::Textures);
@@ -2810,7 +3208,12 @@ mod tests {
         assert_eq!(state.settings_tab, SettingsTab::Textures);
         state.settings_tab_prev();
         assert_eq!(state.settings_tab, SettingsTab::Controls);
+        state.settings_tab_prev();
+        assert_eq!(state.settings_tab, SettingsTab::Audio);
         assert_eq!(state.settings_tab, SettingsTab::ALL[2]);
+        assert_eq!(SettingsTab::from_name("audio"), Some(SettingsTab::Audio));
+        assert_eq!(SettingsTab::from_name("AUDIO"), Some(SettingsTab::Audio));
+        assert_eq!(SettingsTab::from_name("nope"), None);
     }
 
     #[test]
@@ -2834,6 +3237,13 @@ mod tests {
         state.settings_row_down();
         assert_eq!(state.settings_selected_row, 0);
         assert_eq!(state.settings_focused_row(), Some(SettingsRow::RenderDistance));
+
+        state.settings_select_tab(SettingsTab::Audio);
+        assert_eq!(state.settings_rows().len(), 4);
+        assert_eq!(state.settings_focus_count(), 6);
+        assert_eq!(state.settings_focused_row(), Some(SettingsRow::AudioEnabled));
+        state.settings_row_down();
+        assert_eq!(state.settings_focused_row(), Some(SettingsRow::MasterVolume));
 
         state.settings_select_tab(SettingsTab::Controls);
         assert!(state.settings_rows().is_empty());
@@ -2924,6 +3334,63 @@ mod tests {
         assert_eq!(state.settings.texture_style, TextureStyle::Classic);
         assert_eq!(state.settings_adjust(-1), Some(SettingsRow::TextureStyle));
         assert_eq!(state.settings.texture_style, TextureStyle::Minimal);
+    }
+
+    #[test]
+    fn settings_adjust_audio_toggle_and_volumes() {
+        let mut state = UiState::default();
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Audio);
+        assert_eq!(
+            state.settings_rows(),
+            vec![
+                SettingsRow::AudioEnabled,
+                SettingsRow::MasterVolume,
+                SettingsRow::SfxVolume,
+                SettingsRow::MusicVolume
+            ]
+        );
+        assert!(state.settings.audio_enabled);
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::AudioEnabled));
+        assert!(!state.settings.audio_enabled);
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::AudioEnabled));
+        assert!(state.settings.audio_enabled);
+
+        state.settings_selected_row = 1;
+        let info = SettingsInfo::default();
+        assert_eq!(state.settings_row_value(SettingsRow::MasterVolume, &info), "80%");
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::MasterVolume));
+        assert!((state.settings.master_volume - 0.85).abs() < 1e-6);
+        assert_eq!(state.settings_row_value(SettingsRow::MasterVolume, &info), "85%");
+        state.settings.master_volume = 1.0;
+        assert_eq!(state.settings_adjust(1), None);
+        assert!(!state.settings_can_adjust(SettingsRow::MasterVolume, 1));
+        state.settings.master_volume = 0.0;
+        assert_eq!(state.settings_adjust(-1), None);
+        assert!(!state.settings_can_adjust(SettingsRow::MasterVolume, -1));
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::MasterVolume));
+        assert!((state.settings.master_volume - 0.05).abs() < 1e-6);
+
+        state.settings_selected_row = 2;
+        assert_eq!(state.settings_adjust(-1), Some(SettingsRow::SfxVolume));
+        assert!((state.settings.sfx_volume - 0.95).abs() < 1e-6);
+        state.settings_selected_row = 3;
+        assert_eq!(state.settings_adjust(-1), Some(SettingsRow::MusicVolume));
+        assert!((state.settings.music_volume - 0.5).abs() < 1e-6);
+        assert_eq!(state.settings_row_value(SettingsRow::MusicVolume, &info), "50%");
+
+        // Persisted non-finite values display and adjust from their defaults.
+        state.settings.master_volume = f32::NAN;
+        assert_eq!(state.settings_row_value(SettingsRow::MasterVolume, &info), "80%");
+        assert!(state.settings_row_fraction(SettingsRow::MasterVolume).is_some());
+        state.settings.master_volume = 0.8;
+        let screen = [1280.0, 720.0];
+        let arrows = state.settings_arrow_rects(screen);
+        assert_eq!(arrows.len(), 4);
+        assert!(arrows[0].is_none(), "sound is a toggle");
+        for arrows in &arrows[1..] {
+            assert!(arrows.is_some(), "every volume row has arrows");
+        }
     }
 
     #[test]
@@ -3392,6 +3859,15 @@ mod tests {
         state.settings_adjust(1);
         state.settings_selected_row = 3;
         state.settings_adjust(1);
+        state.settings_select_tab(SettingsTab::Audio);
+        state.settings_selected_row = 0;
+        state.settings_adjust(1);
+        state.settings_selected_row = 1;
+        state.settings_adjust(-1);
+        state.settings_selected_row = 2;
+        state.settings_adjust(-1);
+        state.settings_selected_row = 3;
+        state.settings_adjust(-1);
         state.settings_select_tab(SettingsTab::Textures);
         state.settings_selected_row = 0;
         state.settings_adjust(1);
@@ -3550,6 +4026,14 @@ mod tests {
             held: "Stone Pickaxe".into(),
             held_durability: Some((129, 131)),
             mining_speed: 4.0,
+            audio: "headless / 48000 Hz / 2 ch".into(),
+            network: None,
+            mobs_total: 0,
+            mobs_passive: 0,
+            mobs_hostile: 0,
+            day_phase: 18000,
+            day: false,
+            defense: 0,
         };
         let left = stats.left_lines();
         assert_eq!(left.len(), 16);
@@ -3577,6 +4061,28 @@ mod tests {
     }
 
     #[test]
+    fn held_line_reports_new_iron_tool_durability_and_speed() {
+        let mut stats = sample_debug_stats();
+        stats.held = "Iron Pickaxe".into();
+        stats.held_durability = Some((251, 251));
+        stats.mining_speed = 6.0;
+        assert_eq!(stats.held_line(), "Held: Iron Pickaxe 251/251  speed 6.0");
+        assert!(
+            stats
+                .left_lines()
+                .iter()
+                .any(|line| line == "Held: Iron Pickaxe 251/251  speed 6.0")
+        );
+        // Non-tool/armor holds keep a plain name with no durability suffix.
+        stats.held = "Cooked Beef".into();
+        stats.held_durability = None;
+        stats.mining_speed = 1.0;
+        assert_eq!(stats.held_line(), "Held: Cooked Beef  speed 1.0");
+        stats.held.clear();
+        assert_eq!(stats.held_line(), "Held: empty  speed 1.0");
+    }
+
+    #[test]
     fn facing_labels_cover_all_eight_directions() {
         use std::f32::consts::TAU;
         let directions: Vec<&str> = (0..8).map(|i| facing_label(i as f32 * TAU / 8.0)).collect();
@@ -3598,6 +4104,23 @@ mod tests {
         assert_eq!(panel.w, SETTINGS_PANEL_WIDTH);
         assert_eq!(panel.h, SETTINGS_PANEL_HEIGHT);
         assert_eq!((panel.w, panel.h), (620.0, 520.0));
+    }
+
+    #[test]
+    fn armor_pips_sit_next_to_the_hunger_row_and_stay_on_screen() {
+        let screen = [1280.0, 720.0];
+        let pips = armor_layout(screen);
+        assert_eq!(pips.len(), ARMOR_ICON_COUNT);
+        let (_, hunger) = vitals_layout(screen);
+        assert_eq!(pips[0].y, hunger[0].y);
+        assert!(pips[0].x > hunger[VITAL_ICON_COUNT - 1].x);
+        for pair in pips.windows(2) {
+            assert!(pair[1].x - (pair[0].x + pair[0].w) >= VITAL_ICON_GAP - 0.01);
+        }
+        assert!(pips[ARMOR_ICON_COUNT - 1].x + pips[ARMOR_ICON_COUNT - 1].w < screen[0]);
+        let mut frame = UiFrame::new(screen[0], screen[1]);
+        draw_armor(&mut frame, screen, 15);
+        assert_eq!(ARMOR_POINTS_PER_ICON, 2.0);
     }
 
     #[test]

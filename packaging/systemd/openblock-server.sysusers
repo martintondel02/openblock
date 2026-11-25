@@ -1,0 +1,11 @@
+# Dedicated system identity for the OpenBlock dedicated server.
+#
+# The service uses User=openblock and StateDirectory=openblock, so this file
+# must be installed as /usr/lib/sysusers.d/openblock-server.conf (RPM: %{_sysusersdir})
+# and applied before the unit starts:
+#   systemd-sysusers /usr/lib/sysusers.d/openblock-server.conf
+#
+# Stable ownership matters: /var/lib/openblock, backups and any mounted world
+# volume should be owned by openblock:openblock.
+g openblock -
+u openblock - "OpenBlock dedicated server" /var/lib/openblock /sbin/nologin

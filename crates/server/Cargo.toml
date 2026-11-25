@@ -23,6 +23,7 @@ ob_content.workspace = true
 ob_world.workspace = true
 ob_worldgen.workspace = true
 ob_sim.workspace = true
+ob_protocol.workspace = true
 log.workspace = true
 ctrlc.workspace = true
 rayon.workspace = true

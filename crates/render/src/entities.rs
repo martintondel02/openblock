@@ -495,6 +495,10 @@ mod tests {
                     .unwrap() as u32
             )
         );
+        // Dropped block item cubes always show the side texture; the +Z front
+        // texture is a placed-block feature only.
+        assert_eq!(layer("openblock:furnace"), Some(u32::from(textures::FURNACE_SIDE.0)));
+        assert_eq!(layer("openblock:chest"), Some(u32::from(textures::CHEST_SIDE.0)));
         for name in [
             "openblock:apple",
             "openblock:stick",

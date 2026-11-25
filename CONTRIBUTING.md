@@ -40,7 +40,7 @@ OpenBlock is Fedora-first ([DEC-054](docs/decisions.md)). On Fedora 44/45 the
 build dependencies are:
 
 ```sh
-sudo dnf install gcc gcc-c++ pkgconf-pkg-config git alsa-lib-devel \
+sudo dnf install gcc gcc-c++ pkgconf-pkg-config git \
   wayland-devel libxkbcommon-devel vulkan-loader-devel fontconfig-devel \
   freetype-devel systemd-devel
 ```

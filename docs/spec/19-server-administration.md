@@ -18,6 +18,16 @@ about operating that binary, not about gameplay: game rules live in [08](08-game
 wire behaviour in [18](18-networking-multiplayer.md), the save format in [17](17-persistence.md), and
 abuse policy in [20](20-security-and-anti-cheat.md).
 
+> **Implementation note (1.0 interim).** The shipped dedicated server is the
+> interim TCP/JSON host described in [18 §3.13](18-networking-multiplayer.md#313-interim-jsontcp-protocol-implemented-for-10)
+> and §3.13 below. The full configuration schema, TLS console, RPC, metrics,
+> backups, world management and systemd/container contracts in this chapter are
+> the target for the later QUIC/operations milestone and are **not** all
+> implemented in this build. Where they disagree with the interim CLI/config,
+> the interim section is authoritative for this build. Operator-facing
+> quickstart, configuration, backup, upgrade and security runbooks live in
+> [docs/admin](../admin/README.md).
+
 ## 2. Requirements
 
 | ID | Requirement | Verified by | Milestone |
@@ -664,6 +674,109 @@ dashboards, review capacity monthly, and record every drill in `ops/drills/`. No
 collected; the operator owns the data and the support bundle is only produced on request. The
 release cadence and the end-of-life policy live in
 [plan/06](../plan/06-release-and-operations.md).
+
+
+### 3.13 Interim dedicated server (implemented for 1.0)
+
+The `openblock-server` binary runs the same headless `Host` used by
+single-player and the tests. Networking is **off by default**; pass
+`--listen ADDR` (or `listen` in `server.toml`) to start the TCP server. Without
+a listener the binary keeps the original headless host mode and its
+`status`/`save`/`stop` console.
+
+**CLI**
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--listen ADDR` | disabled | bind TCP, e.g. `127.0.0.1:25565` or `[::1]:25565` |
+| `--no-listen` | — | ignore a `listen` value from the config file |
+| `--config PATH` | none | load the flat `server.toml` subset below |
+| `--world NAME` | `world` | world directory name |
+| `--seed N` | random (`0` for `--smoke` when unset) | world seed |
+| `--data-dir DIR` | platform data dir | data directory root |
+| `--render-distance N` | `6` | single-player streaming radius, 1–32 |
+| `--interest-radius N` | `6` | per-client chunk radius, 1–16 |
+| `--max-players N` | `8` | 1–500 |
+| `--motd TEXT` | `A self-hosted OpenBlock world` | ≤128 bytes, plain text |
+| `--save-interval SECONDS` | `60` | dirty-world autosave; `0` disables |
+| `--survival` | default | default mode for new network players (items/vitals apply) |
+| `--creative` | — | creative default for new network players (instant edits, immunity) |
+| `--pack PATH` | base | JSON content pack |
+| `--smoke` | — | deterministic generate/tick/save/reload check, no listener |
+| `--ticks N` | — | run N headless ticks, save, no listener |
+| `--version`, `--help` | — | print information |
+
+`--smoke` and `--ticks` never open a listener, even if `--listen` or a config
+file says otherwise. Exit codes: `0` success, `1` host/save/network failure,
+`2` usage or configuration error.
+
+**`server.toml`** (flat subset; tables are rejected)
+
+```toml
+world = "play"
+seed = 42
+data_dir = "/srv/openblock"
+listen = "0.0.0.0:25565"
+max_players = 8
+motd = "A self-hosted OpenBlock world"
+render_distance = 6
+interest_radius = 6
+save_interval_seconds = 60
+whitelist = ["alice", "bob"]
+game_mode = "survival"   # or "creative"; default for players without a save
+```
+
+Resolution order is **CLI > file > built-in default**. `--no-listen` beats a
+file `listen`. Whitelist entries are case-insensitive player names, not public
+keys. Unknown keys, non-quoted strings, table headers and out-of-range values
+fail with a line number and exit `2`.
+
+**Console** (stdin while the listener runs)
+
+| Command | Effect |
+| --- | --- |
+| `help` | list commands |
+| `list` | ids, names and positions of connected players |
+| `say <msg>` | broadcast a `server` chat line |
+| `kick <id\|name> [reason]` | disconnect one client with a reason |
+| `save` | save the world immediately |
+| `tps` | current TPS, player count, tick count |
+| `stop` (`quit`/`exit`) | disconnect clients, save and exit |
+
+`SIGINT`/`SIGTERM` take the same graceful path as `stop`. On shutdown every
+client receives `Disconnect { reason: "server_shutdown" }`, the host save runs
+once, and the process exits. Join, leave, edits, client errors and periodic
+TPS/tick timing are logged through the existing `OPENBLOCK_LOG` logger; IP
+addresses and chat are not treated as secrets, but no credentials exist in
+this build.
+
+**Limits and behaviour.** See [18 §3.13.5](18-networking-multiplayer.md#3135-authority-streaming-and-limits)
+and [18 §3.13.9](18-networking-multiplayer.md#3139-server-authoritative-survival-protocol-v2)
+for the survival state machine, container windows, entity replication and
+known limitations.
+In short: 8 players (configurable), 2 MiB frames, 256 queued outbound frames
+per client, 30 moves/s, 20 edits/s with a 7-block server reach check, 5 chat
+lines per 10 s, 16/s chunk requests, 16-chunk request radius, 6-chunk default
+interest radius, 4 chunks sent/tick, 10 Hz player-state and entity snapshots,
+64 m entity interest, 5 Hz furnace windows, and 60 s autosave. The host tick is
+authoritative for world blocks, network-player vitals/inventory/equipment,
+containers, mobs and item pickups; movement is client-authoritative (bounds,
+speed/teleport and fall-damage tracking only) and network players do not
+collide. The host's internal single-player `Player` is not a network
+participant and does not appear in `list`.
+
+**Network-player persistence.** `network_players.txt` in the world directory
+stores one line per known player (online first, then offline), containing
+position, look, vitals, dead flag, selected slot, game mode, inventory and
+equipment. A disconnect keeps the record in memory and the next autosave/stop
+writes it; joining again with the same case-insensitive name restores it,
+including across a server restart. A dead record requires `respawn`. This is
+**name-based, without authentication**: anyone who knows a name can resume that
+player, so protect the port and whitelist accordingly. Network state is not
+part of the single-player smoke/state hash. There is no world-directory lock
+(run one process per world), TLS, authentication, server browser, metrics
+endpoint, remote console or backup scheduler yet. Bind to loopback/LAN or
+firewall the port.
 
 ## 4. Data structures and formats
 

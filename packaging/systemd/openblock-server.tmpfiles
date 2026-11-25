@@ -1,0 +1,10 @@
+# Runtime directories for the OpenBlock dedicated server.
+#
+# Install as /usr/lib/tmpfiles.d/openblock-server.conf and apply with:
+#   systemd-tmpfiles --create /usr/lib/tmpfiles.d/openblock-server.conf
+#
+# /var/lib/openblock is created and owned by systemd through StateDirectory=,
+# so it is intentionally not repeated here. Backups are written by the
+# operator-run scripts/server-backup.sh; the directory is root-owned and 0700
+# because world snapshots can contain player names and chat-adjacent state.
+d /var/backups/openblock 0700 root root -

@@ -286,7 +286,7 @@ pub(crate) fn items_state(registry: &Registry, entities: &[ItemEntity]) -> Strin
 /// preserved; the caller derives `next_item_id` from the returned list.
 pub(crate) fn load_items(world_dir: &Path, registry: &Registry) -> Vec<ItemEntity> {
     let path = world_dir.join("items.txt");
-    let text = match std::fs::read_to_string(&path) {
+    let text = match crate::read_sidecar(&path) {
         Ok(text) => text,
         Err(err) => {
             if err.kind() != std::io::ErrorKind::NotFound {

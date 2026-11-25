@@ -1,6 +1,6 @@
 # 18 — Networking and Multiplayer
 
-> Status: normative - Last updated: 2026-11-24
+> Status: normative - Last updated: 2026-11-25
 > Depends on: [DEC-004](../decisions.md), [DEC-006](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-023](../decisions.md), [DEC-024](../decisions.md), [DEC-025](../decisions.md), [DEC-026](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md), [DEC-038](../decisions.md), [DEC-040](../decisions.md), [DEC-043](../decisions.md), [DEC-044](../decisions.md), [DEC-046](../decisions.md), [DEC-048](../decisions.md), [DEC-049](../decisions.md), [DEC-050](../decisions.md), [DEC-052](../decisions.md); [architecture](01-technical-architecture.md), [engine core](02-engine-core.md), [world model](05-world-model.md), [light](07-light-and-weather.md), [gameplay](08-gameplay-survival.md), [items](11-inventory-crafting-items.md), [persistence](17-persistence.md), [server admin](19-server-administration.md), [security](20-security-and-anti-cheat.md); [research 04](../research/04-networking-sota.md)
 > Implements: MS-06, MS-07, MS-15
 
@@ -11,6 +11,17 @@ boundary and its QUIC implementation, the versioned wire protocol and codecs, th
 lifecycle, interest-managed streaming and replication, prediction and reconciliation, session and
 dimension transfer, LAN discovery, chat and commands, the bandwidth and latency model, and the
 simulator used to test all of it.
+
+> **Implementation note (1.0 interim).** The **implemented** transport for the 1.0
+> self-hosted milestone is the plain-TCP JSON protocol in §3.13, not the QUIC
+> design in §3.3–§3.12. The QUIC/TLS/bit-packed catalog below remains the
+> normative target for a later milestone. The interim contract lives in
+> `ob_protocol` (messages, framing, chunk snapshot codec) and
+> `ob_server::net` (accept/tick/streaming); it is versioned
+> `PROTOCOL_VERSION = 2` and is intentionally unencrypted and
+> unauthenticated. The matching client connect mode is implemented in
+> `ob_client::net` / `ob_client::net_app` (§3.13.7–§3.13.8). Do not expose the
+> transport to the public internet without a trusted tunnel or firewall.
 
 The host is authoritative ([DEC-008](../decisions.md)); this chapter is where that becomes bytes.
 Every client message is an **intent** — a movement command, a block-edit intent, a container click, a
@@ -644,6 +655,603 @@ of `PERF-NET-001`, with the same 2 MiB/s join burst. Upstream stays under 1.5 KB
 | same region | 15–40 ms | ~65–90 ms |
 | cross-continent | 90–180 ms | ~140–230 ms |
 | mobile or relayed P2P | 40–120 ms + 20–80 ms relay | ~180–300 ms |
+
+
+### 3.13 Interim JSON/TCP protocol (implemented for 1.0)
+
+**Status.** Implemented in `crates/protocol` (`ob_protocol`) and
+`crates/server/src/net.rs` (`ob_server::net`). It is the contract the client
+connect mode builds against. The requirements in §2 still describe the QUIC
+target; clauses that mention TLS, keys, datagrams, streams or bit-packed
+catalogues do **not** apply to this interim transport. The interim protocol is
+plain TCP and JSON, so it can be inspected with `nc` or a small script and
+self-hosted without a transport dependency.
+
+#### 3.13.1 Transport and framing
+
+* One TCP connection per client; IPv4 and IPv6 literals, loopback default.
+* Every frame is `u32` big-endian payload length followed by UTF-8 JSON. The
+  length excludes the four-byte prefix. Zero-length frames are rejected.
+* `MAX_FRAME_LEN = 2 MiB` (`ob_protocol::MAX_FRAME_LEN`); the server rejects a
+  larger declared length before allocating the payload. Malformed,
+  truncated, invalid-UTF-8 and oversized frames produce a `Disconnect` frame
+  and close the connection; they never panic.
+* Chunk payloads are opaque bytes and travel as **standard padded base64**
+  inside the JSON `bytes` field. This keeps frames small without a dependency
+  and makes chunk data a single validated blob.
+* The server sets a 10 s handshake timeout, a 120 s idle read timeout and a
+  15 s socket write timeout. Framing helpers block on the underlying socket;
+  callers own these timeouts.
+* There is no authentication, encryption, QUIC or TLS in this build. Server
+  operators must firewall the port and are expected to put a trusted tunnel in
+  front of a public deployment.
+
+#### 3.13.2 Message catalog
+
+`PROTOCOL_VERSION = 2`. Both enums are internally tagged with `"type"`
+(snake_case) and serde-derived. Direction is implicit. The v2 additions are
+listed after the v1 table; framing and the chunk payload codec are unchanged.
+Version 1 clients are refused with `protocol_mismatch`, and the reason names
+the server's version so an old client can report an upgrade requirement.
+
+| Dir | `type` | Fields |
+| --- | --- | --- |
+| C→S | `hello` | `protocol: u16`, `name: String` |
+| C→S | `chunk_request` | `cx: i32`, `cz: i32` |
+| C→S | `move` | `pos: [f64; 3]`, `yaw: f32`, `pitch: f32` |
+| C→S | `block_edit` | `pos: [i32; 3]`, `block: u16` (`0` = break) |
+| C→S | `chat` | `text: String` |
+| C→S | `ping` | `id: u32` |
+| C→S | `disconnect` | — |
+| S→C | `hello` | `protocol`, `world_name`, `seed`, `spawn: [f64; 3]`, `content_fingerprint: u64`, `tick: u64`, `day_ticks: u64`, `max_players: u16`, `motd`, `blocks: [{id, name}]` |
+| S→C | `join` | `id: u64`, `name: String` |
+| S→C | `leave` | `id: u64` |
+| S→C | `player_list` | `players: [{id, name, pos, yaw, pitch}]` |
+| S→C | `player_state` | `id`, `name`, `pos: [f64; 3]`, `yaw`, `pitch` |
+| S→C | `chunk_data` | `cx: i32`, `cz: i32`, `bytes: base64 string` |
+| S→C | `block_edit` | `pos: [i32; 3]`, `block: u16`, `player: u64` |
+| S→C | `chat` | `from: String`, `text: String` |
+| S→C | `pong` | `id: u32` |
+| S→C | `disconnect` | `reason: String` |
+
+`tick` is the server tick at which the client joined; `day_ticks` is the length
+of one in-game day (`24_000` ticks at 20 Hz). `player_list` is an addition to
+the minimal catalog and carries the complete initial roster. The server sends
+one `player_state` per roster entry immediately after `join`, then continues
+at 10 Hz (every second tick) for every player, including the receiving
+client.
+
+**Protocol v2 additions.** Stack DTOs are
+`{item: "openblock:...", count: u8, durability?: u16}` (stable names, not
+session-local ids). Slot addresses are hotbar `0..9`, equipment `9..13`, open
+window `100..`.
+
+| Dir | `type` | Fields |
+| --- | --- | --- |
+| C→S | `select_slot` | `slot: u8` |
+| C→S | `use_block` | `pos: [i32; 3]` |
+| C→S | `attack` | `target?: u64` (omit to raycast) |
+| C→S | `inventory_move` | `from: u16`, `to: u16`, `count: u8`, `revision?: u64` |
+| C→S | `eat` | — |
+| C→S | `equip` | `hotbar_slot: u8` |
+| C→S | `respawn` | — |
+| C→S | `container_close` | — |
+| S→C | `player_vitals` | `health: f32`, `hunger: f32`, `armor_defense: u8` |
+| S→C | `inventory_sync` | `hotbar: [stack?; 9]`, `selected: u8`, `equipment: [stack?; 4]` |
+| S→C | `selected_slot` | `slot: u8` |
+| S→C | `container_open` | `window: u32`, `kind: furnace\|chest`, `pos: [i32; 3]`, `revision: u64`, `slots: [stack?]`, `furnace?: {burn_remaining, burn_total, cook_progress}` |
+| S→C | `container_update` | `window`, `revision`, `slots`, `furnace?` |
+| S→C | `container_close` | `window: u32`, `reason: String` |
+| S→C | `entity_snapshot` | `entities: [entity]` (join snapshot) |
+| S→C | `entity_spawn` | `id: u64`, `kind: mob {mob} \| item {stack}`, `pos: [f64; 3]`, `yaw`, `health`, `hurt` |
+| S→C | `entity_state` | `entities: [{id, pos, yaw, health, hurt, stack?}]`, sorted by id |
+| S→C | `entity_despawn` | `ids: [u64]`, `reason: killed\|picked_up\|despawned\|left_interest` |
+| S→C | `damage_event` | `amount: f32`, `cause: String` |
+| S→C | `death` | `cause: String` |
+| S→C | `respawn` | `pos: [f64; 3]`, `health: f32`, `hunger: f32` |
+| S→C | `attack_result` | `target: u64`, `hit: bool`, `damage: f32`, `killed: bool` |
+| S→C | `action_rejected` | `action: String`, `reason: String` |
+
+
+#### 3.13.3 Handshake and rejection
+
+1. The client sends `hello` with `PROTOCOL_VERSION` and a name matching
+   `[A-Za-z0-9_.-]{1,32}`.
+2. The server validates the version, name, player cap and optional whitelist
+   (case-insensitive names), then replies with `hello`, the client's own
+   `join`, one `player_state` per roster entry, `player_list`, and (v2) the
+   initial survival/entity sync described in §3.13.9.
+3. Existing clients receive `join`. The new client is visible to the tick loop
+   only after those frames are queued, so no `player_state` can precede its
+   `hello`.
+4. Chunk streaming and 10 Hz player-state snapshots follow.
+
+Rejections are a single `ServerMessage::Disconnect { reason }` with a short
+stable prefix: `protocol_mismatch`, `server_full`, `invalid_name`,
+`name_taken`, `not_whitelisted`, `frame_too_large`, `rate_limited`,
+`server_shutdown` or `protocol_error`. The optional `: detail` suffix is for
+humans/logs and must not be parsed as machine state.
+
+#### 3.13.4 Chunk snapshot codec
+
+`encode_chunk(registry, column) -> Vec<u8>` produces one deterministic
+snapshot for a whole `ChunkColumn`; `decode_chunk(registry, cx, cz, bytes)`
+validates it and returns a column with a recomputed heightmap. Payload:
+
+```text
+"OBC1" | cx i32 LE | cz i32 LE | section_count u8 (=24)
+       | compression u8 (0 raw, 1 zstd) | raw_len u32 LE | body_len u32 LE | body
+```
+
+The body writes all 24 sections in ascending `y`:
+
+* storage mode `0`: uniform `u16` block id;
+* mode `1/2/3`: `u16` palette length, palette entries as `u16`, then the fixed
+  number of `u64` packed index words (256/512/1024 for 4/8/16-bit indices);
+* light: flag `0` uniform zero, flag `1` dense 4,096 × `u16`, or flag `2`
+  uniform non-zero plus its `u16` word.
+
+The body is zstd-compressed at level 1 when that is smaller. `MAX_CHUNK_BYTES`
+and `MAX_CHUNK_BODY_BYTES` are both 1 MiB. Decoding rejects bad magic,
+coordinate mismatch, wrong section count, unknown storage/light modes, unknown
+block ids, palette indices out of range, length mismatches, decompression
+failures and trailing bytes. Encoding the same column twice yields identical
+bytes. Block ids are session-local indices; validate the handshake's
+`content_fingerprint` (`ob_world::registry_fingerprint`) and `blocks` manifest
+before decoding.
+
+#### 3.13.5 Authority, streaming and limits
+
+* **Block edits** are validated in `Host::apply_remote_edit` (creative path) or
+  by the exact-cell survival helpers (§3.13.9): registered block, world bounds,
+  loaded chunk, breakable current block for a break and air for a placement.
+  Both paths reject edits whose centre is more than `REACH + 2 = 7` blocks from
+  the sender's last accepted position. Successful edits are applied once,
+  broadcast to every client (including the sender) and mark the world dirty.
+  Creative edits have no loot/inventory/tool wear; survival edits use the
+  inventory, loot, block-entity contents and durability rules.
+* **Movement** is client-authoritative in this milestone. The server validates
+  that positions are finite, clamps X/Z to the world border and Y to a safe
+  range, rejects a jump above 64 blocks from the last position and above a
+  generous per-message speed allowance, normalises yaw/pitch and tracks
+  reported vertical deltas for fall damage (§3.13.9), then relays the position
+  in `player_state`. There is no server-side collision, physics, anti-cheat
+  correction or inter-player collision; a later milestone adds
+  prediction/reconciliation and server authority. The host's own single-player
+  `Player` is **not** a network participant: network play ticks only
+  `ServerPlayer`s, and the internal player is not exposed in `player_list`.
+* **Streaming** is per client: default interest radius 6 chunks (1–16),
+  default 4 columns generated/sent per player per tick. A client `chunk_request`
+  is admitted up to 16 chunks from its last position. Columns are generated by
+  `Host::ensure_streaming_around` and are not unloaded in network mode, so
+  explored memory grows for the session; unloading needs a save-safe mechanism.
+* **Rates** per client: moves 30/s (burst 30), edits 20/s (burst 20), chat 5
+  per 10 s (burst 5), chunk requests 16/s (burst 8), pings 10/s, and an
+  inbound-frame ceiling of 120/s (burst 240). The server also caps frames at
+  2 MiB and queues at 256 outbound frames per client; a client whose queue
+  fills is disconnected rather than stalling the tick.
+* **Snapshots** are 10 Hz for player state and entity replication, per-tick
+  for chunk streaming, 2 Hz for dirty vitals and 1 Hz for a full inventory
+  resync; furnace windows update at 5 Hz. Survival mutations push an immediate
+  inventory/vitals/selection sync. Autosave runs every 60 s by default
+  (configurable, `0` disables) when dirty; stop/signal saves once more. World
+  saves use the existing atomic v4 path and write `network_players.txt`
+  alongside the single-player sidecars.
+* **Limits**: 8 players by default (1–500), one world, 32 concurrent
+  handshakes. The tick loop is the sole writer of the host; reader/writer
+  threads never hold the host lock while doing socket I/O.
+
+#### 3.13.6 Non-goals for this milestone
+
+No QUIC, TLS, key authentication, 0-RTT, datagrams, bit-packed catalog,
+prediction/reconciliation, server-authoritative player physics, collision
+between network players, PvP, server browser or LAN discovery. Protocol v2
+does replicate vitals, inventories, equipment, containers, mobs and dropped
+items, and persists network players **by name** (see §3.13.9); it still has no
+identity/authentication, so a name is not a credential. There is also no
+world-directory lock, so run exactly one server process per world. Whitelists
+are plain names, not public keys. The handshake fingerprint protects against
+silent content-pack mismatch, not against a malicious server.
+
+#### 3.13.7 Client connect-mode contract
+
+The client connect mode is implemented in `crates/client/src/net.rs` (headless
+core) and `crates/client/src/net_app.rs` (windowed runtime). It connects TCP,
+sends `hello`, compares `protocol`, `content_fingerprint` and `blocks` against
+the local registry, then reads `join`, the initial `player_state` frames and
+`player_list` before handing the socket to a bounded reader thread. Every
+`chunk_data` is decoded with `decode_chunk` on the reader thread and inserted
+into the client-owned `World`; a `block_edit` for a column that has not arrived
+yet is buffered and replayed when the column is inserted. `move` is sent at
+20 Hz only when the local player actually moved or turned, `ping` runs about
+once a second, and `disconnect.reason` is treated as a machine-readable prefix.
+Movement has no prediction/reconciliation in v1 (the server relays the
+client's last accepted position), while block edits are predicted locally and
+corrected by the server broadcast (see §3.13.8).
+
+#### 3.13.8 Client connect mode (interim v1)
+
+**Status.** Implemented in `ob_client::net` (headless, loopback-tested) and
+`ob_client::net_app` (winit/wgpu). This subsection describes the **v1**
+connect mode: it builds against protocol v2 constants but still treats
+survival state, entities and containers as unavailable. A v2 client must add
+the handlers and HUD/inventory/container/entity rendering in §3.13.9; until it
+does, the server refuses its `hello` and the client cannot play on a v2
+server. The single-player runtime is unchanged; the network runtime does not
+open, tick, save or autosave a local `Host`.
+
+##### State machine
+
+```text
+CLI --connect HOST:PORT
+        |
+        v
+CONNECTING (worker thread: TCP + Hello/handshake, 5 s timeout)
+        |  server Hello/Join/PlayerState/PlayerList validated
+        v
+LOADING (chunk streaming; spawn chunk + 4 cardinal neighbours required)
+        |  threshold reached
+        v
+PLAYING <-> SETTINGS (simulation paused, no Move; connection stays up)
+   |  ^
+   |  +-- CHAT INPUT (simulation paused; T opens, Enter sends, Esc cancels)
+   v
+DISCONNECTED (server Disconnect / EOF / decode error; reason overlay)
+   |  Retry / R -> CONNECTING (drops the old client and clears meshes)
+   +-> Quit / Esc -> exit
+```
+
+Handshake validation rejects a protocol mismatch, a content fingerprint
+mismatch or a block manifest that does not match the local registry before any
+chunk is decoded. The local player id is captured from the server's `join`
+(the roster is a fallback); `PlayerState` echoes of that id are stored for
+diagnostics but never drive the camera or remote avatars.
+
+##### CLI and UI
+
+`--connect HOST:PORT` selects the network runtime and is mutually exclusive
+with `--world`/`--seed` and the offscreen screenshot flags. `--name NAME` sets
+the protocol-valid player name; without it the client generates `playerNNNN`.
+The connection/loading overlay shows the server world name, MOTD, player count,
+`loaded/target` chunk progress and a restart/quit button pair. A failed or
+closed connection shows the server's reason (with friendly text for
+`server_full`, `name_taken`, `not_whitelisted`, `server_shutdown`,
+`protocol_mismatch`, `invalid_name`, `rate_limited` and `protocol_error`).
+There is no title screen in this milestone, so the failure actions are
+Reconnect and Quit. `--survival`/`--creative` are accepted for launcher
+compatibility but the network runtime always uses creative building and does
+not persist a game-mode change.
+
+##### Chunk loading
+
+The client asks for a square ring of `render distance` chunks (1–16) around
+the local player, clamped to the protocol's 16-chunk admission radius. Requests
+are deduplicated for 3 s and capped by the same 16/s (burst 8) bucket the
+server uses; the server's automatic interest stream runs in parallel. Chunks
+that already exist are never replaced, so a late snapshot cannot undo a
+confirmed edit. Inserting a column re-marks the four neighbouring loaded
+columns for meshing, because face culling reads across the border. The client
+does not unload columns; explored memory grows for the session exactly like the
+server's network world.
+
+##### Movement and prediction
+
+`ob_sim::step_player` runs at 20 Hz against the replicated world. A `Move` is
+queued only when the feet position or look angles changed, at 30/s (burst 30)
+matching the server. There is no movement reconciliation: the server clamps and
+relays the position, and the client ignores that echo. Block edits are
+predicted by applying `world.set_block` immediately, remeshing the affected
+sections and sending `BlockEdit`; the server's broadcast is authoritative and
+replaces the predicted value. An unconfirmed prediction is reverted after 2 s,
+which covers rate-limit drops and out-of-reach rejections without a rollback
+protocol. Survival vitals, inventory, crafting and item entities are not
+simulated in network mode; the hotbar is the existing creative palette.
+
+##### Avatars, chat, player list and diagnostics
+
+Remote players are rendered as four flat cubes (two legs, torso and head) with
+a stable FNV-1a hue derived from `(id, name)`. Positions and yaw are
+interpolated between the last two 10 Hz snapshots over 100 ms. Chat keeps a
+bounded 100-line log (the 8 newest lines are drawn) that fades after 10 s;
+server-supplied sender/text are cut to 32/256 characters on a character
+boundary, control characters become spaces and the whole log retains at most
+64 KiB. `T` captures printable ASCII (256-character protocol limit), Enter
+sends and Esc cancels, with the client mirroring the server's 5-per-10-s
+limit. Tab shows the roster (`id`, name, self marker, own ping). Ping is sent
+about once a second and the F3 right column reports
+`Net: connected host:port ping Nms players N/max`. Join/leave produce toasts.
+
+##### Client-local versus server-authoritative
+
+| State | Owner in v1 | Notes |
+| --- | --- | --- |
+| World blocks | server-authoritative | client predicts edits for latency only |
+| Player position/look | client-authoritative | server clamps/rate-limits and relays |
+| Player physics/collision | client | server has no network-player physics |
+| Chat delivery | server relay | sender name comes from the server |
+| Roster, joins/leaves | server | `player_list`, `join`, `leave` |
+| Chunk streaming | server | client requests missing columns |
+| Survival health/hunger | not synced | creative-only prototype; HUD and death screen disabled |
+| Inventory/crafting/item entities | not synced | E/C show "not available" toasts |
+| Mobs/other entities | not replicated | renderer entity list contains avatars only |
+| Day/night time | approximate | `hello.tick + wall clock since join`; no time-of-day messages |
+| Settings, textures, audio, FOV | client | persisted exactly as in single-player |
+
+##### Security limits and known deviations
+
+Plain TCP without TLS, authentication or identity: the name is a label, not a
+credential, and `--server-password` does not exist yet. Treat the transport as
+LAN/trusted-tunnel only. The server remains the edit authority (registered
+block id, world bounds, loaded column, breakable/air rules, reach and rate),
+but movement is client-authoritative and can be teleported within the server's
+per-move distance limit. The client never trusts server-provided chunk payloads
+without registry validation, caps every inbound frame at 2 MiB and every
+decoded column at the protocol limit, and never panics on a malformed or
+truncated stream. Offscreen `--screenshot` remains local-world only; there is
+no title screen, reconnect token, encryption, inventory or server browser. The
+settings footer's "Save & quit" only persists settings and exits because there
+is no local world in network mode.
+
+The next wave (authoritative survival/inventory and mob replication) should
+add messages for vitals, inventory slots, container transactions, item-entity
+spawn/despawn and mob transforms, keep the existing `NetworkClient` chunk/edit
+core, and replace the creative HUD gating in `net_app` with a server-driven
+survival HUD. Movement prediction/reconciliation and entity interpolation
+state already have clean seams (`tick_player`, `RemotePlayer`) for that work.
+
+#### 3.13.9 Server-authoritative survival (protocol v2)
+
+**Status.** Implemented in `ob_server::net_players`, `ob_server::net` and the
+protocol v2 catalog. A network player is a `ServerPlayer`, independent of the
+host's internal single-player `Player`; the single-player `Host` path and state
+hash are unchanged.
+
+##### ServerPlayer and the joining flow
+
+```text
+hello/version/name/whitelist/cap checks
+  -> Host::join_network_player(id, name, default_mode)
+       saved record with the same case-insensitive name? restore it
+       else spawn at the host spawn with the configured default mode
+  -> hello, join, player_state(s), player_list
+  -> inventory_sync, player_vitals, selected_slot
+  -> death (only when reconnecting while dead), entity_snapshot
+  -> join broadcast to existing players; streaming and 10 Hz player_state
+```
+
+`ServerPlayer` carries `id`, `name`, `pos`, `yaw`, `pitch`, `health`, `hunger`,
+`dead`, `respawn_pending`, `inventory: [Option<ItemStack>; 9]`,
+`selected_slot`, `equipment: [Option<ItemStack>; 4]`, `game_mode`,
+`starvation_timer`, `regen_timer`, `fall_distance`, `pending_move_distance`,
+dirty flags for sync and the last damage cause. The server's default network
+mode is **survival**; `--creative`/`game_mode = "creative"` changes the default
+for players without a save, while a saved player keeps its recorded mode.
+
+##### Survival state machine
+
+```text
+JOIN -> PLAYING(survival|creative) -> DEAD -> RESPAWN -> PLAYING
+             |                           ^
+             +-- disconnect -> saved (player.txt-style sidecar)
+```
+
+* **Vitals:** the 20 Hz `Host::tick_network` calls the shared
+  `advance_vitals` rules for hunger, starvation and regeneration; starvation
+  damage is routed through the armor/damage path. Fall damage is derived from
+  client-reported vertical deltas: descending moves accumulate a fall distance
+  and a level move (the apparent landing) converts it to impact speed
+  (`sqrt(2*g*h)`) and `fall_damage`. Armor mitigates it exactly like the
+  single-player host. Creative players are reset to full vitals every tick and
+  take no damage.
+* **Movement:** still client-authoritative. The server validates finite
+  values, clamps X/Z to the world border and Y to `WORLD_MIN_Y-32 ..= WORLD_MAX_Y+256`,
+  drops moves above 64 m and above a generous per-message allowance
+  (horizontal 20 m/s of elapsed time with a 2 m floor; vertical 100 m/s with a
+  5 m floor, so a terminal-velocity fall is not mistaken for a teleport), then
+  stores the reported position.
+  Per-player look angles are normalised. There is no collision or physics
+  authority: see "Known limitations".
+* **Death:** health reaching zero sets `dead` and `respawn_pending`, sends
+  `death { cause }`, closes any window, and ignores actions (movement/chat/ping
+  still work). `respawn` resets vitals and position to the host spawn and
+  **keeps inventory/equipment**; the server replies `respawn`, fresh vitals,
+  inventory sync and selected slot.
+* **Disconnect:** the player is moved to an in-memory offline record and
+  broadcast as `leave`; a later join with the same name restores the record.
+
+##### Actions
+
+The server reuses the single-player rules by temporarily installing the
+network player's pose/inventory/equipment/mode into the host slots
+(`Host::with_network_player_action`) and restoring them afterwards. Thus block
+loot, tool wear, block-entity contents, armor durability and attack damage
+have one implementation.
+
+* `block_edit` is mode-aware. Creative keeps the v1 instant `Host::apply_remote_edit`
+  path (no items, no loot). Survival breaks/places at the **exact** reported
+  cell after a 7 m reach check: a break validates world bounds, a loaded chunk,
+  a registered breakable block, removes it, spawns every loot/container stack
+  as an item entity at the block centre and wears the selected tool; a place
+  validates a registered non-fluid block, an air cell, a loaded chunk, no
+  player-AABB overlap, at least one solid neighbour, and that the selected
+  stack contains that block item, then consumes exactly one item.
+  `block_edit` is rate-limited to 20/s and the result is broadcast to every
+  client (including the sender) as the authoritative edit.
+* `attack { target? }` uses the selected weapon's `attack_damage`, a 5.5 m
+  AABB reach, hurt/knockback state on the mob, one durability point of tool
+  wear, and the normal drop table. When `target` is omitted the server
+  raycasts along the player's look direction. Kills remove the mob, spawn its
+  drops as item entities and broadcast `entity_despawn { reason: "killed" }`;
+  the attacker receives `attack_result`. PvP is not implemented.
+* `select_slot`, `eat` (selected edible item, survival, one item, hunger
+  restored through `eat`), and `equip { hotbar_slot }` (armor only) are
+  validated against the player's authoritative state. `inventory_move` covers
+  hotbar/equipment/container transactions; `equip` and equipment-slot moves
+  use the shared armor rules.
+* Every accepted mutation sends fresh `inventory_sync` + `player_vitals` +
+  `selected_slot`; periodic full syncs run at 2 Hz (vitals, when dirty or
+  0.5 s) and at most 1 Hz (inventory), so a client can recover from a lost
+  delta without a delta protocol.
+
+##### Item pickup
+
+Dropped items remain shared world entities. Each tick every living survival
+network player attracts ready items within 3 m toward its chest; once an item
+reaches 0.9 m the nearest eligible player with room receives it through the
+normal inventory stack rules. A full inventory leaves the entity in the world
+and the next-nearest eligible player may take it. Creative players do not pick
+up items. The entity is removed exactly once, which is what prevents double
+pickup; `entity_despawn { reason: "picked_up" }` is broadcast to clients that
+know it.
+
+##### Furnace and chest windows
+
+`use_block { pos }` opens a window when the block is a furnace/chest with a
+block-entity record, the chunk is loaded and the block centre is within 6 m of
+the player. A player owns at most one window. `container_open` carries the
+window id, kind, position, content revision, slots (`3` furnace / `27` chest)
+and furnace progress. Furnace slots are input/fuel/output. While open the
+server checks distance, block existence/kind and death every tick, closes the
+window with `container_close` (`out_of_range`, `block_removed`, `death`,
+`replaced`, `closed`, `disconnect`) and sends furnace progress `container_update`
+at 5 Hz; chest updates are transaction-driven. Content revisions increment
+whenever slots change; `inventory_move` may echo the latest revision, and a
+present stale revision is rejected with `action_rejected`.
+
+Slot addressing for `inventory_move`: hotbar `0..9`, equipment `9..13` and the
+open window from `100` (`100..103` furnace, `100..127` chest). Counts must be
+positive and no larger than the source; merges respect content max stacks;
+incompatible destinations require a full-stack swap; the furnace output is
+take-only. Transactions are rollback-safe and conserve stacks.
+
+##### Entity replication
+
+Every 2 ticks (10 Hz) each player receives the mobs and item entities within
+64 m: `entity_spawn` for newly visible entities, one `entity_state` batch of
+changed entities sorted by ascending id, and `entity_despawn` batches grouped
+by reason (`killed`, `picked_up`, `despawned`, `left_interest`). The join
+handshake sends an `entity_snapshot` of the current visible set so the client
+can render immediately. Mob states carry kind, position, yaw, health and hurt;
+item states carry the current stack (so a partial pickup updates the rendered
+count). Host item ids and mob ids have independent counters, so wire item ids
+have bit 63 set (clients treat ids as opaque) to keep one id space.
+
+Mob AI targets the nearest living survival network player (creative/dead
+players are not attacked) and natural spawning is anchored to one alive
+network player (lowest id) in network mode. Hostile daylight burn, despawn
+age/distance/void, drops and the passive/hostile caps are the existing rules.
+When the last network player disconnects, saved mobs and items remain in the
+world; there is no per-player entity copy.
+
+##### Persistence and state hash
+
+`network_players.txt` in the world directory holds one line per known player
+(online first, then offline records, sorted by lower-case name):
+
+```text
+name x y z yaw pitch health hunger dead selected game_mode
+     [i<slot>:<item>,<count>[,<durability>]] [e<slot>:<item>,<durability>]
+```
+
+Missing files load as empty; malformed lines/items are skipped or clamped like
+the other sidecars. Offline records are kept indefinitely, so reconnecting by
+name restores position, look, vitals, inventory, equipment, selected slot and
+game mode; a dead record stays dead until `respawn`. There is **no identity or
+authentication**: anyone who knows a name can resume it, and names are only
+unique among online players.
+
+Network runtime state is intentionally **not** part of `Host::state_hash`.
+The smoke hash is therefore unchanged by this milestone (single-player
+determinism remains authoritative), and network persistence has separate
+round-trip tests. Saves happen on the normal autosave interval and once on
+stop; a disconnect only moves the player to the offline map (the next save
+persists it).
+
+##### Additional limits
+
+| Area | Limit |
+| --- | --- |
+| `select_slot` | 20/s, burst 20; slot `0..9` |
+| `use_block` | 5/s, burst 5; container distance ≤6 m |
+| `attack` | 10/s, burst 10; reach 5.5 m; live mob targets only |
+| `inventory_move` | 20/s, burst 30; counts ≥1; window addresses require an owned window |
+| `eat` | 4/s, burst 4; survival + edible + not full |
+| `equip` | 5/s, burst 5; armor items only |
+| `respawn` | 1/s, burst 2; only while dead |
+| `container_close` | 10/s, burst 10 |
+| entity interest | 64 m; 10 Hz; initial join snapshot |
+| window progress | 5 Hz furnace updates; chest transaction-driven |
+
+All other existing limits (2 MiB frames, 256 queued outbound frames, moves
+30/s, edits 20/s, chat 5/10 s, chunk requests 16/s, 120/s inbound) still apply.
+
+**Client status (1.0 audit).** Client-side ingest caps are implemented in
+`ob_client`: even inside the 2 MiB frame limit, a v2 client bounds every
+server-controlled array.
+`player_list` and the join/player-state stream track at most 1024 remote
+players (the handshake preserves the local entry when a hostile roster would
+push it past the cut); `entity_snapshot`/`entity_state` apply at most 4096
+entries per message; `ReplicatedEntities` caches at most 8192 live ids and
+refuses new ids at capacity while still updating known ones. A `respawn`
+position must be finite and is clamped to XZ `±30,000,000` and Y
+`WORLD_MIN_Y-32..=WORLD_MAX_Y+256`; non-finite input falls back to the last
+known good server position, then the local player position. `ChatLog`
+sanitises control characters, truncates sender/text to 32/256 characters on a
+character boundary and evicts the oldest lines to stay within 100 lines and
+64 KiB.
+
+##### Known limitations (documented deviations)
+
+* Movement remains **client-authoritative**. The server clamps bounds and
+  per-message speed, but a cheating client can still teleport within the
+  allowance, avoid fall damage by never reporting a level/landing move, or
+  spoof fall damage onto itself. There is no server-side player physics,
+  collision, anti-cheat or prediction/reconciliation.
+* No authentication, encryption, identity or session tokens. A name resumes a
+  save. Do not expose the port to the internet without a trusted tunnel.
+* Mob attacks send `damage_event` but do not apply server-side knockback to
+  network players (their movement is client-owned); the client may animate a
+  local reaction. There is no PvP, line-of-sight check for melee, shield or
+  status effects.
+* Natural mob spawning in network mode anchors on one (lowest-id) alive
+  player rather than every player; mobs still target the nearest living
+  survival player.
+* Furnace/chest windows are per connection, not shared: two players opening
+  the same chest get independent snapshots updated by the same authoritative
+  slot state; there is no lock or "in use" flag.
+* Container revisions reject stale *contents* transactions only; furnace
+  progress updates reuse the same revision. `inventory_move` may omit the
+  revision (legacy convenience), in which case no stale check is possible.
+* Item entity ids use the high bit (see above); clients must not interpret
+  raw ids as host save ids.
+* The host's single-player `Player` is still not a network participant and is
+  not present in `player_list`.
+
+##### Client contract for the next client wave
+
+A v2 client must handle the following and replace the v1 creative gating:
+
+| Message | Client behaviour |
+| --- | --- |
+| `player_vitals` | drive the survival HUD (health/hunger/armor), damage flash, death overlay |
+| `inventory_sync` | replace the nine hotbar slots and four equipment slots (stable item names), highlight selected |
+| `selected_slot` | update the held slot; send `select_slot` on 1–9/wheel |
+| `container_open` / `container_update` / `container_close` | render a furnace/chest window; send `inventory_move` with slot addresses and the latest revision; close on the server reason |
+| `entity_snapshot` / `entity_spawn` / `entity_state` / `entity_despawn` | create/update/remove interpolated mob and item-entity renderables; treat ids as opaque; item states replace counts |
+| `damage_event` / `death` / `respawn` | HUD feedback, death screen, enable `respawn` after death; disable actions while dead |
+| `attack_result` / `action_rejected` | hit feedback and UI hints (do not treat either as authoritative state) |
+| `block_edit` | authoritative world correction, as in v1; survival break/place is sent as `block_edit` and predicted only for the block change |
+| `chat`, `join`/`leave`/`player_list`, `chunk_data`, `pong`, `disconnect`, `hello` | unchanged from v1 |
+
+Prediction rules: block placement/breaking may be predicted visually, but the
+inventory count, durability, drops and container contents come only from the
+server sync. Do not predict vitals, loot pickup, furnace progress or mob
+health. Movement stays client-local and is validated/clamped by the server; no
+reconciliation is required in this milestone. The client must send
+`disconnect` before closing the socket to avoid a stale online player, and must
+handle a v1/v2 `disconnect { reason: "protocol_mismatch: ..." }` by upgrading
+the protocol crate. New client work must also add a wildcard arm for unknown
+server-message variants so future protocol additions do not break the build.
 
 ## 4. Data structures and formats
 

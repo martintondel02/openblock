@@ -1,8 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- firewalld service definition for the OpenBlock dedicated server.
-     Only the QUIC/UDP game port is opened; the admin console stays local. -->
+     The interim protocol is JSON over TCP; only TCP/25565 is opened.
+     There is no remote console in this build, and no TLS/authentication on the
+     game port: restrict this service to a trusted LAN/VPN source range. -->
 <service>
   <short>OpenBlock Server</short>
-  <description>OpenBlock dedicated voxel game server (QUIC over UDP).</description>
-  <port protocol="udp" port="25565"/>
+  <description>OpenBlock dedicated voxel game server (TCP).</description>
+  <port protocol="tcp" port="25565"/>
 </service>

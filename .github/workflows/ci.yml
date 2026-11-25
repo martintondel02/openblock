@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      build_container:
+        description: Build the full server container image (slow, manual only)
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -44,6 +49,11 @@ jobs:
           bytes=$(wc -c < target/screenshot.png)
           echo "screenshot bytes: $bytes"
           test "$bytes" -gt 5000
+          cargo run --release --locked -p ob_client --bin openblock -- --screenshot target/screenshot-settings-audio.png --seed 42 --fly --render-distance 4 --screenshot-settings=audio
+          test -s target/screenshot-settings-audio.png
+          bytes=$(wc -c < target/screenshot-settings-audio.png)
+          echo "audio settings screenshot bytes: $bytes"
+          test "$bytes" -gt 5000
       - name: Offscreen benchmark gate (lavapipe)
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -60,6 +70,10 @@ jobs:
           bytes=$(stat -c %s "$save")
           echo "save size: $bytes bytes ($save)"
           test "$bytes" -lt 5000000
+      - name: Ops backup/restore test
+        if: matrix.os == 'ubuntu-latest'
+        # Non-root, uses the release binary built by the smoke step above.
+        run: OPENBLOCK_SERVER="$PWD/target/release/openblock-server" bash scripts/tests/test-backup-restore.sh
       - name: Docs
         if: matrix.os == 'ubuntu-latest'
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
@@ -77,7 +91,7 @@ jobs:
       - name: Install build dependencies
         run: >
           dnf -y install gcc gcc-c++ make git tar gzip curl which python3
-          pkgconf-pkg-config alsa-lib-devel wayland-devel libxkbcommon-devel
+          pkgconf-pkg-config wayland-devel libxkbcommon-devel
           vulkan-loader-devel fontconfig-devel freetype-devel systemd-devel
       - uses: actions/checkout@v7
       - name: Install pinned Rust toolchain
@@ -104,8 +118,79 @@ jobs:
           desktop-file-validate packaging/fedora/io.github.martintondel02.OpenBlock.desktop
           appstreamcli validate --no-net packaging/fedora/openblock.metainfo.xml
           install -Dm755 /bin/true /usr/bin/openblock-server
-          useradd -r -M -s /sbin/nologin openblock-server || true
-          systemd-analyze --man=no verify packaging/fedora/openblock-server.service
+          systemd-sysusers packaging/systemd/openblock-server.sysusers
+          systemd-tmpfiles --create packaging/systemd/openblock-server.tmpfiles
+          install -Dm644 packaging/systemd/server.toml /etc/openblock/server.toml
+          systemd-analyze --man=no verify packaging/systemd/openblock-server.service
+
+  server-deps:
+    name: Server dependency and ops-script policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Server has no GPU/window/audio dependencies
+        run: bash scripts/check-server-deps.sh
+      - name: Ops scripts parse
+        run: |
+          bash -n scripts/server-backup.sh
+          bash -n scripts/server-restore.sh
+          bash -n scripts/check-server-deps.sh
+          bash -n scripts/tests/test-backup-restore.sh
+          python3 -m py_compile scripts/load-test.py
+
+  container:
+    name: Container manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate Dockerfile
+        run: |
+          if docker build --help 2>&1 | grep -q -- '--check'; then
+            docker build --check -f packaging/container/Dockerfile .
+          else
+            echo "docker build --check is unavailable on this runner; syntax check skipped"
+          fi
+      - name: Validate Compose file
+        run: docker compose -f packaging/container/docker-compose.yml config --quiet
+
+  container-image:
+    # A cold image build compiles the workspace for musl and is intentionally
+    # manual: run the workflow with build_container=true. Push/PR CI still lints
+    # the Dockerfile and Compose file above.
+    name: Container image (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.build_container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build server image
+        run: docker build -t openblock-server:ci -f packaging/container/Dockerfile .
+      - name: Smoke the image
+        run: |
+          docker run --rm openblock-server:ci --version
+          docker image inspect openblock-server:ci --format 'User={{.Config.User}} Size={{.Size}}'
+          docker run --rm --entrypoint sh openblock-server:ci             -c 'ldd /usr/local/bin/openblock-server 2>&1 | grep -Ei "vulkan|X11|wayland|pulse|asound|libGL" && exit 1 || exit 0'
+
+  bench:
+    name: CPU benchmarks (quick)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Build benchmark tools
+        run: cargo build --release --locked -p ob_tools --bins
+      # The quick profiles are budgeted at well under 60 s of run time in
+      # total; they assert determinism, invariants and the save/reload hash,
+      # never wall-clock thresholds on a shared CI runner.
+      - name: Worldgen benchmark (quick)
+        run: cargo run --release --locked -p ob_tools --bin worldgen_bench -- --quick
+      - name: Server simulation benchmark (quick)
+        run: cargo run --release --locked -p ob_tools --bin server_bench -- --quick
+      - name: Save/persistence benchmark (quick)
+        run: cargo run --release --locked -p ob_tools --bin save_bench -- --quick
+      - name: Soak smoke (quick)
+        run: cargo run --release --locked -p ob_tools --bin soak -- --quick
 
   arch:
     name: Architecture guard

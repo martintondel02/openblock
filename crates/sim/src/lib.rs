@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 #![allow(missing_docs)] // TODO(MS-04): re-enable once the v0.0.1 API surface settles
 
-use ob_content::BlockId;
+use ob_content::{BlockId, MobKind, MobSpec, Registry};
 use ob_math::{Aabb, BlockPos, SEA_LEVEL, WorldVec};
 use ob_world::World;
 
@@ -701,6 +701,627 @@ fn try_step_up(world: &World, player: &mut Player, dx: f64, dz: f64) -> bool {
     false
 }
 
+/// Largest distance a mob may move along one axis per collision sub-step.
+const MOB_MAX_SUBSTEP: f64 = 0.45;
+/// Speed clamp applied to mobs, in metres per second.
+const MOB_TERMINAL_VELOCITY: f64 = 78.4;
+/// Water buoyancy acceleration for mobs, in metres per second squared.
+///
+/// Deliberately stronger than [`GRAVITY`] so an idle mob floats back to the
+/// surface instead of resting on the bottom; player swimming instead holds the
+/// jump control.
+const MOB_WATER_BUOYANCY: f64 = 34.0;
+/// Fraction of velocity retained per tick by a mob in water.
+const MOB_WATER_DRAG: f64 = 0.80;
+/// Fraction of normal speed a mob may use while swimming.
+const MOB_WATER_SPEED_FACTOR: f64 = 0.5;
+/// Smallest wander-target distance from the mob, in metres.
+pub const MOB_WANDER_MIN_RADIUS: f64 = 2.0;
+/// Largest wander-target distance from the mob, in metres.
+pub const MOB_WANDER_MAX_RADIUS: f64 = 8.0;
+/// Shortest wander leg duration, in seconds.
+const MOB_WANDER_MIN_TIME: f64 = 2.0;
+/// Longest wander leg duration, in seconds.
+const MOB_WANDER_MAX_TIME: f64 = 7.0;
+/// How far ahead a passive mob probes for a floor before stepping, in metres.
+pub const MOB_CLIFF_PROBE: f64 = 0.6;
+
+/// A passive mob flees for this long after being hurt, in seconds.
+pub const MOB_HURT_FLEE_TIME: f64 = 4.0;
+/// A zombie notices and chases a living player within this distance, in metres.
+pub const MOB_CHASE_RADIUS: f64 = 16.0;
+/// A zombie attacks a player whose feet position is within this distance, in metres.
+pub const MOB_ATTACK_RANGE: f64 = 1.6;
+/// Damage one zombie attack deals before armor, in health points.
+pub const MOB_ATTACK_DAMAGE: f32 = 3.0;
+/// Seconds between zombie attacks.
+pub const MOB_ATTACK_COOLDOWN: f64 = 1.0;
+/// Horizontal knockback speed applied to a player hit by a mob, in metres per second.
+pub const MOB_KNOCKBACK_HORIZONTAL: f64 = 4.0;
+/// Upward knockback speed applied to a player hit by a mob, in metres per second.
+pub const MOB_KNOCKBACK_UP: f64 = 3.0;
+/// Mobs older than this despawn, in seconds (10 real minutes at 20 Hz).
+pub const MOB_DESPAWN_AGE: f64 = 600.0;
+/// Mobs farther than this from the player request a despawn, in metres.
+pub const MOB_DESPAWN_DISTANCE: f64 = 64.0;
+/// Mobs below this height request a despawn (the void).
+pub const MOB_DESPAWN_Y: f64 = -64.0;
+
+/// The current AI intent of a mob.
+///
+/// The interim brain is a tiny deterministic state machine rather than a goal
+/// graph: passive mobs alternate between [`MobAi::Idle`] and
+/// [`MobAi::Wander`], flee directly away from the player for
+/// [`MOB_HURT_FLEE_TIME`] after damage, and zombies replace the wander intent
+/// with a straight-line [`MobAi::Chase`]. There is no pathfinding, line of
+/// sight, memory, breeding, projectile or villager logic in this slice.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MobAi {
+    /// Standing still for this tick; the next tick may pick a wander leg.
+    Idle,
+    /// Walking toward a deterministic point and a duration for this leg.
+    Wander {
+        /// World-space feet target.
+        target: WorldVec,
+        /// Seconds remaining in this leg.
+        timer: f64,
+    },
+    /// A hostile mob walking straight toward a living player.
+    Chase {
+        /// Latest observed player feet position.
+        target: WorldVec,
+    },
+    /// A hurt passive mob running away from the position it was hurt at.
+    Flee {
+        /// Position to move away from (usually the player).
+        from: WorldVec,
+        /// Seconds remaining in the flee reaction.
+        timer: f64,
+    },
+    /// The mob asked the host to remove it (age, distance or the void).
+    Despawn,
+}
+
+/// One mob's simulation state.
+///
+/// `pos` is the centre of the feet, exactly like [`Player::pos`]; the collision
+/// box extends up by the species height and sideways by the species width. No
+/// AI state is persisted in this slice, so a loaded mob restarts at
+/// [`MobAi::Idle`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mob {
+    /// Species definition key.
+    pub kind: MobKind,
+    /// Feet centre in world space.
+    pub pos: WorldVec,
+    /// Velocity in metres per second.
+    pub velocity: WorldVec,
+    /// Facing angle in radians (zero faces `-Z`, matching the player).
+    pub yaw: f32,
+    /// Health in health points, `0..=MobSpec::health`.
+    pub health: f32,
+    /// Current deterministic AI intent.
+    pub ai: MobAi,
+    /// Seconds alive; drives the despawn timer.
+    pub age: f64,
+    /// Seconds until the next hostile attack is allowed.
+    pub attack_cooldown: f64,
+    /// Whether the downward sweep contacted solid ground last tick.
+    pub on_ground: bool,
+    /// Seconds of recent-damage reaction remaining (host sets this on a hit).
+    pub hurt_timer: f64,
+}
+
+impl Mob {
+    /// Creates a full-health mob at `pos` from its registry definition.
+    pub fn new(spec: &MobSpec, pos: WorldVec) -> Self {
+        Self {
+            kind: spec.kind,
+            pos,
+            velocity: WorldVec::ZERO,
+            yaw: 0.0,
+            health: spec.health,
+            ai: MobAi::Idle,
+            age: 0.0,
+            attack_cooldown: 0.0,
+            on_ground: false,
+            hurt_timer: 0.0,
+        }
+    }
+
+    /// The mob's axis-aligned collision box in the given registry.
+    pub fn aabb(&self, registry: &Registry) -> Aabb {
+        mob_aabb(registry, self.kind, self.pos)
+    }
+
+    /// Whether the mob is still alive.
+    pub fn alive(&self) -> bool {
+        self.health > 0.0
+    }
+}
+
+/// Facts produced by one [`step_mob`] call for the authoritative host.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MobEvents {
+    /// A hostile mob attacked the player this tick.
+    pub attacked: bool,
+    /// Damage the attack would deal before armor mitigation.
+    pub damage: f32,
+    /// Knockback the host should add to the player's velocity, in m/s.
+    pub knockback: WorldVec,
+    /// The host should remove this mob (age, distance or the void).
+    pub despawn: bool,
+    /// The mob began its flee reaction to recent damage this tick.
+    pub hurt: bool,
+}
+
+/// One ray-selectable mob.
+///
+/// The server implements this for its `MobEntity`; tests can use a tiny mock.
+/// Keeping selection in `ob_sim` means the client's crosshair and the host's
+/// reach validation use the same AABB math.
+pub trait MobTarget {
+    /// Stable session entity id.
+    fn mob_id(&self) -> u64;
+    /// Species, used to look up the collision-box size.
+    fn mob_kind(&self) -> MobKind;
+    /// Feet centre in world space.
+    fn mob_pos(&self) -> WorldVec;
+}
+
+/// The axis-aligned box of a mob of `kind` whose feet centre is at `pos`.
+pub fn mob_aabb(registry: &Registry, kind: MobKind, pos: WorldVec) -> Aabb {
+    let spec = registry.mob(kind);
+    let half_width = f64::from(spec.width) * 0.5;
+    let height = f64::from(spec.height);
+    Aabb::new(
+        WorldVec::new(pos.x - half_width, pos.y, pos.z - half_width),
+        WorldVec::new(pos.x + half_width, pos.y + height, pos.z + half_width),
+    )
+}
+
+/// Advances one mob by `dt` seconds.
+///
+/// Physics mirrors the player solver at mob scale: gravity, a swept AABB on
+/// each axis in Y/X/Z order, sub-steps capped at 0.45 m so a mob cannot tunnel
+/// through a floor, and simple buoyancy in water. There is no step-up in this
+/// slice, so a one-block ledge blocks a mob.
+///
+/// AI is a pure function of the mob, the world and `dt`; each decision hashes
+/// the mob kind, quantised position/age and a purpose salt. No RNG state, wall
+/// clock, thread identity or allocation address participates.
+///
+/// * Passive mobs wander within [`MOB_WANDER_MIN_RADIUS`]..
+///   [`MOB_WANDER_MAX_RADIUS`] of their current position for 2..7 s, probe the
+///   floor [`MOB_CLIFF_PROBE`] metres ahead and refuse a step without support,
+///   and flee directly away from the player for [`MOB_HURT_FLEE_TIME`] seconds
+///   after the host sets [`Mob::hurt_timer`].
+/// * Zombies chase a living player within [`MOB_CHASE_RADIUS`] and attack when
+///   within [`MOB_ATTACK_RANGE`] whenever [`Mob::attack_cooldown`] is zero,
+///   dealing [`MOB_ATTACK_DAMAGE`] and returning a knockback vector.
+/// * Mobs that are older than [`MOB_DESPAWN_AGE`], farther than
+///   [`MOB_DESPAWN_DISTANCE`] from the player, or below [`MOB_DESPAWN_Y`] set
+///   [`MobEvents::despawn`]; removal is the host's decision.
+///
+/// Water is not a barrier once a mob is in it: the mob receives buoyancy and
+/// swims at half speed, which floats it back to the surface. A mob walking on
+/// land refuses to step into a column without solid support, so it stops at a
+/// shoreline or cliff edge instead of walking into deep water.
+pub fn step_mob(world: &World, mob: &mut Mob, player_pos: WorldVec, player_alive: bool, dt: f64) -> MobEvents {
+    let mut events = MobEvents::default();
+    if !dt.is_finite() || dt <= 0.0 {
+        return events;
+    }
+    let registry = world.registry();
+    let spec = registry.mob(mob.kind);
+    if mob.ai == MobAi::Despawn {
+        // A caller that did not remove the mob (e.g. a test) may recover on a
+        // later tick once the despawn condition no longer holds.
+        mob.ai = MobAi::Idle;
+    }
+    mob.age += dt;
+
+    mob.hurt_timer = (mob.hurt_timer - dt).max(0.0);
+    if mob.hurt_timer < TIMER_EPSILON {
+        mob.hurt_timer = 0.0;
+    }
+    mob.attack_cooldown = (mob.attack_cooldown - dt).max(0.0);
+
+    // Passive mobs drop everything and run for the duration of the hurt timer.
+    // A caller may also construct `Flee` directly (tests, future scripted
+    // behaviour); its own timer drives the reaction when no fresh hurt exists.
+    let was_fleeing = matches!(mob.ai, MobAi::Flee { .. });
+    if !spec.hostile && mob.hurt_timer > 0.0 {
+        let from = if player_pos.is_finite() { player_pos } else { mob.pos };
+        match mob.ai {
+            MobAi::Flee { from: old, timer } if mob.hurt_timer <= timer => {
+                mob.ai = MobAi::Flee { from: old, timer };
+            }
+            _ => {
+                events.hurt = !was_fleeing;
+                mob.ai = MobAi::Flee {
+                    from,
+                    timer: mob.hurt_timer.max(MOB_HURT_FLEE_TIME),
+                };
+            }
+        }
+    }
+    if let MobAi::Flee { from, timer } = mob.ai {
+        let timer = (timer - dt).max(0.0);
+        mob.ai = if timer <= TIMER_EPSILON {
+            MobAi::Idle
+        } else {
+            MobAi::Flee { from, timer }
+        };
+    }
+
+    let player_valid = player_alive && player_pos.is_finite();
+    let player_distance = if player_pos.is_finite() {
+        mob.pos.distance(player_pos)
+    } else {
+        f64::INFINITY
+    };
+
+    if spec.hostile && player_valid && player_distance <= MOB_CHASE_RADIUS {
+        mob.ai = MobAi::Chase { target: player_pos };
+    } else if !matches!(mob.ai, MobAi::Flee { .. }) {
+        if matches!(mob.ai, MobAi::Chase { .. }) {
+            // The target left the chase radius, died or was never there.
+            mob.ai = MobAi::Idle;
+        }
+        update_wander(mob, dt);
+    }
+
+    let in_water = mob_in_water(world, mob);
+    let mut wish = desired_velocity(mob, spec, in_water);
+    if spec.hostile && player_valid && player_distance <= MOB_CHASE_RADIUS {
+        // A zombie stops just inside attack range instead of walking through
+        // the player.
+        let horizontal = horizontal_distance(mob.pos, player_pos);
+        if horizontal <= MOB_ATTACK_RANGE * 0.9 {
+            wish = WorldVec::ZERO;
+        }
+    }
+
+    if !spec.hostile
+        && mob.on_ground
+        && !in_water
+        && let Some(direction) = horizontal_direction(wish)
+        && !mob_has_support_ahead(world, registry, mob.kind, mob.pos, direction)
+    {
+        // Cliff/shore avoidance: cancel the step and pick a new wander leg on
+        // the next tick rather than walking into the void or deep water.
+        wish = WorldVec::ZERO;
+        mob.velocity.x = 0.0;
+        mob.velocity.z = 0.0;
+        mob.ai = MobAi::Idle;
+    }
+
+    mob.velocity.x = wish.x;
+    mob.velocity.z = wish.z;
+    if wish.length_squared() > f64::EPSILON {
+        mob.yaw = yaw_from_direction(wish);
+    }
+
+    // Vertical integration and collision.
+    mob.velocity.y -= GRAVITY * dt;
+    if in_water {
+        mob.velocity.y += MOB_WATER_BUOYANCY * dt;
+        apply_mob_water_drag(mob, dt);
+    }
+    clamp_mob_velocity(&mut mob.velocity);
+
+    mob.on_ground = false;
+    let blocked_y = sweep_mob_axis(world, registry, mob.kind, &mut mob.pos, AXIS_Y, mob.velocity.y * dt);
+    if blocked_y {
+        if mob.velocity.y < 0.0 {
+            mob.on_ground = true;
+        }
+        mob.velocity.y = 0.0;
+    }
+
+    let blocked_x = sweep_mob_axis(world, registry, mob.kind, &mut mob.pos, AXIS_X, mob.velocity.x * dt);
+    if blocked_x {
+        mob.velocity.x = 0.0;
+    }
+    let blocked_z = sweep_mob_axis(world, registry, mob.kind, &mut mob.pos, AXIS_Z, mob.velocity.z * dt);
+    if blocked_z {
+        mob.velocity.z = 0.0;
+    }
+
+    // Hostile attack: only a living player can be hit. The host runs the
+    // damage through armor and may die; the sim only reports the intent.
+    if spec.hostile
+        && player_valid
+        && mob.attack_cooldown <= TIMER_EPSILON
+        && mob.pos.distance(player_pos) <= MOB_ATTACK_RANGE
+    {
+        let direction = horizontal_direction(player_pos - mob.pos).unwrap_or_else(|| {
+            horizontal_direction(WorldVec::new(-mob.yaw.sin() as f64, 0.0, -mob.yaw.cos() as f64))
+                .unwrap_or(WorldVec::new(0.0, 0.0, 1.0))
+        });
+        events.attacked = true;
+        events.damage = MOB_ATTACK_DAMAGE;
+        events.knockback = WorldVec::new(
+            direction.x * MOB_KNOCKBACK_HORIZONTAL,
+            MOB_KNOCKBACK_UP,
+            direction.z * MOB_KNOCKBACK_HORIZONTAL,
+        );
+        mob.attack_cooldown = MOB_ATTACK_COOLDOWN;
+        mob.yaw = yaw_from_direction(direction);
+    }
+
+    let despawn_age = mob.age > MOB_DESPAWN_AGE;
+    let despawn_void = mob.pos.y < MOB_DESPAWN_Y;
+    let despawn_distance = player_pos.is_finite() && mob.pos.distance(player_pos) > MOB_DESPAWN_DISTANCE;
+    if despawn_age || despawn_void || despawn_distance {
+        events.despawn = true;
+        mob.ai = MobAi::Despawn;
+    }
+
+    events
+}
+
+/// Chooses or advances a wander leg.
+fn update_wander(mob: &mut Mob, dt: f64) {
+    if let MobAi::Wander { target, timer } = mob.ai {
+        let timer = (timer - dt).max(0.0);
+        let reached = horizontal_distance(mob.pos, target) <= 0.6;
+        if timer <= TIMER_EPSILON || reached {
+            mob.ai = MobAi::Idle;
+        } else {
+            mob.ai = MobAi::Wander { target, timer };
+        }
+    }
+    if matches!(mob.ai, MobAi::Idle) {
+        let hash = mob_decision_hash(mob, 0x57A4_11D0_0DC5_1E11);
+        let angle = unit_interval(hash) * std::f64::consts::TAU;
+        let radius = MOB_WANDER_MIN_RADIUS
+            + unit_interval(ob_math::mix64(hash)) * (MOB_WANDER_MAX_RADIUS - MOB_WANDER_MIN_RADIUS);
+        let time = MOB_WANDER_MIN_TIME
+            + unit_interval(ob_math::mix64(hash ^ 0x9E37_79B9_7F4A_7C15)) * (MOB_WANDER_MAX_TIME - MOB_WANDER_MIN_TIME);
+        mob.ai = MobAi::Wander {
+            target: WorldVec::new(
+                mob.pos.x + angle.cos() * radius,
+                mob.pos.y,
+                mob.pos.z + angle.sin() * radius,
+            ),
+            timer: time,
+        };
+    }
+}
+
+/// Desired horizontal velocity for the current AI intent.
+fn desired_velocity(mob: &Mob, spec: &MobSpec, in_water: bool) -> WorldVec {
+    let water_factor = if in_water { MOB_WATER_SPEED_FACTOR } else { 1.0 };
+    let (target, speed_factor) = match mob.ai {
+        MobAi::Idle | MobAi::Despawn => return WorldVec::ZERO,
+        MobAi::Wander { target, .. } => (target, 1.0),
+        MobAi::Chase { target } => (target, 1.0),
+        MobAi::Flee { from, .. } => {
+            let away = horizontal_direction(mob.pos - from).unwrap_or_else(|| {
+                let hash = mob_decision_hash(mob, 0x3F1D_9A2C_4B8E_7711);
+                let angle = unit_interval(hash) * std::f64::consts::TAU;
+                WorldVec::new(angle.cos(), 0.0, angle.sin())
+            });
+            return away * (f64::from(spec.speed) * 1.25 * water_factor);
+        }
+    };
+    let Some(direction) = horizontal_direction(target - mob.pos) else {
+        return WorldVec::ZERO;
+    };
+    direction * (f64::from(spec.speed) * speed_factor * water_factor)
+}
+
+/// Whether a passive mob has solid support just ahead of its feet.
+fn mob_has_support_ahead(
+    world: &World,
+    registry: &Registry,
+    kind: MobKind,
+    pos: WorldVec,
+    direction: WorldVec,
+) -> bool {
+    let probe_centre = pos + direction * MOB_CLIFF_PROBE;
+    let spec = registry.mob(kind);
+    let half = f64::from(spec.width) * 0.5;
+    let probe = Aabb::new(
+        WorldVec::new(probe_centre.x - half, pos.y - 0.12, probe_centre.z - half),
+        WorldVec::new(probe_centre.x + half, pos.y, probe_centre.z + half),
+    );
+    aabb_collides(world, &probe)
+}
+
+/// Whether any block overlapping the mob's lower body or waist is a fluid.
+fn mob_in_water(world: &World, mob: &Mob) -> bool {
+    let spec = world.registry().mob(mob.kind);
+    let feet = BlockPos::new(
+        mob.pos.x.floor() as i32,
+        mob.pos.y.floor() as i32,
+        mob.pos.z.floor() as i32,
+    );
+    let waist = BlockPos::new(
+        feet.x,
+        (mob.pos.y + f64::from(spec.height) * 0.5).floor() as i32,
+        feet.z,
+    );
+    is_fluid(world, feet) || is_fluid(world, waist)
+}
+
+/// Applies per-tick water drag to a mob's velocity.
+fn apply_mob_water_drag(mob: &mut Mob, dt: f64) {
+    let tick_fraction = (dt / TICK_DT).clamp(0.0, 1.0);
+    let drag = 1.0 - (1.0 - MOB_WATER_DRAG) * tick_fraction;
+    mob.velocity.x *= drag;
+    mob.velocity.y *= drag;
+    mob.velocity.z *= drag;
+}
+
+/// Clamps a mob velocity to the terminal speed and recovers from non-finite data.
+fn clamp_mob_velocity(velocity: &mut WorldVec) {
+    if !velocity.x.is_finite() || !velocity.y.is_finite() || !velocity.z.is_finite() {
+        *velocity = WorldVec::ZERO;
+        return;
+    }
+    let max_speed_sq = MOB_TERMINAL_VELOCITY * MOB_TERMINAL_VELOCITY;
+    let speed_sq = velocity.length_squared();
+    if speed_sq > max_speed_sq {
+        *velocity *= MOB_TERMINAL_VELOCITY / speed_sq.sqrt();
+    }
+}
+
+/// Moves a mob along one axis, stopping at the first solid contact.
+fn sweep_mob_axis(
+    world: &World,
+    registry: &Registry,
+    kind: MobKind,
+    pos: &mut WorldVec,
+    axis: usize,
+    delta: f64,
+) -> bool {
+    if delta == 0.0 || !delta.is_finite() {
+        return false;
+    }
+    let sign = if delta > 0.0 { 1.0 } else { -1.0 };
+    let mut remaining = delta.abs();
+    while remaining > 0.0 {
+        let step = remaining.min(MOB_MAX_SUBSTEP);
+        let mut candidate = *pos;
+        offset_axis(&mut candidate, axis, sign * step);
+        if aabb_collides(world, &mob_aabb(registry, kind, candidate)) {
+            let mut low = 0.0;
+            let mut high = step;
+            for _ in 0..CONTACT_ITERATIONS {
+                let mid = (low + high) * 0.5;
+                let mut probe = *pos;
+                offset_axis(&mut probe, axis, sign * mid);
+                if aabb_collides(world, &mob_aabb(registry, kind, probe)) {
+                    high = mid;
+                } else {
+                    low = mid;
+                }
+            }
+            offset_axis(pos, axis, sign * low);
+            return true;
+        }
+        *pos = candidate;
+        remaining -= step;
+    }
+    false
+}
+
+/// Horizontal unit vector of `value`, or `None` when it is degenerate.
+fn horizontal_direction(value: WorldVec) -> Option<WorldVec> {
+    let horizontal = WorldVec::new(value.x, 0.0, value.z);
+    if !horizontal.is_finite() || horizontal.length_squared() <= 1e-12 {
+        return None;
+    }
+    Some(horizontal.normalize())
+}
+
+/// Horizontal distance between two positions.
+fn horizontal_distance(a: WorldVec, b: WorldVec) -> f64 {
+    let dx = a.x - b.x;
+    let dz = a.z - b.z;
+    (dx * dx + dz * dz).sqrt()
+}
+
+/// Yaw that faces `direction` with the player's convention (zero faces `-Z`).
+fn yaw_from_direction(direction: WorldVec) -> f32 {
+    (-direction.x).atan2(-direction.z) as f32
+}
+
+/// Stable 64-bit decision hash for one mob and purpose salt.
+fn mob_decision_hash(mob: &Mob, salt: u64) -> u64 {
+    let mut hash = 0x6A09_E667_F3BC_C909u64 ^ salt;
+    hash = ob_math::mix64(hash ^ mob.kind.index() as u64);
+    hash = ob_math::mix64(hash ^ mob.pos.x.to_bits());
+    hash = ob_math::mix64(hash ^ mob.pos.y.to_bits());
+    hash = ob_math::mix64(hash ^ mob.pos.z.to_bits());
+    hash = ob_math::mix64(hash ^ mob.age.to_bits());
+    hash
+}
+
+/// Maps the top 53 bits of `hash` to `[0, 1)`.
+fn unit_interval(hash: u64) -> f64 {
+    (hash >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Returns the nearest mob id hit by a ray from `origin` along `direction`.
+///
+/// The ray is clamped to `max_distance` and tested against each mob's
+/// species-sized AABB (feet centre plus registry width/height). Ties at the
+/// same entry distance break by ascending id. This is the one selection
+/// primitive shared by the client crosshair and the host's reach check; the
+/// host still validates damage itself.
+pub fn raycast_mob<T: MobTarget>(
+    registry: &Registry,
+    mobs: &[T],
+    origin: WorldVec,
+    direction: WorldVec,
+    max_distance: f64,
+) -> Option<u64> {
+    if !max_distance.is_finite() || max_distance < 0.0 || !origin.is_finite() {
+        return None;
+    }
+    let direction = normalised_direction(direction)?;
+    let mut best: Option<(f64, u64)> = None;
+    for mob in mobs {
+        let aabb = mob_aabb(registry, mob.mob_kind(), mob.mob_pos());
+        let Some(distance) = ray_aabb(origin, direction, &aabb, max_distance) else {
+            continue;
+        };
+        let id = mob.mob_id();
+        best = match best {
+            Some((best_distance, best_id))
+                if distance > best_distance || (distance == best_distance && id > best_id) =>
+            {
+                Some((best_distance, best_id))
+            }
+            _ => Some((distance, id)),
+        };
+    }
+    best.map(|(_, id)| id)
+}
+
+/// Normalises a ray direction, rejecting zero/non-finite vectors.
+fn normalised_direction(direction: WorldVec) -> Option<WorldVec> {
+    if !direction.is_finite() || direction.length_squared() <= 1e-12 {
+        return None;
+    }
+    Some(direction.normalize())
+}
+
+/// Slab test returning the ray parameter where it enters `aabb`.
+fn ray_aabb(origin: WorldVec, direction: WorldVec, aabb: &Aabb, max_distance: f64) -> Option<f64> {
+    let mut t_min = 0.0f64;
+    let mut t_max = max_distance;
+    for axis in 0..3 {
+        let (origin_axis, direction_axis, min, max) = match axis {
+            AXIS_X => (origin.x, direction.x, aabb.min.x, aabb.max.x),
+            AXIS_Y => (origin.y, direction.y, aabb.min.y, aabb.max.y),
+            _ => (origin.z, direction.z, aabb.min.z, aabb.max.z),
+        };
+        if direction_axis.abs() <= 1e-12 {
+            if origin_axis < min || origin_axis > max {
+                return None;
+            }
+            continue;
+        }
+        let inverse = 1.0 / direction_axis;
+        let mut near = (min - origin_axis) * inverse;
+        let mut far = (max - origin_axis) * inverse;
+        if near > far {
+            std::mem::swap(&mut near, &mut far);
+        }
+        t_min = t_min.max(near);
+        t_max = t_max.min(far);
+        if t_min > t_max {
+            return None;
+        }
+    }
+    (t_max >= 0.0).then_some(t_min.max(0.0))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1320,5 +1941,341 @@ mod tests {
             tick(&world, &mut walker, &walk);
         }
         assert!(walker.pos.y < 0.5, "walking player should fall off the ledge");
+    }
+
+    /// Creates a full-health mob from the flat test world's registry.
+    fn mob(world: &World, kind: MobKind, x: f64, y: f64, z: f64) -> Mob {
+        Mob::new(world.registry().mob(kind), WorldVec::new(x, y, z))
+    }
+
+    /// A tiny ray target for `raycast_mob` tests.
+    struct Target {
+        id: u64,
+        kind: MobKind,
+        pos: WorldVec,
+    }
+
+    impl MobTarget for Target {
+        fn mob_id(&self) -> u64 {
+            self.id
+        }
+
+        fn mob_kind(&self) -> MobKind {
+            self.kind
+        }
+
+        fn mob_pos(&self) -> WorldVec {
+            self.pos
+        }
+    }
+
+    #[test]
+    fn mob_falls_gravity_settles_on_the_floor() {
+        let world = flat_world(1);
+        let player = WorldVec::new(8.5, 1.0, 8.5);
+        let mut cow = mob(&world, MobKind::Cow, 8.5, 6.0, 8.5);
+        for _ in 0..200 {
+            step_mob(&world, &mut cow, player, true, TICK_DT);
+            if cow.on_ground {
+                break;
+            }
+        }
+        assert!(cow.on_ground, "cow never landed");
+        assert!((cow.pos.y - 1.0).abs() < 1e-4, "feet settled at {}", cow.pos.y);
+        assert!(cow.velocity.y.abs() < 1e-9);
+        assert!(!aabb_collides(&world, &cow.aabb(world.registry())));
+        assert_eq!(cow.health, 10.0);
+        assert_eq!(cow.kind, MobKind::Cow);
+    }
+
+    #[test]
+    fn passive_wander_is_bounded_and_changes_position() {
+        let world = flat_world(2);
+        let player = WorldVec::new(40.5, 1.0, 8.5);
+        let mut cow = mob(&world, MobKind::Cow, 8.5, 1.0, 8.5);
+        let start = cow.pos;
+        let mut distinct = std::collections::HashSet::new();
+        let mut max_target_radius: f64 = 0.0;
+        for _ in 0..300 {
+            let events = step_mob(&world, &mut cow, player, true, TICK_DT);
+            assert!(!events.attacked, "a passive cow must never attack");
+            distinct.insert((cow.pos.x.to_bits(), cow.pos.z.to_bits()));
+            if let MobAi::Wander { target, .. } = cow.ai {
+                max_target_radius = max_target_radius.max(horizontal_distance(cow.pos, target));
+            }
+            assert!((cow.pos.y - 1.0).abs() < 1e-4, "cow left the floor at {}", cow.pos.y);
+            assert!(!aabb_collides(&world, &cow.aabb(world.registry())));
+        }
+        assert!(distinct.len() > 10, "cow never moved ({} positions)", distinct.len());
+        assert!(
+            max_target_radius <= MOB_WANDER_MAX_RADIUS + 1e-6,
+            "wander target was {max_target_radius} m away"
+        );
+        assert!(
+            horizontal_distance(start, cow.pos) <= 24.0,
+            "cow wandered {} m from its start",
+            horizontal_distance(start, cow.pos)
+        );
+    }
+
+    #[test]
+    fn passive_mob_flees_when_hurt_then_recovers() {
+        let world = flat_world(1);
+        let player = WorldVec::new(6.5, 1.0, 8.5);
+        let mut cow = mob(&world, MobKind::Cow, 8.5, 1.0, 8.5);
+        cow.hurt_timer = MOB_HURT_FLEE_TIME;
+        let first = step_mob(&world, &mut cow, player, true, TICK_DT);
+        assert!(first.hurt, "the first hurt tick must report the flee reaction");
+        assert!(matches!(cow.ai, MobAi::Flee { .. }));
+        let distance_before = cow.pos.distance(player);
+        for _ in 0..20 {
+            step_mob(&world, &mut cow, player, true, TICK_DT);
+        }
+        assert!(
+            cow.pos.distance(player) > distance_before,
+            "cow did not run away: {} -> {}",
+            distance_before,
+            cow.pos.distance(player)
+        );
+        assert!(!matches!(cow.ai, MobAi::Idle), "cow stopped fleeing after one second");
+        for _ in 0..100 {
+            step_mob(&world, &mut cow, player, true, TICK_DT);
+        }
+        assert_eq!(cow.hurt_timer, 0.0);
+        assert!(
+            !matches!(cow.ai, MobAi::Flee { .. }),
+            "flee reaction outlived the hurt timer"
+        );
+
+        // A scripted/future `Flee` state works on its own timer too.
+        let mut scripted = mob(&world, MobKind::Cow, 8.5, 1.0, 8.5);
+        scripted.ai = MobAi::Flee {
+            from: player,
+            timer: 1.0,
+        };
+        let before = scripted.pos.distance(player);
+        for _ in 0..10 {
+            step_mob(&world, &mut scripted, player, true, TICK_DT);
+        }
+        assert!(
+            scripted.pos.distance(player) > before,
+            "a constructed flee state must move away"
+        );
+        for _ in 0..40 {
+            step_mob(&world, &mut scripted, player, true, TICK_DT);
+        }
+        assert!(!matches!(scripted.ai, MobAi::Flee { .. }), "flee timer must expire");
+    }
+
+    #[test]
+    fn zombie_chases_and_attacks_with_a_cooldown() {
+        let world = flat_world(1);
+        let player = WorldVec::new(14.5, 1.0, 8.5);
+        let mut zombie = mob(&world, MobKind::Zombie, 8.5, 1.0, 8.5);
+        let start = zombie.pos.distance(player);
+        let events = step_mob(&world, &mut zombie, player, true, TICK_DT);
+        assert!(matches!(zombie.ai, MobAi::Chase { .. }));
+        assert!(!events.attacked, "zombie attacked from 6 m");
+        for _ in 0..20 {
+            step_mob(&world, &mut zombie, player, true, TICK_DT);
+        }
+        assert!(
+            zombie.pos.distance(player) < start,
+            "zombie did not close distance: {start} -> {}",
+            zombie.pos.distance(player)
+        );
+
+        // Place it inside attack range: one attack, then the cooldown blocks it.
+        zombie.pos = WorldVec::new(13.0, 1.0, 8.5);
+        zombie.attack_cooldown = 0.0;
+        let hit = step_mob(&world, &mut zombie, player, true, TICK_DT);
+        assert!(hit.attacked);
+        assert_eq!(hit.damage, MOB_ATTACK_DAMAGE);
+        assert!(hit.knockback.x > 0.0, "knockback must push away from the zombie");
+        assert!((hit.knockback.y - MOB_KNOCKBACK_UP).abs() < 1e-9);
+        let immediate = step_mob(&world, &mut zombie, player, true, TICK_DT);
+        assert!(!immediate.attacked, "cooldown did not gate the second attack");
+        let mut attacks = 0;
+        for _ in 0..100 {
+            let events = step_mob(&world, &mut zombie, player, true, TICK_DT);
+            attacks += u32::from(events.attacked);
+        }
+        assert!(attacks >= 3, "only {attacks} attacks in five seconds");
+    }
+
+    #[test]
+    fn passive_mobs_never_attack_and_creative_players_are_ignored() {
+        let world = flat_world(0);
+        let player = WorldVec::new(8.9, 1.0, 8.5);
+        let mut cow = mob(&world, MobKind::Cow, 8.5, 1.0, 8.5);
+        let mut zombie = mob(&world, MobKind::Zombie, 8.5, 1.0, 8.5);
+        for _ in 0..100 {
+            let events = step_mob(&world, &mut cow, player, true, TICK_DT);
+            assert!(!events.attacked && events.damage == 0.0);
+            let events = step_mob(&world, &mut zombie, player, false, TICK_DT);
+            assert!(!events.attacked && events.damage == 0.0);
+        }
+        assert!(
+            !matches!(zombie.ai, MobAi::Chase { .. }),
+            "dead/creative player was chased"
+        );
+    }
+
+    #[test]
+    fn passive_mobs_stop_at_a_cliff_edge() {
+        let mut world = flat_world(1);
+        let air = BlockId::AIR;
+        for z in -16..=31 {
+            for x in 11..=31 {
+                world.set_block(BlockPos::new(x, 0, z), air);
+            }
+        }
+        let player = WorldVec::new(8.5, 1.0, 8.5);
+        let mut cow = mob(&world, MobKind::Cow, 9.5, 1.0, 8.5);
+        cow.ai = MobAi::Wander {
+            target: WorldVec::new(20.5, 1.0, 8.5),
+            timer: 100.0,
+        };
+        cow.on_ground = true;
+        for _ in 0..150 {
+            step_mob(&world, &mut cow, player, true, TICK_DT);
+            assert!(!aabb_collides(&world, &cow.aabb(world.registry())));
+            assert!(
+                cow.pos.y > 0.9,
+                "cow fell off the cliff at x = {} (y = {})",
+                cow.pos.x,
+                cow.pos.y
+            );
+        }
+        assert!(
+            cow.pos.x < 11.0,
+            "cow walked past the supported edge to x = {}",
+            cow.pos.x
+        );
+    }
+
+    #[test]
+    fn mob_step_is_deterministic() {
+        let world_a = flat_world(1);
+        let world_b = flat_world(1);
+        let player = WorldVec::new(12.5, 1.0, 8.5);
+        let mut zombie_a = mob(&world_a, MobKind::Zombie, 8.5, 1.0, 8.5);
+        let mut zombie_b = mob(&world_b, MobKind::Zombie, 8.5, 1.0, 8.5);
+        let mut cow_a = mob(&world_a, MobKind::Cow, 7.5, 1.0, 8.5);
+        let mut cow_b = mob(&world_b, MobKind::Cow, 7.5, 1.0, 8.5);
+        cow_a.hurt_timer = MOB_HURT_FLEE_TIME;
+        cow_b.hurt_timer = MOB_HURT_FLEE_TIME;
+        for _ in 0..200 {
+            let za = step_mob(&world_a, &mut zombie_a, player, true, TICK_DT);
+            let zb = step_mob(&world_b, &mut zombie_b, player, true, TICK_DT);
+            let ca = step_mob(&world_a, &mut cow_a, player, true, TICK_DT);
+            let cb = step_mob(&world_b, &mut cow_b, player, true, TICK_DT);
+            assert_eq!(za, zb);
+            assert_eq!(ca, cb);
+        }
+        assert_eq!(zombie_a.pos.x.to_bits(), zombie_b.pos.x.to_bits());
+        assert_eq!(zombie_a.pos.y.to_bits(), zombie_b.pos.y.to_bits());
+        assert_eq!(zombie_a.pos.z.to_bits(), zombie_b.pos.z.to_bits());
+        assert_eq!(zombie_a.yaw.to_bits(), zombie_b.yaw.to_bits());
+        assert_eq!(zombie_a.velocity, zombie_b.velocity);
+        assert_eq!(zombie_a.ai, zombie_b.ai);
+        assert_eq!(zombie_a.age.to_bits(), zombie_b.age.to_bits());
+        assert_eq!(cow_a.pos, cow_b.pos);
+        assert_eq!(cow_a.ai, cow_b.ai);
+        assert_eq!(cow_a.hurt_timer.to_bits(), cow_b.hurt_timer.to_bits());
+    }
+
+    #[test]
+    fn mobs_float_in_water_instead_of_sinking() {
+        let mut world = flat_world(0);
+        let water = world.registry().id_or_air(WATER);
+        for y in 1..=4 {
+            for z in 5..=11 {
+                for x in 5..=11 {
+                    world.set_block(BlockPos::new(x, y, z), water);
+                }
+            }
+        }
+        let player = WorldVec::new(8.5, 1.0, 8.5);
+        let mut cow = mob(&world, MobKind::Cow, 8.5, 1.0, 8.5);
+        let start_y = cow.pos.y;
+        let mut highest = start_y;
+        for _ in 0..100 {
+            step_mob(&world, &mut cow, player, true, TICK_DT);
+            highest = highest.max(cow.pos.y);
+            assert!(!aabb_collides(&world, &cow.aabb(world.registry())));
+        }
+        assert!(
+            highest > start_y + 0.2,
+            "cow sank instead of floating (highest {highest}, start {start_y})"
+        );
+        assert!(cow.pos.y > start_y - 0.05, "cow sank below its start");
+        assert!(
+            world.block_type(world.get_block(BlockPos::new(8, 4, 8))).fluid,
+            "water fixture must stay water"
+        );
+    }
+
+    #[test]
+    fn mobs_despawn_by_age_distance_and_the_void() {
+        let world = flat_world(1);
+        let player = WorldVec::new(8.5, 1.0, 8.5);
+
+        let mut old = mob(&world, MobKind::Cow, 8.5, 1.0, 8.5);
+        old.age = MOB_DESPAWN_AGE + 0.1;
+        assert!(step_mob(&world, &mut old, player, true, TICK_DT).despawn);
+        assert_eq!(old.ai, MobAi::Despawn);
+
+        let mut far = mob(&world, MobKind::Cow, 8.5 + MOB_DESPAWN_DISTANCE + 1.0, 1.0, 8.5);
+        assert!(step_mob(&world, &mut far, player, true, TICK_DT).despawn);
+
+        let mut void = mob(&world, MobKind::Cow, 8.5, MOB_DESPAWN_Y - 1.0, 8.5);
+        assert!(step_mob(&world, &mut void, player, true, TICK_DT).despawn);
+
+        let mut fresh = mob(&world, MobKind::Cow, 8.5, 1.0, 8.5);
+        assert!(!step_mob(&world, &mut fresh, player, true, TICK_DT).despawn);
+    }
+
+    #[test]
+    fn raycast_mob_selects_the_nearest_aabb() {
+        let registry = Registry::base();
+        let mobs = vec![
+            Target {
+                id: 7,
+                kind: MobKind::Cow,
+                pos: WorldVec::new(8.5, 1.0, 8.5),
+            },
+            Target {
+                id: 3,
+                kind: MobKind::Pig,
+                pos: WorldVec::new(8.5, 1.0, 5.5),
+            },
+        ];
+        let origin = WorldVec::new(8.5, 1.5, 0.5);
+        let forward = WorldVec::new(0.0, 0.0, 1.0);
+        assert_eq!(raycast_mob(&registry, &mobs, origin, forward, 20.0), Some(3));
+        assert_eq!(raycast_mob(&registry, &mobs, origin, forward, 2.0), None);
+        assert_eq!(
+            raycast_mob(&registry, &mobs, origin, WorldVec::new(0.0, 1.0, 0.0), 20.0),
+            None
+        );
+        assert_eq!(raycast_mob(&registry, &mobs, origin, WorldVec::ZERO, 20.0), None);
+        // Only the farther cow is selectable through a short reach.
+        assert_eq!(raycast_mob(&registry, &mobs[..1], origin, forward, 20.0), Some(7));
+
+        // Equal entry distance breaks the tie by ascending id.
+        let tied = vec![
+            Target {
+                id: 9,
+                kind: MobKind::Cow,
+                pos: WorldVec::new(8.5, 1.0, 8.5),
+            },
+            Target {
+                id: 4,
+                kind: MobKind::Sheep,
+                pos: WorldVec::new(8.5, 1.0, 8.5),
+            },
+        ];
+        assert_eq!(raycast_mob(&registry, &tied, origin, forward, 20.0), Some(4));
     }
 }

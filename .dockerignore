@@ -1,0 +1,14 @@
+# Build context exclusions for the server container.
+#
+# The Dockerfile builds only crates/server and its path dependencies; it does
+# not need the client, renderer, audio, docs or local build caches.
+target/
+.git/
+.github/
+.cargo-home/
+.toolchain/
+.tmp-sdroot/
+run/
+screenshots/
+perf/
+*.log

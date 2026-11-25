@@ -45,11 +45,14 @@
 //! independent of hash-map iteration order and identical worlds produce
 //! identical bytes.
 
+use std::io::{self, Read};
+use std::path::Path;
 use std::sync::Arc;
 
 use ob_content::{BlockId, Registry};
 use ob_math::{ChunkPos, N_SECTIONS, SECTION_SIZE};
 use rustc_hash::FxHashSet;
+use zstd::decompress::zstd_decompress::{ZSTD_CONTENTSIZE_ERROR, ZSTD_CONTENTSIZE_UNKNOWN, ZSTD_getFrameContentSize};
 use zstd::prelude::{ZSTD_compress, ZSTD_compressBound, ZSTD_decompress, ZSTD_isError};
 
 use crate::chunk::ChunkColumn;
@@ -80,6 +83,12 @@ const ZSTD_LEVEL: i32 = 3;
 /// Upper bound on a decompressed payload, to keep malformed headers from
 /// requesting an unbounded allocation before the payload is parsed.
 const MAX_PAYLOAD_LEN: usize = 256 * 1024 * 1024;
+/// Upper bound on the on-disk size of `world.obs` accepted by
+/// [`read_save_file`].
+///
+/// The compressed body can be slightly larger than the decompressed payload for
+/// incompressible data, so this is deliberately twice the decompressed cap.
+pub const MAX_SAVE_FILE_BYTES: u64 = 512 * 1024 * 1024;
 /// Smallest possible on-disk chunk: position plus 24 uniform sections with
 /// three storage bytes and one uniform-zero light byte each.
 const MIN_CHUNK_BYTES: usize = 8 + N_SECTIONS * 4;
@@ -227,6 +236,34 @@ pub fn from_bytes(registry: Arc<Registry>, bytes: &[u8]) -> Result<World, SaveEr
     }
 }
 
+/// Reads a `world.obs` file with the on-disk size cap enforced before and
+/// during the read.
+///
+/// The metadata check rejects an oversized file without reading it; the
+/// `take` limit still bounds the read if the file grows between the metadata
+/// call and the read (or is a special file that reports no length). A file above
+/// [`MAX_SAVE_FILE_BYTES`] is reported as
+/// [`io::ErrorKind::InvalidData`]; callers can then keep the previous world or
+/// refuse to start without allocating attacker-chosen memory.
+pub fn read_save_file(path: &Path) -> Result<Vec<u8>, io::Error> {
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > MAX_SAVE_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("world save file exceeds the {MAX_SAVE_FILE_BYTES}-byte limit"),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_SAVE_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SAVE_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("world save file exceeds the {MAX_SAVE_FILE_BYTES}-byte limit"),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Encodes the chunk stream (chunk count, coordinates and sections).
 ///
 /// `write_section` is a parameter so tests can also produce the legacy v1
@@ -281,6 +318,16 @@ fn decode_payload(compression: u8, uncompressed_len: usize, body: &[u8]) -> Resu
         COMPRESSION_ZSTD => {
             if uncompressed_len > MAX_PAYLOAD_LEN {
                 return Err(SaveError::InvalidFormat("uncompressed payload too large"));
+            }
+            // The zstd frame header carries the decompressed size. Reject a
+            // header/body disagreement before allocating: a tiny corrupt file
+            // that claims a huge payload must not cause a large allocation.
+            let frame_size = ZSTD_getFrameContentSize(body);
+            if frame_size == ZSTD_CONTENTSIZE_ERROR {
+                return Err(SaveError::InvalidFormat("zstd frame header is invalid"));
+            }
+            if frame_size != ZSTD_CONTENTSIZE_UNKNOWN && frame_size != uncompressed_len as u64 {
+                return Err(SaveError::InvalidFormat("zstd frame content size mismatch"));
             }
             let mut payload = vec![0u8; uncompressed_len];
             let written = ZSTD_decompress(&mut payload, body);
@@ -1346,6 +1393,123 @@ mod tests {
                 "re-checksummed truncated stream of {len} bytes was accepted"
             );
         }
+    }
+
+    /// Wraps a raw chunk payload in a v4 header with no compression and a valid
+    /// checksum, so tests can mutate the payload and still reach the decoder.
+    fn v4_uncompressed(payload: &[u8]) -> Vec<u8> {
+        let len = u32::try_from(payload.len()).expect("test payload fits");
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&7u64.to_le_bytes());
+        out.extend_from_slice(&registry_fingerprint(&base_registry()).to_le_bytes());
+        out.push(COMPRESSION_NONE);
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(payload);
+        let checksum = crc32c(&out);
+        out.extend_from_slice(&checksum.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn compressed_header_size_must_match_the_zstd_frame() {
+        let (registry, world) = sample_world();
+        let bytes = to_bytes(&world);
+        assert_eq!(bytes[22], COMPRESSION_ZSTD);
+
+        // A tiny body that claims a huge decompressed payload must be rejected
+        // from the zstd frame header, before the payload is allocated.
+        let mut lying = bytes.clone();
+        lying[23..27].copy_from_slice(&(64 * 1024 * 1024u32).to_le_bytes());
+        resign(&mut lying);
+        match from_bytes(Arc::clone(&registry), &lying) {
+            Err(SaveError::InvalidFormat("zstd frame content size mismatch")) => {}
+            other => panic!("expected a frame-size mismatch, got {other:?}"),
+        }
+
+        // Garbage behind a valid checksum is a typed error, not a panic.
+        let mut garbage = bytes;
+        let body_end = garbage.len() - CRC_LEN;
+        for byte in &mut garbage[V4_HEADER_LEN..body_end] {
+            *byte = 0xFF;
+        }
+        resign(&mut garbage);
+        assert!(matches!(
+            from_bytes(registry, &garbage),
+            Err(SaveError::InvalidFormat("zstd frame header is invalid"))
+        ));
+    }
+
+    #[test]
+    fn uncompressed_payload_structure_is_validated() {
+        let registry = base_registry();
+        let compact = compact_world(&registry);
+        let payload = encode_payload(&compact, write_section);
+        assert_eq!(encode_payload(&compact, write_section), payload);
+        assert_eq!(payload.len(), 4 + 8 + N_SECTIONS * 4, "one uniform chunk");
+
+        let chunk = &payload[4..];
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("chunk count exceeds payload", vec![1, 0, 0, 0]),
+            ("trailing bytes after chunks", {
+                let mut trailing = payload.clone();
+                trailing.push(0);
+                trailing
+            }),
+            ("unknown storage mode", {
+                let mut bad = payload.clone();
+                bad[12] = 9;
+                bad
+            }),
+            ("invalid light encoding flag", {
+                let mut bad = payload.clone();
+                bad[15] = 9;
+                bad
+            }),
+            ("uniform light value must be non-zero", {
+                let mut bad = payload[..15].to_vec();
+                bad.extend_from_slice(&[2, 0, 0]);
+                bad.extend_from_slice(&payload[16..]);
+                bad
+            }),
+            ("duplicate chunk position", {
+                let mut duplicate = Vec::new();
+                duplicate.extend_from_slice(&2u32.to_le_bytes());
+                duplicate.extend_from_slice(chunk);
+                duplicate.extend_from_slice(chunk);
+                duplicate
+            }),
+        ];
+        for (expected, payload) in cases {
+            let bytes = v4_uncompressed(&payload);
+            match from_bytes(Arc::clone(&registry), &bytes) {
+                Err(SaveError::InvalidFormat(reason)) => {
+                    assert_eq!(reason, expected, "unexpected rejection reason");
+                }
+                other => panic!("payload case {expected:?} was accepted: {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_world_file_is_rejected_from_metadata() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let dir = std::env::temp_dir().join(format!("ob-save-oversized-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("world.obs");
+        let file = std::fs::File::create(&path).expect("create sparse save");
+        file.set_len(MAX_SAVE_FILE_BYTES + 1)
+            .expect("make the sparse save oversized");
+        drop(file);
+        let error = read_save_file(&path).expect_err("oversized save must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("limit"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

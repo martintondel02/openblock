@@ -18,6 +18,20 @@
 //! surface, water up to [`ob_math::SEA_LEVEL`], deterministic broadleaf/spruce
 //! trees, boulders and snow drifts. The finished [`ChunkColumn`] is finalised
 //! for sky light and has a consistent heightmap.
+//!
+//! After the terrain is filled, integer 3D value-noise carvers cut spaghetti
+//! tunnels and low-Y caverns through the stone layer, rare hashed surface
+//! entrances connect those caves to dry ground, and rare region-hashed ravines
+//! open stepped canyons. Carving never touches water, bedrock, the top of the
+//! surface (except at a real entrance or ravine) or the protected spawn crust;
+//! features are planted afterwards on whatever solid surface remains.
+//!
+//! Ore veins are grown last, after the surface features. Each chunk derives an
+//! independent vein stream from its world origin and the world seed, grows
+//! connected six-neighbour blobs of coal, iron and copper inside the tuned Y
+//! bands, and replaces a block only when it is still stone. Ores therefore never
+//! overwrite logs, leaves, water, bedrock, dirt, cave air or the terrain
+//! surface, and generating chunks in any order produces the same veins.
 
 #![forbid(unsafe_code)]
 #![allow(missing_docs)] // TODO(MS-04): re-enable once the v0.0.1 API surface settles
@@ -116,6 +130,105 @@ const SALT_BOULDER: i64 = 0x424F_554C; // "BOUL"
 /// Salt for the per-column snow-drift hash.
 const SALT_DRIFT: i64 = 0x4452_4946; // "DRIF"
 
+/// Salt for the first 3D spaghetti-tunnel field.
+const SALT_CAVE_TUNNEL_A: i64 = 0x4341_5645; // "CAVE"
+
+/// Salt for the second 3D spaghetti-tunnel field.
+const SALT_CAVE_TUNNEL_B: i64 = 0x5455_4E4C; // "TUNL"
+
+/// Salt for the 3D cavern field.
+const SALT_CAVERN: i64 = 0x4341_564E; // "CAVN"
+
+/// Salt for the rare per-column surface-entrance hash.
+const SALT_CAVE_ENTRANCE: i64 = 0x454E_5452; // "ENTR"
+
+/// Salt for the per-region ravine candidate hash.
+const SALT_RAVINE_REGION: i64 = 0x5241_5649; // "RAVI"
+
+/// Horizontal and vertical spacing of the coarse 3D cave sample grid.
+///
+/// Each section samples 5×5×5 lattice points at four-block spacing; the
+/// per-block value is a trilinear blend of the eight surrounding samples.
+const CAVE_GRID_STEP: i32 = 4;
+
+/// Number of coarse samples along one section axis (spacing four blocks).
+const CAVE_GRID_SIZE: usize = (SECTION_SIZE / CAVE_GRID_STEP as usize) + 1;
+
+/// Total samples in one coarse 3D cave grid.
+const CAVE_GRID_CELLS: usize = CAVE_GRID_SIZE * CAVE_GRID_SIZE * CAVE_GRID_SIZE;
+
+/// Half-width threshold of each spaghetti-tunnel field, in fixed point.
+///
+/// A block is a tunnel when both independent fields are within this band. The
+/// two-sheet intersection produces one-dimensional tunnels; the threshold
+/// controls their roughly 2–8 block diameter.
+const CAVE_TUNNEL_THRESHOLD: i64 = fx_percent(9);
+
+/// Highest Y at which cavern noise may carve chambers.
+const CAVE_CAVERN_MAX_Y: i32 = 32;
+
+/// Cavern threshold at the top of the cavern band (rarer).
+const CAVE_CAVERN_THRESHOLD_HIGH: i64 = fx_percent(52);
+
+/// Cavern threshold at the bottom of the world (deeper = larger chambers).
+const CAVE_CAVERN_THRESHOLD_LOW: i64 = fx_percent(42);
+
+/// Vertical span over which the cavern threshold tapers downwards.
+const CAVE_CAVERN_TAPER: i32 = 96;
+
+/// Solid blocks kept between a normal cave and the terrain surface.
+const CAVE_SURFACE_SEAL: i32 = 3;
+
+/// Solid blocks kept between a cave and an underwater surface.
+///
+/// The extra seal means carving can never leave a water block suspended above
+/// cave air at the sea floor.
+const CAVE_WATER_SEAL: i32 = 5;
+
+/// Block radius around the world origin where caves keep the top eight blocks.
+const SPAWN_PROTECT_CHUNKS: i32 = 2;
+
+/// Solid blocks kept below the surface inside the spawn-protection square.
+const SPAWN_PROTECT_DEPTH: i32 = 8;
+
+/// One surface-entrance candidate per this many columns.
+const CAVE_ENTRANCE_RARITY: u64 = 4096;
+
+/// How far below the surface an entrance shaft searches for a cave.
+const CAVE_ENTRANCE_SCAN_DEPTH: i32 = 24;
+
+/// Ravine candidate regions are this many chunks on a side (128 blocks).
+const RAVINE_REGION_CHUNKS: i32 = 8;
+
+/// One ravine candidate per this many regions (1 in 8).
+const RAVINE_RARITY: u64 = 8;
+
+/// Vertical depth of one stepped ravine wall band.
+const RAVINE_STEP: i32 = 6;
+
+/// Direction table for ravines, in primitive integer vectors.
+///
+/// Comparing squared distances against squared integer vector lengths avoids
+/// any floating-point trigonometry while still giving sixteen orientations.
+const RAVINE_DIRECTIONS: [(i32, i32); 16] = [
+    (1, 0),
+    (2, 1),
+    (1, 1),
+    (1, 2),
+    (0, 1),
+    (-1, 2),
+    (-1, 1),
+    (-2, 1),
+    (-1, 0),
+    (-2, -1),
+    (-1, -1),
+    (-1, -2),
+    (0, -1),
+    (1, -2),
+    (1, -1),
+    (2, -1),
+];
+
 /// Candidate hash rarity for broadleaf trees in forest columns.
 ///
 /// The effective planted density is lower than this candidate rate: a tree
@@ -157,6 +270,39 @@ const BOULDER_MARGIN: i32 = 1;
 
 /// Horizontal snow-drift radius in blocks; drifts keep this margin.
 const DRIFT_MARGIN: i32 = 1;
+
+/// Salt for the coal-ore vein stream.
+const SALT_ORE_COAL: i64 = 0x434F_414C; // "COAL"
+
+/// Salt for the iron-ore vein stream.
+const SALT_ORE_IRON: i64 = 0x4952_4F4E; // "IRON"
+
+/// Salt for the copper-ore vein stream.
+const SALT_ORE_COPPER: i64 = 0x434F_5052; // "COPR"
+
+/// Lowest world Y any v1 ore block may occupy (inclusive).
+const ORE_MIN_Y: i32 = 5;
+
+/// Highest world Y any v1 ore block may occupy (inclusive).
+const ORE_MAX_Y: i32 = 96;
+
+/// Largest vein the grower can build, in blocks.
+///
+/// This bounds the fixed cell buffer used by [`grow_ore_vein`]; the tuning table
+/// is checked against it at compile time.
+const MAX_ORE_VEIN: usize = 14;
+
+/// Candidate stone cells tried before a vein seed is abandoned.
+///
+/// Most of the terrain band is stone, so four tries make a lost vein rare while
+/// keeping the worst-case per-vein cost tiny.
+const ORE_START_ATTEMPTS: u32 = 4;
+
+/// Growth attempts allowed per requested vein block.
+///
+/// A vein normally fills its target size; the cap only matters when a cave or
+/// the chunk border encloses the blob.
+const ORE_GROWTH_ATTEMPTS_PER_BLOCK: usize = 12;
 
 /// Edge length of the per-chunk column grid, including the one-block border.
 const GRID_SIZE: usize = CHUNK_SIZE as usize + 2;
@@ -376,6 +522,52 @@ struct TreeSpec {
     kind: TreeKind,
 }
 
+/// One deterministic ravine candidate generated by a region hash.
+#[derive(Debug, Clone, Copy)]
+struct Ravine {
+    /// World-space X of the segment centre.
+    center_x: i32,
+    /// World-space Z of the segment centre.
+    center_z: i32,
+    /// Integer X component of the ravine's long axis.
+    dir_x: i32,
+    /// Integer Z component of the ravine's long axis.
+    dir_z: i32,
+    /// Half-length of the ellipsoidal floor plan, in blocks.
+    half_length: i32,
+    /// Half-width at the surface, in blocks.
+    half_width: i32,
+    /// Depth below each column's surface, in blocks.
+    depth: i32,
+}
+
+impl Ravine {
+    /// Conservative world-space radius the candidate can touch.
+    fn max_radius(self) -> i32 {
+        self.half_length + self.half_width + 2
+    }
+
+    /// Whether the candidate's conservative footprint touches a chunk.
+    fn intersects_chunk(self, origin_x: i32, origin_z: i32) -> bool {
+        let reach = self.max_radius();
+        self.center_x + reach >= origin_x
+            && self.center_x - reach < origin_x + CHUNK_SIZE
+            && self.center_z + reach >= origin_z
+            && self.center_z - reach < origin_z + CHUNK_SIZE
+    }
+
+    /// Whether suppressing this ravine is required for a safe spawn.
+    fn intersects_spawn_protection(self) -> bool {
+        let reach = self.max_radius();
+        let min = -SPAWN_PROTECT_CHUNKS * CHUNK_SIZE;
+        let max = (SPAWN_PROTECT_CHUNKS + 1) * CHUNK_SIZE - 1;
+        self.center_x + reach >= min
+            && self.center_x - reach <= max
+            && self.center_z + reach >= min
+            && self.center_z - reach <= max
+    }
+}
+
 /// The top and soil block chosen for one generated column.
 #[derive(Clone, Copy)]
 struct ColumnSurface {
@@ -415,6 +607,213 @@ impl ColumnSurface {
     }
 }
 
+/// One of the three v1 ore types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OreKind {
+    /// Common fuel ore, shallow to mid-depth.
+    Coal,
+    /// Tool-tier ore in the lower half of the stone band.
+    Iron,
+    /// Tool-tier ore in the mid band, overlapping coal and iron.
+    Copper,
+}
+
+impl OreKind {
+    /// Every ore, in the stable order used by generation and statistics.
+    #[cfg(test)]
+    const ALL: [Self; 3] = [Self::Coal, Self::Iron, Self::Copper];
+
+    /// Index into tuning and statistics arrays.
+    #[cfg(test)]
+    const fn index(self) -> usize {
+        match self {
+            Self::Coal => 0,
+            Self::Iron => 1,
+            Self::Copper => 2,
+        }
+    }
+
+    /// The stable lower-case name used by diagnostics.
+    #[cfg(test)]
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Coal => "coal",
+            Self::Iron => "iron",
+            Self::Copper => "copper",
+        }
+    }
+}
+
+/// Tuning for one ore type: Y band, vein size and target density.
+#[derive(Debug, Clone, Copy)]
+struct OreSpec {
+    /// Which ore this entry configures.
+    kind: OreKind,
+    /// Salt that gives this ore an independent, order-free stream.
+    salt: i64,
+    /// Lowest world Y this ore may occupy (inclusive).
+    min_y: i32,
+    /// Highest world Y this ore may occupy (inclusive).
+    max_y: i32,
+    /// Smallest vein, in blocks.
+    min_size: u32,
+    /// Largest vein, in blocks.
+    max_size: u32,
+    /// Target vein blocks per thousand cells of the estimated stone band.
+    ///
+    /// The estimate comes from the height grid and therefore includes the
+    /// surface soil and cave volume that a vein cannot replace. This factor is
+    /// tuned (see `docs/plan/08-measurements.md`) so the measured share of
+    /// remaining stone in the band lands in the documented density range.
+    target_per_mille: u64,
+}
+
+/// The v1 ore tuning table.
+///
+/// Ranges and sizes are the survival-progression contract; density targets are
+/// verified by `ore_density_is_bounded`. Salts must be unique so adding or
+/// reordering an ore cannot shift another ore's stream (REQ-GEN-004).
+const ORE_SPECS: [OreSpec; 3] = [
+    OreSpec {
+        kind: OreKind::Coal,
+        salt: SALT_ORE_COAL,
+        min_y: ORE_MIN_Y,
+        max_y: ORE_MAX_Y,
+        min_size: 6,
+        max_size: 14,
+        target_per_mille: 9,
+    },
+    OreSpec {
+        kind: OreKind::Iron,
+        salt: SALT_ORE_IRON,
+        min_y: ORE_MIN_Y,
+        max_y: 64,
+        min_size: 3,
+        max_size: 8,
+        target_per_mille: 5,
+    },
+    OreSpec {
+        kind: OreKind::Copper,
+        salt: SALT_ORE_COPPER,
+        min_y: 24,
+        max_y: ORE_MAX_Y,
+        min_size: 4,
+        max_size: 10,
+        target_per_mille: 4,
+    },
+];
+
+// The vein grower uses a fixed-size cell buffer; keep the table in step.
+const _: () = assert!(ORE_SPECS[0].max_size <= MAX_ORE_VEIN as u32);
+const _: () = assert!(ORE_SPECS[1].max_size <= MAX_ORE_VEIN as u32);
+const _: () = assert!(ORE_SPECS[2].max_size <= MAX_ORE_VEIN as u32);
+
+/// Ore block ids resolved from one registry.
+#[derive(Debug, Clone, Copy)]
+struct OreBlocks {
+    /// `openblock:coal_ore`.
+    coal: BlockId,
+    /// `openblock:iron_ore`.
+    iron: BlockId,
+    /// `openblock:copper_ore`.
+    copper: BlockId,
+}
+
+impl OreBlocks {
+    /// Resolves the base ore palette, degrading to air when an ore is absent.
+    fn from_registry(registry: &Registry) -> Self {
+        Self {
+            coal: registry.id_or_air("openblock:coal_ore"),
+            iron: registry.id_or_air("openblock:iron_ore"),
+            copper: registry.id_or_air("openblock:copper_ore"),
+        }
+    }
+
+    /// The block id for one ore kind.
+    const fn get(self, kind: OreKind) -> BlockId {
+        match kind {
+            OreKind::Coal => self.coal,
+            OreKind::Iron => self.iron,
+            OreKind::Copper => self.copper,
+        }
+    }
+}
+
+/// Counts of ore blocks and veins placed in one generated chunk.
+///
+/// Returned by [`Generator::ore_debug_stats`]. A vein is counted once it has
+/// placed at least one block; `blocks` counts the ore blocks actually written
+/// after checking that each cell was stone. This is pure diagnostic data and
+/// does not participate in generation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OreDebugStats {
+    /// Coal-ore blocks written.
+    pub coal_blocks: u32,
+    /// Iron-ore blocks written.
+    pub iron_blocks: u32,
+    /// Copper-ore blocks written.
+    pub copper_blocks: u32,
+    /// Coal veins that placed at least one block.
+    pub coal_veins: u32,
+    /// Iron veins that placed at least one block.
+    pub iron_veins: u32,
+    /// Copper veins that placed at least one block.
+    pub copper_veins: u32,
+}
+
+impl OreDebugStats {
+    /// Records one grown vein and the number of blocks it placed.
+    fn record(&mut self, kind: OreKind, placed: u32) {
+        match kind {
+            OreKind::Coal => {
+                self.coal_blocks += placed;
+                self.coal_veins += 1;
+            }
+            OreKind::Iron => {
+                self.iron_blocks += placed;
+                self.iron_veins += 1;
+            }
+            OreKind::Copper => {
+                self.copper_blocks += placed;
+                self.copper_veins += 1;
+            }
+        }
+    }
+}
+
+/// Internal generation switches.
+///
+/// The public API always enables ores. Tests use [`Self::WITHOUT_ORES`] to
+/// inspect the pre-ore chunk and prove that every ore block replaced stone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GenerationOptions {
+    /// Whether to run the ore-vein pass.
+    ores: bool,
+}
+
+impl GenerationOptions {
+    /// Normal generation, including ores.
+    const WITH_ORES: Self = Self { ores: true };
+    /// Terrain, caves and features only, for differential tests and reports.
+    #[allow(dead_code)] // used by worldgen tests and the ore reports only
+    const WITHOUT_ORES: Self = Self { ores: false };
+}
+
+/// Counts of blocks removed by the cave, entrance and ravine carvers.
+///
+/// Returned by [`Generator::cave_debug_stats`]; the three categories are
+/// disjoint because the entrance and ravine stages only remove blocks that the
+/// cave stage left solid.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CaveDebugStats {
+    /// Solid blocks replaced by air by the noise-driven cave carver.
+    pub cave_blocks: u32,
+    /// Surface columns where a shaft was opened into an existing cave.
+    pub entrance_columns: u32,
+    /// Solid blocks replaced by air by ravine carving.
+    pub ravine_blocks: u32,
+}
+
 /// A deterministic terrain generator for one world seed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Generator {
@@ -430,23 +829,80 @@ impl Generator {
 
     /// Generates one finished chunk column at `pos`.
     ///
-    /// The result contains terrain, sea water, any trees whose full canopy
-    /// fits inside the chunk, occasional boulders and snow drifts, with sky
-    /// light seeded and the heightmap rebuilt.
+    /// The result contains terrain, sea water, deterministic cave and ravine
+    /// carving, any trees whose full canopy fits inside the chunk, occasional
+    /// boulders and snow drifts, deterministic ore veins and sky light, with a
+    /// consistent heightmap.
     pub fn generate_chunk(&self, pos: ChunkPos, registry: &Registry) -> ChunkColumn {
+        self.generate_chunk_with_options(pos, registry, GenerationOptions::WITH_ORES)
+            .0
+    }
+
+    /// Generates one chunk and reports how many blocks the carvers removed.
+    ///
+    /// This is the diagnostic entry point used by the generation tests and
+    /// benchmarks; [`Self::generate_chunk`] discards the report. It is a pure
+    /// function of the seed, position and registry like generation itself.
+    pub fn cave_debug_stats(&self, pos: ChunkPos, registry: &Registry) -> CaveDebugStats {
+        self.generate_chunk_with_options(pos, registry, GenerationOptions::WITH_ORES)
+            .1
+    }
+
+    /// Generates one chunk and reports how many ore blocks and veins it placed.
+    ///
+    /// Diagnostic counterpart to [`Self::cave_debug_stats`] and equally pure.
+    /// Ore placement only replaces stone below the terrain surface, so this
+    /// counts every ore block in the finished chunk.
+    pub fn ore_debug_stats(&self, pos: ChunkPos, registry: &Registry) -> OreDebugStats {
+        self.generate_chunk_with_options(pos, registry, GenerationOptions::WITH_ORES)
+            .2
+    }
+
+    /// Generates one chunk plus the cave/ravine carving report.
+    #[cfg(test)]
+    fn generate_chunk_with_report(&self, pos: ChunkPos, registry: &Registry) -> (ChunkColumn, CaveDebugStats) {
+        let (chunk, cave_stats, _) = self.generate_chunk_with_options(pos, registry, GenerationOptions::WITH_ORES);
+        (chunk, cave_stats)
+    }
+
+    /// Generates one chunk with explicit internal switches.
+    ///
+    /// Returns the chunk, cave/ravine carving counts and ore placement counts.
+    /// Ore insertion runs after every feature stage and only ever replaces a
+    /// stone block, so generating with [`GenerationOptions::WITHOUT_ORES`] and
+    /// generating normally differ in exactly the ore cells.
+    fn generate_chunk_with_options(
+        &self,
+        pos: ChunkPos,
+        registry: &Registry,
+        options: GenerationOptions,
+    ) -> (ChunkColumn, CaveDebugStats, OreDebugStats) {
         let blocks = TerrainBlocks::from_registry(registry);
         let mut chunk = ChunkColumn::new(pos);
         let (origin_x, origin_z) = pos.origin();
         let columns = self.column_grid(origin_x, origin_z);
 
-        self.fill_terrain(&mut chunk, &columns, &blocks);
+        let max_top = self.fill_terrain(&mut chunk, &columns, &blocks);
+        let stats = CaveDebugStats {
+            cave_blocks: self.carve_caves(&mut chunk, &columns, &blocks, max_top),
+            entrance_columns: self.carve_surface_entrances(&mut chunk, &columns, &blocks),
+            ravine_blocks: self.carve_ravines(&mut chunk, &columns, &blocks),
+        };
+
         self.plant_trees(&mut chunk, &columns, &blocks);
         self.plant_boulders(&mut chunk, &columns, &blocks);
         self.plant_snow_drifts(&mut chunk, &columns, &blocks);
 
+        let ore_stats = if options.ores {
+            let ores = OreBlocks::from_registry(registry);
+            self.generate_ores(&mut chunk, &columns, &blocks, &ores)
+        } else {
+            OreDebugStats::default()
+        };
+
         chunk.finalise(registry);
         chunk.recompute_heightmap();
-        chunk
+        (chunk, stats, ore_stats)
     }
 
     /// The dominant biome at world-space block XZ.
@@ -488,7 +944,7 @@ impl Generator {
     /// through [`ChunkColumn::set_block`]; the heightmap is rebuilt once at the
     /// end of generation, so per-block heightmap maintenance would be wasted
     /// work.
-    fn fill_terrain(&self, chunk: &mut ChunkColumn, columns: &ColumnGrid, blocks: &TerrainBlocks) {
+    fn fill_terrain(&self, chunk: &mut ChunkColumn, columns: &ColumnGrid, blocks: &TerrainBlocks) -> i32 {
         let (origin_x, origin_z) = chunk.pos().origin();
         let mut surfaces = [ColumnSurface::EMPTY; CHUNK_SIZE as usize * CHUNK_SIZE as usize];
         let mut max_top = SEA_LEVEL;
@@ -550,6 +1006,268 @@ impl Generator {
                 }
             }
         }
+        max_top
+    }
+
+    /// Carves the deterministic 3D cave system.
+    ///
+    /// The carver samples three noise fields on a 5×5×5 lattice per section
+    /// (four-block spacing) and trilinearly interpolates them per block:
+    ///
+    /// - two independent spaghetti fields whose thin intersection forms
+    ///   one-dimensional tunnels through the whole stone layer;
+    /// - a lower-frequency cavern field that only carves below
+    ///   [`CAVE_CAVERN_MAX_Y`], with a threshold that lowers with depth so the
+    ///   low world has larger chambers.
+    ///
+    /// Carving is capped below the surface (`CAVE_SURFACE_SEAL`, five blocks
+    /// under water and eight inside the spawn area), never touches water,
+    /// bedrock or the bottom world row, and only removes solid blocks. The
+    /// coarse grid is aligned to world coordinates, so chunk borders are
+    /// seamless and order-independent.
+    fn carve_caves(&self, chunk: &mut ChunkColumn, columns: &ColumnGrid, blocks: &TerrainBlocks, max_top: i32) -> u32 {
+        let (origin_x, origin_z) = chunk.pos().origin();
+        let section_size = SECTION_SIZE as i32;
+        let first_section_y = WORLD_MIN_Y / section_size;
+        let last_section_offset = ((max_top - WORLD_MIN_Y) / section_size).min(N_SECTIONS as i32 - 1);
+        let mut heights = [0i32; CHUNK_SIZE as usize * CHUNK_SIZE as usize];
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                heights[(z * CHUNK_SIZE + x) as usize] = grid_at(columns, x, z).height;
+            }
+        }
+
+        let mut carved = 0u32;
+        for offset in 0..=last_section_offset {
+            let section_y = first_section_y + offset;
+            let base_y = section_y * section_size;
+            let mut tunnel_a = [0i64; CAVE_GRID_CELLS];
+            let mut tunnel_b = [0i64; CAVE_GRID_CELLS];
+            let mut cavern = [0i64; CAVE_GRID_CELLS];
+            for gy in 0..CAVE_GRID_SIZE {
+                let world_y = base_y + (gy as i32) * CAVE_GRID_STEP;
+                for gz in 0..CAVE_GRID_SIZE {
+                    let world_z = origin_z + (gz as i32) * CAVE_GRID_STEP;
+                    for gx in 0..CAVE_GRID_SIZE {
+                        let world_x = origin_x + (gx as i32) * CAVE_GRID_STEP;
+                        let index = cave_grid_index(gx, gy, gz);
+                        tunnel_a[index] = fbm_3d(self.seed, world_x, world_y, world_z, 5, 2, SALT_CAVE_TUNNEL_A);
+                        tunnel_b[index] = fbm_3d(self.seed, world_x, world_y, world_z, 5, 2, SALT_CAVE_TUNNEL_B);
+                        // The cavern field is only used up to one grid step
+                        // above its Y limit; skipping higher samples saves a
+                        // third of the cave noise cost in the upper sections.
+                        if world_y <= CAVE_CAVERN_MAX_Y + CAVE_GRID_STEP {
+                            cavern[index] = fbm_3d(self.seed, world_x, world_y, world_z, 6, 2, SALT_CAVERN);
+                        }
+                    }
+                }
+            }
+
+            let Some(section) = chunk.section_mut(SectionPos::new(
+                origin_x / section_size,
+                section_y,
+                origin_z / section_size,
+            )) else {
+                continue;
+            };
+
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    let height = heights[(z * CHUNK_SIZE + x) as usize];
+                    let world_x = origin_x + x;
+                    let world_z = origin_z + z;
+                    let seal = if spawn_protected(world_x, world_z) {
+                        SPAWN_PROTECT_DEPTH
+                    } else if height < SEA_LEVEL {
+                        CAVE_WATER_SEAL
+                    } else {
+                        CAVE_SURFACE_SEAL
+                    };
+                    let top = height - seal;
+                    if top < base_y {
+                        continue;
+                    }
+                    let gx = (x / CAVE_GRID_STEP) as usize;
+                    let fx = i64::from(x % CAVE_GRID_STEP);
+                    let gz = (z / CAVE_GRID_STEP) as usize;
+                    let fz = i64::from(z % CAVE_GRID_STEP);
+
+                    for local_y in 0..section_size {
+                        let y = base_y + local_y;
+                        if y > top {
+                            break;
+                        }
+                        if y <= WORLD_MIN_Y {
+                            continue;
+                        }
+                        let gy = (local_y / CAVE_GRID_STEP) as usize;
+                        let fy = i64::from(local_y % CAVE_GRID_STEP);
+                        let tunnel = cave_trilinear(&tunnel_a, gx, fx, gy, fy, gz, fz).abs() < CAVE_TUNNEL_THRESHOLD
+                            && cave_trilinear(&tunnel_b, gx, fx, gy, fy, gz, fz).abs() < CAVE_TUNNEL_THRESHOLD;
+                        let cavern_carve = if y <= CAVE_CAVERN_MAX_Y {
+                            cave_trilinear(&cavern, gx, fx, gy, fy, gz, fz) > cavern_threshold(y)
+                        } else {
+                            false
+                        };
+                        if !tunnel && !cavern_carve {
+                            continue;
+                        }
+                        let local = LocalPos {
+                            x: x as u8,
+                            y: local_y as u8,
+                            z: z as u8,
+                        };
+                        let current = section.get(local);
+                        if current == BlockId::AIR || current == blocks.water || current == blocks.bedrock {
+                            continue;
+                        }
+                        section.set(local, BlockId::AIR);
+                        carved += 1;
+                    }
+                }
+            }
+        }
+        carved
+    }
+
+    /// Opens rare one-column shafts from dry surfaces into existing caves.
+    ///
+    /// A per-column hash picks one candidate per [`CAVE_ENTRANCE_RARITY`]
+    /// columns. The candidate only becomes an entrance when a cave air block
+    /// exists within [`CAVE_ENTRANCE_SCAN_DEPTH`] blocks below the normal cave
+    /// seal; the shaft then removes the intervening solid blocks. This keeps
+    /// the surface sealed almost everywhere while guaranteeing that every
+    /// entrance actually leads to a cave.
+    fn carve_surface_entrances(&self, chunk: &mut ChunkColumn, columns: &ColumnGrid, blocks: &TerrainBlocks) -> u32 {
+        let (origin_x, origin_z) = chunk.pos().origin();
+        let mut entrances = 0u32;
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                let height = grid_at(columns, x, z).height;
+                if height <= SEA_LEVEL + 2 {
+                    continue;
+                }
+                let world_x = origin_x + x;
+                let world_z = origin_z + z;
+                if spawn_protected(world_x, world_z) {
+                    continue;
+                }
+                let hash = derive_seed(self.seed, i64::from(world_x), i64::from(world_z), SALT_CAVE_ENTRANCE);
+                if !hash.is_multiple_of(CAVE_ENTRANCE_RARITY) {
+                    continue;
+                }
+                if chunk.get_block(BlockPos::new(world_x, height, world_z)) == BlockId::AIR {
+                    continue;
+                }
+
+                let scan_bottom = (height - CAVE_ENTRANCE_SCAN_DEPTH).max(WORLD_MIN_Y + 2);
+                let mut target = None;
+                for y in (scan_bottom..=height - CAVE_SURFACE_SEAL).rev() {
+                    if chunk.get_block(BlockPos::new(world_x, y, world_z)) == BlockId::AIR
+                        && cave_has_volume(chunk, world_x, y, world_z)
+                    {
+                        target = Some(y);
+                        break;
+                    }
+                }
+                let Some(target) = target else {
+                    continue;
+                };
+
+                let mut blocked = false;
+                for y in target..=height {
+                    let block = chunk.get_block(BlockPos::new(world_x, y, world_z));
+                    if block == blocks.water || block == blocks.bedrock {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if blocked {
+                    continue;
+                }
+                for y in target..=height {
+                    chunk.set_block(BlockPos::new(world_x, y, world_z), BlockId::AIR);
+                }
+                entrances += 1;
+            }
+        }
+        entrances
+    }
+
+    /// Carves rare ravine candidates from neighbouring 128-block regions.
+    ///
+    /// Ravines are discovered by region hash rather than accumulated state, so
+    /// every chunk that a ravine touches independently decides to carve its
+    /// own columns. The one-region search margin is sufficient because a
+    /// candidate's maximum reach (half-length plus half-width) is well under
+    /// the 128-block region size.
+    fn carve_ravines(&self, chunk: &mut ChunkColumn, columns: &ColumnGrid, blocks: &TerrainBlocks) -> u32 {
+        let (origin_x, origin_z) = chunk.pos().origin();
+        let chunk_region_x = chunk.pos().x.div_euclid(RAVINE_REGION_CHUNKS);
+        let chunk_region_z = chunk.pos().z.div_euclid(RAVINE_REGION_CHUNKS);
+        let mut carved = 0u32;
+        for region_z in (chunk_region_z - 1)..=(chunk_region_z + 1) {
+            for region_x in (chunk_region_x - 1)..=(chunk_region_x + 1) {
+                let Some(ravine) = ravine_for_region(self.seed, region_x, region_z) else {
+                    continue;
+                };
+                if ravine.intersects_spawn_protection() || !ravine.intersects_chunk(origin_x, origin_z) {
+                    continue;
+                }
+                carved += self.carve_ravine(chunk, columns, blocks, ravine);
+            }
+        }
+        carved
+    }
+
+    /// Carves one ravine's columns inside the current chunk.
+    fn carve_ravine(
+        &self,
+        chunk: &mut ChunkColumn,
+        columns: &ColumnGrid,
+        blocks: &TerrainBlocks,
+        ravine: Ravine,
+    ) -> u32 {
+        let (origin_x, origin_z) = chunk.pos().origin();
+        let len_sq = i64::from(ravine.dir_x * ravine.dir_x + ravine.dir_z * ravine.dir_z);
+        let half_len_sq = i64::from(ravine.half_length * ravine.half_length);
+        let mut carved = 0u32;
+
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                let world_x = origin_x + x;
+                let world_z = origin_z + z;
+                let height = grid_at(columns, x, z).height;
+                if height <= SEA_LEVEL + 2 || spawn_protected(world_x, world_z) {
+                    continue;
+                }
+                let px = i64::from(world_x - ravine.center_x);
+                let pz = i64::from(world_z - ravine.center_z);
+                let along = px * i64::from(ravine.dir_x) + pz * i64::from(ravine.dir_z);
+                let across = px * i64::from(ravine.dir_z) - pz * i64::from(ravine.dir_x);
+                let along_sq = along * along;
+                let across_sq = across * across;
+                let bottom = (height - ravine.depth).max(WORLD_MIN_Y + 1);
+
+                for y in (bottom..=height).rev() {
+                    let depth_below = height - y;
+                    let half_width = ravine_half_width(ravine, depth_below);
+                    let width_sq = i64::from(half_width * half_width);
+                    let limit = half_len_sq * width_sq * len_sq;
+                    if along_sq * width_sq + across_sq * half_len_sq > limit {
+                        continue;
+                    }
+                    let pos = BlockPos::new(world_x, y, world_z);
+                    let current = chunk.get_block(pos);
+                    if current == BlockId::AIR || current == blocks.water || current == blocks.bedrock {
+                        continue;
+                    }
+                    chunk.set_block(pos, BlockId::AIR);
+                    carved += 1;
+                }
+            }
+        }
+        carved
     }
 
     /// Chooses the surface and soil material for one column.
@@ -942,6 +1660,154 @@ impl Generator {
             }
         }
     }
+
+    /// Grows deterministic ore veins through stone left by the carvers.
+    ///
+    /// Each ore type gets its own counter-based stream derived from the world
+    /// seed, the chunk's world origin and a per-ore salt. Veins are connected
+    /// six-neighbour blobs seeded at a hashed stone cell inside the ore's Y
+    /// band; every write first checks that the target is still stone, so the
+    /// pass can never overwrite a log, leaf, water, bedrock, dirt, gravel, snow
+    /// or cave-air block. It also never writes at or above the terrain surface,
+    /// keeping the spawn crust and every other exposed surface intact.
+    ///
+    /// The vein count follows the chunk's estimated stone volume in each band
+    /// instead of being fixed per chunk, so mountains and lowlands keep a
+    /// comparable density. The pass runs after all features and reads no shared
+    /// state, making it independent of generation order (REQ-GEN-001/004).
+    fn generate_ores(
+        &self,
+        chunk: &mut ChunkColumn,
+        columns: &ColumnGrid,
+        blocks: &TerrainBlocks,
+        ores: &OreBlocks,
+    ) -> OreDebugStats {
+        let mut stats = OreDebugStats::default();
+        if blocks.stone == BlockId::AIR {
+            return stats;
+        }
+        let (origin_x, origin_z) = chunk.pos().origin();
+        for spec in &ORE_SPECS {
+            let ore = ores.get(spec.kind);
+            if ore == BlockId::AIR || ore == blocks.stone {
+                continue;
+            }
+            let veins = self.ore_vein_count(spec, columns);
+            if veins == 0 {
+                continue;
+            }
+            let mut rng = Rng::new(derive_seed(
+                self.seed,
+                i64::from(origin_x),
+                i64::from(origin_z),
+                spec.salt,
+            ));
+            for _ in 0..veins {
+                let placed = grow_ore_vein(chunk, columns, blocks.stone, ore, spec, &mut rng);
+                if placed > 0 {
+                    stats.record(spec.kind, placed);
+                }
+            }
+        }
+        stats
+    }
+
+    /// Number of veins to attempt for one ore in one chunk.
+    ///
+    /// Sums the height-grid cells inside the ore's Y band (below the terrain
+    /// surface), scales by the tuned per-mille target and divides by the mean
+    /// vein size. Soil and cave losses are part of the tuned factor, so a
+    /// mountain chunk with twice the stone band receives roughly twice the ore
+    /// blocks and the measured share of stone stays in its documented range.
+    fn ore_vein_count(&self, spec: &OreSpec, columns: &ColumnGrid) -> u32 {
+        let mut band_cells = 0u64;
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                let height = grid_at(columns, x, z).height;
+                let highest = (height - 1).min(spec.max_y);
+                if highest >= spec.min_y {
+                    band_cells += (highest - spec.min_y + 1) as u64;
+                }
+            }
+        }
+        let mean_size = u64::from(spec.min_size + spec.max_size) / 2;
+        let target_blocks = band_cells * spec.target_per_mille / 1000;
+        target_blocks.div_ceil(mean_size) as u32
+    }
+}
+
+/// Grows one connected ore blob and returns the number of blocks it placed.
+///
+/// The first cell is drawn from the chunk's local XZ and the ore's Y band,
+/// retrying [`ORE_START_ATTEMPTS`] times when the candidate is not stone (a
+/// cave, water, soil or the terrain surface). Growth then repeatedly picks a
+/// random placed cell, steps to one of its six neighbours, and writes the
+/// neighbour only when it is inside the same chunk, inside the ore's Y band and
+/// still stone. This produces a compact, always-connected vein of exactly the
+/// requested size unless caves or the chunk border enclose it first; the
+/// attempt cap guarantees termination. All randomness comes from the caller's
+/// per-ore, per-chunk stream.
+fn grow_ore_vein(
+    chunk: &mut ChunkColumn,
+    columns: &ColumnGrid,
+    stone: BlockId,
+    ore: BlockId,
+    spec: &OreSpec,
+    rng: &mut Rng,
+) -> u32 {
+    let (origin_x, origin_z) = chunk.pos().origin();
+    let mut cells = [BlockPos::default(); MAX_ORE_VEIN];
+    let mut placed = 0usize;
+
+    for _ in 0..ORE_START_ATTEMPTS {
+        let local_x = rng.next_below(CHUNK_SIZE as u32) as i32;
+        let local_z = rng.next_below(CHUNK_SIZE as u32) as i32;
+        let height = grid_at(columns, local_x, local_z).height;
+        let highest = (height - 1).min(spec.max_y);
+        if highest < spec.min_y {
+            continue;
+        }
+        let span = (highest - spec.min_y + 1) as u32;
+        let y = spec.min_y + rng.next_below(span) as i32;
+        let seed = BlockPos::new(origin_x + local_x, y, origin_z + local_z);
+        if chunk.get_block(seed) != stone {
+            continue;
+        }
+        chunk.set_block(seed, ore);
+        cells[0] = seed;
+        placed = 1;
+        break;
+    }
+    if placed == 0 {
+        return 0;
+    }
+
+    let target = (spec.min_size + rng.next_below(spec.max_size - spec.min_size + 1)) as usize;
+    let max_attempts = target * ORE_GROWTH_ATTEMPTS_PER_BLOCK;
+    let mut attempts = 0;
+    while placed < target && attempts < max_attempts {
+        attempts += 1;
+        let parent = cells[rng.next_below(placed as u32) as usize];
+        let next = match rng.next_below(6) {
+            0 => parent.offset(1, 0, 0),
+            1 => parent.offset(-1, 0, 0),
+            2 => parent.offset(0, 1, 0),
+            3 => parent.offset(0, -1, 0),
+            4 => parent.offset(0, 0, 1),
+            _ => parent.offset(0, 0, -1),
+        };
+        if !(origin_x..origin_x + CHUNK_SIZE).contains(&next.x)
+            || !(origin_z..origin_z + CHUNK_SIZE).contains(&next.z)
+            || !(spec.min_y..=spec.max_y).contains(&next.y)
+            || chunk.get_block(next) != stone
+        {
+            continue;
+        }
+        chunk.set_block(next, ore);
+        cells[placed] = next;
+        placed += 1;
+    }
+    placed as u32
 }
 
 /// Reads a local column from the padded column grid (`x`/`z` in `-1..=16`).
@@ -1041,6 +1907,175 @@ fn fbm(seed: u64, x: i32, z: i32, base_shift: u32, octaves: u32, salt: i64) -> i
         amplitude >>= 1;
     }
     sum / total
+}
+
+/// Hashes one 3D lattice point into a fixed-point value in `[-FX_ONE, FX_ONE]`.
+///
+/// The three coordinate multipliers are distinct odd constants derived from
+/// the splitmix64 mix, so neighbouring lattice points decorrelate and the three
+/// cave fields can share the same primitive with different salts.
+#[inline]
+fn lattice_value_3d(seed: u64, ix: i64, iy: i64, iz: i64, salt: i64) -> i64 {
+    let hash = mix64(
+        seed ^ (salt as u64)
+            ^ (ix as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (iy as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+            ^ (iz as u64).wrapping_mul(0x1656_67B1_9E37_79F9),
+    );
+    let signed = (hash >> 32) as u32 as i32;
+    i64::from(signed) << 1
+}
+
+/// Trilinear smoothstep value noise at world XYZ for a lattice cell of
+/// `2^shift` blocks.
+fn value_noise_3d(seed: u64, x: i32, y: i32, z: i32, shift: u32, salt: i64) -> i64 {
+    let cell = 1i32 << shift;
+    let ix = (x >> shift) as i64;
+    let iy = (y >> shift) as i64;
+    let iz = (z >> shift) as i64;
+    let fx = i64::from(x & (cell - 1)) << (32 - shift);
+    let fy = i64::from(y & (cell - 1)) << (32 - shift);
+    let fz = i64::from(z & (cell - 1)) << (32 - shift);
+    let sx = smoothstep(fx);
+    let sy = smoothstep(fy);
+    let sz = smoothstep(fz);
+
+    let v000 = lattice_value_3d(seed, ix, iy, iz, salt);
+    let v100 = lattice_value_3d(seed, ix + 1, iy, iz, salt);
+    let v010 = lattice_value_3d(seed, ix, iy + 1, iz, salt);
+    let v110 = lattice_value_3d(seed, ix + 1, iy + 1, iz, salt);
+    let v001 = lattice_value_3d(seed, ix, iy, iz + 1, salt);
+    let v101 = lattice_value_3d(seed, ix + 1, iy, iz + 1, salt);
+    let v011 = lattice_value_3d(seed, ix, iy + 1, iz + 1, salt);
+    let v111 = lattice_value_3d(seed, ix + 1, iy + 1, iz + 1, salt);
+
+    let bottom = fx_lerp(fx_lerp(v000, v100, sx), fx_lerp(v010, v110, sx), sz);
+    let top = fx_lerp(fx_lerp(v001, v101, sx), fx_lerp(v011, v111, sx), sz);
+    fx_lerp(bottom, top, sy)
+}
+
+/// Dyadic 3D value-noise FBM in `[-FX_ONE, FX_ONE]`.
+fn fbm_3d(seed: u64, x: i32, y: i32, z: i32, base_shift: u32, octaves: u32, salt: i64) -> i64 {
+    let mut sum = 0i64;
+    let mut total = 0i64;
+    let mut amplitude = 1i64 << (octaves - 1);
+    for octave in 0..octaves {
+        sum += value_noise_3d(seed, x, y, z, base_shift + octave, salt + i64::from(octave)) * amplitude;
+        total += amplitude;
+        amplitude >>= 1;
+    }
+    sum / total
+}
+
+/// Index into one coarse 3D cave grid.
+#[inline]
+fn cave_grid_index(x: usize, y: usize, z: usize) -> usize {
+    (y * CAVE_GRID_SIZE + z) * CAVE_GRID_SIZE + x
+}
+
+/// Trilinearly blends one coarse cave grid at integer weights `0..=3`.
+///
+/// The weights are quarter-block offsets, so the blend is
+/// `(a·(4−w) + b·w) / 4` with no `i128` intermediate and no rounding mode
+/// dependence.
+#[inline]
+fn cave_trilinear(values: &[i64; CAVE_GRID_CELLS], x: usize, fx: i64, y: usize, fy: i64, z: usize, fz: i64) -> i64 {
+    #[inline]
+    fn lerp(a: i64, b: i64, weight: i64) -> i64 {
+        (a * (4 - weight) + b * weight) >> 2
+    }
+    let c00 = lerp(
+        values[cave_grid_index(x, y, z)],
+        values[cave_grid_index(x + 1, y, z)],
+        fx,
+    );
+    let c10 = lerp(
+        values[cave_grid_index(x, y + 1, z)],
+        values[cave_grid_index(x + 1, y + 1, z)],
+        fx,
+    );
+    let c01 = lerp(
+        values[cave_grid_index(x, y, z + 1)],
+        values[cave_grid_index(x + 1, y, z + 1)],
+        fx,
+    );
+    let c11 = lerp(
+        values[cave_grid_index(x, y + 1, z + 1)],
+        values[cave_grid_index(x + 1, y + 1, z + 1)],
+        fx,
+    );
+    let bottom = lerp(c00, c01, fz);
+    let top = lerp(c10, c11, fz);
+    lerp(bottom, top, fy)
+}
+
+/// The depth-dependent cavern-noise threshold.
+///
+/// Caverns are rare near their ceiling and become progressively larger toward
+/// the bottom of the world.
+fn cavern_threshold(y: i32) -> i64 {
+    let depth = (CAVE_CAVERN_MAX_Y - y).clamp(0, CAVE_CAVERN_TAPER);
+    let range = CAVE_CAVERN_THRESHOLD_HIGH - CAVE_CAVERN_THRESHOLD_LOW;
+    CAVE_CAVERN_THRESHOLD_HIGH - range * i64::from(depth) / i64::from(CAVE_CAVERN_TAPER)
+}
+
+/// Whether a cave air block is part of a usable cavity rather than a one-block
+/// pocket.
+///
+/// A horizontal tunnel qualifies through an air neighbour at the same Y; a
+/// vertical or cavern-like opening qualifies through air directly below. A
+/// surface entrance is only opened into a qualifying cell.
+fn cave_has_volume(chunk: &ChunkColumn, x: i32, y: i32, z: i32) -> bool {
+    if y > WORLD_MIN_Y && chunk.get_block(BlockPos::new(x, y - 1, z)) == BlockId::AIR {
+        return true;
+    }
+    let (origin_x, origin_z) = chunk.pos().origin();
+    [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)].into_iter().any(|(dx, dz)| {
+        let nx = x + dx;
+        let nz = z + dz;
+        (origin_x..origin_x + CHUNK_SIZE).contains(&nx)
+            && (origin_z..origin_z + CHUNK_SIZE).contains(&nz)
+            && chunk.get_block(BlockPos::new(nx, y, nz)) == BlockId::AIR
+    })
+}
+
+/// Whether a world column lies inside the cave-free spawn protection square.
+fn spawn_protected(x: i32, z: i32) -> bool {
+    let chunk_x = x.div_euclid(CHUNK_SIZE);
+    let chunk_z = z.div_euclid(CHUNK_SIZE);
+    (-SPAWN_PROTECT_CHUNKS..=SPAWN_PROTECT_CHUNKS).contains(&chunk_x)
+        && (-SPAWN_PROTECT_CHUNKS..=SPAWN_PROTECT_CHUNKS).contains(&chunk_z)
+}
+
+/// Derives one ravine candidate from its region coordinate, or `None` when the
+/// region's hash does not select a ravine.
+fn ravine_for_region(seed: u64, region_x: i32, region_z: i32) -> Option<Ravine> {
+    let hash = derive_seed(seed, i64::from(region_x), i64::from(region_z), SALT_RAVINE_REGION);
+    if !hash.is_multiple_of(RAVINE_RARITY) {
+        return None;
+    }
+    let region_size = RAVINE_REGION_CHUNKS * CHUNK_SIZE;
+    let origin_x = region_x * region_size;
+    let origin_z = region_z * region_size;
+    let direction = RAVINE_DIRECTIONS[((hash >> 24) % RAVINE_DIRECTIONS.len() as u64) as usize];
+    Some(Ravine {
+        center_x: origin_x + 20 + ((hash >> 8) % 88) as i32,
+        center_z: origin_z + 20 + ((hash >> 16) % 88) as i32,
+        dir_x: direction.0,
+        dir_z: direction.1,
+        half_length: 20 + ((hash >> 32) % 31) as i32,
+        half_width: 3 + ((hash >> 40) % 5) as i32,
+        depth: 24 + ((hash >> 48) % 29) as i32,
+    })
+}
+
+/// The stepped half-width of a ravine at `depth_below` the local surface.
+///
+/// The width drops by one block every [`RAVINE_STEP`] blocks of depth, leaving
+/// horizontal ledges between vertical wall sections.
+fn ravine_half_width(ravine: Ravine, depth_below: i32) -> i32 {
+    let drop = (depth_below / RAVINE_STEP).min(ravine.half_width - 1);
+    (ravine.half_width - drop).max(1)
 }
 
 /// Terrain parameters blended from the dominant and neighbouring biomes.
@@ -1230,6 +2265,62 @@ mod tests {
             return BlockId::AIR;
         }
         chunk.get_block(BlockPos::new(x, y, z))
+    }
+
+    /// The ore kind of a block, or `None` for every other block.
+    fn ore_kind(block: BlockId, ores: &OreBlocks) -> Option<OreKind> {
+        if block == ores.coal {
+            Some(OreKind::Coal)
+        } else if block == ores.iron {
+            Some(OreKind::Iron)
+        } else if block == ores.copper {
+            Some(OreKind::Copper)
+        } else {
+            None
+        }
+    }
+
+    /// Collects every ore block of a chunk in Y/Z/X scan order.
+    ///
+    /// The scan covers exactly the union of the three ore Y bands, so a block
+    /// outside its band can never be missed by an ore test.
+    fn ore_blocks_in(chunk: &ChunkColumn, ores: &OreBlocks) -> Vec<(i32, i32, i32, OreKind)> {
+        let (origin_x, origin_z) = chunk.pos().origin();
+        let mut blocks = Vec::new();
+        for y in ORE_MIN_Y..=ORE_MAX_Y {
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    let block = chunk.get_block(BlockPos::new(origin_x + x, y, origin_z + z));
+                    if let Some(kind) = ore_kind(block, ores) {
+                        blocks.push((origin_x + x, y, origin_z + z, kind));
+                    }
+                }
+            }
+        }
+        blocks
+    }
+
+    /// Generates a chunk with the ore pass disabled.
+    fn generate_without_ores(generator: &Generator, pos: ChunkPos, registry: &Registry) -> ChunkColumn {
+        generator
+            .generate_chunk_with_options(pos, registry, GenerationOptions::WITHOUT_ORES)
+            .0
+    }
+
+    /// Times `chunks` generations with one option set.
+    fn measure_generation(
+        generator: &Generator,
+        registry: &Registry,
+        options: GenerationOptions,
+        chunks: i32,
+    ) -> std::time::Duration {
+        let start = std::time::Instant::now();
+        for index in 0..chunks {
+            let result =
+                generator.generate_chunk_with_options(ChunkPos::new(index % 20, index / 20), registry, options);
+            std::hint::black_box(result);
+        }
+        start.elapsed()
     }
 
     /// Whether the height field at a world column counts as a steep slope.
@@ -1452,12 +2543,19 @@ mod tests {
         x: i32,
         z: i32,
         blocks: &TerrainBlocks,
+        ores: &OreBlocks,
     ) -> Biome {
         let height = generator.height_at(x, z);
         let biome = generator.biome_at(x, z);
         let steep = world_is_steep(generator, x, z);
         let top = chunk.get_block(BlockPos::new(x, height, z));
-        assert_ne!(top, BlockId::AIR, "air at the terrain surface ({x}, {height}, {z})");
+        if top == BlockId::AIR {
+            // A cave entrance or a ravine intentionally opens the surface.
+            let has_cave = (height - CAVE_ENTRANCE_SCAN_DEPTH..=height - 1)
+                .any(|y| chunk.get_block(BlockPos::new(x, y, z)) == BlockId::AIR);
+            assert!(has_cave, "surface air at ({x}, {height}, {z}) is not above a cave");
+            return biome;
+        }
         assert_ne!(top, blocks.water, "water at the terrain surface ({x}, {height}, {z})");
 
         if height < SEA_LEVEL {
@@ -1485,10 +2583,10 @@ mod tests {
                     (DESERT_SAND_MIN..=DESERT_SAND_MAX).contains(&thickness),
                     "desert sand at ({x}, {height}, {z}) is {thickness} blocks thick"
                 );
-                assert_eq!(
-                    chunk.get_block(BlockPos::new(x, y, z)),
-                    blocks.stone,
-                    "desert sand at ({x}, {height}, {z}) does not sit on stone"
+                let under = chunk.get_block(BlockPos::new(x, y, z));
+                assert!(
+                    under == blocks.stone || ore_kind(under, ores).is_some(),
+                    "desert sand at ({x}, {height}, {z}) does not sit on stone or ore"
                 );
             }
             Biome::SnowyTaiga => {
@@ -1653,6 +2751,7 @@ mod tests {
     fn biome_surfaces_and_biome_at_agree() {
         let registry = Registry::base();
         let blocks = TerrainBlocks::from_registry(&registry);
+        let ores = OreBlocks::from_registry(&registry);
         for seed in [1u64, 42] {
             let generator = Generator::new(seed);
             let found = find_chunks_for_all_biomes(&generator, 32);
@@ -1665,7 +2764,7 @@ mod tests {
                 for z in 0..CHUNK_SIZE {
                     for x in 0..CHUNK_SIZE {
                         let column_biome =
-                            check_surface_column(&generator, &chunk, origin_x + x, origin_z + z, &blocks);
+                            check_surface_column(&generator, &chunk, origin_x + x, origin_z + z, &blocks, &ores);
                         seen[column_biome as usize] = true;
                     }
                 }
@@ -1799,6 +2898,12 @@ mod tests {
                     let world_x = origin_x + x;
                     let world_z = origin_z + z;
                     let surface = generator.height_at(world_x, world_z);
+                    // A cave entrance or ravine legitimately removes the top
+                    // block; the height field intentionally still reports the
+                    // pre-carving terrain surface.
+                    if chunk.get_block(BlockPos::new(world_x, surface, world_z)) == BlockId::AIR {
+                        continue;
+                    }
 
                     let decorated = (surface + 1..WORLD_MAX_Y).any(|y| {
                         let block = chunk.get_block(BlockPos::new(world_x, y, world_z));
@@ -1855,11 +2960,13 @@ mod tests {
                         let steep = world_is_steep(&generator, world_x, world_z);
                         if biome == Biome::SnowyTaiga && height > SEA_LEVEL + 2 && !steep {
                             taiga_columns += 1;
-                            assert_eq!(
-                                chunk.get_block(BlockPos::new(world_x, height, world_z)),
-                                blocks.snow,
-                                "non-steep taiga column ({world_x}, {world_z}) has no snow"
-                            );
+                            if chunk.get_block(BlockPos::new(world_x, height, world_z)) != BlockId::AIR {
+                                assert_eq!(
+                                    chunk.get_block(BlockPos::new(world_x, height, world_z)),
+                                    blocks.snow,
+                                    "non-steep taiga column ({world_x}, {world_z}) has no snow"
+                                );
+                            }
                         }
                         for y in height..WORLD_MAX_Y {
                             if chunk.get_block(BlockPos::new(world_x, y, world_z)) != blocks.snow {
@@ -2144,6 +3251,843 @@ mod tests {
             spruce_width * (broadleaf.len() as i32) < broadleaf_width * (spruce.len() as i32),
             "spruce trees are not narrower on average"
         );
+    }
+
+    #[test]
+    fn caves_are_deterministic_and_order_independent() {
+        let registry = Registry::base();
+        let seed = 0x0CA7_5EED_1234_ABCD;
+        let positions = [
+            ChunkPos::new(0, 0),
+            ChunkPos::new(1, 0),
+            ChunkPos::new(-1, 2),
+            ChunkPos::new(5, -3),
+            ChunkPos::new(12, 7),
+            ChunkPos::new(0, 1),
+        ];
+
+        let mut forward = Vec::new();
+        for &pos in &positions {
+            forward.push((pos, chunk_hash(&Generator::new(seed).generate_chunk(pos, &registry))));
+        }
+
+        let mut backward = Vec::new();
+        for &pos in positions.iter().rev() {
+            // Generate an unrelated neighbour first so any hidden shared state
+            // (there must be none) has a chance to leak into the result.
+            let _ = Generator::new(seed).generate_chunk(ChunkPos::new(pos.x + 9, pos.z - 4), &registry);
+            backward.push((pos, chunk_hash(&Generator::new(seed).generate_chunk(pos, &registry))));
+        }
+        backward.reverse();
+        assert_eq!(forward, backward, "generation order changed the carved blocks");
+
+        let pos = ChunkPos::new(3, 4);
+        let first = chunk_hash(&Generator::new(seed).generate_chunk(pos, &registry));
+        let _ = Generator::new(seed).generate_chunk(ChunkPos::new(4, 4), &registry);
+        let second = chunk_hash(&Generator::new(seed).generate_chunk(pos, &registry));
+        assert_eq!(first, second, "regenerating the same chunk changed its blocks");
+    }
+
+    #[test]
+    fn cave_density_is_bounded_and_bedrock_survives() {
+        let registry = Registry::base();
+        let bedrock = registry.id_or_air("openblock:bedrock");
+        for seed in [1u64, 42] {
+            let generator = Generator::new(seed);
+            let mut air = 0u64;
+            let mut cells = 0u64;
+            let mut deep_air = 0u64;
+            let mut deep_cells = 0u64;
+            let mut carved_chunks = 0usize;
+
+            for cz in -2..2 {
+                for cx in -2..2 {
+                    let pos = ChunkPos::new(cx, cz);
+                    let (chunk, report) = generator.generate_chunk_with_report(pos, &registry);
+                    if report.cave_blocks > 0 {
+                        carved_chunks += 1;
+                    }
+                    let (origin_x, origin_z) = pos.origin();
+                    for z in 0..CHUNK_SIZE {
+                        for x in 0..CHUNK_SIZE {
+                            let world_x = origin_x + x;
+                            let world_z = origin_z + z;
+                            let height = generator.height_at(world_x, world_z);
+                            assert_eq!(
+                                chunk.get_block(BlockPos::new(world_x, WORLD_MIN_Y, world_z)),
+                                bedrock,
+                                "seed {seed:#x}: bedrock was carved at ({world_x}, {world_z})"
+                            );
+
+                            let top = chunk.get_block(BlockPos::new(world_x, height, world_z));
+                            if top != BlockId::AIR {
+                                assert_ne!(
+                                    chunk.get_block(BlockPos::new(world_x, height - 1, world_z)),
+                                    BlockId::AIR,
+                                    "seed {seed:#x}: cave undercut the top block at ({world_x}, {world_z})"
+                                );
+                                assert_ne!(
+                                    chunk.get_block(BlockPos::new(world_x, height - 2, world_z)),
+                                    BlockId::AIR,
+                                    "seed {seed:#x}: cave undercut the second block at ({world_x}, {world_z})"
+                                );
+                            }
+
+                            for y in (WORLD_MIN_Y + 2)..=(height - 4) {
+                                cells += 1;
+                                if chunk.get_block(BlockPos::new(world_x, y, world_z)) == BlockId::AIR {
+                                    air += 1;
+                                    if y <= 0 {
+                                        deep_air += 1;
+                                    }
+                                }
+                                if y <= 0 {
+                                    deep_cells += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            assert_eq!(carved_chunks, 16, "seed {seed:#x}: a sampled chunk had no caves");
+            assert!(air * 100 > cells, "seed {seed:#x}: cave air is under 1%");
+            assert!(air * 100 < cells * 40, "seed {seed:#x}: cave air is over 40%");
+            assert!(deep_cells > 0 && deep_air > 0, "seed {seed:#x}: no deep cave air");
+            assert!(
+                deep_air * 100 < deep_cells * 40,
+                "seed {seed:#x}: deep cave air is over 40%"
+            );
+            println!(
+                "seed {seed:#x}: cave air {:.2}% of the stone band, {:.2}% below y=0",
+                air as f64 * 100.0 / cells as f64,
+                deep_air as f64 * 100.0 / deep_cells as f64
+            );
+        }
+    }
+
+    #[test]
+    fn surface_entrances_connect_to_caves() {
+        let registry = Registry::base();
+        for seed in [1u64, 42] {
+            let generator = Generator::new(seed);
+            let mut found = None;
+            'search: for cz in -16..16 {
+                for cx in -16..16 {
+                    let pos = ChunkPos::new(cx, cz);
+                    let (chunk, report) = generator.generate_chunk_with_report(pos, &registry);
+                    if report.entrance_columns > 0 {
+                        found = Some((pos, chunk, report));
+                        break 'search;
+                    }
+                }
+            }
+
+            let (pos, chunk, report) =
+                found.unwrap_or_else(|| panic!("seed {seed:#x}: no surface entrance in 32x32 chunks"));
+            let (origin_x, origin_z) = pos.origin();
+            let mut verified = 0usize;
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    let world_x = origin_x + x;
+                    let world_z = origin_z + z;
+                    let height = generator.height_at(world_x, world_z);
+                    if height <= SEA_LEVEL + 2
+                        || chunk.get_block(BlockPos::new(world_x, height, world_z)) != BlockId::AIR
+                    {
+                        continue;
+                    }
+                    let connected = (height - CAVE_ENTRANCE_SCAN_DEPTH..=height - 1)
+                        .any(|y| chunk.get_block(BlockPos::new(world_x, y, world_z)) == BlockId::AIR);
+                    if connected {
+                        verified += 1;
+                    }
+                }
+            }
+            assert!(
+                verified > 0,
+                "seed {seed:#x}: entrance report at {pos:?} has no connected surface hole"
+            );
+            println!(
+                "seed {seed:#x}: {} entrance columns, {verified} verified in {pos:?}",
+                report.entrance_columns
+            );
+        }
+    }
+
+    #[test]
+    fn ravines_are_findable_deep_and_stepped() {
+        let registry = Registry::base();
+        for seed in [1u64, 42] {
+            let generator = Generator::new(seed);
+            let mut chosen = None;
+            'search: for region_z in -16..16 {
+                for region_x in -16..16 {
+                    let Some(ravine) = ravine_for_region(seed, region_x, region_z) else {
+                        continue;
+                    };
+                    if ravine.intersects_spawn_protection() {
+                        continue;
+                    }
+                    let height = generator.height_at(ravine.center_x, ravine.center_z);
+                    if height <= SEA_LEVEL + 2 {
+                        continue;
+                    }
+                    chosen = Some((ravine, height));
+                    break 'search;
+                }
+            }
+
+            let (ravine, height) =
+                chosen.unwrap_or_else(|| panic!("seed {seed:#x}: no dry ravine candidate in 1024 regions"));
+            assert!(
+                ravine_half_width(ravine, 0) > ravine_half_width(ravine, 12),
+                "seed {seed:#x}: ravine walls are not stepped"
+            );
+            assert!(
+                ravine_half_width(ravine, 12) >= ravine_half_width(ravine, 36),
+                "seed {seed:#x}: ravine walls widen with depth"
+            );
+
+            let pos = ChunkPos::new(
+                ravine.center_x.div_euclid(CHUNK_SIZE),
+                ravine.center_z.div_euclid(CHUNK_SIZE),
+            );
+            let (chunk, report) = generator.generate_chunk_with_report(pos, &registry);
+            assert!(
+                report.ravine_blocks > 0,
+                "seed {seed:#x}: candidate chunk reported no ravine blocks"
+            );
+            assert_eq!(
+                chunk.get_block(BlockPos::new(ravine.center_x, height, ravine.center_z)),
+                BlockId::AIR,
+                "seed {seed:#x}: ravine is not open to the sky"
+            );
+            assert_eq!(
+                chunk.get_block(BlockPos::new(ravine.center_x, height - 10, ravine.center_z)),
+                BlockId::AIR,
+                "seed {seed:#x}: ravine is not deep"
+            );
+            println!(
+                "seed {seed:#x}: ravine at ({}, {}) depth {} half-width {}->{}, {} blocks carved in {pos:?}",
+                ravine.center_x,
+                ravine.center_z,
+                ravine.depth,
+                ravine_half_width(ravine, 0),
+                ravine_half_width(ravine, 36),
+                report.ravine_blocks
+            );
+        }
+    }
+
+    #[test]
+    fn carving_never_leaves_water_over_air() {
+        let registry = Registry::base();
+        let water = registry.id_or_air("openblock:water");
+        let generator = Generator::new(0xC0FF_EE00_1234_5678);
+        let ocean = find_chunk_with_height(&generator, 8, |height| height < SEA_LEVEL)
+            .expect("expected an ocean chunk within 17 chunks");
+        let mut checked = 0usize;
+
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let pos = ChunkPos::new(ocean.x + dx, ocean.z + dz);
+                let chunk = generator.generate_chunk(pos, &registry);
+                let (origin_x, origin_z) = pos.origin();
+                for z in 0..CHUNK_SIZE {
+                    for x in 0..CHUNK_SIZE {
+                        let world_x = origin_x + x;
+                        let world_z = origin_z + z;
+                        let height = generator.height_at(world_x, world_z);
+                        if height >= SEA_LEVEL {
+                            continue;
+                        }
+                        for y in (height + 1)..=SEA_LEVEL {
+                            if chunk.get_block(BlockPos::new(world_x, y, world_z)) != water {
+                                continue;
+                            }
+                            checked += 1;
+                            assert_ne!(
+                                chunk.get_block(BlockPos::new(world_x, y - 1, world_z)),
+                                BlockId::AIR,
+                                "water at ({world_x}, {y}, {world_z}) floats over carved air"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 0, "ocean sample contained no water");
+    }
+
+    #[test]
+    fn spawn_area_keeps_a_solid_crust() {
+        let registry = Registry::base();
+        for seed in [1u64, 42, 0xC0FF_EE00_1234_5678] {
+            let generator = Generator::new(seed);
+            for cz in -SPAWN_PROTECT_CHUNKS..=SPAWN_PROTECT_CHUNKS {
+                for cx in -SPAWN_PROTECT_CHUNKS..=SPAWN_PROTECT_CHUNKS {
+                    let pos = ChunkPos::new(cx, cz);
+                    let (chunk, report) = generator.generate_chunk_with_report(pos, &registry);
+                    assert_eq!(
+                        report.entrance_columns, 0,
+                        "seed {seed:#x}: cave entrance inside spawn protection at {pos:?}"
+                    );
+                    assert_eq!(
+                        report.ravine_blocks, 0,
+                        "seed {seed:#x}: ravine inside spawn protection at {pos:?}"
+                    );
+
+                    let (origin_x, origin_z) = pos.origin();
+                    for z in 0..CHUNK_SIZE {
+                        for x in 0..CHUNK_SIZE {
+                            let world_x = origin_x + x;
+                            let world_z = origin_z + z;
+                            let height = generator.height_at(world_x, world_z);
+                            for y in (height - SPAWN_PROTECT_DEPTH + 1)..=height {
+                                assert_ne!(
+                                    chunk.get_block(BlockPos::new(world_x, y, world_z)),
+                                    BlockId::AIR,
+                                    "seed {seed:#x}: spawn crust at ({world_x}, {y}, {world_z}) is air"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ores_are_deterministic_and_order_independent() {
+        let registry = Registry::base();
+        let ores = OreBlocks::from_registry(&registry);
+        let seed = 0x0E5E_1234_ABCD_9876;
+        let positions = [
+            ChunkPos::new(0, 0),
+            ChunkPos::new(1, 0),
+            ChunkPos::new(-1, 2),
+            ChunkPos::new(5, -3),
+            ChunkPos::new(12, 7),
+            ChunkPos::new(0, 1),
+        ];
+
+        let forward: Vec<_> = positions
+            .iter()
+            .map(|&pos| {
+                let chunk = Generator::new(seed).generate_chunk(pos, &registry);
+                let found = ore_blocks_in(&chunk, &ores);
+                assert!(!found.is_empty(), "seed {seed:#x}: {pos:?} contains no ore");
+                (pos, found)
+            })
+            .collect();
+
+        // Generate in reverse order, with an unrelated neighbour in between, so
+        // any hidden shared state would show up as a different vein layout.
+        let mut backward: Vec<_> = positions
+            .iter()
+            .rev()
+            .map(|&pos| {
+                let _ = Generator::new(seed).generate_chunk(ChunkPos::new(pos.x + 9, pos.z - 4), &registry);
+                let chunk = Generator::new(seed).generate_chunk(pos, &registry);
+                (pos, ore_blocks_in(&chunk, &ores))
+            })
+            .collect();
+        backward.reverse();
+        assert_eq!(forward, backward, "generation order changed ore veins");
+
+        let pos = ChunkPos::new(3, 4);
+        let first = ore_blocks_in(&Generator::new(seed).generate_chunk(pos, &registry), &ores);
+        let _ = Generator::new(seed).generate_chunk(ChunkPos::new(4, 4), &registry);
+        let second = ore_blocks_in(&Generator::new(seed).generate_chunk(pos, &registry), &ores);
+        assert_eq!(first, second, "regenerating a chunk changed its ore veins");
+
+        let other = ore_blocks_in(
+            &Generator::new(seed ^ 0xA5A5_A5A5_A5A5_A5A5).generate_chunk(pos, &registry),
+            &ores,
+        );
+        assert_ne!(first, other, "different seeds produced identical ore veins");
+
+        // The public diagnostic helper must agree with a fresh scan.
+        let stats = Generator::new(seed).ore_debug_stats(positions[0], &registry);
+        let count = |kind: OreKind| forward[0].1.iter().filter(|(_, _, _, found)| *found == kind).count() as u32;
+        assert_eq!(stats.coal_blocks, count(OreKind::Coal));
+        assert_eq!(stats.iron_blocks, count(OreKind::Iron));
+        assert_eq!(stats.copper_blocks, count(OreKind::Copper));
+        assert!(stats.coal_veins > 0 && stats.iron_veins > 0 && stats.copper_veins > 0);
+
+        println!(
+            "seed {seed:#x}: {} ore blocks checked over {} chunks, stats {stats:?}",
+            forward.iter().map(|(_, found)| found.len()).sum::<usize>(),
+            positions.len()
+        );
+    }
+
+    #[test]
+    fn all_three_ores_appear_with_expected_depth_ranges() {
+        const SIZE: i32 = 24;
+        let registry = Registry::base();
+        let ores = OreBlocks::from_registry(&registry);
+        let generator = Generator::new(42);
+        let mut counts = [0u64; 3];
+        let mut min_seen = [i32::MAX; 3];
+        let mut max_seen = [i32::MIN; 3];
+        let mut chunks_with_ore = [0u64; 3];
+        let mut chunks = 0u64;
+
+        for cz in 0..SIZE {
+            for cx in 0..SIZE {
+                chunks += 1;
+                let chunk = generator.generate_chunk(ChunkPos::new(cx, cz), &registry);
+                let mut present = [false; 3];
+                for (x, y, z, kind) in ore_blocks_in(&chunk, &ores) {
+                    let index = kind.index();
+                    let spec = &ORE_SPECS[index];
+                    assert!(
+                        (spec.min_y..=spec.max_y).contains(&y),
+                        "{} ore at ({x}, {y}, {z}) is outside its {}..={} band",
+                        kind.name(),
+                        spec.min_y,
+                        spec.max_y
+                    );
+                    counts[index] += 1;
+                    present[index] = true;
+                    min_seen[index] = min_seen[index].min(y);
+                    max_seen[index] = max_seen[index].max(y);
+                }
+                for (index, found) in present.into_iter().enumerate() {
+                    if found {
+                        chunks_with_ore[index] += 1;
+                    }
+                }
+            }
+        }
+
+        assert!(chunks > 0);
+        for kind in OreKind::ALL {
+            let index = kind.index();
+            assert!(
+                counts[index] > 0,
+                "{} ore never appeared in {SIZE}x{SIZE} chunks",
+                kind.name()
+            );
+            assert!(
+                chunks_with_ore[index] * 10 >= chunks * 9,
+                "{} ore appeared in only {} of {chunks} chunks",
+                kind.name(),
+                chunks_with_ore[index]
+            );
+            println!(
+                "{}: {} blocks in {} of {chunks} chunks, observed Y {}..={} (configured {}..={})",
+                kind.name(),
+                counts[index],
+                chunks_with_ore[index],
+                min_seen[index],
+                max_seen[index],
+                ORE_SPECS[index].min_y,
+                ORE_SPECS[index].max_y
+            );
+        }
+    }
+
+    #[test]
+    fn no_ore_replaces_non_stone_or_floats_in_caves() {
+        let registry = Registry::base();
+        let ores = OreBlocks::from_registry(&registry);
+        let blocks = TerrainBlocks::from_registry(&registry);
+        let generator = Generator::new(0xC0FF_EE00_1234_5678);
+        let mut checked = 0u64;
+
+        for cz in -2..2 {
+            for cx in -2..2 {
+                let pos = ChunkPos::new(cx, cz);
+                let with_ores = generator.generate_chunk(pos, &registry);
+                let without_ores = generate_without_ores(&generator, pos, &registry);
+                let (origin_x, origin_z) = pos.origin();
+                for z in 0..CHUNK_SIZE {
+                    for x in 0..CHUNK_SIZE {
+                        let world_x = origin_x + x;
+                        let world_z = origin_z + z;
+                        let height = generator.height_at(world_x, world_z);
+                        let top = BlockPos::new(world_x, height, world_z);
+                        assert_eq!(
+                            with_ores.get_block(top),
+                            without_ores.get_block(top),
+                            "ore changed the terrain surface at ({world_x}, {height}, {world_z})"
+                        );
+                        for y in ORE_MIN_Y..=ORE_MAX_Y {
+                            let block_pos = BlockPos::new(world_x, y, world_z);
+                            let block = with_ores.get_block(block_pos);
+                            if ore_kind(block, &ores).is_none() {
+                                continue;
+                            }
+                            checked += 1;
+                            assert_eq!(
+                                without_ores.get_block(block_pos),
+                                blocks.stone,
+                                "ore at ({world_x}, {y}, {world_z}) did not replace stone"
+                            );
+                            assert!(
+                                y < height,
+                                "ore at ({world_x}, {y}, {world_z}) is not below the {} surface",
+                                height
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 1_000, "only {checked} ore blocks were inspected");
+        println!("checked {checked} ore blocks against a no-ore generation pass");
+    }
+
+    #[test]
+    fn ore_density_is_bounded() {
+        const SIZE: i32 = 12;
+        // Documented density ranges, in blocks per thousand pre-ore stone.
+        const BOUNDS: [(u64, u64); 3] = [(8, 12), (4, 7), (3, 6)];
+        let registry = Registry::base();
+        let ores = OreBlocks::from_registry(&registry);
+        let blocks = TerrainBlocks::from_registry(&registry);
+
+        for seed in [1u64, 42, 0xC0FF_EE00_1234_5678] {
+            let generator = Generator::new(seed);
+            let mut ore_blocks = [0u64; 3];
+            let mut stone_blocks = [0u64; 3];
+            let mut band_ore_blocks = [0u64; 3];
+            for cz in -(SIZE / 2)..(SIZE / 2) {
+                for cx in -(SIZE / 2)..(SIZE / 2) {
+                    let chunk = generator.generate_chunk(ChunkPos::new(cx, cz), &registry);
+                    let (origin_x, origin_z) = chunk.pos().origin();
+                    for z in 0..CHUNK_SIZE {
+                        for x in 0..CHUNK_SIZE {
+                            let world_x = origin_x + x;
+                            let world_z = origin_z + z;
+                            for y in ORE_MIN_Y..=ORE_MAX_Y {
+                                let block = chunk.get_block(BlockPos::new(world_x, y, world_z));
+                                if let Some(kind) = ore_kind(block, &ores) {
+                                    ore_blocks[kind.index()] += 1;
+                                    for (index, spec) in ORE_SPECS.iter().enumerate() {
+                                        if (spec.min_y..=spec.max_y).contains(&y) {
+                                            band_ore_blocks[index] += 1;
+                                        }
+                                    }
+                                } else if block == blocks.stone {
+                                    for (index, spec) in ORE_SPECS.iter().enumerate() {
+                                        if (spec.min_y..=spec.max_y).contains(&y) {
+                                            stone_blocks[index] += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            for kind in OreKind::ALL {
+                let index = kind.index();
+                let pre_ore_stone = stone_blocks[index] + band_ore_blocks[index];
+                assert!(
+                    pre_ore_stone > 0,
+                    "seed {seed:#x}: no stone in the {} band",
+                    kind.name()
+                );
+                let permille = ore_blocks[index] * 1000 / pre_ore_stone;
+                assert!(
+                    (BOUNDS[index].0..=BOUNDS[index].1).contains(&permille),
+                    "seed {seed:#x}: {} density is {permille} per mille \
+                     ({} ore / {pre_ore_stone} pre-ore stone), expected {}..={}",
+                    kind.name(),
+                    ore_blocks[index],
+                    BOUNDS[index].0,
+                    BOUNDS[index].1
+                );
+                println!(
+                    "seed {seed:#x}: {} {permille} per mille ({:.2}%), {} ore blocks in {}x{SIZE} chunks",
+                    kind.name(),
+                    permille as f64 / 10.0,
+                    ore_blocks[index],
+                    SIZE
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "ore throughput benchmark; run with --ignored --nocapture"]
+    fn ore_throughput_report() {
+        let registry = Registry::base();
+        let chunks = 200i32;
+        for seed in [1u64, 42, 0xC0FF_EE00_1234_5678] {
+            let generator = Generator::new(seed);
+            // Warm both paths before timing.
+            let _ = std::hint::black_box(generator.generate_chunk(ChunkPos::new(0, 0), &registry));
+            let _ = std::hint::black_box(generator.generate_chunk_with_options(
+                ChunkPos::new(0, 0),
+                &registry,
+                GenerationOptions::WITHOUT_ORES,
+            ));
+
+            let mut with = std::time::Duration::ZERO;
+            let mut without = std::time::Duration::ZERO;
+            for round in 0..2 {
+                if round == 0 {
+                    without += measure_generation(&generator, &registry, GenerationOptions::WITHOUT_ORES, chunks);
+                    with += measure_generation(&generator, &registry, GenerationOptions::WITH_ORES, chunks);
+                } else {
+                    with += measure_generation(&generator, &registry, GenerationOptions::WITH_ORES, chunks);
+                    without += measure_generation(&generator, &registry, GenerationOptions::WITHOUT_ORES, chunks);
+                }
+            }
+            let samples = f64::from(chunks) * 2.0;
+            let with_ms = with.as_secs_f64() * 1000.0 / samples;
+            let without_ms = without.as_secs_f64() * 1000.0 / samples;
+            let added_ms = with_ms - without_ms;
+            println!(
+                "seed {seed:#x}: {chunks} chunks, with ores {with_ms:.3} ms/chunk, \
+                 without {without_ms:.3} ms/chunk, added {added_ms:+.3} ms/chunk"
+            );
+            assert!(
+                added_ms <= 0.35,
+                "seed {seed:#x}: ore generation added {added_ms:.3} ms/chunk (target <= 0.35)"
+            );
+            assert!(
+                with_ms < 5.0,
+                "seed {seed:#x}: generation averaged {with_ms:.3} ms/chunk"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "ore distribution report; run with --ignored --nocapture"]
+    fn ore_distribution_report() {
+        const SIZE: i32 = 24;
+        let registry = Registry::base();
+        let ores = OreBlocks::from_registry(&registry);
+        let blocks = TerrainBlocks::from_registry(&registry);
+        for seed in [1u64, 42] {
+            let generator = Generator::new(seed);
+            let mut ore_blocks = [0u64; 3];
+            let mut stone_blocks = [0u64; 3];
+            let mut band_ore_blocks = [0u64; 3];
+            let mut veins = [0u64; 3];
+            let mut min_seen = [i32::MAX; 3];
+            let mut max_seen = [i32::MIN; 3];
+            let mut chunks_with_ore = [0u64; 3];
+            let mut sampled_hash = 0u64;
+            let mut chunks = 0u64;
+
+            for cz in -(SIZE / 2)..(SIZE / 2) {
+                for cx in -(SIZE / 2)..(SIZE / 2) {
+                    let pos = ChunkPos::new(cx, cz);
+                    let (chunk, _, stats) =
+                        generator.generate_chunk_with_options(pos, &registry, GenerationOptions::WITH_ORES);
+                    chunks += 1;
+                    if pos == ChunkPos::new(0, 0) {
+                        sampled_hash = chunk_hash(&chunk);
+                    }
+                    veins[0] += u64::from(stats.coal_veins);
+                    veins[1] += u64::from(stats.iron_veins);
+                    veins[2] += u64::from(stats.copper_veins);
+                    let mut present = [false; 3];
+                    let (origin_x, origin_z) = pos.origin();
+                    for z in 0..CHUNK_SIZE {
+                        for x in 0..CHUNK_SIZE {
+                            let world_x = origin_x + x;
+                            let world_z = origin_z + z;
+                            for y in ORE_MIN_Y..=ORE_MAX_Y {
+                                let block = chunk.get_block(BlockPos::new(world_x, y, world_z));
+                                if let Some(kind) = ore_kind(block, &ores) {
+                                    let index = kind.index();
+                                    ore_blocks[index] += 1;
+                                    present[index] = true;
+                                    min_seen[index] = min_seen[index].min(y);
+                                    max_seen[index] = max_seen[index].max(y);
+                                    for (band, spec) in ORE_SPECS.iter().enumerate() {
+                                        if (spec.min_y..=spec.max_y).contains(&y) {
+                                            band_ore_blocks[band] += 1;
+                                        }
+                                    }
+                                } else if block == blocks.stone {
+                                    for (index, spec) in ORE_SPECS.iter().enumerate() {
+                                        if (spec.min_y..=spec.max_y).contains(&y) {
+                                            stone_blocks[index] += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for (index, found) in present.into_iter().enumerate() {
+                        if found {
+                            chunks_with_ore[index] += 1;
+                        }
+                    }
+                }
+            }
+
+            for kind in OreKind::ALL {
+                let index = kind.index();
+                let pre_ore_stone = stone_blocks[index] + band_ore_blocks[index];
+                let permille = ore_blocks[index] * 1000 / pre_ore_stone;
+                let density = ore_blocks[index] as f64 * 100.0 / pre_ore_stone as f64;
+                let mean_vein = ore_blocks[index] as f64 / veins[index].max(1) as f64;
+                println!(
+                    "seed {seed:#x}: {:>6} {density:.2}% ({permille} per mille), \
+                     {:.1} blocks/chunk, {:.1} veins/chunk, {mean_vein:.1} blocks/vein, \
+                     {} of {chunks} chunks, Y {}..={}",
+                    kind.name(),
+                    ore_blocks[index] as f64 / chunks as f64,
+                    veins[index] as f64 / chunks as f64,
+                    chunks_with_ore[index],
+                    min_seen[index],
+                    max_seen[index],
+                );
+            }
+            println!(
+                "seed {seed:#x}: hash(0,0)={sampled_hash:#018x}, {} ore blocks from {} veins in {chunks} chunks",
+                ore_blocks.iter().sum::<u64>(),
+                veins.iter().sum::<u64>()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "throughput benchmark; run with --ignored --nocapture"]
+    fn cave_throughput_report() {
+        let registry = Registry::base();
+        for seed in [1u64, 42, 0xC0FF_EE00_1234_5678] {
+            let generator = Generator::new(seed);
+            let warm = generator.generate_chunk(ChunkPos::new(0, 0), &registry);
+            let hash = chunk_hash(&warm);
+            let _ = std::hint::black_box(warm);
+
+            let chunks = 200i32;
+            let start = std::time::Instant::now();
+            let mut worst = std::time::Duration::ZERO;
+            for index in 0..chunks {
+                let chunk_start = std::time::Instant::now();
+                let _ =
+                    std::hint::black_box(generator.generate_chunk(ChunkPos::new(index % 20, index / 20), &registry));
+                worst = worst.max(chunk_start.elapsed());
+            }
+            let elapsed = start.elapsed();
+            let millis = elapsed.as_secs_f64() * 1000.0 / f64::from(chunks);
+            println!(
+                "seed {seed:#x}: {chunks} chunks in {elapsed:?} ({millis:.3} ms/chunk, worst {worst:?}), \
+                 hash(0,0)={hash:#018x}, stats={:?}",
+                generator.cave_debug_stats(ChunkPos::new(0, 0), &registry)
+            );
+            assert!(
+                millis < 5.0,
+                "cave generation averaged {millis:.3} ms/chunk for seed {seed:#x}"
+            );
+        }
+    }
+
+    /// FNV-1a hash of a chunk's blocks, used by determinism tests and reports.
+    fn chunk_hash(chunk: &ChunkColumn) -> u64 {
+        let mut hash = 0xCBF2_9CE4_8422_2325u64;
+        for block in collect_blocks(chunk) {
+            hash ^= u64::from(block.0);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        hash
+    }
+
+    #[test]
+    #[ignore = "cave distribution report; run with --ignored --nocapture"]
+    fn cave_distribution_report() {
+        let registry = Registry::base();
+        let water = registry.id_or_air("openblock:water");
+        for seed in [1u64, 42] {
+            let generator = Generator::new(seed);
+            let mut stats = CaveDebugStats::default();
+            let mut air = 0u64;
+            let mut cells = 0u64;
+            let mut deep_air = 0u64;
+            let mut deep_cells = 0u64;
+            let mut upper_air = 0u64;
+            let mut upper_cells = 0u64;
+            let mut bedrock_air = 0u64;
+            let mut surface_holes = 0u64;
+            let mut undercut_tops = 0u64;
+            let mut unsupported_water = 0u64;
+            let mut ravine_chunks = 0u64;
+            for cz in -12..12 {
+                for cx in -12..12 {
+                    let pos = ChunkPos::new(cx, cz);
+                    let (chunk, report) = generator.generate_chunk_with_report(pos, &registry);
+                    stats.cave_blocks += report.cave_blocks;
+                    stats.entrance_columns += report.entrance_columns;
+                    stats.ravine_blocks += report.ravine_blocks;
+                    if report.ravine_blocks > 0 {
+                        ravine_chunks += 1;
+                    }
+                    let (origin_x, origin_z) = pos.origin();
+                    for z in 0..CHUNK_SIZE {
+                        for x in 0..CHUNK_SIZE {
+                            let world_x = origin_x + x;
+                            let world_z = origin_z + z;
+                            let height = generator.height_at(world_x, world_z);
+                            if chunk.get_block(BlockPos::new(world_x, height, world_z)) == BlockId::AIR {
+                                surface_holes += 1;
+                            }
+                            if chunk.get_block(BlockPos::new(world_x, height, world_z)) != BlockId::AIR
+                                && (chunk.get_block(BlockPos::new(world_x, height - 1, world_z)) == BlockId::AIR
+                                    || chunk.get_block(BlockPos::new(world_x, height - 2, world_z)) == BlockId::AIR)
+                            {
+                                undercut_tops += 1;
+                            }
+                            for y in (WORLD_MIN_Y + 2)..=(height - 4) {
+                                cells += 1;
+                                if chunk.get_block(BlockPos::new(world_x, y, world_z)) == BlockId::AIR {
+                                    air += 1;
+                                    if y <= 0 {
+                                        deep_air += 1;
+                                    }
+                                }
+                                if y <= 0 {
+                                    deep_cells += 1;
+                                } else if y > CAVE_CAVERN_MAX_Y {
+                                    upper_cells += 1;
+                                    if chunk.get_block(BlockPos::new(world_x, y, world_z)) == BlockId::AIR {
+                                        upper_air += 1;
+                                    }
+                                }
+                            }
+                            if chunk.get_block(BlockPos::new(world_x, WORLD_MIN_Y, world_z)) == BlockId::AIR {
+                                bedrock_air += 1;
+                            }
+                            if height < SEA_LEVEL {
+                                for y in (height + 1)..=SEA_LEVEL {
+                                    if chunk.get_block(BlockPos::new(world_x, y, world_z)) == water
+                                        && chunk.get_block(BlockPos::new(world_x, y - 1, world_z)) == BlockId::AIR
+                                    {
+                                        unsupported_water += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            println!(
+                "seed {seed:#x}: air {:.2}% ({air}/{cells}), tunnels-above-y{CAVE_CAVERN_MAX_Y} {:.2}% \
+                 ({upper_air}/{upper_cells}), deep y<=0 {:.2}% ({deep_air}/{deep_cells}), \
+                 cave_blocks={}, entrances={}, ravine_blocks={} in {ravine_chunks} chunks, \
+                 surface_holes={surface_holes}, undercut_tops={undercut_tops}, bedrock_air={bedrock_air}, \
+                 unsupported_water={unsupported_water}, hash(0,0)={:#018x}",
+                air as f64 * 100.0 / cells as f64,
+                upper_air as f64 * 100.0 / upper_cells as f64,
+                deep_air as f64 * 100.0 / deep_cells as f64,
+                stats.cave_blocks,
+                stats.entrance_columns,
+                stats.ravine_blocks,
+                chunk_hash(&generator.generate_chunk(ChunkPos::new(0, 0), &registry)),
+            );
+        }
     }
 
     #[test]

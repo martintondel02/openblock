@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           openblock
-Version:        0.0.9
+Version:        0.1.0
 Release:        1%{?dist}
 Summary:        Fast, deeply moddable, server-first voxel sandbox
 
@@ -25,11 +25,16 @@ Provides:       bundled(crate(openblock)) = %{version}
 
 BuildRequires:  gcc gcc-c++ make
 BuildRequires:  rust cargo
+# Audio output uses runtime-loaded libpulse-simple; no ALSA/PulseAudio
+# development headers are needed at build time.
 BuildRequires:  pkgconf-pkg-config
-BuildRequires:  alsa-lib-devel wayland-devel libxkbcommon-devel
+BuildRequires:  wayland-devel libxkbcommon-devel
 BuildRequires:  vulkan-loader-devel fontconfig-devel freetype-devel
-BuildRequires:  systemd-devel systemd-rpm-macros
+BuildRequires:  systemd-devel systemd-rpm-macros firewalld-filesystem
 Requires:       mesa-vulkan-drivers
+# libpulse-simple is dlopened at runtime and audio is optional, so recommend it
+# rather than making a sound server a hard dependency of the game.
+Recommends:     pulseaudio-libs
 
 %description
 OpenBlock is an open-source voxel sandbox game. Mine, build, explore and
@@ -37,20 +42,24 @@ survive alone or with friends on servers you host yourself. It targets the
 Minecraft Java feature set as a baseline and goes further with a scriptable
 content platform, GPU-driven rendering and server-first multiplayer.
 
-This package installs the client with desktop integration. The dedicated
-server is in the openblock-server subpackage.
+This package installs the client with desktop integration. Audio is synthesised
+in memory and played through PipeWire's PulseAudio compatibility service (or
+PulseAudio itself); no sound files are bundled and no audio development headers
+are needed to build. The dedicated server is in the openblock-server subpackage.
 
 %package server
 Summary:        Dedicated server for OpenBlock
-Requires(pre):  shadow-utils
 Requires:       systemd
+Requires(pre):  systemd
 Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
 %description server
-The headless OpenBlock dedicated server. No GPU, display server or audio
-device is required. Includes a hardened systemd unit, a firewalld service
-definition for the QUIC/UDP game port, and a dedicated system user.
+The headless OpenBlock dedicated server for the interim JSON/TCP protocol.
+No GPU, display server or audio device is required. Includes a hardened
+systemd unit, a firewalld service definition for TCP/25565, sysusers/tmpfiles
+definitions and the default flat server.toml. The interim protocol has no TLS
+or authentication: bind it to a trusted LAN/VPN, not the public internet.
 
 %prep
 %autosetup -n openblock-%{version}
@@ -75,21 +84,29 @@ install -Dpm 0644 packaging/fedora/io.github.martintondel02.OpenBlock.svg \
 install -Dpm 0644 packaging/fedora/openblock.mime.xml \
   %{buildroot}%{_datadir}/mime/packages/openblock.xml
 
-install -Dpm 0644 packaging/fedora/openblock-server.service \
+install -Dpm 0644 packaging/systemd/openblock-server.service \
   %{buildroot}%{_unitdir}/openblock-server.service
+install -Dpm 0644 packaging/systemd/openblock-server.env.example \
+  %{buildroot}%{_sysconfdir}/openblock/server.env.example
 install -Dpm 0644 packaging/fedora/openblock-server.firewalld.xml \
   %{buildroot}%{_prefix}/lib/firewalld/services/openblock-server.xml
-install -Dpm 0644 packaging/fedora/openblock-server.sysusers \
+install -Dpm 0644 packaging/systemd/openblock-server.sysusers \
   %{buildroot}%{_sysusersdir}/openblock-server.conf
-install -dpm 0750 %{buildroot}%{_localstatedir}/lib/openblock-server
-install -Dpm 0640 packaging/fedora/server.toml \
-  %{buildroot}%{_sysconfdir}/openblock-server/server.toml
+install -Dpm 0644 packaging/systemd/openblock-server.tmpfiles \
+  %{buildroot}%{_tmpfilesdir}/openblock-server.conf
+install -dpm 0750 %{buildroot}%{_localstatedir}/lib/openblock
+install -Dpm 0644 packaging/systemd/server.toml \
+  %{buildroot}%{_sysconfdir}/openblock/server.toml
+install -Dpm 0755 scripts/server-backup.sh \
+  %{buildroot}%{_bindir}/openblock-server-backup
+install -Dpm 0755 scripts/server-restore.sh \
+  %{buildroot}%{_bindir}/openblock-server-restore
 
 %pre server
-getent group openblock-server >/dev/null || groupadd -r openblock-server
-getent passwd openblock-server >/dev/null || \
-  useradd -r -g openblock-server -d %{_localstatedir}/lib/openblock-server \
-  -s /sbin/nologin -c "OpenBlock dedicated server" openblock-server
+# Create the unprivileged openblock user/group with systemd-sysusers. The same
+# definition is installed at %{_sysusersdir}/openblock-server.conf for later
+# boots; --inline avoids depending on a payload file that %pre cannot read yet.
+systemd-sysusers --inline 'g openblock -' 'u openblock - "OpenBlock dedicated server" /var/lib/openblock /sbin/nologin'
 exit 0
 
 %post
@@ -98,6 +115,7 @@ if command -v appstreamcli >/dev/null 2>&1; then appstreamcli refresh --source=o
 
 %post server
 %systemd_post openblock-server.service
+systemd-tmpfiles --create %{_tmpfilesdir}/openblock-server.conf || :
 %firewalld_reload
 
 %preun server
@@ -119,14 +137,36 @@ update-desktop-database &>/dev/null || :
 %{_datadir}/mime/packages/openblock.xml
 
 %files server
+%doc packaging/systemd/README.md docs/admin
 %{_bindir}/openblock-server
+%{_bindir}/openblock-server-backup
+%{_bindir}/openblock-server-restore
 %{_unitdir}/openblock-server.service
 %{_prefix}/lib/firewalld/services/openblock-server.xml
 %{_sysusersdir}/openblock-server.conf
-%attr(0750,openblock-server,openblock-server) %dir %{_localstatedir}/lib/openblock-server
-%config(noreplace) %{_sysconfdir}/openblock-server/server.toml
+%{_tmpfilesdir}/openblock-server.conf
+%attr(0750,openblock,openblock) %dir %{_localstatedir}/lib/openblock
+%dir %{_sysconfdir}/openblock
+%config(noreplace) %{_sysconfdir}/openblock/server.toml
+%config(noreplace) %{_sysconfdir}/openblock/server.env.example
 
 %changelog
+* Sat Nov 25 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.1.0-1
+- Multiplayer alpha: dedicated server (TCP/JSON protocol v2) with
+  server-authoritative survival (inventories, vitals, equipment, actions,
+  furnace/chest windows, death/respawn, persistence), client connect mode with
+  chunk streaming, avatars, chat/roster, and replicated mobs/items.
+- Mobs and combat (cow/pig/sheep/chicken/zombie, AI, spawning, drops, attack,
+  armor mitigation, knockback, day burn); ores (coal/iron/copper), furnace
+  smelting/fuel, iron tools and leather/iron armor, chests.
+- Procedural audio engine (PulseAudio on Linux, silent stub elsewhere) with
+  footsteps/material sounds, UI/action sounds and ambient music, volumes in a
+  new Audio settings tab.
+- Worldgen caves/ravines and deterministic ore veins; benchmark/soak tooling
+  (worldgen/server/save/soak) and published 1.0 performance envelope.
+- Server operations: systemd unit, container image + compose, backup/restore
+  scripts, load-test bot, admin handbook; graceful SIGINT/SIGTERM saves.
+
 * Tue Nov 24 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.0.9-1
 - Readable F3 debug overlay: larger line spacing, four grouped sections with
   gaps and separators, dimmer secondary column, word-wrapped GPU name, adaptive

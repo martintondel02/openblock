@@ -1,0 +1,101 @@
+# Hardened systemd unit for the OpenBlock dedicated server (interim JSON/TCP build).
+#
+# Install (distribution package or manual):
+#   /usr/lib/systemd/system/openblock-server.service
+#   /etc/openblock/server.toml              flat key = value config, installed 0644
+#   /etc/systemd/system/openblock-server.service.d/  local overrides
+#
+# The unit runs as the unprivileged "openblock" user from sysusers, with all
+# writable state confined to /var/lib/openblock (StateDirectory). The server
+# needs no GPU, display, audio device, container runtime or root privileges.
+#
+# Operator notes:
+#   - The console reads stdin. Under systemd stdin is /dev/null, so use
+#     `journalctl -u openblock-server -f` and `systemctl stop` for a graceful
+#     save; run the binary in a terminal/tmux if you need `say`/`kick`/`save`.
+#   - Only the TCP game port is used (25565 by default). There is no TLS or
+#     authentication in this build: firewall it to trusted networks.
+#   - Config changes require `systemctl restart openblock-server`.
+#   - Open the port only for trusted networks, e.g.:
+#       firewall-cmd --permanent --add-service=openblock-server && firewall-cmd --reload
+#   - This interim binary handles SIGINT (Ctrl-C) as its graceful shutdown
+#     signal. SIGTERM support is pending a server-side `ctrlc` feature, so the
+#     unit deliberately sends SIGINT on stop. Once SIGTERM is handled, this can
+#     return to the systemd default without changing operator commands.
+
+[Unit]
+Description=OpenBlock dedicated server
+Documentation=https://github.com/martintondel02/openblock/blob/main/docs/admin/README.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/openblock/server.toml
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/openblock-server --config /etc/openblock/server.toml --data-dir /var/lib/openblock
+WorkingDirectory=/var/lib/openblock
+
+# Unprivileged, stable identity created by systemd-sysusers from the packaged
+# openblock-server.conf. StateDirectory is owned by openblock:openblock.
+User=openblock
+Group=openblock
+StateDirectory=openblock
+StateDirectoryMode=0750
+ConfigurationDirectory=openblock
+ConfigurationDirectoryMode=0755
+UMask=0027
+
+# Environment: OPENBLOCK_LOG is read by the server at start-up. The optional
+# file is installed as server.env.example so admins can opt in deliberately.
+Environment=OPENBLOCK_LOG=info
+EnvironmentFile=-/etc/openblock/server.env
+
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=40
+# SIGINT is the graceful save path in this interim build; SIGTERM is not
+# handled (see the note above). Keep this until the server installs a SIGTERM
+# handler, otherwise `systemctl stop` kills without a final save.
+KillSignal=SIGINT
+SuccessExitStatus=130 143
+
+# Sandboxing. ProtectSystem=strict makes the whole filesystem read-only except
+# the explicitly writable state directory; /etc/openblock stays readable so the
+# config can be loaded. ProtectHome=read-only deliberately permits reads (for
+# example an operator-supplied content pack) without permitting writes.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/openblock
+
+# No capabilities are needed for the default port. To bind below 1024, add
+# CAP_NET_BIND_SERVICE to both CapabilityBoundingSet and AmbientCapabilities
+# in a drop-in and set the config listen port accordingly.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+LimitNOFILE=65536
+TasksMax=4096
+# Tune for the host. The interim server is comfortable well below this; the
+# limit exists so a runaway world cannot take the whole machine down.
+MemoryMax=8G
+
+[Install]
+WantedBy=multi-user.target

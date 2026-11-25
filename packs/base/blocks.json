@@ -277,6 +277,103 @@
       "hardness": 2.5,
       "preferred_tool": "axe",
       "required_tier": 0
+    },
+    {
+      "id": "openblock:coal_ore",
+      "solid": true,
+      "opaque": true,
+      "fluid": false,
+      "color": [
+        0.25,
+        0.25,
+        0.27
+      ],
+      "textures": {
+        "top": "coal_ore",
+        "side": "coal_ore",
+        "bottom": "coal_ore"
+      },
+      "hardness": 3.0,
+      "preferred_tool": "pickaxe",
+      "required_tier": 1
+    },
+    {
+      "id": "openblock:iron_ore",
+      "solid": true,
+      "opaque": true,
+      "fluid": false,
+      "color": [
+        0.64,
+        0.56,
+        0.47
+      ],
+      "textures": {
+        "top": "iron_ore",
+        "side": "iron_ore",
+        "bottom": "iron_ore"
+      },
+      "hardness": 3.0,
+      "preferred_tool": "pickaxe",
+      "required_tier": 2
+    },
+    {
+      "id": "openblock:copper_ore",
+      "solid": true,
+      "opaque": true,
+      "fluid": false,
+      "color": [
+        0.66,
+        0.45,
+        0.32
+      ],
+      "textures": {
+        "top": "copper_ore",
+        "side": "copper_ore",
+        "bottom": "copper_ore"
+      },
+      "hardness": 3.0,
+      "preferred_tool": "pickaxe",
+      "required_tier": 2
+    },
+    {
+      "id": "openblock:furnace",
+      "solid": true,
+      "opaque": true,
+      "fluid": false,
+      "color": [
+        0.42,
+        0.42,
+        0.44
+      ],
+      "textures": {
+        "top": "furnace_top",
+        "side": "furnace_side",
+        "bottom": "furnace_top",
+        "front": "furnace_front"
+      },
+      "hardness": 3.5,
+      "preferred_tool": "axe",
+      "required_tier": 0
+    },
+    {
+      "id": "openblock:chest",
+      "solid": true,
+      "opaque": true,
+      "fluid": false,
+      "color": [
+        0.6,
+        0.42,
+        0.22
+      ],
+      "textures": {
+        "top": "chest_top",
+        "side": "chest_side",
+        "bottom": "chest_top",
+        "front": "chest_front"
+      },
+      "hardness": 2.5,
+      "preferred_tool": "axe",
+      "required_tier": 0
     }
   ]
 }

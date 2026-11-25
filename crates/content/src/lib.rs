@@ -8,16 +8,22 @@
 //! loads the versioned JSON block schema and builds a [`Registry`] through the
 //! same [`Registry::from_blocks`] path used by [`Registry::base`].
 //!
-//! # Items, tools and recipes (interim)
+//! # Items, tools, armor and recipes (interim)
 //!
 //! Every non-air block gets a matching block item (`id` = the block's resource
-//! id). The catalogue also contains `openblock:apple`, `openblock:stick` and the
-//! eight wooden/stone tools. Item ids are frozen: v0.0.7 positions never move,
-//! appended block items follow the apple, and new non-block items follow them.
-//! Recipes are code-defined ingredient totals in deterministic id order;
-//! shaped/grid crafting, item components and block loot tables arrive with the
-//! data-driven content pipeline in
+//! id). The catalogue also contains `openblock:apple`, `openblock:stick`, the
+//! eight wooden/stone tools, iron tools, leather/iron armor, ores and metals,
+//! and the animal-food items. Item ids are frozen: v0.0.7 and v0.0.8 positions
+//! never move, the v0.0.9 non-block items occupy ids 24..=46, and block items
+//! for blocks appended after `crafting_table` follow them. Recipes are
+//! code-defined ingredient totals in deterministic id order; furnace smelting
+//! and fuel values are pure lookup tables. Shaped/grid crafting, item
+//! components, block loot tables and the data-driven item pipeline arrive in
 //! `docs/spec/11-inventory-crafting-items.md`.
+//!
+//! The 1.0 interim catalogue also carries a five-species mob table
+//! ([`MobKind`], [`MobSpec`]) and a melee `attack_damage` value on every tool;
+//! see [`Registry::mob`] and [`Registry::attack_damage`].
 
 use rustc_hash::FxHashMap;
 
@@ -70,7 +76,7 @@ impl ToolKind {
     }
 }
 
-/// Mining statistics for one tool.
+/// Mining and melee statistics for one tool.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ToolSpec {
     /// Which blocks this tool is efficient against.
@@ -79,8 +85,152 @@ pub struct ToolSpec {
     pub tier: u8,
     /// Mining-speed multiplier against blocks of the matching kind.
     pub speed: f32,
-    /// Durability in blocks broken before the tool disappears.
+    /// Base melee damage in health points when this tool is selected.
+    ///
+    /// A hand (no selected item) deals `1.0`; see
+    /// [`Registry::attack_damage`]. Every tool keeps its mining fields, so a
+    /// pickaxe is both a slower weapon and a mining tool.
+    pub attack_damage: f32,
+    /// Durability in blocks broken (or mobs hit) before the tool disappears.
     pub durability: u16,
+}
+
+/// The armor slot an [`ArmorSpec`] occupies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArmorSlot {
+    /// Head slot.
+    Helmet,
+    /// Chest slot.
+    Chestplate,
+    /// Leg slot.
+    Leggings,
+    /// Feet slot.
+    Boots,
+}
+
+impl ArmorSlot {
+    /// Stable lower-case name used by content packs and hints.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Helmet => "helmet",
+            Self::Chestplate => "chestplate",
+            Self::Leggings => "leggings",
+            Self::Boots => "boots",
+        }
+    }
+}
+
+/// Armor statistics for one wearable item.
+///
+/// The interim model exposes defense points and durability only; toughness,
+/// knockback resistance and enchantability arrive with the data-driven item
+/// pipeline in `docs/spec/11-inventory-crafting-items.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArmorSpec {
+    /// Equip slot this piece occupies.
+    pub slot: ArmorSlot,
+    /// Armor points contributed while worn.
+    pub defense: u8,
+    /// Durability in hits absorbed before the piece breaks.
+    pub durability: u16,
+}
+
+/// One mob species in the interim 1.0 catalogue.
+///
+/// Mobs are a deliberately small, code-defined set in this slice. The
+/// data-driven entity pipeline in `docs/spec/09-entities-ai.md` replaces this
+/// enum with registry definitions after 1.0; the namespaced names below are
+/// stable save keys and never change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MobKind {
+    /// A passive cow.
+    Cow,
+    /// A passive pig.
+    Pig,
+    /// A passive sheep.
+    Sheep,
+    /// A passive chicken.
+    Chicken,
+    /// A hostile zombie.
+    Zombie,
+}
+
+impl MobKind {
+    /// Every mob kind, in stable catalogue order.
+    pub const ALL: [MobKind; 5] = [
+        MobKind::Cow,
+        MobKind::Pig,
+        MobKind::Sheep,
+        MobKind::Chicken,
+        MobKind::Zombie,
+    ];
+
+    /// Stable namespaced resource id, e.g. `openblock:cow`.
+    ///
+    /// This is the string written to `mobs.txt` and the key accepted by
+    /// [`MobKind::from_name`]; it never changes for a shipped kind.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Cow => "openblock:cow",
+            Self::Pig => "openblock:pig",
+            Self::Sheep => "openblock:sheep",
+            Self::Chicken => "openblock:chicken",
+            Self::Zombie => "openblock:zombie",
+        }
+    }
+
+    /// Parses a namespaced mob id from a save line.
+    ///
+    /// Only the exact namespaced form is accepted, so malformed or
+    /// unnamespaced ids are skipped by the loader instead of being guessed.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+
+    /// Stable catalogue index (`Cow == 0` .. `Zombie == 4`).
+    ///
+    /// [`Registry::mob`] indexes its spec table by this value.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Cow => 0,
+            Self::Pig => 1,
+            Self::Sheep => 2,
+            Self::Chicken => 3,
+            Self::Zombie => 4,
+        }
+    }
+}
+
+/// Definition and deterministic drop table for one mob kind.
+///
+/// Drop entries are resolved against the registry when it is built, so a
+/// custom block pack that lacks an item simply omits that drop. The list is
+/// static and deterministic: no RNG is involved in a mob death.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MobSpec {
+    /// Species this definition describes.
+    pub kind: MobKind,
+    /// ASCII display name for hints, HUD and tests.
+    pub display_name: &'static str,
+    /// Maximum and starting health in health points.
+    pub health: f32,
+    /// Horizontal movement speed in metres per second.
+    pub speed: f32,
+    /// Whether the mob attacks players (zombies).
+    pub hostile: bool,
+    /// Collision-box width in metres.
+    pub width: f32,
+    /// Collision-box height in metres.
+    pub height: f32,
+    /// Deterministic death drops as `(item, count)` pairs.
+    pub drops: &'static [(ItemId, u8)],
+}
+
+impl MobSpec {
+    /// Whether this mob belongs to the passive (creature) cap.
+    pub fn passive(&self) -> bool {
+        !self.hostile
+    }
 }
 
 /// An item type definition.
@@ -98,6 +248,8 @@ pub struct ItemType {
     pub food: Option<u8>,
     /// Tool statistics; `None` for every non-tool item.
     pub tool: Option<ToolSpec>,
+    /// Armor statistics; `None` for every non-wearable item.
+    pub armor: Option<ArmorSpec>,
     /// Maximum number of items in one stack (`1..=`[`MAX_ITEM_STACK`]).
     pub max_stack: u8,
 }
@@ -111,6 +263,11 @@ impl ItemType {
     /// Whether this item is a tool.
     pub fn is_tool(&self) -> bool {
         self.tool.is_some()
+    }
+
+    /// Whether this item is a wearable armor piece.
+    pub fn is_armor(&self) -> bool {
+        self.armor.is_some()
     }
 
     /// The block this item places, for block items.
@@ -171,9 +328,27 @@ pub mod textures {
     pub const CRAFTING_TABLE_TOP: TextureId = TextureId(16);
     /// Crafting table side (the front face reuses this layer).
     pub const CRAFTING_TABLE_SIDE: TextureId = TextureId(17);
+    /// Coal ore.
+    pub const COAL_ORE: TextureId = TextureId(18);
+    /// Iron ore.
+    pub const IRON_ORE: TextureId = TextureId(19);
+    /// Copper ore.
+    pub const COPPER_ORE: TextureId = TextureId(20);
+    /// Furnace top and bottom.
+    pub const FURNACE_TOP: TextureId = TextureId(21);
+    /// Furnace side.
+    pub const FURNACE_SIDE: TextureId = TextureId(22);
+    /// Furnace front (interim: always the +Z face; see [`crate::BlockTextures`]).
+    pub const FURNACE_FRONT: TextureId = TextureId(23);
+    /// Chest top and bottom.
+    pub const CHEST_TOP: TextureId = TextureId(24);
+    /// Chest side.
+    pub const CHEST_SIDE: TextureId = TextureId(25);
+    /// Chest front (interim: always the +Z face; see [`crate::BlockTextures`]).
+    pub const CHEST_FRONT: TextureId = TextureId(26);
 
     /// Number of texture layers the renderer must generate.
-    pub const COUNT: usize = 18;
+    pub const COUNT: usize = 27;
 
     /// Names of the procedural textures, indexed by layer.
     pub const NAMES: [&str; COUNT] = [
@@ -195,13 +370,26 @@ pub mod textures {
         "cobblestone",
         "crafting_table_top",
         "crafting_table_side",
+        "coal_ore",
+        "iron_ore",
+        "copper_ore",
+        "furnace_top",
+        "furnace_side",
+        "furnace_front",
+        "chest_top",
+        "chest_side",
+        "chest_front",
     ];
 
     // Compile-time guard: the layer table and the catalogue must stay in sync.
     const _: () = assert!(NAMES.len() == COUNT);
 }
 
-/// Per-face texture set: top, side, bottom.
+/// Per-face texture set: top, side, bottom and an optional front.
+///
+/// The simplified v0.x block model has no facing state. Blocks that declare a
+/// front texture (the furnace and the chest) use it on the +Z face only; a
+/// facing state (and per-placement rotation) arrives post-1.0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockTextures {
     /// Texture for the +Y face.
@@ -210,6 +398,8 @@ pub struct BlockTextures {
     pub side: TextureId,
     /// Texture for the -Y face.
     pub bottom: TextureId,
+    /// Optional texture for the +Z face; `None` reuses [`Self::side`].
+    pub front: Option<TextureId>,
 }
 
 impl BlockTextures {
@@ -219,19 +409,48 @@ impl BlockTextures {
             top: id,
             side: id,
             bottom: id,
+            front: None,
         }
     }
 
     /// Distinct top and side textures with a shared bottom.
     pub const fn column(top: TextureId, side: TextureId, bottom: TextureId) -> Self {
-        Self { top, side, bottom }
+        Self {
+            top,
+            side,
+            bottom,
+            front: None,
+        }
     }
 
-    /// Texture for a face direction: 0 = +Y, 1 = -Y, 2..=5 = sides.
+    /// Distinct top, side and bottom textures plus an interim +Z front.
+    pub const fn fronted(top: TextureId, side: TextureId, bottom: TextureId, front: TextureId) -> Self {
+        Self {
+            top,
+            side,
+            bottom,
+            front: Some(front),
+        }
+    }
+
+    /// The texture used by the interim front face, falling back to the side.
+    pub const fn front_texture(&self) -> TextureId {
+        match self.front {
+            Some(front) => front,
+            None => self.side,
+        }
+    }
+
+    /// Texture for a face direction: 0 = +Y, 1 = -Y, 2/3/5 = sides, 4 = +Z.
+    ///
+    /// Face 4 is the interim front face: it uses [`Self::front`] when declared
+    /// and [`Self::side`] otherwise. Render code can keep calling this method;
+    /// a post-1.0 facing state should select the side explicitly instead.
     pub fn for_face(&self, face: u8) -> TextureId {
         match face {
             0 => self.top,
             1 => self.bottom,
+            4 => self.front_texture(),
             _ => self.side,
         }
     }
@@ -277,6 +496,16 @@ impl BlockType {
         self.hardness.is_finite()
     }
 
+    /// Whether this block is an ore.
+    ///
+    /// The interim catalogue marks ores by the `_ore` resource-id suffix, so a
+    /// pack can add `openblock:gold_ore` without an engine change. A real
+    /// `#c:ores` tag replaces this naming convention with the data-driven
+    /// content pipeline.
+    pub fn is_ore(&self) -> bool {
+        self.id.ends_with("_ore")
+    }
+
     /// Whether a held tool satisfies this block's tier requirement.
     fn tool_satisfies(&self, tool: Option<ToolSpec>) -> bool {
         let Some(preferred) = self.preferred_tool else {
@@ -313,6 +542,25 @@ pub struct Recipe {
     pub needs_table: bool,
 }
 
+/// One code-defined furnace smelting recipe.
+///
+/// This is a pure lookup table: furnace block state, fuel burn progress and the
+/// furnace UI are implemented by later host/client agents. One input item is
+/// consumed per smelt and the output is produced after
+/// [`SMELT_TICKS_PER_ITEM`] ticks of cooking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmeltRecipe {
+    /// Item consumed from the furnace input slot.
+    pub input: ItemId,
+    /// Item produced in the output slot.
+    pub output: ItemId,
+    /// Number of output items produced per smelt.
+    pub output_count: u8,
+}
+
+/// Ticks one item takes to smelt in a furnace (20 ticks/s).
+pub const SMELT_TICKS_PER_ITEM: u16 = 200;
+
 /// A frozen registry of block and item types for a session.
 #[derive(Debug, Clone)]
 pub struct Registry {
@@ -323,6 +571,10 @@ pub struct Registry {
     item_for_block: Vec<Option<ItemId>>,
     recipes: Vec<Recipe>,
     recipe_by_id: FxHashMap<&'static str, RecipeId>,
+    smelt_recipes: Vec<SmeltRecipe>,
+    smelt_by_input: FxHashMap<ItemId, usize>,
+    fuel_ticks: FxHashMap<ItemId, u16>,
+    mobs: Vec<MobSpec>,
 }
 
 /// Raw definition tuple used while building the base registry.
@@ -338,11 +590,13 @@ type BlockDef = (
     u8,
 );
 
-/// Resource ids whose item ids are frozen at their v0.0.7 values.
+/// Block resource ids whose item ids are frozen at their v0.0.7/v0.0.8 values.
 ///
-/// New blocks are appended after the v0.0.7 set, and their block items are
-/// appended after these items and the apple so existing item ids never move.
-const STABLE_ITEM_ORDER: [&str; 12] = [
+/// These fourteen block items occupy item ids 0..=10 (the eleven original
+/// block items) and ids 12..=14 after the apple. New blocks are appended after
+/// `openblock:crafting_table`; their block items are added after the frozen item
+/// catalogue at ids 47..=51 so no existing item id moves.
+const FROZEN_BLOCK_ITEMS: [&str; 14] = [
     "openblock:stone",
     "openblock:dirt",
     "openblock:grass",
@@ -354,7 +608,9 @@ const STABLE_ITEM_ORDER: [&str; 12] = [
     "openblock:gravel",
     "openblock:clay",
     "openblock:snow",
-    "openblock:apple",
+    "openblock:planks",
+    "openblock:cobblestone",
+    "openblock:crafting_table",
 ];
 
 /// Non-block items appended after the apple, in stable id order.
@@ -367,6 +623,7 @@ const NON_BLOCK_ITEMS: [(&str, u8, Option<ToolSpec>); 9] = [
             kind: ToolKind::Pickaxe,
             tier: 1,
             speed: 2.0,
+            attack_damage: 2.0,
             durability: 59,
         }),
     ),
@@ -377,6 +634,7 @@ const NON_BLOCK_ITEMS: [(&str, u8, Option<ToolSpec>); 9] = [
             kind: ToolKind::Axe,
             tier: 1,
             speed: 2.0,
+            attack_damage: 2.0,
             durability: 59,
         }),
     ),
@@ -387,6 +645,7 @@ const NON_BLOCK_ITEMS: [(&str, u8, Option<ToolSpec>); 9] = [
             kind: ToolKind::Shovel,
             tier: 1,
             speed: 2.0,
+            attack_damage: 2.0,
             durability: 59,
         }),
     ),
@@ -397,6 +656,7 @@ const NON_BLOCK_ITEMS: [(&str, u8, Option<ToolSpec>); 9] = [
             kind: ToolKind::Sword,
             tier: 1,
             speed: 1.0,
+            attack_damage: 4.0,
             durability: 59,
         }),
     ),
@@ -407,6 +667,7 @@ const NON_BLOCK_ITEMS: [(&str, u8, Option<ToolSpec>); 9] = [
             kind: ToolKind::Pickaxe,
             tier: 2,
             speed: 4.0,
+            attack_damage: 3.0,
             durability: 131,
         }),
     ),
@@ -417,6 +678,7 @@ const NON_BLOCK_ITEMS: [(&str, u8, Option<ToolSpec>); 9] = [
             kind: ToolKind::Axe,
             tier: 2,
             speed: 4.0,
+            attack_damage: 3.0,
             durability: 131,
         }),
     ),
@@ -427,6 +689,7 @@ const NON_BLOCK_ITEMS: [(&str, u8, Option<ToolSpec>); 9] = [
             kind: ToolKind::Shovel,
             tier: 2,
             speed: 4.0,
+            attack_damage: 3.0,
             durability: 131,
         }),
     ),
@@ -437,9 +700,337 @@ const NON_BLOCK_ITEMS: [(&str, u8, Option<ToolSpec>); 9] = [
             kind: ToolKind::Sword,
             tier: 2,
             speed: 1.0,
+            attack_damage: 5.0,
             durability: 131,
         }),
     ),
+];
+
+/// One code-defined non-block item in the v0.0.9 catalogue.
+struct NewItemDef {
+    id: &'static str,
+    max_stack: u8,
+    food: Option<u8>,
+    tool: Option<ToolSpec>,
+    armor: Option<ArmorSpec>,
+}
+
+/// `Some` tool statistics for a [`NewItemDef`].
+const fn tool_spec(kind: ToolKind, tier: u8, speed: f32, attack_damage: f32, durability: u16) -> Option<ToolSpec> {
+    Some(ToolSpec {
+        kind,
+        tier,
+        speed,
+        attack_damage,
+        durability,
+    })
+}
+
+/// `Some` armor statistics for a [`NewItemDef`].
+const fn armor_spec(slot: ArmorSlot, defense: u8, durability: u16) -> Option<ArmorSpec> {
+    Some(ArmorSpec {
+        slot,
+        defense,
+        durability,
+    })
+}
+
+/// New non-block items appended after the v0.0.8 tools, in stable id order.
+///
+/// These occupy item ids 24..=46. The block items for the five blocks appended
+/// after `crafting_table` occupy ids 47..=51.
+const NEW_ITEMS: [NewItemDef; 23] = [
+    NewItemDef {
+        id: "openblock:coal",
+        max_stack: 64,
+        food: None,
+        tool: None,
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:charcoal",
+        max_stack: 64,
+        food: None,
+        tool: None,
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:raw_iron",
+        max_stack: 64,
+        food: None,
+        tool: None,
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:iron_ingot",
+        max_stack: 64,
+        food: None,
+        tool: None,
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:raw_copper",
+        max_stack: 64,
+        food: None,
+        tool: None,
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:copper_ingot",
+        max_stack: 64,
+        food: None,
+        tool: None,
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:iron_pickaxe",
+        max_stack: 1,
+        food: None,
+        tool: tool_spec(ToolKind::Pickaxe, 3, 6.0, 4.0, 251),
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:iron_axe",
+        max_stack: 1,
+        food: None,
+        tool: tool_spec(ToolKind::Axe, 3, 6.0, 4.0, 251),
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:iron_shovel",
+        max_stack: 1,
+        food: None,
+        tool: tool_spec(ToolKind::Shovel, 3, 6.0, 4.0, 251),
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:iron_sword",
+        max_stack: 1,
+        food: None,
+        tool: tool_spec(ToolKind::Sword, 3, 1.0, 6.0, 251),
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:leather_helmet",
+        max_stack: 1,
+        food: None,
+        tool: None,
+        armor: armor_spec(ArmorSlot::Helmet, 1, 55),
+    },
+    NewItemDef {
+        id: "openblock:leather_chestplate",
+        max_stack: 1,
+        food: None,
+        tool: None,
+        armor: armor_spec(ArmorSlot::Chestplate, 3, 80),
+    },
+    NewItemDef {
+        id: "openblock:leather_leggings",
+        max_stack: 1,
+        food: None,
+        tool: None,
+        armor: armor_spec(ArmorSlot::Leggings, 2, 75),
+    },
+    NewItemDef {
+        id: "openblock:leather_boots",
+        max_stack: 1,
+        food: None,
+        tool: None,
+        armor: armor_spec(ArmorSlot::Boots, 1, 65),
+    },
+    NewItemDef {
+        id: "openblock:iron_helmet",
+        max_stack: 1,
+        food: None,
+        tool: None,
+        armor: armor_spec(ArmorSlot::Helmet, 2, 165),
+    },
+    NewItemDef {
+        id: "openblock:iron_chestplate",
+        max_stack: 1,
+        food: None,
+        tool: None,
+        armor: armor_spec(ArmorSlot::Chestplate, 6, 240),
+    },
+    NewItemDef {
+        id: "openblock:iron_leggings",
+        max_stack: 1,
+        food: None,
+        tool: None,
+        armor: armor_spec(ArmorSlot::Leggings, 5, 225),
+    },
+    NewItemDef {
+        id: "openblock:iron_boots",
+        max_stack: 1,
+        food: None,
+        tool: None,
+        armor: armor_spec(ArmorSlot::Boots, 2, 195),
+    },
+    NewItemDef {
+        id: "openblock:raw_beef",
+        max_stack: 64,
+        food: Some(3),
+        tool: None,
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:cooked_beef",
+        max_stack: 64,
+        food: Some(8),
+        tool: None,
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:raw_porkchop",
+        max_stack: 64,
+        food: Some(3),
+        tool: None,
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:cooked_porkchop",
+        max_stack: 64,
+        food: Some(8),
+        tool: None,
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:leather",
+        max_stack: 64,
+        food: None,
+        tool: None,
+        armor: None,
+    },
+];
+
+/// One name-resolved mob definition used to build [`Registry::base`].
+///
+/// Stats are copied verbatim into [`MobSpec`]; drop item names are resolved
+/// against the registry's item table so packs without an item omit the drop.
+struct MobDef {
+    kind: MobKind,
+    display_name: &'static str,
+    health: f32,
+    speed: f32,
+    hostile: bool,
+    width: f32,
+    height: f32,
+    drops: &'static [(&'static str, u8)],
+}
+
+/// The interim 1.0 mob catalogue, in stable [`MobKind`] order.
+///
+/// Passive animals drop their food plus leather; zombies deliberately drop
+/// nothing (they are the hostile combat target, not a resource). Counts are
+/// fixed rather than rolled: a kill always produces exactly this list.
+const MOB_DEFS: [MobDef; 5] = [
+    MobDef {
+        kind: MobKind::Cow,
+        display_name: "Cow",
+        health: 10.0,
+        speed: 1.4,
+        hostile: false,
+        width: 0.9,
+        height: 1.3,
+        drops: &[("openblock:raw_beef", 1), ("openblock:leather", 1)],
+    },
+    MobDef {
+        kind: MobKind::Pig,
+        display_name: "Pig",
+        health: 10.0,
+        speed: 1.4,
+        hostile: false,
+        width: 0.9,
+        height: 0.9,
+        drops: &[("openblock:raw_porkchop", 1)],
+    },
+    MobDef {
+        kind: MobKind::Sheep,
+        display_name: "Sheep",
+        health: 8.0,
+        speed: 1.4,
+        hostile: false,
+        width: 0.9,
+        height: 1.3,
+        drops: &[("openblock:leather", 1)],
+    },
+    MobDef {
+        kind: MobKind::Chicken,
+        display_name: "Chicken",
+        health: 4.0,
+        speed: 1.5,
+        hostile: false,
+        width: 0.4,
+        height: 0.7,
+        drops: &[],
+    },
+    MobDef {
+        kind: MobKind::Zombie,
+        display_name: "Zombie",
+        health: 20.0,
+        speed: 2.2,
+        hostile: true,
+        width: 0.6,
+        height: 1.8,
+        drops: &[],
+    },
+];
+
+/// One name-resolved smelting definition used to build [`Registry::base`].
+struct SmeltDef {
+    input: &'static str,
+    output: &'static str,
+    output_count: u8,
+}
+
+/// The interim furnace smelting table, in deterministic recipe order.
+///
+/// Glass is intentionally out of scope for 1.0, so `sand` is not smeltable.
+/// `cobblestone -> stone` is the one reversible-smelting convenience included
+/// in this slice.
+const BASE_SMELT_RECIPES: [SmeltDef; 6] = [
+    SmeltDef {
+        input: "openblock:raw_iron",
+        output: "openblock:iron_ingot",
+        output_count: 1,
+    },
+    SmeltDef {
+        input: "openblock:raw_copper",
+        output: "openblock:copper_ingot",
+        output_count: 1,
+    },
+    SmeltDef {
+        input: "openblock:log",
+        output: "openblock:charcoal",
+        output_count: 1,
+    },
+    SmeltDef {
+        input: "openblock:raw_beef",
+        output: "openblock:cooked_beef",
+        output_count: 1,
+    },
+    SmeltDef {
+        input: "openblock:raw_porkchop",
+        output: "openblock:cooked_porkchop",
+        output_count: 1,
+    },
+    SmeltDef {
+        input: "openblock:cobblestone",
+        output: "openblock:stone",
+        output_count: 1,
+    },
+];
+
+/// The interim fuel table: burn time in ticks.
+///
+/// One coal burns for 1,600 ticks, exactly eight 200-tick smelts. Planks and
+/// logs burn for 300 ticks (one and a half smelts) and sticks for 100 ticks.
+const BASE_FUELS: [(&str, u16); 5] = [
+    ("openblock:coal", 1_600),
+    ("openblock:charcoal", 1_600),
+    ("openblock:planks", 300),
+    ("openblock:stick", 100),
+    ("openblock:log", 300),
 ];
 
 /// One name-resolved recipe definition used to build [`Registry::base`].
@@ -451,7 +1042,7 @@ struct RecipeDef {
     needs_table: bool,
 }
 
-const BASE_RECIPES: [RecipeDef; 11] = [
+const BASE_RECIPES: [RecipeDef; 25] = [
     RecipeDef {
         id: "openblock:planks",
         name: "Planks",
@@ -529,13 +1120,111 @@ const BASE_RECIPES: [RecipeDef; 11] = [
         ingredients: &[("openblock:cobblestone", 2), ("openblock:stick", 1)],
         needs_table: true,
     },
+    RecipeDef {
+        id: "openblock:furnace",
+        name: "Furnace",
+        output: ("openblock:furnace", 1),
+        ingredients: &[("openblock:cobblestone", 8)],
+        needs_table: true,
+    },
+    RecipeDef {
+        id: "openblock:chest",
+        name: "Chest",
+        output: ("openblock:chest", 1),
+        ingredients: &[("openblock:planks", 8)],
+        needs_table: true,
+    },
+    RecipeDef {
+        id: "openblock:iron_pickaxe",
+        name: "Iron Pickaxe",
+        output: ("openblock:iron_pickaxe", 1),
+        ingredients: &[("openblock:iron_ingot", 3), ("openblock:stick", 2)],
+        needs_table: true,
+    },
+    RecipeDef {
+        id: "openblock:iron_axe",
+        name: "Iron Axe",
+        output: ("openblock:iron_axe", 1),
+        ingredients: &[("openblock:iron_ingot", 3), ("openblock:stick", 2)],
+        needs_table: true,
+    },
+    RecipeDef {
+        id: "openblock:iron_shovel",
+        name: "Iron Shovel",
+        output: ("openblock:iron_shovel", 1),
+        ingredients: &[("openblock:iron_ingot", 1), ("openblock:stick", 2)],
+        needs_table: true,
+    },
+    RecipeDef {
+        id: "openblock:iron_sword",
+        name: "Iron Sword",
+        output: ("openblock:iron_sword", 1),
+        ingredients: &[("openblock:iron_ingot", 2), ("openblock:stick", 1)],
+        needs_table: true,
+    },
+    RecipeDef {
+        id: "openblock:leather_helmet",
+        name: "Leather Helmet",
+        output: ("openblock:leather_helmet", 1),
+        ingredients: &[("openblock:leather", 5)],
+        needs_table: true,
+    },
+    RecipeDef {
+        id: "openblock:leather_chestplate",
+        name: "Leather Chestplate",
+        output: ("openblock:leather_chestplate", 1),
+        ingredients: &[("openblock:leather", 8)],
+        needs_table: true,
+    },
+    RecipeDef {
+        id: "openblock:leather_leggings",
+        name: "Leather Leggings",
+        output: ("openblock:leather_leggings", 1),
+        ingredients: &[("openblock:leather", 7)],
+        needs_table: true,
+    },
+    RecipeDef {
+        id: "openblock:leather_boots",
+        name: "Leather Boots",
+        output: ("openblock:leather_boots", 1),
+        ingredients: &[("openblock:leather", 4)],
+        needs_table: true,
+    },
+    RecipeDef {
+        id: "openblock:iron_helmet",
+        name: "Iron Helmet",
+        output: ("openblock:iron_helmet", 1),
+        ingredients: &[("openblock:iron_ingot", 5)],
+        needs_table: true,
+    },
+    RecipeDef {
+        id: "openblock:iron_chestplate",
+        name: "Iron Chestplate",
+        output: ("openblock:iron_chestplate", 1),
+        ingredients: &[("openblock:iron_ingot", 8)],
+        needs_table: true,
+    },
+    RecipeDef {
+        id: "openblock:iron_leggings",
+        name: "Iron Leggings",
+        output: ("openblock:iron_leggings", 1),
+        ingredients: &[("openblock:iron_ingot", 7)],
+        needs_table: true,
+    },
+    RecipeDef {
+        id: "openblock:iron_boots",
+        name: "Iron Boots",
+        output: ("openblock:iron_boots", 1),
+        ingredients: &[("openblock:iron_ingot", 4)],
+        needs_table: true,
+    },
 ];
 
 impl Registry {
     /// Builds the first-party base block set.
     pub fn base() -> Self {
         use textures as tex;
-        let defs: [BlockDef; 15] = [
+        let defs: [BlockDef; 20] = [
             (
                 "openblock:air",
                 [0.0, 0.0, 0.0],
@@ -701,6 +1390,66 @@ impl Registry {
                 Some(ToolKind::Axe),
                 0,
             ),
+            (
+                "openblock:coal_ore",
+                [0.25, 0.25, 0.27],
+                true,
+                true,
+                false,
+                BlockTextures::all(tex::COAL_ORE),
+                3.0,
+                Some(ToolKind::Pickaxe),
+                1,
+            ),
+            (
+                "openblock:iron_ore",
+                [0.64, 0.56, 0.47],
+                true,
+                true,
+                false,
+                BlockTextures::all(tex::IRON_ORE),
+                3.0,
+                Some(ToolKind::Pickaxe),
+                2,
+            ),
+            (
+                "openblock:copper_ore",
+                [0.66, 0.45, 0.32],
+                true,
+                true,
+                false,
+                BlockTextures::all(tex::COPPER_ORE),
+                3.0,
+                Some(ToolKind::Pickaxe),
+                2,
+            ),
+            (
+                "openblock:furnace",
+                [0.42, 0.42, 0.44],
+                true,
+                true,
+                false,
+                BlockTextures::fronted(
+                    tex::FURNACE_TOP,
+                    tex::FURNACE_SIDE,
+                    tex::FURNACE_TOP,
+                    tex::FURNACE_FRONT,
+                ),
+                3.5,
+                Some(ToolKind::Axe),
+                0,
+            ),
+            (
+                "openblock:chest",
+                [0.60, 0.42, 0.22],
+                true,
+                true,
+                false,
+                BlockTextures::fronted(tex::CHEST_TOP, tex::CHEST_SIDE, tex::CHEST_TOP, tex::CHEST_FRONT),
+                2.5,
+                Some(ToolKind::Axe),
+                0,
+            ),
         ];
         let blocks = defs
             .into_iter()
@@ -757,12 +1506,11 @@ impl Registry {
             }
         }
 
-        // Interim code-defined item catalogue. Block ids are append-only, so
-        // item ids must not shift when a new block is appended: the v0.0.7
-        // items keep their frozen positions, the apple stays at its v0.0.7 id,
-        // and only then do block items for newly appended blocks and the
-        // non-block items follow. Data-driven item packs will replace this
-        // derivation without changing the lookup API.
+        // Interim code-defined item catalogue. Item ids are append-only: the
+        // v0.0.7/v0.0.8 items keep their frozen positions (0..=23), the v0.0.9
+        // non-block items occupy 24..=46, and the block items for the five
+        // blocks appended after `crafting_table` occupy 47..=51. Data-driven
+        // item packs replace this derivation without changing the lookup API.
         fn add_block_item(
             blocks: &[BlockType],
             block_index: usize,
@@ -771,7 +1519,7 @@ impl Registry {
             item_for_block: &mut [Option<ItemId>],
         ) {
             let block = &blocks[block_index];
-            if block.id == pack::AIR_ID || item_for_block[block_index].is_some() {
+            if block.id == pack::AIR_ID || item_for_block[block_index].is_some() || item_by_id.contains_key(block.id) {
                 return;
             }
             let item_id = ItemId(items.len() as u16);
@@ -780,18 +1528,43 @@ impl Registry {
                 block: Some(BlockId(block_index as u16)),
                 food: None,
                 tool: None,
+                armor: None,
                 max_stack: MAX_ITEM_STACK,
             });
             item_by_id.insert(block.id, item_id);
             item_for_block[block_index] = Some(item_id);
         }
 
-        let mut items: Vec<ItemType> = Vec::with_capacity(blocks.len() + NON_BLOCK_ITEMS.len());
+        fn add_item(
+            items: &mut Vec<ItemType>,
+            item_by_id: &mut FxHashMap<&'static str, ItemId>,
+            id: &'static str,
+            food: Option<u8>,
+            tool: Option<ToolSpec>,
+            armor: Option<ArmorSpec>,
+            max_stack: u8,
+        ) {
+            if item_by_id.contains_key(id) {
+                return;
+            }
+            item_by_id.insert(id, ItemId(items.len() as u16));
+            items.push(ItemType {
+                id,
+                block: None,
+                food,
+                tool,
+                armor,
+                max_stack,
+            });
+        }
+
+        let capacity = blocks.len() + NON_BLOCK_ITEMS.len() + NEW_ITEMS.len();
+        let mut items: Vec<ItemType> = Vec::with_capacity(capacity);
         let mut item_by_id = FxHashMap::default();
         let mut item_for_block = vec![None; blocks.len()];
 
-        // Frozen v0.0.7 positions: the eleven original block items, then apple.
-        for name in STABLE_ITEM_ORDER.iter().filter(|name| **name != "openblock:apple") {
+        // Item ids 0..=10: the eleven original v0.0.7 block items.
+        for name in &FROZEN_BLOCK_ITEMS[..11] {
             if let Some(block_index) = by_id.get(name) {
                 add_block_item(
                     &blocks,
@@ -802,44 +1575,62 @@ impl Registry {
                 );
             }
         }
-        // A pack may legitimately define a block with this resource id; in that
-        // case the block item wins and the interim apple is omitted rather than
-        // making the registry invalid.
+        // Item id 11: the apple. A pack may legitimately define a block with
+        // this resource id; in that case the block item wins and the interim
+        // apple is omitted rather than making the registry invalid.
         const APPLE_ID: &str = "openblock:apple";
-        if !by_id.contains_key(APPLE_ID) {
-            item_by_id.insert(APPLE_ID, ItemId(items.len() as u16));
-            items.push(ItemType {
-                id: APPLE_ID,
-                block: None,
-                food: Some(6),
-                tool: None,
-                max_stack: 16,
-            });
+        if let Some(block_index) = by_id.get(APPLE_ID) {
+            add_block_item(
+                &blocks,
+                block_index.0 as usize,
+                &mut items,
+                &mut item_by_id,
+                &mut item_for_block,
+            );
+        } else {
+            add_item(&mut items, &mut item_by_id, APPLE_ID, Some(6), None, None, 16);
+        }
+        // Item ids 12..=14: the v0.0.8 block items.
+        for name in &FROZEN_BLOCK_ITEMS[11..] {
+            if let Some(block_index) = by_id.get(name) {
+                add_block_item(
+                    &blocks,
+                    block_index.0 as usize,
+                    &mut items,
+                    &mut item_by_id,
+                    &mut item_for_block,
+                );
+            }
         }
 
-        // Block items for blocks appended after the frozen v0.0.7 catalogue.
+        // Item ids 15..=23: the v0.0.8 non-block items.
+        for (name, max_stack, tool) in NON_BLOCK_ITEMS {
+            add_item(&mut items, &mut item_by_id, name, None, tool, None, max_stack);
+        }
+
+        // Item ids 24..=46: the v0.0.9 ores/metals, iron tools, armor and food.
+        for def in NEW_ITEMS {
+            add_item(
+                &mut items,
+                &mut item_by_id,
+                def.id,
+                def.food,
+                def.tool,
+                def.armor,
+                def.max_stack,
+            );
+        }
+
+        // Item ids 47..=51: block items for blocks appended after the frozen
+        // catalogue (the five new blocks in the base pack), plus any extra
+        // custom-pack blocks in deterministic block-index order.
         for block_index in 0..blocks.len() {
             add_block_item(&blocks, block_index, &mut items, &mut item_by_id, &mut item_for_block);
         }
 
-        // New non-block items, appended after the apple.
-        for (name, max_stack, tool) in NON_BLOCK_ITEMS {
-            if item_by_id.contains_key(name) {
-                continue;
-            }
-            item_by_id.insert(name, ItemId(items.len() as u16));
-            items.push(ItemType {
-                id: name,
-                block: None,
-                food: None,
-                tool,
-                max_stack,
-            });
-        }
-
         // Resolve the base recipe table against this registry. A custom pack
         // that lacks an ingredient or output simply omits that recipe; the base
-        // pack contains everything, so all eleven are present there.
+        // pack contains everything, so all 25 are present there.
         let mut recipes = Vec::with_capacity(BASE_RECIPES.len());
         let mut recipe_by_id = FxHashMap::default();
         for def in BASE_RECIPES {
@@ -876,6 +1667,53 @@ impl Registry {
             recipe_by_id.insert(def.id, recipe_id);
         }
 
+        // Resolve the interim smelting and fuel tables. Like recipes, entries
+        // whose item is absent from a custom pack are simply omitted.
+        let mut smelt_recipes = Vec::with_capacity(BASE_SMELT_RECIPES.len());
+        let mut smelt_by_input = FxHashMap::default();
+        for def in BASE_SMELT_RECIPES {
+            let (Some(&input), Some(&output)) = (item_by_id.get(def.input), item_by_id.get(def.output)) else {
+                continue;
+            };
+            smelt_by_input.insert(input, smelt_recipes.len());
+            smelt_recipes.push(SmeltRecipe {
+                input,
+                output,
+                output_count: def.output_count,
+            });
+        }
+        let mut fuel_ticks = FxHashMap::default();
+        for (name, ticks) in BASE_FUELS {
+            if let Some(&item) = item_by_id.get(name) {
+                fuel_ticks.insert(item, ticks);
+            }
+        }
+
+        // Resolve the interim mob catalogue against this registry. Every base
+        // kind is always present; only a drop whose item is absent from a
+        // custom pack is omitted, so a pack cannot make `mob(kind)` panic.
+        let mut mobs = Vec::with_capacity(MOB_DEFS.len());
+        for def in MOB_DEFS {
+            let mut drops: Vec<(ItemId, u8)> = Vec::with_capacity(def.drops.len());
+            for (name, count) in def.drops {
+                if let Some(&item) = item_by_id.get(*name) {
+                    drops.push((item, *count));
+                }
+            }
+            let leaked: &'static [(ItemId, u8)] = Box::leak(drops.into_boxed_slice());
+            mobs.push(MobSpec {
+                kind: def.kind,
+                display_name: def.display_name,
+                health: def.health,
+                speed: def.speed,
+                hostile: def.hostile,
+                width: def.width,
+                height: def.height,
+                drops: leaked,
+            });
+        }
+        debug_assert_eq!(mobs.len(), MobKind::ALL.len());
+
         Ok(Self {
             blocks,
             by_id,
@@ -884,6 +1722,10 @@ impl Registry {
             item_for_block,
             recipes,
             recipe_by_id,
+            smelt_recipes,
+            smelt_by_input,
+            fuel_ticks,
+            mobs,
         })
     }
 
@@ -921,6 +1763,50 @@ impl Registry {
         self.items.len()
     }
 
+    /// Iterates over the interim mob catalogue in stable [`MobKind`] order.
+    pub fn mobs(&self) -> impl Iterator<Item = &MobSpec> + '_ {
+        self.mobs.iter()
+    }
+
+    /// The definition for one mob kind.
+    ///
+    /// The base registry always contains every [`MobKind`]; a custom block pack
+    /// cannot remove a kind, only individual drop items. The table is indexed by
+    /// [`MobKind::index`].
+    pub fn mob(&self, kind: MobKind) -> &MobSpec {
+        &self.mobs[kind.index()]
+    }
+
+    /// The definition for a namespaced mob id (`openblock:cow`, ...).
+    pub fn mob_by_name(&self, name: &str) -> Option<&MobSpec> {
+        MobKind::from_name(name).map(|kind| self.mob(kind))
+    }
+
+    /// Parses a namespaced mob id into a kind.
+    ///
+    /// This is the save-facing lookup: unknown ids return `None` and the mob
+    /// loader skips the line rather than inventing a kind.
+    pub fn mob_id(&self, name: &str) -> Option<MobKind> {
+        MobKind::from_name(name)
+    }
+
+    /// Number of registered mob kinds.
+    pub fn mob_len(&self) -> usize {
+        self.mobs.len()
+    }
+
+    /// Base melee damage for a selected item, or hand damage.
+    ///
+    /// A hand (`None`) and every non-tool item deal `1.0` health point. A tool
+    /// deals its [`ToolSpec::attack_damage`], so a sword is best and a pickaxe,
+    /// axe or shovel still improves on a fist. An out-of-range id also falls
+    /// back to `1.0` instead of panicking.
+    pub fn attack_damage(&self, held: Option<ItemId>) -> f32 {
+        held.filter(|item| (item.0 as usize) < self.items.len())
+            .and_then(|item| self.items[item.0 as usize].tool)
+            .map_or(1.0, |spec| spec.attack_damage)
+    }
+
     /// Iterates over all item types with their ids.
     pub fn items(&self) -> impl Iterator<Item = (ItemId, &ItemType)> + '_ {
         self.items.iter().enumerate().map(|(i, item)| (ItemId(i as u16), item))
@@ -947,6 +1833,47 @@ impl Registry {
     /// Number of registered recipes.
     pub fn recipe_len(&self) -> usize {
         self.recipes.len()
+    }
+
+    /// Iterates over the interim furnace smelting table in deterministic order.
+    pub fn smelt_recipes(&self) -> impl Iterator<Item = &SmeltRecipe> + '_ {
+        self.smelt_recipes.iter()
+    }
+
+    /// The smelting result for `input`, if the item is smeltable.
+    ///
+    /// Returns the output item and count; cooking progress and the furnace
+    /// block state belong to the host agent.
+    pub fn smelt_recipe_for(&self, input: ItemId) -> Option<(ItemId, u8)> {
+        self.smelt_by_input
+            .get(&input)
+            .map(|&index| (self.smelt_recipes[index].output, self.smelt_recipes[index].output_count))
+    }
+
+    /// The output item smelted from `input`, ignoring the output count.
+    ///
+    /// Convenience for recipe hints and UI; use [`Self::smelt_recipe_for`] when
+    /// the count matters.
+    pub fn smelt_result_for(&self, input: ItemId) -> Option<ItemId> {
+        self.smelt_recipe_for(input).map(|(output, _)| output)
+    }
+
+    /// Burn time of `item` as furnace fuel, in ticks (`20` ticks/s).
+    ///
+    /// One item smelts per [`SMELT_TICKS_PER_ITEM`] ticks, so one coal
+    /// (`1_600`) is worth eight smelts.
+    pub fn fuel_ticks(&self, item: ItemId) -> Option<u16> {
+        self.fuel_ticks.get(&item).copied()
+    }
+
+    /// Whether `item` is registered as a furnace fuel.
+    pub fn is_fuel(&self, item: ItemId) -> bool {
+        self.fuel_ticks.contains_key(&item)
+    }
+
+    /// Whether `item` has a furnace smelting recipe.
+    pub fn is_smeltable(&self, item: ItemId) -> bool {
+        self.smelt_by_input.contains_key(&item)
     }
 
     /// The mining-speed multiplier for `block` with `held` selected.
@@ -1002,10 +1929,11 @@ impl Registry {
     /// tool-tier check.
     ///
     /// Most blocks drop themselves once; stone drops cobblestone, grass drops
-    /// dirt, leaves drop nothing here (the Host adds a deterministic rare
-    /// apple), and unbreakable blocks (water, bedrock) and air drop nothing. A
-    /// block loot table in the content pack will replace these hard-coded rules
-    /// later; callers must still apply [`Registry::can_drop`] for tiering.
+    /// dirt, ores drop their raw/coal item, leaves drop nothing here (the Host
+    /// adds a deterministic rare apple), and unbreakable blocks (water, bedrock)
+    /// and air drop nothing. A block loot table in the content pack will replace
+    /// these hard-coded rules later; callers must still apply
+    /// [`Registry::can_drop`] for tiering.
     pub fn block_drop(&self, block: BlockId) -> Option<(ItemId, u8)> {
         let block_type = self.block(block);
         if block == BlockId::AIR || !block_type.breakable() {
@@ -1018,6 +1946,18 @@ impl Registry {
                 .map(|item| (item, 1)),
             "openblock:grass" => self.item_id("openblock:dirt").map(|item| (item, 1)),
             "openblock:leaves" => None,
+            "openblock:coal_ore" => self
+                .item_id("openblock:coal")
+                .or_else(|| self.item_for_block(block))
+                .map(|item| (item, 1)),
+            "openblock:iron_ore" => self
+                .item_id("openblock:raw_iron")
+                .or_else(|| self.item_for_block(block))
+                .map(|item| (item, 1)),
+            "openblock:copper_ore" => self
+                .item_id("openblock:raw_copper")
+                .or_else(|| self.item_for_block(block))
+                .map(|item| (item, 1)),
             _ => self.item_for_block(block).map(|item| (item, 1)),
         }
     }
@@ -1054,13 +1994,85 @@ mod tests {
         assert_eq!(reg.id("openblock:grass"), Some(BlockId(3)));
         assert!(reg.block(BlockId(3)).opaque);
         assert!(reg.block(reg.id("openblock:water").unwrap()).fluid);
-        assert_eq!(reg.len(), 15);
+        assert_eq!(reg.len(), 20);
         assert_eq!(reg.block(reg.id("openblock:bedrock").unwrap()).hardness, f32::INFINITY);
         assert!(!reg.block(reg.id("openblock:bedrock").unwrap()).breakable());
         assert_eq!(reg.block(reg.id("openblock:stone").unwrap()).hardness, 1.5);
         assert_eq!(reg.id("openblock:planks"), Some(BlockId(12)));
         assert_eq!(reg.id("openblock:cobblestone"), Some(BlockId(13)));
         assert_eq!(reg.id("openblock:crafting_table"), Some(BlockId(14)));
+        assert_eq!(reg.id("openblock:coal_ore"), Some(BlockId(15)));
+        assert_eq!(reg.id("openblock:iron_ore"), Some(BlockId(16)));
+        assert_eq!(reg.id("openblock:copper_ore"), Some(BlockId(17)));
+        assert_eq!(reg.id("openblock:furnace"), Some(BlockId(18)));
+        assert_eq!(reg.id("openblock:chest"), Some(BlockId(19)));
+    }
+
+    #[test]
+    fn new_ore_and_station_blocks_have_properties() {
+        let reg = Registry::base();
+        let block = |name: &str| reg.block(reg.id(name).unwrap());
+        let pickaxe = Some(ToolKind::Pickaxe);
+
+        for (name, texture, tier) in [
+            ("openblock:coal_ore", textures::COAL_ORE, 1),
+            ("openblock:iron_ore", textures::IRON_ORE, 2),
+            ("openblock:copper_ore", textures::COPPER_ORE, 2),
+        ] {
+            let ore = block(name);
+            assert_eq!(ore.hardness, 3.0, "{name}");
+            assert!(ore.solid && ore.opaque && !ore.fluid && ore.breakable(), "{name}");
+            assert_eq!(ore.preferred_tool, pickaxe, "{name}");
+            assert_eq!(ore.required_tier, tier, "{name}");
+            assert_eq!(ore.textures, BlockTextures::all(texture), "{name}");
+            assert!(ore.is_ore(), "{name}");
+            assert_eq!(ore.textures.for_face(4), texture, "{name}");
+        }
+
+        let furnace = block("openblock:furnace");
+        assert_eq!(furnace.hardness, 3.5);
+        assert!(furnace.solid && furnace.opaque && furnace.breakable());
+        assert_eq!(furnace.preferred_tool, Some(ToolKind::Axe));
+        assert_eq!(furnace.required_tier, 0);
+        assert!(!furnace.is_ore());
+        assert_eq!(
+            furnace.textures,
+            BlockTextures::fronted(
+                textures::FURNACE_TOP,
+                textures::FURNACE_SIDE,
+                textures::FURNACE_TOP,
+                textures::FURNACE_FRONT
+            )
+        );
+        assert_eq!(furnace.textures.for_face(0), textures::FURNACE_TOP);
+        assert_eq!(furnace.textures.for_face(1), textures::FURNACE_TOP);
+        for side in [2, 3, 5] {
+            assert_eq!(furnace.textures.for_face(side), textures::FURNACE_SIDE);
+        }
+        assert_eq!(furnace.textures.for_face(4), textures::FURNACE_FRONT);
+        assert_eq!(furnace.textures.front, Some(textures::FURNACE_FRONT));
+
+        let chest = block("openblock:chest");
+        assert_eq!(chest.hardness, 2.5);
+        assert!(chest.solid && chest.opaque && chest.breakable());
+        assert_eq!(chest.preferred_tool, Some(ToolKind::Axe));
+        assert_eq!(chest.required_tier, 0);
+        assert_eq!(
+            chest.textures,
+            BlockTextures::fronted(
+                textures::CHEST_TOP,
+                textures::CHEST_SIDE,
+                textures::CHEST_TOP,
+                textures::CHEST_FRONT
+            )
+        );
+        assert_eq!(chest.textures.for_face(4), textures::CHEST_FRONT);
+
+        // Blocks without a front keep using their side texture on +Z.
+        let plain = block("openblock:stone");
+        assert_eq!(plain.textures.front, None);
+        assert_eq!(plain.textures.for_face(4), textures::STONE);
+        assert_eq!(plain.textures.front_texture(), textures::STONE);
     }
 
     #[test]
@@ -1159,11 +2171,29 @@ mod tests {
             }
         }
         assert_eq!(textures::NAMES.len(), textures::COUNT);
-        assert_eq!(textures::COUNT, 18);
+        assert_eq!(textures::COUNT, 27);
         assert_eq!(textures::NAMES[14], "planks");
         assert_eq!(textures::NAMES[15], "cobblestone");
         assert_eq!(textures::NAMES[16], "crafting_table_top");
         assert_eq!(textures::NAMES[17], "crafting_table_side");
+        assert_eq!(textures::NAMES[18], "coal_ore");
+        assert_eq!(textures::NAMES[19], "iron_ore");
+        assert_eq!(textures::NAMES[20], "copper_ore");
+        assert_eq!(textures::NAMES[21], "furnace_top");
+        assert_eq!(textures::NAMES[22], "furnace_side");
+        assert_eq!(textures::NAMES[23], "furnace_front");
+        assert_eq!(textures::NAMES[24], "chest_top");
+        assert_eq!(textures::NAMES[25], "chest_side");
+        assert_eq!(textures::NAMES[26], "chest_front");
+        assert_eq!(textures::COAL_ORE, TextureId(18));
+        assert_eq!(textures::IRON_ORE, TextureId(19));
+        assert_eq!(textures::COPPER_ORE, TextureId(20));
+        assert_eq!(textures::FURNACE_TOP, TextureId(21));
+        assert_eq!(textures::FURNACE_SIDE, TextureId(22));
+        assert_eq!(textures::FURNACE_FRONT, TextureId(23));
+        assert_eq!(textures::CHEST_TOP, TextureId(24));
+        assert_eq!(textures::CHEST_SIDE, TextureId(25));
+        assert_eq!(textures::CHEST_FRONT, TextureId(26));
         let mut names: Vec<&str> = textures::NAMES.to_vec();
         names.sort_unstable();
         names.dedup();
@@ -1182,9 +2212,10 @@ mod tests {
     #[test]
     fn item_ids_are_stable_and_unique() {
         let reg = Registry::base();
-        // v0.0.7 item ids are frozen: eleven block items, then apple. New block
-        // items and non-block items are appended after the apple.
-        assert_eq!(reg.item_len(), 24);
+        // v0.0.7/v0.0.8 item ids are frozen: eleven block items, the apple,
+        // three block items, then the stick and eight tools. v0.0.9 appends 23
+        // non-block items at 24..=46 and five block items at 47..=51.
+        assert_eq!(reg.item_len(), 52);
         assert_eq!(reg.item_id("openblock:stone"), Some(ItemId(0)));
         assert_eq!(reg.item_id("openblock:dirt"), Some(ItemId(1)));
         assert_eq!(reg.item_id("openblock:grass"), Some(ItemId(2)));
@@ -1196,6 +2227,56 @@ mod tests {
         assert_eq!(reg.item_id("openblock:stick"), Some(ItemId(15)));
         assert_eq!(reg.item_id("openblock:wooden_pickaxe"), Some(ItemId(16)));
         assert_eq!(reg.item_id("openblock:stone_sword"), Some(ItemId(23)));
+        assert_eq!(reg.item_id("openblock:coal"), Some(ItemId(24)));
+        assert_eq!(reg.item_id("openblock:charcoal"), Some(ItemId(25)));
+        assert_eq!(reg.item_id("openblock:raw_iron"), Some(ItemId(26)));
+        assert_eq!(reg.item_id("openblock:iron_ingot"), Some(ItemId(27)));
+        assert_eq!(reg.item_id("openblock:raw_copper"), Some(ItemId(28)));
+        assert_eq!(reg.item_id("openblock:copper_ingot"), Some(ItemId(29)));
+        assert_eq!(reg.item_id("openblock:iron_pickaxe"), Some(ItemId(30)));
+        assert_eq!(reg.item_id("openblock:iron_sword"), Some(ItemId(33)));
+        assert_eq!(reg.item_id("openblock:leather_helmet"), Some(ItemId(34)));
+        assert_eq!(reg.item_id("openblock:leather_boots"), Some(ItemId(37)));
+        assert_eq!(reg.item_id("openblock:iron_helmet"), Some(ItemId(38)));
+        assert_eq!(reg.item_id("openblock:iron_boots"), Some(ItemId(41)));
+        assert_eq!(reg.item_id("openblock:raw_beef"), Some(ItemId(42)));
+        assert_eq!(reg.item_id("openblock:cooked_porkchop"), Some(ItemId(45)));
+        assert_eq!(reg.item_id("openblock:leather"), Some(ItemId(46)));
+        assert_eq!(reg.item_id("openblock:coal_ore"), Some(ItemId(47)));
+        assert_eq!(reg.item_id("openblock:iron_ore"), Some(ItemId(48)));
+        assert_eq!(reg.item_id("openblock:copper_ore"), Some(ItemId(49)));
+        assert_eq!(reg.item_id("openblock:furnace"), Some(ItemId(50)));
+        assert_eq!(reg.item_id("openblock:chest"), Some(ItemId(51)));
+
+        // The v0.0.9 non-block item ids 24..=46 are frozen in this exact order.
+        let appended = [
+            "openblock:coal",
+            "openblock:charcoal",
+            "openblock:raw_iron",
+            "openblock:iron_ingot",
+            "openblock:raw_copper",
+            "openblock:copper_ingot",
+            "openblock:iron_pickaxe",
+            "openblock:iron_axe",
+            "openblock:iron_shovel",
+            "openblock:iron_sword",
+            "openblock:leather_helmet",
+            "openblock:leather_chestplate",
+            "openblock:leather_leggings",
+            "openblock:leather_boots",
+            "openblock:iron_helmet",
+            "openblock:iron_chestplate",
+            "openblock:iron_leggings",
+            "openblock:iron_boots",
+            "openblock:raw_beef",
+            "openblock:cooked_beef",
+            "openblock:raw_porkchop",
+            "openblock:cooked_porkchop",
+            "openblock:leather",
+        ];
+        for (offset, name) in appended.iter().enumerate() {
+            assert_eq!(reg.item_id(name), Some(ItemId(24 + offset as u16)), "{name}");
+        }
 
         let mut seen = std::collections::BTreeSet::new();
         for (id, item) in reg.items() {
@@ -1217,6 +2298,7 @@ mod tests {
         assert_eq!(apple.block(), None);
         assert_eq!(apple.max_stack, 16);
         assert!(!apple.is_tool());
+        assert!(!apple.is_armor());
         assert!(!apple.id.contains("air"));
     }
 
@@ -1246,6 +2328,7 @@ mod tests {
                 kind: ToolKind::Pickaxe,
                 tier: 1,
                 speed: 2.0,
+                attack_damage: 2.0,
                 durability: 59
             })
         );
@@ -1255,6 +2338,7 @@ mod tests {
                 kind: ToolKind::Pickaxe,
                 tier: 2,
                 speed: 4.0,
+                attack_damage: 3.0,
                 durability: 131
             })
         );
@@ -1283,6 +2367,187 @@ mod tests {
         assert_eq!(ToolKind::Sword.name(), "sword");
     }
 
+    #[test]
+    fn iron_tools_have_stable_stats() {
+        let reg = Registry::base();
+        let item = |name: &str| reg.item(name_id(&reg, name));
+        for (name, kind, speed) in [
+            ("openblock:iron_pickaxe", ToolKind::Pickaxe, 6.0),
+            ("openblock:iron_axe", ToolKind::Axe, 6.0),
+            ("openblock:iron_shovel", ToolKind::Shovel, 6.0),
+            ("openblock:iron_sword", ToolKind::Sword, 1.0),
+        ] {
+            let tool = item(name);
+            assert_eq!(tool.max_stack, 1, "{name}");
+            assert!(tool.is_tool(), "{name}");
+            assert!(!tool.is_armor(), "{name}");
+            assert_eq!(tool.block, None, "{name}");
+            assert_eq!(
+                tool.tool,
+                Some(ToolSpec {
+                    kind,
+                    tier: 3,
+                    speed,
+                    attack_damage: if kind == ToolKind::Sword { 6.0 } else { 4.0 },
+                    durability: 251
+                }),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn armor_items_have_stable_stats() {
+        let reg = Registry::base();
+        let item = |name: &str| reg.item(name_id(&reg, name));
+        let expected = [
+            ("openblock:leather_helmet", ArmorSlot::Helmet, 1, 55),
+            ("openblock:leather_chestplate", ArmorSlot::Chestplate, 3, 80),
+            ("openblock:leather_leggings", ArmorSlot::Leggings, 2, 75),
+            ("openblock:leather_boots", ArmorSlot::Boots, 1, 65),
+            ("openblock:iron_helmet", ArmorSlot::Helmet, 2, 165),
+            ("openblock:iron_chestplate", ArmorSlot::Chestplate, 6, 240),
+            ("openblock:iron_leggings", ArmorSlot::Leggings, 5, 225),
+            ("openblock:iron_boots", ArmorSlot::Boots, 2, 195),
+        ];
+        for (name, slot, defense, durability) in expected {
+            let armor = item(name);
+            assert_eq!(armor.max_stack, 1, "{name}");
+            assert!(armor.is_armor(), "{name}");
+            assert!(!armor.is_tool(), "{name}");
+            assert!(!armor.edible(), "{name}");
+            assert_eq!(armor.block, None, "{name}");
+            assert_eq!(
+                armor.armor,
+                Some(ArmorSpec {
+                    slot,
+                    defense,
+                    durability
+                }),
+                "{name}"
+            );
+        }
+        assert_eq!(ArmorSlot::Helmet.name(), "helmet");
+        assert_eq!(ArmorSlot::Chestplate.name(), "chestplate");
+        assert_eq!(ArmorSlot::Leggings.name(), "leggings");
+        assert_eq!(ArmorSlot::Boots.name(), "boots");
+    }
+
+    #[test]
+    fn animal_food_items_are_edible() {
+        let reg = Registry::base();
+        for (name, food) in [
+            ("openblock:raw_beef", 3),
+            ("openblock:cooked_beef", 8),
+            ("openblock:raw_porkchop", 3),
+            ("openblock:cooked_porkchop", 8),
+        ] {
+            let item = reg.item(name_id(&reg, name));
+            assert_eq!(item.food, Some(food), "{name}");
+            assert!(item.edible(), "{name}");
+            assert_eq!(item.max_stack, 64, "{name}");
+            assert_eq!(item.block, None, "{name}");
+            assert!(!item.is_tool() && !item.is_armor(), "{name}");
+        }
+        let leather = reg.item(name_id(&reg, "openblock:leather"));
+        assert_eq!(leather.food, None);
+        assert_eq!(leather.max_stack, 64);
+        assert!(!leather.edible() && !leather.is_tool() && !leather.is_armor());
+    }
+
+    #[test]
+    fn smelting_and_fuel_tables_are_stable() {
+        let reg = Registry::base();
+        let item = |name: &str| name_id(&reg, name);
+        assert_eq!(reg.smelt_recipes().count(), 6);
+        assert_eq!(SMELT_TICKS_PER_ITEM, 200);
+
+        let expected = [
+            ("openblock:raw_iron", "openblock:iron_ingot", 1),
+            ("openblock:raw_copper", "openblock:copper_ingot", 1),
+            ("openblock:log", "openblock:charcoal", 1),
+            ("openblock:raw_beef", "openblock:cooked_beef", 1),
+            ("openblock:raw_porkchop", "openblock:cooked_porkchop", 1),
+            ("openblock:cobblestone", "openblock:stone", 1),
+        ];
+        for (input, output, count) in expected {
+            assert_eq!(
+                reg.smelt_recipe_for(item(input)),
+                Some((item(output), count)),
+                "{input}"
+            );
+            assert_eq!(reg.smelt_result_for(item(input)), Some(item(output)));
+            assert!(reg.is_smeltable(item(input)));
+        }
+
+        // Sand/glass is explicitly out of scope for 1.0.
+        assert_eq!(reg.smelt_recipe_for(item("openblock:sand")), None);
+        assert!(!reg.is_smeltable(item("openblock:sand")));
+        assert_eq!(reg.smelt_result_for(ItemId(999)), None);
+
+        assert_eq!(reg.fuel_ticks(item("openblock:coal")), Some(1_600));
+        assert_eq!(reg.fuel_ticks(item("openblock:charcoal")), Some(1_600));
+        assert_eq!(reg.fuel_ticks(item("openblock:planks")), Some(300));
+        assert_eq!(reg.fuel_ticks(item("openblock:stick")), Some(100));
+        assert_eq!(reg.fuel_ticks(item("openblock:log")), Some(300));
+        assert_eq!(reg.fuel_ticks(item("openblock:apple")), None);
+        assert_eq!(reg.fuel_ticks(ItemId(999)), None);
+        assert!(reg.is_fuel(item("openblock:coal")));
+        assert!(!reg.is_fuel(item("openblock:apple")));
+
+        // One coal is exactly eight smelts.
+        assert_eq!(
+            reg.fuel_ticks(item("openblock:coal")).unwrap() / SMELT_TICKS_PER_ITEM,
+            8
+        );
+    }
+
+    #[test]
+    fn ore_tiers_control_drops_and_mining_speed() {
+        let reg = Registry::base();
+        let item = |name: &str| name_id(&reg, name);
+        let block = |name: &str| reg.id(name).unwrap();
+        let wood_pick = item("openblock:wooden_pickaxe");
+        let stone_pick = item("openblock:stone_pickaxe");
+        let iron_pick = item("openblock:iron_pickaxe");
+
+        // Coal ore is harvestable with any pickaxe; hand mining drops nothing.
+        let coal_ore = block("openblock:coal_ore");
+        assert!(!reg.can_drop(coal_ore, None));
+        assert!(reg.can_drop(coal_ore, Some(wood_pick)));
+        assert_eq!(reg.mining_speed(coal_ore, Some(wood_pick)), 2.0);
+        assert_eq!(reg.mining_speed(coal_ore, Some(stone_pick)), 4.0);
+        assert_eq!(reg.mining_speed(coal_ore, Some(iron_pick)), 6.0);
+        assert_eq!(reg.effective_mining_seconds(coal_ore, Some(iron_pick)), 0.5);
+        assert_eq!(reg.block_drop(coal_ore), Some((item("openblock:coal"), 1)));
+
+        // Iron/copper ore require a tier-2 pickaxe.
+        for (ore, drop) in [
+            ("openblock:iron_ore", "openblock:raw_iron"),
+            ("openblock:copper_ore", "openblock:raw_copper"),
+        ] {
+            let block_id = block(ore);
+            assert!(!reg.can_drop(block_id, None), "{ore}");
+            assert!(!reg.can_drop(block_id, Some(wood_pick)), "{ore}");
+            assert!(reg.can_drop(block_id, Some(stone_pick)), "{ore}");
+            assert!(reg.can_drop(block_id, Some(iron_pick)), "{ore}");
+            assert!(!reg.can_drop(block_id, Some(item("openblock:stone_sword"))), "{ore}");
+            assert_eq!(reg.block_drop(block_id), Some((item(drop), 1)), "{ore}");
+        }
+
+        // Furnace and chest drop themselves.
+        for name in ["openblock:furnace", "openblock:chest"] {
+            let block_id = block(name);
+            assert!(reg.can_drop(block_id, None), "{name}");
+            assert_eq!(
+                reg.block_drop(block_id),
+                Some((reg.item_for_block(block_id).unwrap(), 1)),
+                "{name}"
+            );
+            assert!(!reg.block(block_id).is_ore(), "{name}");
+        }
+    }
+
     fn name_id(reg: &Registry, name: &str) -> ItemId {
         reg.item_id(name).unwrap_or_else(|| panic!("missing item {name}"))
     }
@@ -1290,7 +2555,7 @@ mod tests {
     #[test]
     fn recipe_table_is_stable_and_complete() {
         let reg = Registry::base();
-        assert_eq!(reg.recipe_len(), 11);
+        assert_eq!(reg.recipe_len(), 25);
         let expected = [
             "openblock:planks",
             "openblock:sticks",
@@ -1303,6 +2568,20 @@ mod tests {
             "openblock:stone_axe",
             "openblock:stone_shovel",
             "openblock:stone_sword",
+            "openblock:furnace",
+            "openblock:chest",
+            "openblock:iron_pickaxe",
+            "openblock:iron_axe",
+            "openblock:iron_shovel",
+            "openblock:iron_sword",
+            "openblock:leather_helmet",
+            "openblock:leather_chestplate",
+            "openblock:leather_leggings",
+            "openblock:leather_boots",
+            "openblock:iron_helmet",
+            "openblock:iron_chestplate",
+            "openblock:iron_leggings",
+            "openblock:iron_boots",
         ];
         for (index, id) in expected.iter().enumerate() {
             let recipe_id = reg.recipe_id(id).expect("base recipe exists");
@@ -1356,11 +2635,83 @@ mod tests {
                 (name_id(&reg, "openblock:stick"), 1)
             ]
         );
+
+        assert_eq!(
+            recipe("openblock:furnace").ingredients,
+            &[(name_id(&reg, "openblock:cobblestone"), 8)]
+        );
+        assert!(recipe("openblock:furnace").needs_table);
+        assert_eq!(
+            recipe("openblock:chest").ingredients,
+            &[(name_id(&reg, "openblock:planks"), 8)]
+        );
+        assert!(recipe("openblock:chest").needs_table);
+
+        assert!(recipe("openblock:iron_pickaxe").needs_table);
+        assert_eq!(
+            recipe("openblock:iron_pickaxe").ingredients,
+            &[
+                (name_id(&reg, "openblock:iron_ingot"), 3),
+                (name_id(&reg, "openblock:stick"), 2)
+            ]
+        );
+        assert!(recipe("openblock:iron_axe").needs_table);
+        assert_eq!(
+            recipe("openblock:iron_axe").ingredients,
+            &[
+                (name_id(&reg, "openblock:iron_ingot"), 3),
+                (name_id(&reg, "openblock:stick"), 2)
+            ]
+        );
+        assert!(recipe("openblock:iron_shovel").needs_table);
+        assert_eq!(
+            recipe("openblock:iron_shovel").ingredients,
+            &[
+                (name_id(&reg, "openblock:iron_ingot"), 1),
+                (name_id(&reg, "openblock:stick"), 2)
+            ]
+        );
+        assert!(recipe("openblock:iron_sword").needs_table);
+        assert_eq!(
+            recipe("openblock:iron_sword").ingredients,
+            &[
+                (name_id(&reg, "openblock:iron_ingot"), 2),
+                (name_id(&reg, "openblock:stick"), 1)
+            ]
+        );
+        for (leather, count) in [
+            ("openblock:leather_helmet", 5),
+            ("openblock:leather_chestplate", 8),
+            ("openblock:leather_leggings", 7),
+            ("openblock:leather_boots", 4),
+        ] {
+            assert_eq!(
+                recipe(leather).ingredients,
+                &[(name_id(&reg, "openblock:leather"), count)],
+                "{leather}"
+            );
+            assert!(recipe(leather).needs_table, "{leather}");
+        }
+        for (iron, count) in [
+            ("openblock:iron_helmet", 5),
+            ("openblock:iron_chestplate", 8),
+            ("openblock:iron_leggings", 7),
+            ("openblock:iron_boots", 4),
+        ] {
+            assert_eq!(
+                recipe(iron).ingredients,
+                &[(name_id(&reg, "openblock:iron_ingot"), count)],
+                "{iron}"
+            );
+            assert!(recipe(iron).needs_table, "{iron}");
+        }
+
         for (_, recipe) in reg.recipes() {
             let total: u32 = recipe.ingredients.iter().map(|(_, count)| u32::from(*count)).sum();
             assert!(total > 0);
-            if recipe.id.starts_with("openblock:stone_") {
-                assert!(recipe.needs_table);
+            // Everything that cannot fit the player's 2x2 grid needs a table.
+            if total > 4 || recipe.id.starts_with("openblock:stone_") || recipe.id.starts_with("openblock:iron_") {
+                assert!(recipe.needs_table, "{} must need a table", recipe.id);
             }
         }
     }
@@ -1400,11 +2751,150 @@ mod tests {
         assert_eq!(reg.block_drop(block("openblock:water")), None);
         assert_eq!(reg.block_drop(block("openblock:bedrock")), None);
         assert_eq!(reg.block_drop(block("openblock:log")), Some((item("openblock:log"), 1)));
-        for name in ["openblock:planks", "openblock:cobblestone", "openblock:crafting_table"] {
+        assert_eq!(
+            reg.block_drop(block("openblock:coal_ore")),
+            Some((item("openblock:coal"), 1))
+        );
+        assert_eq!(
+            reg.block_drop(block("openblock:iron_ore")),
+            Some((item("openblock:raw_iron"), 1))
+        );
+        assert_eq!(
+            reg.block_drop(block("openblock:copper_ore")),
+            Some((item("openblock:raw_copper"), 1))
+        );
+        for name in [
+            "openblock:planks",
+            "openblock:cobblestone",
+            "openblock:crafting_table",
+            "openblock:furnace",
+            "openblock:chest",
+        ] {
             assert_eq!(
                 reg.block_drop(block(name)),
                 Some((item(name), 1)),
                 "{name} must drop itself"
+            );
+        }
+    }
+
+    #[test]
+    fn mob_ids_and_kinds_are_stable_and_unique() {
+        let reg = Registry::base();
+        assert_eq!(reg.mob_len(), 5);
+        assert_eq!(MobKind::ALL.len(), reg.mobs().count());
+        let mut names = std::collections::HashSet::new();
+        for (index, kind) in MobKind::ALL.into_iter().enumerate() {
+            assert_eq!(kind.index(), index);
+            assert!(names.insert(kind.name()), "duplicate mob id {}", kind.name());
+            assert_eq!(MobKind::from_name(kind.name()), Some(kind));
+            assert_eq!(reg.mob_id(kind.name()), Some(kind));
+            assert_eq!(reg.mob(kind).kind, kind);
+            assert_eq!(reg.mob_by_name(kind.name()).map(|spec| spec.kind), Some(kind));
+        }
+        assert_eq!(MobKind::from_name("cow"), None, "saves are namespaced");
+        assert_eq!(MobKind::from_name("openblock:enderman"), None);
+        assert_eq!(reg.mob_id("openblock:enderman"), None);
+        assert_eq!(reg.mob_id("openblock:cow"), Some(MobKind::Cow));
+
+        // Exhaustive table lookup by index and by iteration agrees.
+        for (spec, kind) in reg.mobs().zip(MobKind::ALL) {
+            assert_eq!(spec.kind, kind);
+            assert_eq!(reg.mob(kind), spec);
+        }
+    }
+
+    #[test]
+    fn mob_catalogue_has_the_interim_stats() {
+        let reg = Registry::base();
+        let expected = [
+            (MobKind::Cow, "Cow", 10.0, 1.4, false, 0.9, 1.3),
+            (MobKind::Pig, "Pig", 10.0, 1.4, false, 0.9, 0.9),
+            (MobKind::Sheep, "Sheep", 8.0, 1.4, false, 0.9, 1.3),
+            (MobKind::Chicken, "Chicken", 4.0, 1.5, false, 0.4, 0.7),
+            (MobKind::Zombie, "Zombie", 20.0, 2.2, true, 0.6, 1.8),
+        ];
+        for (kind, display_name, health, speed, hostile, width, height) in expected {
+            let spec = reg.mob(kind);
+            assert_eq!(spec.display_name, display_name);
+            assert_eq!(spec.health, health);
+            assert_eq!(spec.speed, speed);
+            assert_eq!(spec.hostile, hostile, "{kind:?}");
+            assert_eq!(spec.passive(), !hostile, "{kind:?}");
+            assert_eq!(spec.width, width);
+            assert_eq!(spec.height, height);
+            assert!(spec.health > 0.0 && spec.speed > 0.0);
+            assert!(spec.width > 0.0 && spec.height > 0.0);
+        }
+        for spec in reg.mobs().filter(|spec| spec.hostile) {
+            assert_eq!(spec.kind, MobKind::Zombie);
+        }
+        assert_eq!(
+            reg.mobs().filter(|spec| spec.hostile).count(),
+            1,
+            "only the zombie is hostile in this slice"
+        );
+    }
+
+    #[test]
+    fn mob_drops_are_fixed_and_every_item_resolves() {
+        let reg = Registry::base();
+        let item = |name: &str| reg.item_id(name).unwrap();
+        assert_eq!(
+            reg.mob(MobKind::Cow).drops,
+            &[(item("openblock:raw_beef"), 1), (item("openblock:leather"), 1)]
+        );
+        assert_eq!(reg.mob(MobKind::Pig).drops, &[(item("openblock:raw_porkchop"), 1)]);
+        assert_eq!(reg.mob(MobKind::Sheep).drops, &[(item("openblock:leather"), 1)]);
+        assert!(reg.mob(MobKind::Chicken).drops.is_empty());
+        assert!(reg.mob(MobKind::Zombie).drops.is_empty());
+        for spec in reg.mobs() {
+            for &(drop, count) in spec.drops {
+                assert!(count > 0, "{:?} has a zero-count drop", spec.kind);
+                assert!((drop.0 as usize) < reg.item_len(), "{:?} drop is invalid", spec.kind);
+                assert!(!reg.item(drop).id.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn attack_damage_table_is_stable() {
+        let reg = Registry::base();
+        let item = |name: &str| reg.item_id(name);
+        assert_eq!(reg.attack_damage(None), 1.0);
+        assert_eq!(reg.attack_damage(Some(ItemId(999))), 1.0, "invalid ids fall back");
+        assert_eq!(reg.attack_damage(item("openblock:apple")), 1.0);
+        assert_eq!(reg.attack_damage(item("openblock:stick")), 1.0);
+        assert_eq!(reg.attack_damage(item("openblock:stone")), 1.0);
+
+        for (name, damage) in [
+            ("openblock:wooden_pickaxe", 2.0),
+            ("openblock:wooden_axe", 2.0),
+            ("openblock:wooden_shovel", 2.0),
+            ("openblock:wooden_sword", 4.0),
+            ("openblock:stone_pickaxe", 3.0),
+            ("openblock:stone_axe", 3.0),
+            ("openblock:stone_shovel", 3.0),
+            ("openblock:stone_sword", 5.0),
+            ("openblock:iron_pickaxe", 4.0),
+            ("openblock:iron_axe", 4.0),
+            ("openblock:iron_shovel", 4.0),
+            ("openblock:iron_sword", 6.0),
+        ] {
+            let id = item(name);
+            assert_eq!(reg.attack_damage(id), damage, "{name}");
+            assert_eq!(reg.item(id.unwrap()).tool.unwrap().attack_damage, damage, "{name}");
+        }
+
+        // Every sword beats every other tool of the same tier.
+        for (sword, pickaxe) in [
+            ("openblock:wooden_sword", "openblock:wooden_pickaxe"),
+            ("openblock:stone_sword", "openblock:stone_pickaxe"),
+            ("openblock:iron_sword", "openblock:iron_pickaxe"),
+        ] {
+            assert!(
+                reg.attack_damage(item(sword)) > reg.attack_damage(item(pickaxe)),
+                "{sword} must out-damage {pickaxe}"
             );
         }
     }

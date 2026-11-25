@@ -6,6 +6,69 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [0.1.0] — 2026-11-25 (multiplayer alpha)
+
+### Added
+- **Multiplayer / dedicated server**: `ob_protocol` v2 (TCP + JSON framing,
+  versioned catalog, palette chunk codec with zstd option, strict limits),
+  `openblock-server` with world streaming, edit/movement/chat relay, survival
+  inventories/vitals/equipment, server-authoritative actions, furnace/chest
+  container windows with revisions, death/respawn, mob/item replication,
+  per-player persistence, whitelist/max players/motd/config/console commands,
+  autosave and graceful SIGINT/SIGTERM saves. Client `--connect` mode with
+  connect/loading/failure UI, chunk replication, predicted edits with revert,
+  remote player avatars, chat/roster, replicated entities, survival HUD and
+  remote container screens.
+- **Mobs & combat**: cow/pig/sheep/chicken/zombie content+mob specs, deterministic
+  AI (wander/flee/chase/attack), day/night/depth spawning with caps, zombie sun
+  burn, melee combat with weapon attack damage and tool durability, knockback,
+  armor mitigation (up to 80%) and armor wear/break, mob drops as item entities,
+  mob persistence (`mobs.txt`), blocky client avatars/interpolation, hit
+  feedback/audio.
+- **Ores, smelting, gear, containers**: coal/iron/copper ore veins (deterministic,
+  depth-banded, density-tuned) with tool-tier drops; furnace block entity with
+  fuel, 200-tick smelting, progress/lit state and persistence; 25 recipes incl.
+  iron tools, leather and iron armor; chest block entity with 27 slots; armor
+  equipping/defense/durability and equipment persistence; container and furnace
+  UIs with click-to-cursor transfer, revisions and output-only slots.
+- **Audio**: dependency-free `ob_audio` with 79 procedurally synthesized clips
+  (material footsteps, break/place, pickup, hurt/death, eat, craft, tool break,
+  splash, UI) plus wind/music loops, 48 kHz stereo mixer with 16 voices and soft
+  limiter; Linux PulseAudio backend loaded at runtime (no ALSA/cpal build deps),
+  silent stub on other platforms; Audio settings tab with master/SFX/music
+  volumes and mute, persisted; event hooks across gameplay.
+- **Worldgen**: deterministic cave/ravine systems and ore veins; spawn-safe
+  crust, cave/ore density tests and throughput reports.
+- **Server operations**: hardened systemd unit/sysusers/tmpfiles, multi-stage
+  container image + compose file, backup/restore scripts with retention and
+  verification, Python load-test bots, server dependency check (no
+  GPU/audio/X11 deps), admin handbook (quickstart/config/admin/security/backup/
+  upgrade/troubleshooting).
+- **Benchmarks/QA**: `worldgen_bench`, `server_bench`, `save_bench`, `soak`
+  tools, quick CI benchmark profile, published performance envelope and known
+  gaps; security/adversarial test coverage.
+
+### Changed
+- Save-world sidecars now include mobs, block entities (furnaces/chests) and
+  network players; item pickup and inventory transfers preserve tool/armor
+  durability exactly.
+- Server banner/version reports protocol 2 consistently (core constant).
+- Protocol v1 clients are refused with an upgrade reason.
+- Settings: Audio tab; F3 shows armor/mobs/net status; network mode uses
+  server-authoritative survival HUD.
+
+### Measured
+- Test suite: 683 passed, 0 failed, 10 ignored across the workspace (client 186
+  lib + 13 loopback, server lib 89 + protocol 30 + world 35 + content 39 +
+  audio 36 + render/sim/tools suites; adversarial/robustness tests included).
+  Ignored entries are intentional GPU screenshot probes, real-pack/measurement
+  reports and the network-throughput probe.
+- Benchmarks: worldgen 0.921 ms/chunk mean (p99 1.147), server tick p99
+  <=0.03 ms single-player baseline, save 21 ms @289 columns / 156 ms @2,025
+  columns, 60,000-tick soak pass; v1-v4 save migrations pass.
+- Smoke seed 42: `33875a6597c2ce7b` (save format 4; network runtime state is not
+  hashed); two fresh runs deterministic.
+
 ## [0.0.9] — 2026-11-24 (tech preview, UI readability, pickup radius)
 
 ### Fixed

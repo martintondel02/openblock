@@ -1,8 +1,91 @@
 # 14 — Audio: Events, Mixing, Music, Ambience and Voice
 
-> Status: normative - Last updated: 2026-11-24
+> Status: normative - Last updated: 2026-11-25 (interim procedural implementation in §0)
 > Depends on: [DEC-003](../decisions.md), [DEC-019](../decisions.md), [DEC-031](../decisions.md), [DEC-032](../decisions.md), [DEC-040](../decisions.md), [DEC-044](../decisions.md), [DEC-049](../decisions.md), [DEC-050](../decisions.md), [DEC-053](../decisions.md), [conventions](00-conventions.md), [technical architecture](01-technical-architecture.md), [UI, audio and localization research](../research/08-ui-audio-localization.md)
 > Implements: MS-05 (event bus, placeholder bank, volume settings), MS-12 (full mix, music, ambience, occlusion, captions)
+
+## 0. Interim implementation status (1.0 audio slice)
+
+> This section records what ships today and how it differs from the normative design below. It is
+> not a replacement for the requirements: the full content-defined bank, captions, occlusion and
+> voice chat remain follow-up work.
+
+The workspace now contains a working, self-contained `ob_audio` crate. It synthesises every sound
+into in-memory 48 kHz mono PCM at startup, mixes up to 16 sample voices plus a quiet wind loop and a
+generative music pad, and optionally feeds a stereo output stream on Linux. Output uses the
+PulseAudio *simple* API loaded with `dlopen` at runtime, so the build needs no ALSA or PulseAudio
+development headers and adds no audio crate dependency. No external sound file, codec, `kira` or
+`symphonia` dependency is used at this milestone.
+
+| Area | Interim implementation |
+| --- | --- |
+| Synthesis | 77 SFX clips + 2 loops (79 total): four footstep variants for grass/dirt/stone/wood/sand/snow/gravel; three break and two place variants per material; pickup, hurt (2), death, eat (2), drink, craft, craft-fail, tool-break, splash (2), UI click and UI confirm. Integer-hash noise and plain arithmetic only; no `rand`. |
+| Output | Linux: `libpulse-simple.so.0` (or `.so`) loaded dynamically at runtime; PipeWire's `pipewire-pulse` compatibility server works, as does PulseAudio. 48 kHz stereo `f32`, 512-frame writer blocks, 25 ms requested server buffer. Windows/macOS: silent stub (`AudioEngine::new` returns `BackendDisabled`); real backends are post-1.0. |
+| Mixer | 16-voice cap with quietest-voice stealing, constant-power pan, distance attenuation for world positions, 3 ms attack/10 ms release, per-group cooldown, soft limiter and a separate music/ambience bus that fades in and out over roughly 1.5 s. |
+| Volumes | `master_volume` (0.8), `sfx_volume` (1.0) and `music_volume` (0.55), all linear `0.0..=1.0`; `audio_enabled` (true). Settings apply live, are persisted immediately, and use 5% steps in the UI. |
+| No device | `AudioEngine::new()` returns `Err(AudioError)` (no library, no server, denied socket or bad configuration); the client logs exactly one line and continues silently. Every later play call is a no-op. `AudioEngine::headless()` renders the same mixer offline for tests. |
+| Tests | Synth determinism (whole-bank hashes), variant coverage, envelope/limiter bounds, volume sanitising, voice cap, panning, rate limiting, no-device construction, offline mixing, shutdown idempotence, hostile-input safety, `dlopen` symbol-table fallback with fakes, 25 ms buffer-target ABI checks, fixed-block writer rendering, write-failure backoff and writer-thread `Drop`/join safety. |
+
+### 0.1 Threading and latency
+
+The main thread owns `AudioEngine`. Volume/mute changes are atomics; play requests are small `Copy`
+values pushed into a bounded 256-entry ring. On Linux one writer thread owns the mixer and the
+PulseAudio stream. The mixer uses `try_lock` on the ring and does not allocate, log, block on a lock
+or perform I/O; the writer then blocks in `pa_simple_write`, which is the intended back-pressure.
+This deliberately satisfies the *spirit* of REQ-AUDIO-010; the mutex is an interim deviation from the
+normative lock-free SPSC requirement and is a candidate for replacement once the full event bus
+lands. The ring drops the newest command when full, the engine drops duplicate-group requests inside
+their cooldown, and the voice pool caps at 16.
+
+Writes are 512 interleaved stereo frames (**10.7 ms** at 48 kHz). The `pa_buffer_attr` request asks
+for a 25 ms server buffer (`tlength` 9,600 bytes, `maxlength` 38,400 bytes) and reports 25 ms in the
+status line; actual latency depends on the server's scheduling. After three consecutive write
+failures the writer stops, sets the backend unavailable and the client continues silently. There is
+no hotplug or device-loss retry yet (REQ-AUDIO-026); restart the client to recover output.
+
+Measured on the development Fedora 45 x86_64 machine (Ryzen 7 9800X3D): in a release build, startup
+synthesis of all 79 clips took **12.6 ms** and mixing one second of stereo output took **0.94 ms**
+(about **0.016 ms per 60 Hz frame**), well inside the <0.5 ms/frame target. The `dev` test profile
+(opt-level 1) measured 27.8 ms synthesis and 0.98 ms per stereo second. Startup work is one-time; the
+frame loop only enqueues commands and updates fades. The 1.0 performance report should repeat this on
+the reference machine with the real event load.
+
+### 0.2 Deliberate gaps versus the normative design
+
+- No content-defined `SoundDef` bank, `SoundId` registry, Ogg/Vorbis assets, `kira`, streaming,
+  loudness normalisation or offline asset tooling (REQ-AUDIO-003/004/011/012/019/021).
+- No captions, subtitle data or accessibility surface yet (REQ-AUDIO-023).
+- No HRTF-lite, occlusion probes, air absorption, reverb zones or underwater filter; spatialisation
+  is constant-power pan + linear 24 m attenuation only (REQ-AUDIO-013/014/015/016).
+- No music context machine or playlists; the single synthesised pad loops continuously at low volume
+  (REQ-AUDIO-020/022).
+- No voice chat (REQ-AUDIO-024, explicitly post-1.0).
+- No lookahead limiter: a memoryless soft limiter protects full scale (REQ-AUDIO-018).
+- No hotplug recovery: a device that disappears leaves the client silent until restart
+  (REQ-AUDIO-026). The writer stops after three consecutive write errors rather than retrying.
+- Linux only for 1.0: Windows and macOS compile the silent stub; WASAPI, CoreAudio and raw ALSA
+  output are post-1.0 work.
+- 16 voices and zero music/ambience streams instead of 64 voices and 4 streams (REQ-AUDIO-007);
+  category buses are `sfx` and `music/ambience`, not the full ten-category table (REQ-AUDIO-017).
+
+### 0.3 Settings, controls and runtime requirements
+
+`Esc` opens Settings; the **Audio** tab has `Sound`, `Master volume`, `SFX volume` and
+`Music volume`. Up/Down selects, Left/Right or the mouse wheel changes in 5% steps, the existing
+`<`/`>` arrows are clickable, and every change is applied to the live engine and saved immediately.
+The Audio tab shows the active output (device, rate, channel count and latency, or why audio is off).
+The Controls tab points at the Audio tab; F3 shows a compact `Audio` status line.
+
+CLI flags: `--no-audio` skips device enumeration and synthesis entirely (useful for headless capture
+and streaming hosts); `--mute` starts with `audio_enabled = false` for this run without rewriting the
+saved setting (unless the player edits the Sound row). The settings screenshot accepts a deterministic tab selector:
+`--screenshot-settings=audio` (or `--screenshot-settings-tab audio`) renders the Audio tab.
+
+Runtime requirements: Linux with a reachable PipeWire (`pipewire-pulse`) or PulseAudio server for
+sound; `libpulse-simple.so.0` is loaded at runtime, so there are no build-time audio headers and no
+new crate. The Fedora RPM needs no audio `BuildRequires` and recommends `pulseaudio-libs`; the
+Flatpak keeps `--socket=pulseaudio` in its finish-args. Windows/macOS compile and run silently with
+the stub. The dedicated server continues to exclude `ob_audio` and every audio library entirely.
 
 ## 1. Purpose and scope
 
@@ -15,7 +98,7 @@ post-1.0 voice-chat module. Device enumeration, slider widgets and other UI mech
 [18](18-networking-multiplayer.md); asset compilation to [21](21-tooling-and-pipelines.md).
 
 The headless server does not link audio at all: `ob_server`'s dependency closure excludes `ob_audio`,
-`cpal` and every ALSA/PipeWire/X11 library, enforced by `arch-guard` ([DEC-003](../decisions.md),
+`ob_audio` and every audio/X11 library, enforced by `arch-guard` ([DEC-003](../decisions.md),
 REQ-ARCH-002). The host *produces* advisory sound events; nothing in the simulation waits for, reads,
 or depends on a mixer, and a server with no audio stack runs identically ([DEC-028](../decisions.md)).
 
@@ -66,8 +149,9 @@ or depends on a mixer, and a server with no audio stack runs identically ([DEC-0
 
 `ob_audio` owns one `AudioService` (lifecycle `Created → Initialising → Ready → Running →
 Draining → Stopped`, [01 §3.5](01-technical-architecture.md#35-services-plugins-and-lifecycle)) and one
-OS thread. The service receives `AudioCommand` values from the main thread and renders through a
-`cpal` output stream; `kira` supplies tracks, effects, tweens, clocks and streaming; `symphonia`
+OS thread. In the 1.0 slice the service receives `AudioCommand` values from the main thread and
+renders through the runtime-loaded PulseAudio output stream; the full design keeps the same thin
+backend seam, while `kira` supplies tracks, effects, tweens, clocks and streaming and `symphonia`
 decodes Vorbis/FLAC/WAV. The server has no counterpart to any of this.
 
 ```mermaid
@@ -442,7 +526,7 @@ p95 unless stated, reference machine ([vision §9](../vision.md#9-platforms-and-
 
 | Failure | Detection | Containment | User-visible |
 | --- | --- | --- | --- |
-| No output device at start | `cpal` enumeration empty | null device, `AudioAvailable::No`, events dropped cheaply | settings show "no output device"; game unaffected |
+| No output device at start | `libpulse-simple` missing, or PulseAudio/PipeWire connection refused | null device, `AudioAvailable::No`, events dropped cheaply | settings show "no output device"; game unaffected |
 | Device removed, hotplug or format change | backend error callback | stop streams, null device, retry every 2 s up to 30 s | sound stops; reconnects when a device returns |
 | Sample rate mismatch (44.1/96 kHz) or loop points past the clip end | device config; manifest validation | resample cache keyed by rate (≤ 2 resident); clip rejected and falls back to a one-shot | inaudible; loop plays once |
 | Missing, corrupt or truncated clip | decode error, manifest mismatch | silent placeholder, caption kept, one log line per ID | caption appears, no sound |
@@ -468,7 +552,7 @@ p95 unless stated, reference machine ([vision §9](../vision.md#9-platforms-and-
 | Music and ambience | context matrix, hysteresis, cooldown, no repeat, bed weights, storm behaviour | fixture snapshots with a virtual clock |
 | Captions | every critical definition has a key; culled voices still caption; sectors are correct | shared contract test with [23](23-accessibility-localization.md) |
 | Determinism | audio on/off produces the same replay hash | MS-02 harness, audio feature toggled |
-| Device matrix and stress | **PipeWire-first on Fedora 44/45** with PulseAudio and ALSA fallbacks, then WASAPI and CoreAudio; 44.1/48/96 kHz; hotplug; one hour at 64 voices, 10k-event storms, rapid teleports | Fedora VM/CI runners, manual checklist, soak with leak and underrun counters |
+| Device matrix and stress | **PipeWire-first on Fedora 44/45** (`pipewire-pulse` compatibility), then a PulseAudio server; 48 kHz in 1.0 (raw ALSA, WASAPI and CoreAudio are post-1.0); hotplug; one hour at 64 voices, 10k-event storms, rapid teleports | Fedora VM/CI runners, manual checklist, soak with leak and underrun counters |
 | Privacy (voice) | no voice bytes in logs, crash reports or saves | feature test, review |
 
 ## 8. Open questions
@@ -501,7 +585,8 @@ p95 unless stated, reference machine ([vision §9](../vision.md#9-platforms-and-
   voice budget, mixing, occlusion, HRTF arithmetic and voice-chat options; Weft's acoustics constants
   are cited there as a read-only budget reference, not copied.
 - Milestones: [MS-05, MS-12, MS-14](../plan/01-milestones.md).
-- External: [kira](https://docs.rs/kira/latest/kira/), [cpal](https://github.com/RustAudio/cpal),
+- External: [PulseAudio simple API](https://freedesktop.org/software/pulseaudio/doxygen/simple.html),
+  [PipeWire](https://pipewire.org/), [kira](https://docs.rs/kira/latest/kira/),
   [symphonia](https://github.com/pdeljanov/Symphonia), [RFC 6716 (Opus)](https://www.rfc-editor.org/rfc/rfc6716),
   [ITU-R BS.1770](https://www.itu.int/rec/R-REC-BS.1770/en), [EBU R 128](https://tech.ebu.ch/publications/r128),
   [WCAG 1.2.2](https://www.w3.org/WAI/WCAG22/Understanding/captions-prerecorded.html),

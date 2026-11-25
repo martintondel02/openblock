@@ -458,6 +458,8 @@ struct RawTextures {
     top: Option<String>,
     side: Option<String>,
     bottom: Option<String>,
+    /// Optional interim front face (+Z); omitted means the side texture.
+    front: Option<String>,
 }
 
 fn read_pack_file(path: &Path) -> Result<Vec<u8>, PackError> {
@@ -673,6 +675,10 @@ fn resolve_textures(
         top: resolve_texture(path, index, id, "top", textures.top.as_deref())?,
         side: resolve_texture(path, index, id, "side", textures.side.as_deref())?,
         bottom: resolve_texture(path, index, id, "bottom", textures.bottom.as_deref())?,
+        front: match textures.front.as_deref() {
+            Some(front) => Some(resolve_texture(path, index, id, "front", Some(front))?),
+            None => None,
+        },
     })
 }
 
@@ -768,6 +774,7 @@ mod tests {
         assert_eq!(expected.opaque, actual.opaque);
         assert_eq!(expected.fluid, actual.fluid);
         assert_eq!(expected.textures, actual.textures);
+        assert_eq!(expected.textures.front, actual.textures.front);
         assert_eq!(expected.hardness, actual.hardness);
         assert_eq!(expected.preferred_tool, actual.preferred_tool);
         assert_eq!(expected.required_tier, actual.required_tier);
@@ -785,12 +792,18 @@ mod tests {
             assert_block_eq(base_block, loaded_block);
         }
         assert_eq!(loaded.id("openblock:air"), Some(BlockId(0)));
-        assert_eq!(loaded.len(), 15);
+        assert_eq!(loaded.len(), 20);
         assert_eq!(
             loaded.block(loaded.id("openblock:cobblestone").unwrap()).preferred_tool,
             Some(ToolKind::Pickaxe)
         );
         assert_eq!(loaded.block(loaded.id("openblock:stone").unwrap()).required_tier, 1);
+        let furnace = loaded.block(loaded.id("openblock:furnace").unwrap());
+        assert_eq!(furnace.textures.front, Some(textures::FURNACE_FRONT));
+        assert_eq!(furnace.textures.for_face(4), textures::FURNACE_FRONT);
+        let coal_ore = loaded.block(loaded.id("openblock:coal_ore").unwrap());
+        assert_eq!(coal_ore.required_tier, 1);
+        assert!(coal_ore.is_ore());
     }
 
     #[test]
@@ -835,6 +848,47 @@ mod tests {
         assert_eq!(
             block.textures,
             BlockTextures::column(textures::STONE, textures::DIRT, textures::GRASS_SIDE)
+        );
+    }
+
+    #[test]
+    fn front_texture_is_optional_and_validated() {
+        let temp = TempPack::new("front_texture");
+        let path = temp.write(
+            "blocks.json",
+            r#"{
+                "format": 1,
+                "blocks": [
+                    { "id": "openblock:air" },
+                    {
+                        "id": "openblock:test_front",
+                        "textures": { "top": "stone", "side": "dirt", "bottom": "stone", "front": "sand" }
+                    }
+                ]
+            }"#,
+        );
+        let registry = registry_from_pack(&path).expect("front texture pack loads");
+        let block = registry.block(registry.id("openblock:test_front").unwrap());
+        assert_eq!(block.textures.top, textures::STONE);
+        assert_eq!(block.textures.side, textures::DIRT);
+        assert_eq!(block.textures.bottom, textures::STONE);
+        assert_eq!(block.textures.front, Some(textures::SAND));
+        assert_eq!(block.textures.for_face(4), textures::SAND);
+
+        let unknown = temp.write(
+            "unknown_front.json",
+            r#"{
+                "format": 1,
+                "blocks": [
+                    { "id": "openblock:air" },
+                    { "id": "openblock:test_front", "textures": { "front": "nope" } }
+                ]
+            }"#,
+        );
+        let error = load_blocks_json(&unknown).expect_err("unknown front texture must fail");
+        assert!(
+            matches!(&error, PackError::UnknownTexture { face: "front", .. }),
+            "{error}"
         );
     }
 
@@ -1111,6 +1165,69 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    #[test]
+    fn hostile_json_shapes_are_bounded_and_typed() {
+        let temp = TempPack::new("hostile-json");
+        let valid_root = r#"{"format":1,"blocks":[{"id":"openblock:air"}]}"#;
+        let cases = [
+            // Unknown fields are rejected at every level of the schema.
+            r#"{"format":1,"blocks":[],"extra":true}"#.to_string(),
+            r#"{"format":1,"blocks":[{"id":"openblock:air","extra":1}]}"#.to_string(),
+            r#"{"format":1,"blocks":[{"id":"openblock:air","textures":{"top":"stone","extra":1}}]}"#.to_string(),
+            // Trailing garbage and non-object roots are parse errors.
+            format!("{valid_root}garbage"),
+            r#"[1,2,3]"#.to_string(),
+        ];
+        for (index, json) in cases.iter().enumerate() {
+            let path = temp.write(&format!("hostile_{index}.json"), json);
+            let error = load_blocks_json(&path).expect_err("hostile JSON must be rejected");
+            assert!(
+                matches!(error, PackError::InvalidJson { .. }),
+                "case {index} produced {error}"
+            );
+        }
+
+        // Deep nesting hits serde_json's recursion limit instead of recursing
+        // until the stack overflows.
+        let mut nested = String::from(r#"{"format":1,"blocks":[{"id":"openblock:air","extra":"#);
+        nested.push_str(&"[".repeat(512));
+        nested.push('0');
+        nested.push_str(&"]".repeat(512));
+        nested.push_str("}]}");
+        let path = temp.write("deep.json", nested);
+        assert!(matches!(load_blocks_json(&path), Err(PackError::InvalidJson { .. })));
+
+        // A huge attacker-controlled string is still parsed within the 8 MiB
+        // cap and then rejected by the id rule, not by a panic.
+        let huge_id = format!(
+            r#"{{"format":1,"blocks":[{{"id":"openblock:air"}},{{"id":"openblock:{}"}}]}}"#,
+            "a".repeat(1_000_000)
+        );
+        let path = temp.write("huge-id.json", huge_id);
+        assert!(matches!(load_blocks_json(&path), Err(PackError::InvalidId { .. })));
+
+        // Extreme hardness values are validated as numbers.
+        let huge_hardness = temp.write(
+            "hardness.json",
+            r#"{"format":1,"blocks":[{"id":"openblock:air"},{"id":"openblock:test","hardness":1e300}]}"#,
+        );
+        assert!(matches!(
+            load_blocks_json(&huge_hardness),
+            Err(PackError::InvalidHardness { .. })
+        ));
+        let unbreakable = temp.write(
+            "unbreakable.json",
+            r#"{"format":1,"blocks":[{"id":"openblock:air"},{"id":"openblock:test","hardness":-1}]}"#,
+        );
+        let blocks = load_blocks_json(&unbreakable).expect("negative hardness means unbreakable");
+        assert!(blocks[1].hardness.is_infinite());
+
+        // Non-UTF-8 JSON is a typed parse error.
+        let path = temp.path("non-utf8.json");
+        std::fs::write(&path, [0xffu8, 0xfe, b'{']).expect("write non-utf8 pack");
+        assert!(matches!(load_blocks_json(&path), Err(PackError::InvalidJson { .. })));
     }
 
     #[test]

@@ -9,6 +9,7 @@ path = [
   "Cargo.toml", "rust-toolchain.toml", "rustfmt.toml", "deny.toml",
   "architecture.toml", "REUSE.toml", "perf/**",
   ".github/**", ".editorconfig", ".markdownlint.jsonc", ".gitignore",
+  ".dockerignore", "scripts/**",
 ]
 SPDX-FileCopyrightText = "2026 OpenBlock contributors"
 SPDX-License-Identifier = "MIT OR Apache-2.0"
