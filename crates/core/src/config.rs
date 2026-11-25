@@ -1017,6 +1017,8 @@ pub const MIN_MOUSE_SENSITIVITY: f32 = 0.05;
 pub const MAX_MOUSE_SENSITIVITY: f32 = 3.0;
 /// Longest accepted persisted resource-pack path, in bytes.
 pub const MAX_TEXTURE_PACK_PATH_BYTES: usize = 4096;
+/// Longest accepted persisted UI-font path, in characters.
+pub const MAX_UI_FONT_PATH_CHARS: usize = 4096;
 /// Lowest volume accepted by the audio settings, as a linear gain.
 pub const MIN_AUDIO_VOLUME: f32 = 0.0;
 /// Highest volume accepted by the audio settings, as a linear gain.
@@ -1082,6 +1084,11 @@ pub struct Settings {
     /// Optional path to a Minecraft-style resource pack, persisted after a
     /// successful `--texture-pack` launch.
     pub texture_pack: Option<String>,
+    /// Optional path to a TrueType/OpenType UI font, persisted after a
+    /// successful `--ui-font` launch. When unset the client uses the embedded
+    /// Monocraft font, an auto-discovered `<data>/fonts/` file or a system
+    /// Minecraftia installation.
+    pub ui_font_path: Option<String>,
     /// Gameplay mode: survival (default) or creative.
     pub game_mode: GameMode,
     /// Whether the audio engine produces sound. Defaults to on.
@@ -1117,6 +1124,7 @@ impl Default for Settings {
             mesh_workers: None,
             texture_style: TextureStyle::Classic,
             texture_pack: None,
+            ui_font_path: None,
             game_mode: GameMode::Survival,
             audio_enabled: true,
             master_volume: 0.8,
@@ -1194,6 +1202,34 @@ impl Settings {
         }
         reason
     }
+
+    /// Clears an unusable persisted UI-font path, returning the reason it was
+    /// rejected.
+    fn validate_ui_font_path(&mut self) -> Option<&'static str> {
+        let reason = self.ui_font_path.as_deref().and_then(ui_font_path_rejection_reason);
+        if reason.is_some() {
+            self.ui_font_path = None;
+        }
+        reason
+    }
+}
+
+/// Why a persisted or command-line UI-font path cannot be used, if it cannot.
+///
+/// The rules match the resource-pack path: a non-empty path of at most
+/// [`MAX_UI_FONT_PATH_CHARS`] characters with no control characters. Existence
+/// and font validity are checked later by the client, so a missing file can
+/// fall back to discovery instead of discarding the preference.
+pub fn ui_font_path_rejection_reason(path: &str) -> Option<&'static str> {
+    if path.is_empty() {
+        Some("path is empty")
+    } else if path.chars().count() > MAX_UI_FONT_PATH_CHARS {
+        Some("path is longer than 4096 characters")
+    } else if path.chars().any(char::is_control) {
+        Some("path contains control characters")
+    } else {
+        None
+    }
 }
 
 /// Trims, validates, deduplicates and truncates the recent-server list.
@@ -1257,6 +1293,12 @@ pub fn load_settings(data_dir: &Path) -> Settings {
                     path.display()
                 );
             }
+            if let Some(reason) = settings.validate_ui_font_path() {
+                log::warn!(
+                    "ignoring UI font path in {}: {reason}; using font discovery",
+                    path.display()
+                );
+            }
             if settings.clamp() {
                 log::warn!("settings in {} were out of range and have been clamped", path.display());
             }
@@ -1275,6 +1317,7 @@ pub fn save_settings(data_dir: &Path, settings: &Settings) -> io::Result<()> {
     let path = settings_path(data_dir);
     let mut settings = sanitised(settings);
     settings.validate_texture_pack();
+    settings.validate_ui_font_path();
     settings.clamp();
     let text =
         serde_json::to_string_pretty(&settings).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -1417,6 +1460,76 @@ mod tests {
         .expect("write");
         let settings = load_settings(&dir);
         assert_eq!(settings.texture_pack.as_deref(), Some(path.as_str()));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ui_font_path_is_optional_and_round_trips() {
+        let dir = temp_dir("ui-font-roundtrip");
+        let settings = Settings {
+            ui_font_path: Some("/tmp/fonts/Minecraftia.ttf".to_string()),
+            ..Settings::default()
+        };
+        save_settings(&dir, &settings).expect("save");
+        let text = fs::read_to_string(settings_path(&dir)).expect("read");
+        assert!(text.contains("\"ui_font_path\": \"/tmp/fonts/Minecraftia.ttf\""));
+        assert_eq!(
+            load_settings(&dir).ui_font_path.as_deref(),
+            Some("/tmp/fonts/Minecraftia.ttf")
+        );
+
+        let settings = Settings {
+            ui_font_path: None,
+            ..Settings::default()
+        };
+        save_settings(&dir, &settings).expect("save");
+        assert_eq!(load_settings(&dir).ui_font_path, None);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn empty_or_invalid_persisted_ui_font_path_is_read_as_none() {
+        let dir = temp_dir("ui-font-invalid");
+        for (label, value) in [
+            ("empty", r#""""#.to_string()),
+            ("nul", r#""bad\u0000path""#.to_string()),
+            ("newline", r#""bad\npath""#.to_string()),
+            ("long", format!("\"{}\"", "a".repeat(MAX_UI_FONT_PATH_CHARS + 1))),
+        ] {
+            fs::write(
+                settings_path(&dir),
+                format!(r#"{{"render_distance_chunks": 8, "ui_font_path": {value}}}"#),
+            )
+            .expect("write");
+            let settings = load_settings(&dir);
+            assert_eq!(settings.ui_font_path, None, "{label} path must be rejected");
+            // The rest of the settings document still loads.
+            assert_eq!(settings.render_distance_chunks, 8, "{label}");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn longest_accepted_ui_font_path_is_kept_and_save_sanitises_bad_paths() {
+        let dir = temp_dir("ui-font-longest");
+        let path = "c".repeat(MAX_UI_FONT_PATH_CHARS);
+        fs::write(
+            settings_path(&dir),
+            serde_json::json!({ "ui_font_path": path }).to_string(),
+        )
+        .expect("write");
+        assert_eq!(load_settings(&dir).ui_font_path.as_deref(), Some(path.as_str()));
+
+        // Saving a settings value with a bad path clears it instead of writing
+        // an unusable preference.
+        let settings = Settings {
+            ui_font_path: Some("bad\u{7}path".to_string()),
+            ..Settings::default()
+        };
+        save_settings(&dir, &settings).expect("save");
+        assert_eq!(load_settings(&dir).ui_font_path, None);
+        let text = fs::read_to_string(settings_path(&dir)).expect("read");
+        assert!(!text.contains("bad"));
         let _ = fs::remove_dir_all(dir);
     }
 

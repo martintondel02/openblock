@@ -54,3 +54,11 @@ SPDX-License-Identifier = "MIT"
 path = ["LICENSE-APACHE", "LICENSES/Apache-2.0.txt"]
 SPDX-FileCopyrightText = "Apache Software Foundation"
 SPDX-License-Identifier = "Apache-2.0"
+
+# Bundled Minecraft-style UI font (Monocraft) is third-party software under the
+# SIL Open Font License 1.1; it lives outside crates/** so the broad annotation
+# above does not claim it as MIT/Apache-2.0. The unmodified OFL text is included.
+[[annotations]]
+path = ["assets/ui-font/Monocraft.ttf", "assets/ui-font/OFL.txt"]
+SPDX-FileCopyrightText = "Copyright (c) 2022, Idrees Hassan (https://github.com/IdreesInc/Monocraft)"
+SPDX-License-Identifier = "OFL-1.1"

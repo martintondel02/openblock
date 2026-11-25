@@ -123,9 +123,10 @@ impl ApplicationHandler for NetApp {
         };
         let (mut settings, data_dir) = crate::effective_settings(&self.options);
         crate::persist_texture_pack_choice(&self.options, &mut settings, &data_dir);
-        let (renderer, texture_source) =
-            match crate::create_window_renderer(Arc::clone(&window), &self.options, &settings) {
-                Ok(pair) => pair,
+        crate::persist_ui_font_choice(&self.options, &mut settings, &data_dir);
+        let (renderer, texture_source, font_source) =
+            match crate::create_window_renderer(Arc::clone(&window), &self.options, &settings, &data_dir) {
+                Ok(triple) => triple,
                 Err(error) => {
                     log::error!("{error}");
                     log::error!(
@@ -147,6 +148,8 @@ impl ApplicationHandler for NetApp {
         let initial_fov = settings.fov_degrees;
         let mut ui = UiState::from_settings(settings);
         ui.active_texture_pack = crate::active_texture_pack_label(&texture_source);
+        ui.active_ui_font_name = renderer.ui_font_name().to_string();
+        ui.active_ui_font_source = font_source.display_label();
         ui.ui_scale_percent = resolved_ui_scale_percent(ui.settings.ui_scale_percent, window_size.1);
         ui.screen = Screen::Connecting;
         let applied_render_distance = ui.settings.render_distance_chunks.clamp(1, 16);
@@ -2125,6 +2128,7 @@ impl NetGameState {
             ),
             time_of_day,
             texture_source: crate::describe_texture_source(&self.texture_source, self.renderer.texture_resolution()),
+            ui_font: self.renderer.ui_font_name().to_string(),
             game_mode: "survival",
             health,
             hunger,
@@ -2517,6 +2521,9 @@ impl NetGameState {
             | SettingsRow::Fov
             | SettingsRow::MouseSensitivity
             | SettingsRow::MeshWorkers
+            | SettingsRow::UiFont
+            | SettingsRow::ResetUiFont
+            | SettingsRow::ReloadUiFont
             | SettingsRow::Keybind(_)
             | SettingsRow::ResetKeybinds => {}
         }
@@ -2549,6 +2556,19 @@ impl NetGameState {
             SettingsAction::ResetKeybinds => {
                 self.ui.reset_keybinds();
                 self.persist_settings();
+                false
+            }
+            SettingsAction::ResetUiFont => {
+                let source = crate::reset_ui_font(&mut self.renderer, &mut self.ui.settings);
+                self.ui.active_ui_font_name = self.renderer.ui_font_name().to_string();
+                self.ui.active_ui_font_source = source.display_label();
+                self.persist_settings();
+                false
+            }
+            SettingsAction::ReloadUiFont => {
+                let source = crate::reload_ui_font(&mut self.renderer, &self.ui.settings, &self.data_dir);
+                self.ui.active_ui_font_name = self.renderer.ui_font_name().to_string();
+                self.ui.active_ui_font_source = source.display_label();
                 false
             }
         }

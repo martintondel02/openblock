@@ -1,6 +1,6 @@
 //! The `openblock` game client binary.
 
-const USAGE: &str = "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--mesh-workers N] [--survival|--creative] [--fly] [--x11] [--no-audio] [--mute] [--connect HOST:PORT] [--name NAME] [--screenshot PATH] [--screenshot-inventory PATH] [--screenshot-dead] [--screenshot-settings[=TAB]] [--screenshot-settings-tab TAB] [--screenshot-crafting] [--screenshot-title] [--screenshot-new-world] [--screenshot-worlds] [--screenshot-connect] [--screenshot-debug] [--screenshot-mobs] [--screenshot-furnace] [--screenshot-chest] [--screenshot-items] [--screenshot-network] [--screenshot-name-tags] [--screenshot-net-ui=KIND] [--screenshot-size WxH] [--ui-scale PERCENT|auto] [--seconds N] [--texture-style NAME] [--texture-pack PATH] [--no-texture-pack] [--time-of-day F] [--title|--menu] [--version]";
+const USAGE: &str = "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--mesh-workers N] [--survival|--creative] [--fly] [--x11] [--no-audio] [--mute] [--connect HOST:PORT] [--name NAME] [--screenshot PATH] [--screenshot-inventory PATH] [--screenshot-dead] [--screenshot-settings[=TAB]] [--screenshot-settings-tab TAB] [--screenshot-crafting] [--screenshot-title] [--screenshot-new-world] [--screenshot-worlds] [--screenshot-connect] [--screenshot-debug] [--screenshot-mobs] [--screenshot-furnace] [--screenshot-chest] [--screenshot-items] [--screenshot-network] [--screenshot-name-tags] [--screenshot-net-ui=KIND] [--screenshot-size WxH] [--ui-scale PERCENT|auto] [--seconds N] [--texture-style NAME] [--texture-pack PATH] [--no-texture-pack] [--ui-font PATH] [--default-ui-font] [--time-of-day F] [--title|--menu] [--version]";
 
 fn main() {
     ob_core::init_logging();
@@ -14,6 +14,9 @@ fn main() {
         println!("graphics: {}", gpu);
         println!("textures: --texture-pack PATH loads a Minecraft resource pack and remembers it");
         println!("          --no-texture-pack clears the saved pack and uses the procedural style");
+        println!("fonts:    --ui-font PATH loads a TTF/OTF UI font (e.g. Minecraftia) and remembers it");
+        println!("          --default-ui-font clears the saved UI font; Monocraft is bundled");
+        println!("          <data-dir>/fonts/Minecraftia.ttf is discovered automatically");
         println!("headless: --screenshot PATH renders one HUD frame to a PNG and exits");
         println!("          --screenshot-inventory PATH renders the inventory screen to a PNG and exits");
         println!(
@@ -87,6 +90,9 @@ fn main() {
         println!("  --texture-pack PATH  load a Minecraft-style resource pack for this run and remember it");
         println!("  --resource-pack PATH  alias for --texture-pack");
         println!("  --no-texture-pack  forget the saved resource pack and use the procedural style");
+        println!("  --ui-font PATH     load this TTF/OTF UI font for this and future runs");
+        println!("  --default-ui-font  forget the saved UI font and use the bundled Monocraft");
+        println!("                     (place Minecraftia.ttf in <data-dir>/fonts/ to use it automatically)");
         println!("  --render-distance N  streaming radius in chunks (overrides saved settings)");
         println!("  --no-audio         do not open an output device (headless/streaming)");
         println!("  --mute             start muted for this run; saved audio settings are unchanged");

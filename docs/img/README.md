@@ -1,11 +1,12 @@
 # Release screenshots
 
-The `v1.0.0-*.png` images in this directory are the 1.0.0 release captures and
-the `v1.0.1-*.png` images are the post-release GUI-scale/connect-polish captures.
-They are PNGs rendered by the offscreen client with the **classic procedural
-textures** (`--no-texture-pack`) and no third-party resource-pack assets. Menus
-use the deterministic temporary data set built into `--screenshot-*`; gameplay
-captures use a fresh `--data-dir` so no local save can leak into a shot.
+The `v1.0.0-*.png` images in this directory are the 1.0.0 release captures, the
+`v1.0.1-*.png` images are the post-release GUI-scale/connect-polish captures and
+the `v1.0.2-*.png` images show the Minecraft-style UI font. They are PNGs
+rendered by the offscreen client with the **classic procedural textures**
+(`--no-texture-pack`) and no third-party resource-pack assets. Menus use the
+deterministic temporary data set built into `--screenshot-*`; gameplay captures
+use a fresh `--data-dir` so no local save can leak into a shot.
 
 Every capture is windowless and needs a working Vulkan driver, but no display:
 
@@ -89,6 +90,45 @@ to a 10-line compact set. The 960x540 125% capture is included because that is
 the combination most likely to be used on a small laptop. Implementation and
 layout notes are in [client GUI scale](../client-gui-scale.md).
 
+## v1.0.2 screenshots (Minecraft-style UI font)
+
+The v1.0.2 set uses the bundled Monocraft UI font for body text and keeps the
+original 8×8 bitmap font for the title logo and every screen/panel heading.
+All captures are 1280x720 at 100% GUI scale except the explicit 960x540@125%
+sample. They are windowless, use classic procedural textures and a fresh data
+directory. No Minecraftia font is required or redistributed; see
+[client UI font](../client-ui-font.md) for using a personal `Minecraftia.ttf`.
+
+```sh
+# Front-end (deterministic temporary data; built-in Monocraft)
+openblock --no-audio --no-texture-pack --screenshot docs/img/v1.0.2-title.png   --screenshot-title
+openblock --no-audio --no-texture-pack --screenshot docs/img/v1.0.2-connect.png --screenshot-connect
+
+# Survival / menus (fresh data dirs)
+openblock --no-audio --no-texture-pack --screenshot docs/img/v1.0.2-survival.png   --screenshot-items --data-dir /tmp/ob-shots/v1.0.2-survival
+openblock --no-audio --no-texture-pack --screenshot-inventory docs/img/v1.0.2-inventory.png --screenshot-items --data-dir /tmp/ob-shots/v1.0.2-inventory
+openblock --no-audio --no-texture-pack --screenshot docs/img/v1.0.2-crafting.png   --screenshot-crafting --data-dir /tmp/ob-shots/v1.0.2-crafting
+openblock --no-audio --no-texture-pack --screenshot docs/img/v1.0.2-settings.png   --screenshot-settings=display --screenshot-items --data-dir /tmp/ob-shots/v1.0.2-settings
+
+# F3 overlay (right column reports the active UI font)
+openblock --no-audio --no-texture-pack --screenshot docs/img/v1.0.2-debug.png      --screenshot-debug --screenshot-items --data-dir /tmp/ob-shots/v1.0.2-debug
+
+# Loading overlay (in-process deterministic network UI)
+openblock --no-audio --no-texture-pack --screenshot docs/img/v1.0.2-loading.png    --screenshot-net-ui=loading --data-dir /tmp/ob-shots/v1.0.2-loading
+
+# 960x540 at 125% GUI scale (the Display tab still shows the UI-font row)
+openblock --no-audio --no-texture-pack --screenshot-size 960x540 --ui-scale 125 \
+  --screenshot docs/img/v1.0.2-960x540-125.png --screenshot-settings=display --screenshot-items \
+  --data-dir /tmp/ob-shots/v1.0.2-960x540-125
+```
+
+The settings capture focuses **Display → UI font** and shows
+`Monocraft (built-in)` plus the Reset/Reload action rows and the
+`<data>/fonts/` hint. To reproduce the same shots with exact Minecraftia,
+obtain the font yourself and add `--ui-font /path/to/Minecraftia.ttf` to the
+commands (the committed images use the bundled Monocraft so they remain
+redistributable).
+
 ## 960x540 fallback audit
 
 Add `--screenshot-size 960x540` to any of the commands above. The front-end,
@@ -120,9 +160,9 @@ openblock --screenshot /tmp/mobs-plain.png    --screenshot-mobs=plain    --no-au
 Each offscreen capture logs a UI geometry line such as:
 
 ```text
-ui frame Crafting: 989 quads, 5934 vertices, <=3 texture draws
+ui frame Crafting: 989 quads, 5934 vertices, <=4 texture draws
 ```
 
-The UI renderer batches by texture (solid rectangles, font glyphs and block
-icons), so a frame is at most three draw calls; quads/vertices are the useful
-per-screen workload numbers.
+The UI renderer batches by texture (solid rectangles, Monocraft glyphs, bitmap
+title glyphs and block icons), so a frame is at most four draw calls;
+quads/vertices are the useful per-screen workload numbers.

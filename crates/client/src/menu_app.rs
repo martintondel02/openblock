@@ -113,9 +113,10 @@ impl ApplicationHandler for MenuApp {
         };
         let (mut settings, data_dir) = crate::effective_settings(&self.options);
         crate::persist_texture_pack_choice(&self.options, &mut settings, &data_dir);
-        let (renderer, texture_source) =
-            match crate::create_window_renderer(Arc::clone(&window), &self.options, &settings) {
-                Ok(pair) => pair,
+        crate::persist_ui_font_choice(&self.options, &mut settings, &data_dir);
+        let (renderer, texture_source, font_source) =
+            match crate::create_window_renderer(Arc::clone(&window), &self.options, &settings, &data_dir) {
+                Ok(triple) => triple,
                 Err(error) => {
                     log::error!("{error}");
                     log::error!(
@@ -130,6 +131,8 @@ impl ApplicationHandler for MenuApp {
         let mut ui = UiState::from_settings(settings);
         ui.host_optional = true;
         ui.active_texture_pack = crate::active_texture_pack_label(&texture_source);
+        ui.active_ui_font_name = renderer.ui_font_name().to_string();
+        ui.active_ui_font_source = font_source.display_label();
         let worlds = discover_worlds(&data_dir);
         let title = TitleMenu::new(continue_target(&data_dir, ui.settings.last_world.as_deref()));
         let audio_enabled_before_mute = if self.options.mute {
@@ -664,6 +667,19 @@ impl MenuRuntime {
                 self.persist_settings();
                 self.play_ui_sound(true);
             }
+            SettingsAction::ResetUiFont => {
+                let source = crate::reset_ui_font(&mut self.renderer, &mut self.ui.settings);
+                self.ui.active_ui_font_name = self.renderer.ui_font_name().to_string();
+                self.ui.active_ui_font_source = source.display_label();
+                self.persist_settings();
+                self.play_ui_sound(true);
+            }
+            SettingsAction::ReloadUiFont => {
+                let source = crate::reload_ui_font(&mut self.renderer, &self.ui.settings, &self.data_dir);
+                self.ui.active_ui_font_name = self.renderer.ui_font_name().to_string();
+                self.ui.active_ui_font_source = source.display_label();
+                self.play_ui_sound(true);
+            }
         }
     }
 
@@ -690,6 +706,9 @@ impl MenuRuntime {
             | SettingsRow::ShowHud
             | SettingsRow::DebugOverlay
             | SettingsRow::MeshWorkers
+            | SettingsRow::UiFont
+            | SettingsRow::ResetUiFont
+            | SettingsRow::ReloadUiFont
             | SettingsRow::GameMode
             | SettingsRow::Keybind(_)
             | SettingsRow::ResetKeybinds => {}
@@ -947,12 +966,16 @@ fn screenshot_menu_inner(
     }
     settings.clamp();
     let (width, height) = crate::screenshot_dimensions(options);
+    let (mut renderer, texture_source, font_source) =
+        crate::create_offscreen_renderer(options, &settings, data_dir, None)?;
     let physical = [width as f32, height as f32];
     let screen = ui_screen(physical, settings.ui_scale_percent);
     let effective_ui_scale = resolved_ui_scale_percent(settings.ui_scale_percent, physical[1]);
     let mut ui = UiState::from_settings(settings.clone());
     ui.host_optional = true;
     ui.ui_scale_percent = effective_ui_scale;
+    ui.active_ui_font_name = renderer.ui_font_name().to_string();
+    ui.active_ui_font_source = font_source.display_label();
     let worlds = discover_worlds(data_dir);
     let mut frame = UiFrame::new(screen[0], screen[1]);
     let mut camera = Camera::new(WorldVec::new(0.5, 74.0, 6.0), 0.0, -0.12);
@@ -1008,7 +1031,6 @@ fn screenshot_menu_inner(
         }
     }
     crate::log_ui_frame(&format!("{mode:?}"), &frame);
-    let (mut renderer, texture_source) = crate::create_offscreen_renderer(options, &settings)?;
     let environment = Environment::default();
     renderer.render_cached_scene(
         &camera,

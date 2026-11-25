@@ -52,6 +52,7 @@ pub mod net;
 mod net_app;
 pub mod net_state;
 mod net_ui;
+pub mod ui_font;
 pub mod ui_scale;
 pub mod ui_state;
 
@@ -126,6 +127,10 @@ pub struct ClientOptions {
     pub texture_pack: Option<std::path::PathBuf>,
     /// Clear the persisted resource pack and use the procedural style.
     pub no_texture_pack: bool,
+    /// External TTF/OTF UI font for this run; persisted when given.
+    pub ui_font: Option<std::path::PathBuf>,
+    /// Clear the persisted UI-font override and use the embedded Monocraft.
+    pub default_ui_font: bool,
     /// Time-of-day override in 0..=1 for screenshots (0 midnight, 0.5 noon).
     pub time_of_day: Option<f32>,
     /// Explicit gameplay-mode override for this run (persisted when given).
@@ -220,6 +225,8 @@ impl Default for ClientOptions {
             texture_style: None,
             texture_pack: None,
             no_texture_pack: false,
+            ui_font: None,
+            default_ui_font: false,
             time_of_day: None,
             game_mode: None,
             ui_scale: None,
@@ -278,12 +285,12 @@ pub(crate) fn screenshot_dimensions(options: &ClientOptions) -> (u32, u32) {
 
 /// Logs UI geometry for offscreen audit captures.
 ///
-/// The UI renderer batches by texture (solid, font, block icons), so the quad
-/// count is the meaningful per-screen workload and draw calls are at most the
-/// three texture batches.
+/// The UI renderer batches by texture (solid, UI font, bitmap title font and
+/// block icons), so the quad count is the meaningful per-screen workload and
+/// draw calls are at most the four texture batches.
 pub(crate) fn log_ui_frame(label: &str, frame: &UiFrame) {
     let (vertices, quads) = frame.measure();
-    log::info!("ui frame {label}: {quads} quads, {vertices} vertices, <=3 texture draws");
+    log::info!("ui frame {label}: {quads} quads, {vertices} vertices, <=4 texture draws");
 }
 
 /// Runs the client until the window closes, or writes a single screenshot and exits.
@@ -292,6 +299,12 @@ pub(crate) fn log_ui_frame(label: &str, frame: &UiFrame) {
 /// behaviour and bypass the title. A plain launch opens the front-end, which
 /// returns a world or multiplayer choice and then starts the matching runtime.
 pub fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
+    // Persist an explicit UI-font choice before any front-end/screenshot path
+    // starts so `--ui-font` affects this and future runs exactly like
+    // `--texture-pack`. The network demo paths below resolve it separately
+    // because they build their renderer from a temporary data directory.
+    let (mut startup_settings, startup_data_dir) = effective_settings(&options);
+    persist_ui_font_choice(&options, &mut startup_settings, &startup_data_dir);
     if let Some(mode) = menu_screenshot_mode(&options) {
         return menu_app::screenshot_menu(&options, mode);
     }
@@ -307,7 +320,16 @@ pub fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .ok_or("--screenshot-network requires --screenshot PATH")?;
         let (width, height) = screenshot_dimensions(&options);
-        return screenshot_network_demo_at_scaled(path, None, options.seed, width, height, options.ui_scale);
+        let startup_font = ui_font::resolve_ui_font(&options, &startup_settings, &startup_data_dir);
+        return screenshot_network_demo_at_scaled(
+            path,
+            None,
+            options.seed,
+            width,
+            height,
+            options.ui_scale,
+            Some(&startup_font),
+        );
     }
     if options.screenshot_name_tags {
         let path = options
@@ -315,7 +337,15 @@ pub fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .ok_or("--screenshot-name-tags requires --screenshot PATH")?;
         let (width, height) = screenshot_dimensions(&options);
-        return screenshot_name_tags_demo_at_scaled(path, options.seed, width, height, options.ui_scale);
+        let startup_font = ui_font::resolve_ui_font(&options, &startup_settings, &startup_data_dir);
+        return screenshot_name_tags_demo_at_scaled(
+            path,
+            options.seed,
+            width,
+            height,
+            options.ui_scale,
+            Some(&startup_font),
+        );
     }
     if let Some(path) = &options.screenshot {
         let mode = if let Some(kind) = options.screenshot_net_ui {
@@ -397,6 +427,14 @@ pub fn should_show_title(options: &ClientOptions) -> bool {
         && !options.screenshot_connect
         && !options.screenshot_new_world
         && !options.screenshot_settings_title
+}
+
+/// Clears one-shot UI-font CLI overrides after the front-end has applied and
+/// persisted them, so later runtime construction reads the saved settings
+/// (including a Reset UI font action) instead of re-applying the flag.
+fn clear_ui_font_cli_overrides(options: &mut ClientOptions) {
+    options.ui_font = None;
+    options.default_ui_font = false;
 }
 
 /// Which front-end screen an offscreen screenshot should render.
@@ -530,7 +568,7 @@ pub fn screenshot_network_demo_at(
     width: u32,
     height: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    screenshot_network_demo_at_scaled(path, debug_path, seed, width, height, None)
+    screenshot_network_demo_at_scaled(path, debug_path, seed, width, height, None, None)
 }
 
 /// Like [`screenshot_network_demo_at`] but applies a GUI-scale override.
@@ -541,6 +579,7 @@ pub(crate) fn screenshot_network_demo_at_scaled(
     width: u32,
     height: u32,
     ui_scale: Option<u16>,
+    ui_font: Option<&ui_font::ResolvedUiFont>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let registry = Arc::new(Registry::base());
     let nanos = SystemTime::now()
@@ -549,7 +588,9 @@ pub(crate) fn screenshot_network_demo_at_scaled(
         .unwrap_or_default();
     let data_dir = std::env::temp_dir().join(format!("openblock-net-shot-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&data_dir)?;
-    let result = screenshot_network_demo_inner(path, debug_path, seed, &registry, &data_dir, width, height, ui_scale);
+    let result = screenshot_network_demo_inner(
+        path, debug_path, seed, &registry, &data_dir, width, height, ui_scale, ui_font,
+    );
     let _ = std::fs::remove_dir_all(&data_dir);
     result
 }
@@ -571,7 +612,7 @@ pub fn screenshot_name_tags_demo_at(
     width: u32,
     height: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    screenshot_name_tags_demo_at_scaled(path, seed, width, height, None)
+    screenshot_name_tags_demo_at_scaled(path, seed, width, height, None, None)
 }
 
 /// Like [`screenshot_name_tags_demo_at`] but applies a GUI-scale override.
@@ -581,6 +622,7 @@ pub(crate) fn screenshot_name_tags_demo_at_scaled(
     width: u32,
     height: u32,
     ui_scale: Option<u16>,
+    ui_font: Option<&ui_font::ResolvedUiFont>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let registry = Arc::new(Registry::base());
     let nanos = SystemTime::now()
@@ -589,7 +631,7 @@ pub(crate) fn screenshot_name_tags_demo_at_scaled(
         .unwrap_or_default();
     let data_dir = std::env::temp_dir().join(format!("openblock-name-tags-shot-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&data_dir)?;
-    let result = screenshot_name_tags_demo_inner(path, seed, &registry, &data_dir, width, height, ui_scale);
+    let result = screenshot_name_tags_demo_inner(path, seed, &registry, &data_dir, width, height, ui_scale, ui_font);
     let _ = std::fs::remove_dir_all(&data_dir);
     result
 }
@@ -603,6 +645,7 @@ fn screenshot_name_tags_demo_inner(
     width: u32,
     height: u32,
     ui_scale: Option<u16>,
+    ui_font_override: Option<&ui_font::ResolvedUiFont>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut host = Host::open(
         Arc::clone(registry),
@@ -638,7 +681,8 @@ fn screenshot_name_tags_demo_inner(
     };
     options.game_mode = Some(SettingsGameMode::Survival);
     let (settings, _) = effective_settings(&options);
-    let (mut renderer, _texture_source) = create_offscreen_renderer(&options, &settings)?;
+    let (mut renderer, _texture_source, _font_source) =
+        create_offscreen_renderer(&options, &settings, data_dir, ui_font_override)?;
     let player = host.player();
     let eye = player.eye();
     let mut camera = Camera::new(eye, player.yaw, player.pitch);
@@ -718,6 +762,7 @@ fn screenshot_network_demo_inner(
     width: u32,
     height: u32,
     ui_scale: Option<u16>,
+    ui_font_override: Option<&ui_font::ResolvedUiFont>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut host = Host::open(
         Arc::clone(registry),
@@ -928,7 +973,8 @@ fn screenshot_network_demo_inner(
         ..ClientOptions::default()
     };
     let (settings, _) = effective_settings(&options);
-    let (mut renderer, texture_source) = create_offscreen_renderer(&options, &settings)?;
+    let (mut renderer, texture_source, _font_source) =
+        create_offscreen_renderer(&options, &settings, data_dir, ui_font_override)?;
     let physical = [width as f32, height as f32];
     let effective_ui_scale = resolved_ui_scale_percent(settings.ui_scale_percent, physical[1]);
     let screen = ui_screen(physical, settings.ui_scale_percent);
@@ -998,6 +1044,7 @@ fn screenshot_network_demo_inner(
         ui_scale: crate::ui_scale::debug_line(settings.ui_scale_percent, [width as f32, height as f32]),
         time_of_day,
         texture_source: describe_texture_source(&texture_source, renderer.texture_resolution()),
+        ui_font: renderer.ui_font_name().to_string(),
         game_mode: "survival",
         health: client.health(),
         hunger: client.hunger(),
@@ -1106,6 +1153,7 @@ fn screenshot_with_mode(
     let (mut settings, data_dir) = effective_settings(options);
     persist_texture_pack_choice(options, &mut settings, &data_dir);
     persist_game_mode_choice(options, &mut settings, &data_dir);
+    persist_ui_font_choice(options, &mut settings, &data_dir);
     let registry = Arc::new(Registry::base());
     let config = HostConfig {
         seed: options.seed,
@@ -1200,7 +1248,7 @@ fn screenshot_with_mode(
     let mut camera = Camera::new(eye, yaw, pitch);
     camera.far = (host.render_distance_chunks() as f32 * 16.0 + 48.0).max(128.0);
 
-    let (mut renderer, texture_source) = create_offscreen_renderer(options, &settings)?;
+    let (mut renderer, texture_source, font_source) = create_offscreen_renderer(options, &settings, &data_dir, None)?;
     log_texture_source(&texture_source);
 
     // Compose a showcase frame: HUD, inventory or death screen over the world.
@@ -1213,6 +1261,8 @@ fn screenshot_with_mode(
     let mut ui = UiState::from_settings(settings.clone());
     ui.ui_scale_percent = effective_ui_scale;
     ui.active_texture_pack = active_texture_pack_label(&texture_source);
+    ui.active_ui_font_name = renderer.ui_font_name().to_string();
+    ui.active_ui_font_source = font_source.display_label();
     ui.hotbar_selected = host.hotbar_selection();
     if options.screenshot_items
         || matches!(
@@ -1340,8 +1390,10 @@ fn screenshot_with_mode(
                 ui.settings_select_tab(tab);
             }
             if ui.settings_tab == SettingsTab::Display
-                && let Some(index) = ui.settings_rows().iter().position(|row| *row == SettingsRow::UiScale)
+                && let Some(index) = ui.settings_rows().iter().position(|row| *row == SettingsRow::UiFont)
             {
+                // Focus the UI-font row so the capture shows both the active
+                // font/source and the placement hint.
                 ui.settings_selected_row = index;
             }
             if ui.settings_tab == SettingsTab::Controls {
@@ -1761,6 +1813,7 @@ fn screenshot_debug_stats(
         ),
         time_of_day: Environment::from_ticks(host.tick_count() + DAY_LENGTH_TICKS / 4, DAY_LENGTH_TICKS).time_of_day,
         texture_source: describe_texture_source(texture_source, renderer.texture_resolution()),
+        ui_font: renderer.ui_font_name().to_string(),
         game_mode: host.game_mode().name(),
         health: player.health,
         hunger: player.hunger,
@@ -2374,6 +2427,12 @@ impl RootApp {
         let Some(outcome) = outcome else {
             return;
         };
+        // The front-end already applied and persisted any `--ui-font` /
+        // `--default-ui-font` choice. Clear the run-only flags before the game
+        // or network runtime loads settings, otherwise a Reset UI font action
+        // performed in the title-screen Settings panel would be undone when a
+        // world starts in the same process.
+        clear_ui_font_cli_overrides(&mut self.options);
         match outcome {
             menu_app::MenuOutcome::Quit => {
                 self.state = RootState::Empty;
@@ -3303,6 +3362,9 @@ impl GameState {
             | SettingsRow::Fov
             | SettingsRow::MouseSensitivity
             | SettingsRow::MeshWorkers
+            | SettingsRow::UiFont
+            | SettingsRow::ResetUiFont
+            | SettingsRow::ReloadUiFont
             | SettingsRow::Keybind(_)
             | SettingsRow::ResetKeybinds => {}
         }
@@ -3337,6 +3399,20 @@ impl GameState {
             SettingsAction::ResetKeybinds => {
                 self.ui.reset_keybinds();
                 self.persist_settings();
+                false
+            }
+            SettingsAction::ResetUiFont => {
+                let source = reset_ui_font(&mut self.renderer, &mut self.ui.settings);
+                self.ui.active_ui_font_name = self.renderer.ui_font_name().to_string();
+                self.ui.active_ui_font_source = source.display_label();
+                self.persist_settings();
+                false
+            }
+            SettingsAction::ReloadUiFont => {
+                let source = reload_ui_font(&mut self.renderer, &self.ui.settings, &self.data_dir);
+                self.ui.active_ui_font_name = self.renderer.ui_font_name().to_string();
+                self.ui.active_ui_font_source = source.display_label();
+                log::info!("reloaded UI font: {}", source.display_label());
                 false
             }
         }
@@ -3485,6 +3561,7 @@ impl GameState {
             time_of_day: Environment::from_ticks(self.host.tick_count() + DAY_LENGTH_TICKS / 4, DAY_LENGTH_TICKS)
                 .time_of_day,
             texture_source: self.texture_source_description(),
+            ui_font: self.renderer.ui_font_name().to_string(),
             game_mode: self.host.game_mode().name(),
             health: player.health,
             hunger: player.hunger,
@@ -3931,6 +4008,10 @@ impl GameState {
                 return;
             }
         };
+        // F2 must capture the same UI font as the window, including a saved
+        // Minecraftia override or a font discovered in <data>/fonts/.
+        let resolved_font = ui_font::resolve_ui_font_for_settings(&self.ui.settings, &self.data_dir);
+        ui_font::install_ui_font(&mut renderer, &resolved_font);
         // Build the UI for the offscreen target size so the HUD is included.
         let ui_frame = if ui.is_some() {
             self.build_ui_frame_at([SCREENSHOT_WIDTH as f32, SCREENSHOT_HEIGHT as f32])
@@ -4659,21 +4740,23 @@ impl ApplicationHandler for App {
         let (mut settings, data_dir) = effective_settings(&self.options);
         persist_texture_pack_choice(&self.options, &mut settings, &data_dir);
         persist_game_mode_choice(&self.options, &mut settings, &data_dir);
+        persist_ui_font_choice(&self.options, &mut settings, &data_dir);
         // Continue on the title screen points at the most recently opened
         // single-player world, including worlds started from the CLI.
         menu_app::remember_last_world_choice(&data_dir, &self.options.world);
         settings.last_world = Some(self.options.world.clone());
-        let (renderer, texture_source) = match create_window_renderer(Arc::clone(&window), &self.options, &settings) {
-            Ok(pair) => pair,
-            Err(err) => {
-                log::error!("{err}");
-                log::error!(
-                    "OpenBlock requires a working Vulkan driver (Fedora: mesa-vulkan-drivers or the NVIDIA driver)."
-                );
-                event_loop.exit();
-                return;
-            }
-        };
+        let (renderer, texture_source, font_source) =
+            match create_window_renderer(Arc::clone(&window), &self.options, &settings, &data_dir) {
+                Ok(triple) => triple,
+                Err(err) => {
+                    log::error!("{err}");
+                    log::error!(
+                        "OpenBlock requires a working Vulkan driver (Fedora: mesa-vulkan-drivers or the NVIDIA driver)."
+                    );
+                    event_loop.exit();
+                    return;
+                }
+            };
         log_texture_source(&texture_source);
         log::info!("GPU: {}", renderer.adapter_summary());
         log::info!(
@@ -4701,6 +4784,8 @@ impl ApplicationHandler for App {
         let initial_fov = settings.fov_degrees;
         let mut ui = UiState::from_settings(settings);
         ui.active_texture_pack = active_texture_pack_label(&texture_source);
+        ui.active_ui_font_name = renderer.ui_font_name().to_string();
+        ui.active_ui_font_source = font_source.display_label();
         ui.ui_scale_percent = resolved_ui_scale_percent(ui.settings.ui_scale_percent, window_size.1);
         let applied_render_distance = ui.settings.render_distance_chunks;
         let mut host = match Host::open(Arc::clone(&registry), config) {
@@ -5595,6 +5680,60 @@ fn persist_texture_pack_choice(options: &ClientOptions, settings: &mut Settings,
     }
 }
 
+/// Persists an explicit `--ui-font`/`--default-ui-font` choice.
+///
+/// Like `--texture-pack`, the in-memory settings are updated immediately so the
+/// rest of startup sees the selection, while the save starts from the settings
+/// on disk so unrelated CLI overrides are not persisted. A bad explicit path is
+/// still stored (for the user to fix with `--default-ui-font`); the renderer
+/// warns and falls back to Monocraft instead of refusing to start.
+fn persist_ui_font_choice(options: &ClientOptions, settings: &mut Settings, data_dir: &Path) {
+    let selection = if options.default_ui_font {
+        Some(None)
+    } else {
+        options
+            .ui_font
+            .as_ref()
+            .map(|path| Some(path.to_string_lossy().into_owned()))
+    };
+    let Some(selection) = selection else {
+        return;
+    };
+    settings.ui_font_path = selection.clone();
+
+    let mut disk_settings = load_settings(data_dir);
+    if disk_settings.ui_font_path == selection {
+        return;
+    }
+    disk_settings.ui_font_path = selection;
+    match save_settings(data_dir, &disk_settings) {
+        Ok(()) => log::info!(
+            "saved UI font selection to {}",
+            ob_core::config::settings_path(data_dir).display()
+        ),
+        Err(err) => log::warn!("could not save UI font selection: {err}"),
+    }
+}
+
+/// Clears the saved UI-font override and restores the embedded Monocraft atlas.
+pub(crate) fn reset_ui_font<T: ui_font::UiFontTarget>(
+    target: &mut T,
+    settings: &mut Settings,
+) -> ui_font::UiFontSource {
+    settings.ui_font_path = None;
+    ui_font::install_ui_font(target, &ui_font::ResolvedUiFont::builtin())
+}
+
+/// Re-scans the data/system font folders and applies the current choice.
+pub(crate) fn reload_ui_font<T: ui_font::UiFontTarget>(
+    target: &mut T,
+    settings: &Settings,
+    data_dir: &Path,
+) -> ui_font::UiFontSource {
+    let resolved = ui_font::resolve_ui_font_for_settings(settings, data_dir);
+    ui_font::install_ui_font(target, &resolved)
+}
+
 /// Human-readable description of a texture source and its texel resolution.
 fn describe_texture_source(source: &TextureSource, resolution: u32) -> String {
     format!("{} {}px", source.label(), resolution)
@@ -5619,15 +5758,17 @@ fn log_texture_source(source: &TextureSource) {
 }
 
 /// Builds the offscreen renderer, falling back to the procedural style when a
-/// requested resource pack cannot be loaded.
+/// requested resource pack cannot be loaded, then installs the resolved UI font.
 fn create_offscreen_renderer(
     options: &ClientOptions,
     settings: &Settings,
-) -> Result<(OffscreenRenderer, TextureSource), ob_render::RenderError> {
+    data_dir: &Path,
+    font_override: Option<&ui_font::ResolvedUiFont>,
+) -> Result<(OffscreenRenderer, TextureSource, ui_font::UiFontSource), ob_render::RenderError> {
     let source = resolve_texture_source(options, settings);
     let (width, height) = screenshot_dimensions(options);
-    match OffscreenRenderer::new_with_source(width, height, source.clone()) {
-        Ok(renderer) => Ok((renderer, source)),
+    let (mut renderer, active_source) = match OffscreenRenderer::new_with_source(width, height, source.clone()) {
+        Ok(renderer) => (renderer, source),
         Err(ob_render::RenderError::Texture(reason)) => {
             if let TextureSource::ResourcePack(path) = &source {
                 log::warn!(
@@ -5636,26 +5777,34 @@ fn create_offscreen_renderer(
                     settings.texture_style.name()
                 );
                 let style = render_texture_style(settings.texture_style);
-                let renderer = OffscreenRenderer::new_with_style(width, height, style)?;
-                Ok((renderer, TextureSource::Style(style)))
+                (
+                    OffscreenRenderer::new_with_style(width, height, style)?,
+                    TextureSource::Style(style),
+                )
             } else {
-                Err(ob_render::RenderError::Texture(reason))
+                return Err(ob_render::RenderError::Texture(reason));
             }
         }
-        Err(err) => Err(err),
-    }
+        Err(err) => return Err(err),
+    };
+    let resolved = font_override
+        .cloned()
+        .unwrap_or_else(|| ui_font::resolve_ui_font(options, settings, data_dir));
+    let font_source = ui_font::install_ui_font(&mut renderer, &resolved);
+    Ok((renderer, active_source, font_source))
 }
 
 /// Builds the windowed renderer, falling back to the procedural style when a
-/// requested resource pack cannot be loaded.
+/// requested resource pack cannot be loaded, then installs the resolved UI font.
 fn create_window_renderer(
     window: Arc<Window>,
     options: &ClientOptions,
     settings: &Settings,
-) -> Result<(Renderer, TextureSource), ob_render::RenderError> {
+    data_dir: &Path,
+) -> Result<(Renderer, TextureSource, ui_font::UiFontSource), ob_render::RenderError> {
     let source = resolve_texture_source(options, settings);
-    match Renderer::new_with_source(Arc::clone(&window), source.clone()) {
-        Ok(renderer) => Ok((renderer, source)),
+    let (mut renderer, active_source) = match Renderer::new_with_source(Arc::clone(&window), source.clone()) {
+        Ok(renderer) => (renderer, source),
         Err(ob_render::RenderError::Texture(reason)) => {
             if let TextureSource::ResourcePack(path) = &source {
                 log::warn!(
@@ -5664,14 +5813,16 @@ fn create_window_renderer(
                     settings.texture_style.name()
                 );
                 let style = render_texture_style(settings.texture_style);
-                let renderer = Renderer::new_with_style(window, style)?;
-                Ok((renderer, TextureSource::Style(style)))
+                (Renderer::new_with_style(window, style)?, TextureSource::Style(style))
             } else {
-                Err(ob_render::RenderError::Texture(reason))
+                return Err(ob_render::RenderError::Texture(reason));
             }
         }
-        Err(err) => Err(err),
-    }
+        Err(err) => return Err(err),
+    };
+    let resolved = ui_font::resolve_ui_font(options, settings, data_dir);
+    let font_source = ui_font::install_ui_font(&mut renderer, &resolved);
+    Ok((renderer, active_source, font_source))
 }
 
 /// Writes an RGBA8 image to a PNG file.
@@ -5760,6 +5911,13 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
                 options.texture_pack = Some(value.into());
             }
             "no-texture-pack" => options.no_texture_pack = true,
+            "ui-font" => {
+                if let Some(reason) = ob_core::config::ui_font_path_rejection_reason(value) {
+                    return Err(format!("invalid --ui-font path '{value}': {reason}"));
+                }
+                options.ui_font = Some(value.into());
+            }
+            "default-ui-font" => options.default_ui_font = true,
             "mesh-workers" => {
                 options.mesh_workers = value
                     .parse()
@@ -6058,6 +6216,9 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
     }
     if options.force_title && (saw_world || saw_seed || options.connect.is_some()) {
         return Err("--title/--menu cannot be combined with --world, --seed or --connect".into());
+    }
+    if options.ui_font.is_some() && options.default_ui_font {
+        return Err("--ui-font and --default-ui-font cannot be combined".into());
     }
     Ok(options)
 }
@@ -6445,6 +6606,98 @@ mod tests {
         persist_texture_pack_choice(&options, &mut runtime, &dir);
         assert_eq!(runtime.texture_pack, None);
         assert_eq!(load_settings(&dir).texture_pack, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ui_font_flags_parse_validate_and_conflict() {
+        let path = PathBuf::from("/tmp/fonts/Minecraftia.ttf");
+        let options =
+            options_from_args(&[("ui-font".to_string(), path.to_string_lossy().into_owned())]).expect("valid font");
+        assert_eq!(options.ui_font.as_deref(), Some(path.as_path()));
+        assert!(!options.default_ui_font);
+        assert!(
+            should_show_title(&options),
+            "a font selection does not bypass the title"
+        );
+
+        let options = options_from_args(&[("default-ui-font".to_string(), String::new())]).expect("valid flag");
+        assert!(options.default_ui_font);
+        assert_eq!(options.ui_font, None);
+        assert!(should_show_title(&options));
+
+        for value in [String::new(), "bad\u{7}path".to_string(), "x".repeat(4097)] {
+            let error = options_from_args(&[("ui-font".to_string(), value)]).expect_err("bad path must fail");
+            assert!(error.contains("--ui-font"), "{error}");
+        }
+        let error = options_from_args(&[
+            ("ui-font".to_string(), path.to_string_lossy().into_owned()),
+            ("default-ui-font".to_string(), String::new()),
+        ])
+        .expect_err("conflicting font flags");
+        assert!(error.contains("--default-ui-font"), "{error}");
+    }
+
+    #[test]
+    fn front_end_transition_clears_persisted_font_cli_overrides() {
+        let mut options = ClientOptions {
+            ui_font: Some(PathBuf::from("/tmp/fonts/custom.ttf")),
+            ..ClientOptions::default()
+        };
+        clear_ui_font_cli_overrides(&mut options);
+        assert_eq!(options.ui_font, None);
+        assert!(!options.default_ui_font);
+
+        let mut options = ClientOptions {
+            default_ui_font: true,
+            ..ClientOptions::default()
+        };
+        clear_ui_font_cli_overrides(&mut options);
+        assert!(!options.default_ui_font);
+    }
+
+    #[test]
+    fn cli_ui_font_choice_is_persisted_without_other_cli_overrides() {
+        let dir = std::env::temp_dir().join(format!(
+            "openblock-client-font-choice-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let disk = Settings {
+            render_distance_chunks: 5,
+            ui_font_path: Some("/old/Monocraft.ttf".into()),
+            ..Settings::default()
+        };
+        save_settings(&dir, &disk).expect("save seed settings");
+
+        let mut runtime = Settings {
+            render_distance_chunks: 11,
+            ui_font_path: Some("/old/Monocraft.ttf".into()),
+            ..Settings::default()
+        };
+        let options = ClientOptions {
+            ui_font: Some(PathBuf::from("/new/Minecraftia.ttf")),
+            render_distance_chunks: 11,
+            ..ClientOptions::default()
+        };
+        persist_ui_font_choice(&options, &mut runtime, &dir);
+        assert_eq!(runtime.ui_font_path.as_deref(), Some("/new/Minecraftia.ttf"));
+        let loaded = load_settings(&dir);
+        assert_eq!(loaded.ui_font_path.as_deref(), Some("/new/Minecraftia.ttf"));
+        assert_eq!(loaded.render_distance_chunks, 5);
+
+        // `--default-ui-font` clears both the runtime and persisted selection.
+        let options = ClientOptions {
+            default_ui_font: true,
+            render_distance_chunks: 11,
+            ..ClientOptions::default()
+        };
+        persist_ui_font_choice(&options, &mut runtime, &dir);
+        assert_eq!(runtime.ui_font_path, None);
+        assert_eq!(load_settings(&dir).ui_font_path, None);
         let _ = std::fs::remove_dir_all(dir);
     }
 

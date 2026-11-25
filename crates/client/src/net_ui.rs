@@ -137,7 +137,7 @@ pub fn draw_connect_panel(frame: &mut UiFrame, panel_info: &ConnectPanel<'_>, sc
 
     let centre_x = panel.x + panel.w / 2.0;
     let failure = panel_info.failure;
-    frame.text_centered(centre_x, panel.y + 18.0, 2.4, [0.98, 0.99, 1.0, 1.0], panel_info.title);
+    frame.title_text_centered(centre_x, panel.y + 18.0, 2.4, [0.98, 0.99, 1.0, 1.0], panel_info.title);
     let status_color = if failure.is_some() {
         [0.98, 0.62, 0.55, 1.0]
     } else {
@@ -460,7 +460,7 @@ pub fn draw_player_list(
     frame.outline(panel.x, panel.y, panel.w, panel.h, 1.5, [0.40, 0.47, 0.58, 0.95]);
     let centre_x = panel.x + panel.w / 2.0;
     let title = format!("Players {}/{}", entries.len(), max_players);
-    frame.text_centered(centre_x, panel.y + 12.0, 1.9, [0.98, 0.99, 1.0, 1.0], &title);
+    frame.title_text_centered(centre_x, panel.y + 12.0, 1.9, [0.98, 0.99, 1.0, 1.0], &title);
     let ping = ping_ms
         .map(|millis| format!("ping {millis} ms"))
         .unwrap_or_else(|| "ping --".to_string());

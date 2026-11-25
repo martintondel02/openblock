@@ -306,6 +306,12 @@ pub enum SettingsRow {
     UiScale,
     /// Read-only worker-thread count.
     MeshWorkers,
+    /// Active UI font name and source (read-only).
+    UiFont,
+    /// Clear the saved UI-font override and use the embedded Monocraft font.
+    ResetUiFont,
+    /// Re-scan the data/system font folders and apply the chosen font.
+    ReloadUiFont,
     /// Procedural texture style.
     TextureStyle,
     /// External resource pack toggle.
@@ -339,6 +345,9 @@ impl SettingsRow {
             SettingsRow::Fullscreen => "Fullscreen",
             SettingsRow::UiScale => "GUI scale",
             SettingsRow::MeshWorkers => "Mesh workers",
+            SettingsRow::UiFont => "UI font",
+            SettingsRow::ResetUiFont => "Reset UI font",
+            SettingsRow::ReloadUiFont => "Reload UI font",
             SettingsRow::TextureStyle => "Texture style",
             SettingsRow::TexturePack => "Texture pack",
             SettingsRow::AudioEnabled => "Sound",
@@ -366,8 +375,8 @@ impl SettingsRow {
             | SettingsRow::MasterVolume
             | SettingsRow::SfxVolume
             | SettingsRow::MusicVolume => SettingsRowKind::Range,
-            SettingsRow::TexturePack => SettingsRowKind::Action,
-            SettingsRow::MeshWorkers => SettingsRowKind::ReadOnly,
+            SettingsRow::TexturePack | SettingsRow::ResetUiFont | SettingsRow::ReloadUiFont => SettingsRowKind::Action,
+            SettingsRow::MeshWorkers | SettingsRow::UiFont => SettingsRowKind::ReadOnly,
             SettingsRow::Keybind(_) | SettingsRow::ResetKeybinds => SettingsRowKind::Action,
         }
     }
@@ -408,6 +417,10 @@ pub enum SettingsAction {
     BeginBind(Action),
     /// Restore every keybinding to its factory default.
     ResetKeybinds,
+    /// Clear the persisted UI-font path and restore embedded Monocraft.
+    ResetUiFont,
+    /// Re-scan the UI-font folders and apply the current choice.
+    ReloadUiFont,
 }
 
 /// One binding listed by the read-only Controls tab.
@@ -809,6 +822,8 @@ pub struct DebugStats {
     pub time_of_day: f32,
     /// Active texture source label, e.g. `painterly 32px` or a pack folder name.
     pub texture_source: String,
+    /// Active UI font name reported by the renderer (`Monocraft` or `custom`).
+    pub ui_font: String,
     /// `survival` or `creative`.
     pub game_mode: &'static str,
     /// Current health in half-hearts.
@@ -962,6 +977,14 @@ impl DebugStats {
             "Renderer wgpu (Vulkan)".to_string(),
             "Mesh pipeline: greedy + AO".to_string(),
             format!("Audio {}", if self.audio.is_empty() { "off" } else { &self.audio }),
+            format!(
+                "UI font: {}",
+                if self.ui_font.is_empty() {
+                    ob_render::default_ui_font_name()
+                } else {
+                    &self.ui_font
+                }
+            ),
         ] {
             lines.extend(wrap_words(&text, DEBUG_RIGHT_WRAP_COLUMNS));
         }
@@ -988,7 +1011,7 @@ impl DebugStats {
                 self.fps, self.frame_p50_ms, self.frame_p95_ms
             ),
             format!(
-                "Game: {}   Move: {}",
+                "Game: {}   Move: {}   UI font: {}",
                 if self.game_mode.is_empty() {
                     "survival"
                 } else {
@@ -998,6 +1021,11 @@ impl DebugStats {
                     "walk"
                 } else {
                     self.movement
+                },
+                if self.ui_font.is_empty() {
+                    ob_render::default_ui_font_name()
+                } else {
+                    &self.ui_font
                 }
             ),
             format!(
@@ -1494,6 +1522,10 @@ pub struct UiState {
     pub cursor: (f32, f32),
     /// Display name of the active external resource pack, if one is loaded.
     pub active_texture_pack: Option<String>,
+    /// Active UI font name reported by the renderer (`Monocraft` or `custom`).
+    pub active_ui_font_name: String,
+    /// Source of the active UI font: `built-in` or the font file's base name.
+    pub active_ui_font_source: String,
     /// Drag value for a future settings slider.
     pub dragging: bool,
     /// Recent pickup/hint messages shown above the vitals.
@@ -1542,6 +1574,8 @@ impl Default for UiState {
             break_flash_seconds: 0.0,
             cursor: (0.0, 0.0),
             active_texture_pack: None,
+            active_ui_font_name: "Monocraft".to_string(),
+            active_ui_font_source: "built-in".to_string(),
             dragging: false,
             toasts: ToastQueue::default(),
             death_selected: 0,
@@ -1565,6 +1599,8 @@ impl UiState {
             debug_overlay: settings.show_debug_overlay,
             hud_visible: settings.show_hud,
             ui_scale_percent: 100,
+            active_ui_font_name: ob_render::default_ui_font_name().to_string(),
+            active_ui_font_source: "built-in".to_string(),
             settings,
             ..Self::default()
         }
@@ -1770,6 +1806,9 @@ impl UiState {
                 SettingsRow::UiScale,
                 SettingsRow::ReducedMotion,
                 SettingsRow::MeshWorkers,
+                SettingsRow::UiFont,
+                SettingsRow::ResetUiFont,
+                SettingsRow::ReloadUiFont,
             ],
             SettingsTab::Audio => vec![
                 SettingsRow::AudioEnabled,
@@ -1903,11 +1942,13 @@ impl UiState {
             | SettingsRow::DebugOverlay
             | SettingsRow::Fullscreen
             | SettingsRow::TexturePack
+            | SettingsRow::ResetUiFont
+            | SettingsRow::ReloadUiFont
             | SettingsRow::AudioEnabled
             | SettingsRow::ReducedMotion
             | SettingsRow::Keybind(_)
             | SettingsRow::ResetKeybinds => true,
-            SettingsRow::MeshWorkers => false,
+            SettingsRow::MeshWorkers | SettingsRow::UiFont => false,
         }
     }
 
@@ -1957,6 +1998,21 @@ impl UiState {
                 crate::ui_scale::ui_scale_label(self.settings.ui_scale_percent, info.ui_scale_percent)
             }
             SettingsRow::MeshWorkers => format!("{} threads (launch)", info.mesh_workers.max(1)),
+            SettingsRow::UiFont => {
+                let name = if self.active_ui_font_name.is_empty() {
+                    ob_render::default_ui_font_name()
+                } else {
+                    &self.active_ui_font_name
+                };
+                let source = if self.active_ui_font_source.is_empty() {
+                    "built-in"
+                } else {
+                    &self.active_ui_font_source
+                };
+                shorten_row_value(&format!("{name} ({source})"))
+            }
+            SettingsRow::ResetUiFont => "Use built-in".to_string(),
+            SettingsRow::ReloadUiFont => "Rescan fonts".to_string(),
             SettingsRow::TextureStyle => texture_style_label(self.settings.texture_style).to_string(),
             SettingsRow::TexturePack => {
                 if let Some(name) = &self.active_texture_pack {
@@ -2166,7 +2222,12 @@ impl UiState {
                 self.settings.reduced_motion = !self.settings.reduced_motion;
                 true
             }
-            SettingsRow::MeshWorkers | SettingsRow::Keybind(_) | SettingsRow::ResetKeybinds => false,
+            SettingsRow::MeshWorkers
+            | SettingsRow::UiFont
+            | SettingsRow::ResetUiFont
+            | SettingsRow::ReloadUiFont
+            | SettingsRow::Keybind(_)
+            | SettingsRow::ResetKeybinds => false,
             SettingsRow::TextureStyle => {
                 let index = TextureStyle::ALL
                     .iter()
@@ -2204,6 +2265,8 @@ impl UiState {
         match row {
             SettingsRow::Keybind(action) => Some(SettingsAction::BeginBind(action)),
             SettingsRow::ResetKeybinds => Some(SettingsAction::ResetKeybinds),
+            SettingsRow::ResetUiFont => Some(SettingsAction::ResetUiFont),
+            SettingsRow::ReloadUiFont => Some(SettingsAction::ReloadUiFont),
             _ => self.settings_adjust(1).map(SettingsAction::Adjust),
         }
     }
@@ -2397,9 +2460,10 @@ impl UiState {
                 .collect();
         }
         // Fit every single-column row between the content top and the footer
-        // buttons. At 100% the old 44 px pitch is kept; the extra Display row
-        // (GUI scale) compresses the pitch slightly rather than overlapping.
-        let gap = 6.0;
+        // buttons. At 100% the old 44 px pitch is kept; the extra Display rows
+        // (GUI scale and UI font actions) compress the pitch slightly rather
+        // than overlapping.
+        let gap = 7.0;
         let available = (buttons[0].y - 6.0 - start_y).max(1.0);
         let height = metrics
             .row_height
@@ -2588,7 +2652,7 @@ fn vital_value(value: f32) -> f32 {
 ///
 /// The release layouts are the 100% baseline. When the logical height drops
 /// below 500 px (for example 960x540 at 150% GUI scale, which is 640x360
-/// logical), a compact metric set keeps the tab strip, seven Display rows and
+/// logical), a compact metric set keeps the tab strip, the ten Display rows and
 /// the footer buttons inside the panel instead of clipping them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SettingsMetrics {
@@ -2896,7 +2960,7 @@ fn draw_settings_panel(frame: &mut UiFrame, panel: UiRect) {
 }
 
 fn draw_settings_header(frame: &mut UiFrame, panel: UiRect, metrics: SettingsMetrics) {
-    frame.text(
+    frame.title_text(
         panel.x + metrics.margin,
         panel.y + metrics.title_y,
         metrics.title_scale,
@@ -3300,7 +3364,18 @@ fn draw_settings_footer(frame: &mut UiFrame, panel: UiRect, ui: &UiState, metric
         "GUI scale applies immediately; Auto grows with the window.",
         "Panels reflow to stay on screen. Esc: back",
     ]);
+    let ui_font_help = (ui.settings_tab == SettingsTab::Display
+        && matches!(
+            ui.settings_focused_row(),
+            Some(SettingsRow::UiFont | SettingsRow::ResetUiFont | SettingsRow::ReloadUiFont)
+        ))
+    .then_some([
+        "Place Minecraftia.ttf in <data>/fonts/ or use --ui-font PATH.",
+        "Reset uses built-in Monocraft; Reload re-scans data/system fonts.",
+    ]);
     let lines: &[&str] = if let Some(lines) = ui_scale_help.as_ref() {
+        lines
+    } else if let Some(lines) = ui_font_help.as_ref() {
         lines
     } else if ui.settings_tab == SettingsTab::Controls {
         &SETTINGS_CONTROLS_HINT_LINES
@@ -3672,7 +3747,7 @@ pub fn draw_death_screen_custom(
     } else {
         (centre_y - 142.0, 4.0, centre_y - 104.0, 1.2, centre_y - 84.0, 1.5)
     };
-    frame.text_centered(centre_x, title_y, title_scale, [1.0, 0.88, 0.86, 1.0], "You died");
+    frame.title_text_centered(centre_x, title_y, title_scale, [1.0, 0.88, 0.86, 1.0], "You died");
     if let Some(cause) = cause {
         let max_chars = ((width - 32.0) / ob_render::glyph_advance(cause_scale)).max(8.0) as usize;
         frame.text_centered(
@@ -3785,6 +3860,7 @@ mod tests {
             ui_scale: "UI 100% (1280x720 logical)".to_string(),
             time_of_day: 0.5,
             texture_source: "classic 16px".into(),
+            ui_font: "Monocraft".into(),
             game_mode: "survival",
             health: 14.0,
             hunger: 12.0,
@@ -4004,8 +4080,8 @@ mod tests {
         assert_eq!(state.settings_focused_button(), None);
 
         state.settings_select_tab(SettingsTab::Display);
-        assert_eq!(state.settings_focus_count(), 9);
-        state.settings_selected_row = 8;
+        assert_eq!(state.settings_focus_count(), 12);
+        state.settings_selected_row = 11;
         assert_eq!(state.settings_focused_button(), Some(SettingsButton::SaveAndQuit));
         state.settings_row_down();
         assert_eq!(state.settings_selected_row, 0);
@@ -4261,7 +4337,7 @@ mod tests {
         assert_eq!(state.settings_tab, SettingsTab::Display);
 
         let rows = state.settings_row_rects(screen);
-        assert_eq!(rows.len(), 7);
+        assert_eq!(rows.len(), 10);
         state.cursor = rows[3].center();
         assert_eq!(
             state.settings_click(screen),
@@ -4406,7 +4482,7 @@ mod tests {
         let screen = [1280.0, 720.0];
         let rows = state.settings_row_rects(screen);
         let arrows = state.settings_arrow_rects(screen);
-        assert_eq!(rows.len(), 7);
+        assert_eq!(rows.len(), 10);
         assert!(arrows[0].is_some(), "render distance is a range");
         assert!(arrows[1].is_some(), "FOV is a range");
         assert!(arrows[2].is_some(), "sensitivity is a range");
@@ -4552,6 +4628,7 @@ mod tests {
         );
         let lines = stats.compact_left_lines();
         assert!(lines.iter().any(|line| line.contains("UI 150% (640x360 logical)")));
+        assert!(lines.iter().any(|line| line.contains("UI font: Monocraft")));
         assert!(lines.iter().any(|line| line.contains("XYZ")));
         assert!(lines.iter().any(|line| line.contains("FPS")));
         assert!(lines.iter().any(|line| line.contains("Vitals")));
@@ -4693,6 +4770,46 @@ mod tests {
             state.settings_row_value(SettingsRow::TexturePack, &info),
             "rotrBLOCKS V88"
         );
+    }
+
+    #[test]
+    fn settings_ui_font_row_shows_the_active_source_and_actions() {
+        let mut state = UiState::default();
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Display);
+        let info = SettingsInfo::default();
+        assert_eq!(
+            state.settings_row_value(SettingsRow::UiFont, &info),
+            "Monocraft (built-in)"
+        );
+        assert_eq!(
+            state.settings_row_info(SettingsRow::UiFont, &info).kind,
+            SettingsRowKind::ReadOnly
+        );
+        assert!(!state.settings_can_adjust(SettingsRow::UiFont, 1));
+
+        state.active_ui_font_name = "custom".to_string();
+        state.active_ui_font_source = "Minecraftia.ttf".to_string();
+        assert_eq!(
+            state.settings_row_value(SettingsRow::UiFont, &info),
+            "custom (Minecraftia.ttf)"
+        );
+
+        // The two action rows request renderer/persistence side effects.
+        let rows = state.settings_rows();
+        state.settings_selected_row = rows.iter().position(|row| *row == SettingsRow::ResetUiFont).unwrap();
+        assert_eq!(state.settings_activate(), Some(SettingsAction::ResetUiFont));
+        state.settings_selected_row = rows.iter().position(|row| *row == SettingsRow::ReloadUiFont).unwrap();
+        assert_eq!(state.settings_activate(), Some(SettingsAction::ReloadUiFont));
+        let arrows = state.settings_arrow_rects([1280.0, 720.0]);
+        for row in [SettingsRow::UiFont, SettingsRow::ResetUiFont, SettingsRow::ReloadUiFont] {
+            let index = state
+                .settings_rows()
+                .iter()
+                .position(|candidate| *candidate == row)
+                .unwrap();
+            assert!(arrows[index].is_none(), "{row:?} has no arrows");
+        }
     }
 
     #[test]
@@ -4869,6 +4986,7 @@ mod tests {
             ui_scale: "UI 100% (1280x720 logical)".to_string(),
             time_of_day: 0.5,
             texture_source: "painterly 32px".into(),
+            ui_font: "Monocraft".into(),
             game_mode: "survival",
             health: 14.0,
             hunger: 12.5,
@@ -5098,6 +5216,39 @@ mod tests {
         assert_eq!(state.selected_death_action(), Some(DeathAction::SaveAndQuit));
         state.clear_death();
         assert_eq!(state.screen, Screen::Playing);
+    }
+
+    #[test]
+    fn death_heading_uses_the_bitmap_font_and_body_text_uses_the_ui_font() {
+        let state = UiState::default();
+        let screen = [1280.0, 720.0];
+        let mut body = UiFrame::new(screen[0], screen[1]);
+        draw_death_screen_custom(
+            &mut body,
+            &state,
+            Some("Test cause"),
+            ["Respawn", "Save & quit"],
+            DEATH_NOTE,
+            "Enter respawn",
+            screen,
+        );
+        let debug = format!("{body:?}");
+        assert!(
+            debug.contains("texture: Font"),
+            "the death heading must use the bitmap atlas"
+        );
+        assert!(
+            debug.contains("texture: UiFont"),
+            "buttons/body must use the UI font atlas"
+        );
+
+        // Only "You died" with empty labels/cause/note/hint: the bitmap batch
+        // remains and the UI-font batch disappears.
+        let mut heading = UiFrame::new(screen[0], screen[1]);
+        draw_death_screen_custom(&mut heading, &state, None, ["", ""], "", "", screen);
+        let debug = format!("{heading:?}");
+        assert!(debug.contains("texture: Font"));
+        assert!(!debug.contains("texture: UiFont"));
     }
 
     #[test]
@@ -5358,7 +5509,7 @@ mod tests {
                     assert_inside(&format!("{label} multiplayer field"), rect, screen);
                 }
 
-                // Every settings tab, including the seven-row Display tab.
+                // Every settings tab, including the ten-row Display tab.
                 for tab in SettingsTab::ALL {
                     state.settings_select_tab(tab);
                     let panel = settings_panel_rect(screen);

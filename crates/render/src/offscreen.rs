@@ -184,10 +184,27 @@ impl OffscreenRenderer {
         let textures = BlockTextureArray::new_with_source(&self.device, &self.queue, &source)?;
         let layout = pipeline::create_bind_group_layout(&self.device);
         self.bind_group = pipeline::create_bind_group(&self.device, &layout, &self.uniform_buffer, &textures);
-        self.ui = UiRenderer::new(&self.device, &self.queue, &textures, COLOR_FORMAT);
+        // Keep the UI renderer (and any custom UI font) alive; only its block
+        // bind group references the replaced textures.
+        self.ui.set_block_textures(&textures);
         self._textures = textures;
         log::info!("offscreen texture source set to {}", source.label());
         Ok(())
+    }
+
+    /// Replaces the Minecraft-style UI font used by [`UiFrame::text`].
+    ///
+    /// `font` is the raw contents of a TrueType/OpenType file; `None` restores
+    /// the embedded Monocraft font. On error the previous font is kept and the
+    /// error is returned. Titles drawn with [`UiFrame::title_text`] keep the
+    /// built-in 8×8 bitmap font regardless.
+    pub fn set_ui_font(&mut self, font: Option<&[u8]>) -> Result<(), crate::UiFontError> {
+        self.ui.set_ui_font(font)
+    }
+
+    /// Display name of the active UI font: `"Monocraft"` or `"custom"`.
+    pub fn ui_font_name(&self) -> &str {
+        self.ui.ui_font_name()
     }
 
     /// Rebuilds the block textures for a procedural style.
@@ -1739,6 +1756,181 @@ mod tests {
         write_pack_texture(&block_dir, "dirt.png", 8, [110, 85, 55, 255]);
         write_pack_texture(&block_dir, "oak_leaves.png", 8, [40, 130, 45, 255]);
         pack
+    }
+
+    #[test]
+    fn offscreen_ui_font_swap_draws_ui_and_title_text() {
+        let Some(mut renderer) = open_renderer(320, 180, "offscreen_ui_font_swap_draws_ui_and_title_text") else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let empty = World::new(registry, 1);
+        let camera = Camera::new(WorldVec::new(0.0, 128.0, 0.0), 0.0, 0.0);
+        assert_eq!(renderer.ui_font_name(), "Monocraft");
+
+        renderer.render_world(&empty, &camera).expect("render baseline sky");
+        let without_ui = renderer.read_rgba();
+
+        let mut frame = UiFrame::new(320.0, 180.0);
+        frame.rect(8.0, 8.0, 304.0, 40.0, [0.05, 0.05, 0.1, 1.0]);
+        frame.text(12.0, 12.0, 2.0, [1.0; 4], "Monocraft UI 0123");
+        frame.title_text(12.0, 56.0, 2.0, [0.9, 0.8, 0.2, 1.0], "TITLE 8x8");
+        renderer
+            .render_world_with_ui(&empty, &camera, Some(&frame))
+            .expect("render UI and title text");
+        let with_ui = renderer.read_rgba();
+        assert_eq!(with_ui.len(), without_ui.len());
+
+        let mut changed = 0usize;
+        for (before, after) in without_ui
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(with_ui.as_chunks::<4>().0.iter())
+        {
+            if before[0].abs_diff(after[0]) > 2 || before[1].abs_diff(after[1]) > 2 || before[2].abs_diff(after[2]) > 2
+            {
+                changed += 1;
+            }
+        }
+        assert!(changed > 100, "UI frame changed only {changed} pixels");
+
+        let count_bright = |pixels: &[u8], x0: u32, x1: u32, y0: u32, y1: u32| {
+            let mut count = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let offset = ((y * 320 + x) * 4) as usize;
+                    if pixels[offset] > 200 && pixels[offset + 1] > 200 && pixels[offset + 2] > 200 {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        };
+        // The title is drawn in warm yellow, so count that instead of white.
+        let count_yellow = |pixels: &[u8], x0: u32, x1: u32, y0: u32, y1: u32| {
+            let mut count = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let offset = ((y * 320 + x) * 4) as usize;
+                    if pixels[offset] > 170 && pixels[offset + 1] > 130 && pixels[offset + 2] < 130 {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        };
+        let ui_pixels = count_bright(&with_ui, 12, 300, 12, 28);
+        let title_pixels = count_yellow(&with_ui, 12, 120, 56, 72);
+        eprintln!("offscreen UI font: {ui_pixels} UI-font pixels, {title_pixels} bitmap-title pixels");
+        assert!(ui_pixels > 40, "UI font drew only {ui_pixels} bright pixels");
+        assert!(
+            title_pixels > 10,
+            "bitmap title font drew only {title_pixels} bright pixels"
+        );
+
+        // Invalid overrides are rejected without changing the active atlas.
+        let error = renderer
+            .set_ui_font(Some(b"definitely not a TTF"))
+            .expect_err("invalid UI font must be rejected");
+        assert!(
+            matches!(error, crate::UiFontError::InvalidFont(_)),
+            "unexpected error: {error}"
+        );
+        assert_eq!(renderer.ui_font_name(), "Monocraft");
+        renderer
+            .render_world_with_ui(&empty, &camera, Some(&frame))
+            .expect("render after rejected UI font");
+        let after_invalid = renderer.read_rgba();
+        assert!(
+            after_invalid
+                .iter()
+                .zip(with_ui.iter())
+                .all(|(actual, expected)| actual.abs_diff(*expected) <= 1),
+            "a rejected UI font must not change the rendered frame"
+        );
+
+        // Reloading the embedded bytes and `None` both restore the default.
+        renderer
+            .set_ui_font(Some(crate::default_ui_font()))
+            .expect("default font bytes are valid");
+        assert_eq!(renderer.ui_font_name(), "Monocraft");
+        renderer
+            .render_world_with_ui(&empty, &camera, Some(&frame))
+            .expect("render after reloading the default UI font");
+        let after_default = renderer.read_rgba();
+        assert!(
+            after_default
+                .iter()
+                .zip(with_ui.iter())
+                .all(|(actual, expected)| actual.abs_diff(*expected) <= 1),
+            "reloading the default font must render the same frame"
+        );
+        renderer
+            .set_ui_font(None)
+            .expect("the embedded default is always available");
+        assert_eq!(renderer.ui_font_name(), "Monocraft");
+    }
+
+    /// Ignored GPU verification: writes a UI-font sample with both the
+    /// Monocraft UI text and the bitmap title text.
+    ///
+    /// Run with:
+    /// `./dev-cargo test -p ob_render --lib -- --ignored write_ui_font_sample`
+    #[test]
+    #[ignore = "GPU screenshot verification; writes /tmp/ui-font-sample.png"]
+    fn write_ui_font_sample() {
+        let Some(mut renderer) = open_renderer(640, 360, "write_ui_font_sample") else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let world = test_world(&registry);
+        let camera = look_at(WorldVec::new(8.5, 72.0, 16.0), [8.5, 66.8, 8.5]);
+
+        let mut frame = UiFrame::new(640.0, 360.0);
+        frame.rect(16.0, 16.0, 608.0, 328.0, [0.04, 0.05, 0.08, 0.94]);
+        frame.title_text(28.0, 28.0, 4.0, [1.0, 0.85, 0.3, 1.0], "OPENBLOCK");
+        frame.title_text(28.0, 72.0, 1.0, [0.7, 0.8, 0.95, 1.0], "BITMAP TITLE FONT 8x8");
+        frame.text(
+            28.0,
+            96.0,
+            1.0,
+            [1.0; 4],
+            "Monocraft UI font 8 px: The quick brown fox jumps over the lazy dog.",
+        );
+        frame.text(
+            28.0,
+            112.0,
+            1.0,
+            [1.0; 4],
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789 !@#$%^&*()_+-=[]{};:'\",.<>/?\\|",
+        );
+        frame.text(
+            28.0,
+            128.0,
+            1.0,
+            [0.6, 0.9, 0.6, 1.0],
+            "abcdefghijklmnopqrstuvwxyz gpqyj descenders",
+        );
+        frame.text(28.0, 152.0, 2.0, [1.0; 4], "Scale 2 UI text: OpenBlock 1.0.1");
+        frame.title_text(28.0, 180.0, 2.0, [1.0, 0.85, 0.3, 1.0], "Scale 2 title: OpenBlock");
+        frame.text(28.0, 204.0, 3.0, [0.85, 0.9, 1.0, 1.0], "Scale 3 UI");
+        frame.title_text(28.0, 240.0, 3.0, [1.0, 0.85, 0.3, 1.0], "SCALE 3 TITLE");
+        frame.text(
+            28.0,
+            272.0,
+            1.0,
+            [0.8, 0.8, 0.8, 1.0],
+            "UI font name shown in F3: Monocraft / custom",
+        );
+
+        renderer
+            .render_world_with_ui(&world, &camera, Some(&frame))
+            .expect("render UI font sample");
+        let pixels = renderer.read_rgba();
+        assert_eq!(pixels.len(), (640 * 360 * 4) as usize);
+        write_test_png(std::path::Path::new("/tmp/ui-font-sample.png"), 640, 360, &pixels);
+        eprintln!("wrote /tmp/ui-font-sample.png");
     }
 
     #[test]

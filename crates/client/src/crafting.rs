@@ -576,7 +576,7 @@ pub fn draw_crafting_screen(
     let panel = layout.panel;
     draw_panel(frame, panel);
 
-    frame.text(
+    frame.title_text(
         panel.x + CRAFTING_MARGIN,
         panel.y + 16.0,
         2.6,

@@ -6,6 +6,42 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [1.0.2] — 2026-11-25 (Minecraft-style UI font)
+
+### Added
+- **Dual-font UI**: all body text, HUD, menus, chat, tooltips and F3 now use a
+  Minecraft-style TTF font — bundled **Monocraft 4.2** under SIL OFL 1.1 — while
+  the logo and screen/panel titles keep the original 8x8 bitmap font. Rendering
+  uses a second rasterized 128x64 glyph atlas (16x8 cells of 8x8, printable
+  ASCII, cap-height-normalised, crisp binary alpha); layout metrics are
+  unchanged (8 px advance/line at scale 1), so no UI re-layout was needed.
+- **Runtime font override**: `--ui-font PATH` (persisted) and `--default-ui-font`;
+  `Settings.ui_font_path`; auto-discovery of any `.ttf`/`.otf` in
+  `<data-dir>/fonts/` (preferring `minecraftia`, then `minecraft`, then first
+  sorted) and a shallow cross-platform system Minecraftia search; built-in
+  Monocraft fallback. Invalid/unreadable fonts warn and fall back without
+  failing startup.
+- **Settings → Display → UI font** row showing the active font/source, plus
+  Reset (built-in) and Reload (rescan) actions; the row works from the title
+  Settings too. F3 reports the active UI font. Title/heading call sites migrated
+  to `title_text`; body text uses `text()`.
+- `docs/client-ui-font.md`, v1.0.2 screenshots (classic textures), asset
+  licensing metadata: `assets/ui-font/Monocraft.ttf` + OFL text, REUSE
+  annotation as `OFL-1.1`.
+
+### Notes
+- Minecraftia itself is **not bundled** (its licence is personal-use only);
+  place `Minecraftia.ttf` in `<data-dir>/fonts/` or pass `--ui-font` to use the
+  exact font locally. Monocraft is the bundled, permissively licensed
+  Minecraft-style font.
+- No save-format or protocol change; existing worlds/settings/servers work.
+
+### Verification
+- ob_render: 123+ tests including dual-font GPU tests; ob_client: 267 lib +
+  13 loopback; ob_core: 39; workspace check, clippy `-D warnings`, fmt, rustdoc,
+  architecture/docs checks; offscreen font sample and v1.0.2 screenshot set
+  visually verified (crisp UI text, 8x8 titles intact).
+
 ## [1.0.1] — 2026-11-25
 
 Strict post-release polish update; no save-format or protocol change.
