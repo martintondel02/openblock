@@ -22,11 +22,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ob_content::Registry;
-use ob_math::{BlockPos, ChunkPos, N_SECTIONS, SECTION_SIZE, SectionPos, WORLD_MIN_Y, WorldVec};
+use ob_math::{BlockPos, ChunkPos, N_SECTIONS, SEA_LEVEL, SECTION_SIZE, SectionPos, WORLD_MIN_Y, WorldVec};
 use ob_render::{
     Camera, DEFAULT_FULL_DETAIL_RADIUS_CHUNKS, DEFAULT_LOD_GROUP_CHUNKS, DEFAULT_SHELL_DEPTH_BLOCKS, Environment,
-    GraphicsPreset, GraphicsSettings, LodBatchKey, LodConfig, LodTier, OffscreenRenderer, SceneParams,
-    TexturePackStyle, far_plane_for_render_distance, mesh_lod_batch, mesh_section,
+    FarBiome, FarSample, FarTerrainConfig, GraphicsPreset, GraphicsSettings, LodBatchKey, LodConfig, LodTier,
+    OffscreenRenderer, SceneParams, TexturePackStyle, build_far_terrain, far_plane_for_render_distance,
+    far_plane_for_view_distance, mesh_lod_batch, mesh_section,
 };
 use ob_server::{Host, HostConfig};
 use ob_world::World;
@@ -48,8 +49,12 @@ const GROUP_BATCH: usize = 24;
 /// Options for one render-distance benchmark run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
-    /// Streaming radius in chunks.
+    /// Simulation (streaming/full-detail) radius in chunks.
     pub radius: i32,
+    /// Visual render distance including far terrain, in chunks.
+    pub view_distance: i32,
+    /// Skip visual far terrain (pre-far-terrain near-world comparison).
+    pub no_far: bool,
     /// Measured frames.
     pub frames: u32,
     /// Unmeasured warm-up frames.
@@ -72,6 +77,9 @@ pub struct Options {
     pub time_of_day: f32,
     /// Scene animation clock for clouds and water (deterministic when fixed).
     pub time_seconds: f32,
+    /// Eye height above the player's eyes, in blocks (18 for the default vista,
+    /// larger for a flying/high-angle far-terrain capture).
+    pub eye_height: f32,
     /// Optional camera pitch override (radians); `None` uses the spawn pitch.
     pub pitch: Option<f32>,
     /// Optional camera yaw override (radians); `None` uses the spawn yaw.
@@ -82,6 +90,8 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             radius: DEFAULT_RADIUS,
+            view_distance: 512,
+            no_far: false,
             frames: 120,
             warmup: 10,
             width: 1280,
@@ -93,6 +103,7 @@ impl Default for Options {
             graphics: GraphicsSettings::default(),
             time_of_day: 0.5,
             time_seconds: 0.0,
+            eye_height: 18.0,
             pitch: None,
             yaw: None,
         }
@@ -116,6 +127,18 @@ pub struct Report {
     pub world_heap_bytes: usize,
     /// Streaming wall time.
     pub stream_ms: f64,
+    /// Far-terrain sampling, meshing and upload wall time.
+    pub far_mesh_ms: f64,
+    /// Visual far-terrain LOD tiers.
+    pub far_tiers: usize,
+    /// Opaque far-terrain quads.
+    pub far_quads: u64,
+    /// Opaque far-terrain vertices.
+    pub far_vertices: u64,
+    /// Far-terrain water triangles.
+    pub far_water_triangles: u64,
+    /// Estimated far-terrain vertex + index bytes.
+    pub far_bytes: u64,
     /// Columns generated during streaming.
     pub streamed_columns: usize,
     /// Streaming calls made.
@@ -138,6 +161,16 @@ pub struct Report {
     pub drawn_sections: u32,
     /// Last frame far batch draws.
     pub drawn_batches: u32,
+    /// Last frame opaque far-terrain draw calls (0 or 1).
+    pub far_draw_calls: u32,
+    /// Last frame opaque far-terrain vertices.
+    pub far_drawn_vertices: u64,
+    /// Last frame opaque far-terrain triangles.
+    pub far_drawn_triangles: u64,
+    /// Last frame far-water draw calls.
+    pub far_water_draw_calls: u32,
+    /// Last frame far-water vertices drawn.
+    pub far_water_vertices: u64,
     /// Last frame culled section meshes.
     pub culled_sections: u32,
     /// Last frame culled far batches.
@@ -185,6 +218,14 @@ pub fn options_from_flags(flags: &[(String, String)]) -> Result<Options, String>
                     return Err("--render-distance must be between 1 and 32 chunks".to_string());
                 }
             }
+            "view-distance" => {
+                let raw = required(name, value)?;
+                options.view_distance = raw.parse().map_err(|_| format!("invalid --{name} value '{raw}'"))?;
+                if !(32..=512).contains(&options.view_distance) {
+                    return Err("--view-distance must be between 32 and 512 chunks".to_string());
+                }
+            }
+            "no-far" => options.no_far = true,
             "frames" => {
                 let raw = required(name, value)?;
                 options.frames = raw.parse().map_err(|_| format!("invalid --frames value '{raw}'"))?;
@@ -237,6 +278,13 @@ pub fn options_from_flags(flags: &[(String, String)]) -> Result<Options, String>
                 options.time_seconds = raw.parse().map_err(|_| format!("invalid --scene-time value '{raw}'"))?;
                 if !options.time_seconds.is_finite() || options.time_seconds < 0.0 {
                     return Err("--scene-time must be a non-negative number".to_string());
+                }
+            }
+            "eye-height" => {
+                let raw = required(name, value)?;
+                options.eye_height = raw.parse().map_err(|_| format!("invalid --eye-height value '{raw}'"))?;
+                if !options.eye_height.is_finite() || !(0.0..=4_000.0).contains(&options.eye_height) {
+                    return Err("--eye-height must be between 0 and 4000 blocks".to_string());
                 }
             }
             "pitch" => {
@@ -307,6 +355,9 @@ pub fn run(options: &Options) -> Result<Report, String> {
     if options.radius < 1 || options.radius > 32 {
         return Err("render distance must be between 1 and 32 chunks".to_string());
     }
+    if !(32..=512).contains(&options.view_distance) {
+        return Err("view distance must be between 32 and 512 chunks".to_string());
+    }
     let temp = if options.data_dir.is_none() {
         Some(measure::temp_dir("openblock-rd512").map_err(|error| format!("temp dir: {error}"))?)
     } else {
@@ -355,9 +406,17 @@ pub fn run(options: &Options) -> Result<Report, String> {
     // conservatively increases the visible section count. It is still a real
     // world position above the spawn column, not a synthetic test box.
     let player = host.player();
-    let eye = WorldVec::new(player.pos.x, player.eye().y + 18.0, player.pos.z);
+    let eye = WorldVec::new(
+        player.pos.x,
+        player.eye().y + f64::from(options.eye_height),
+        player.pos.z,
+    );
     let mut camera = Camera::new(eye, options.yaw.unwrap_or(player.yaw), options.pitch.unwrap_or(-0.10));
-    camera.far = far_plane_for_render_distance(options.radius);
+    camera.far = if options.no_far {
+        far_plane_for_render_distance(options.radius)
+    } else {
+        far_plane_for_view_distance(options.view_distance)
+    };
     let camera_chunk = BlockPos::new(
         camera.position.x.floor() as i32,
         camera.position.y.floor() as i32,
@@ -403,7 +462,19 @@ pub fn run(options: &Options) -> Result<Report, String> {
         build_lod_scene(&mut renderer, host.world(), camera_chunk, &lod, &mut report)?;
     }
     report.mesh_ms = millis(mesh_start);
-    report.mesh_bytes = report.cache_vertices * std::mem::size_of::<ob_render::Vertex>() as u64 * 2;
+    if !options.no_far {
+        let far_start = Instant::now();
+        build_far_scene(
+            &mut renderer,
+            host.world().seed(),
+            &camera,
+            options.view_distance,
+            options.radius,
+            &mut report,
+        );
+        report.far_mesh_ms = millis(far_start);
+    }
+    report.mesh_bytes = report.cache_vertices * std::mem::size_of::<ob_render::Vertex>() as u64 * 2 + report.far_bytes;
     report.rss_after_build_mib = measure::rss_kib().map_or(0.0, |kib| kib as f64 / 1024.0);
 
     let scene = SceneParams {
@@ -430,6 +501,11 @@ pub fn run(options: &Options) -> Result<Report, String> {
     report.draw_calls = last_stats.draw_calls;
     report.drawn_sections = last_stats.sections;
     report.drawn_batches = last_stats.lod_batches;
+    report.far_draw_calls = last_stats.far_draw_calls;
+    report.far_drawn_vertices = last_stats.far_vertices;
+    report.far_drawn_triangles = last_stats.far_triangles;
+    report.far_water_draw_calls = last_stats.far_water_draw_calls;
+    report.far_water_vertices = last_stats.far_water_vertices;
     report.culled_sections = last_stats.culled_sections;
     report.culled_batches = last_stats.culled_lod_batches;
     report.drawn_vertices = last_stats.vertices;
@@ -537,15 +613,66 @@ fn build_full_detail_scene(renderer: &mut OffscreenRenderer, world: &World, repo
     Ok(())
 }
 
+/// Builds and uploads the visual far-terrain heightfield for the benchmark.
+///
+/// This is the same builder and sampler mapping the client worker uses, so the
+/// benchmark measures the production geometry cost (parallel sampling plus
+/// mesh assembly and one GPU upload), not a synthetic approximation.
+fn build_far_scene(
+    renderer: &mut OffscreenRenderer,
+    seed: u64,
+    camera: &Camera,
+    view_distance: i32,
+    simulation_distance: i32,
+    report: &mut Report,
+) {
+    let config = FarTerrainConfig::new(view_distance, simulation_distance, SEA_LEVEL as f32 + 1.0).normalised();
+    let generator = ob_worldgen::Generator::new(seed);
+    let build = build_far_terrain(
+        seed,
+        config,
+        move |x, z| {
+            let sample = generator.surface_sample(x, z);
+            FarSample {
+                height: sample.height,
+                biome: match sample.biome {
+                    ob_worldgen::Biome::Plains => FarBiome::Plains,
+                    ob_worldgen::Biome::Forest => FarBiome::Forest,
+                    ob_worldgen::Biome::Desert => FarBiome::Desert,
+                    ob_worldgen::Biome::SnowyTaiga => FarBiome::SnowyTaiga,
+                    ob_worldgen::Biome::Mountains => FarBiome::Mountains,
+                },
+            }
+        },
+        [camera.position.x, camera.position.z],
+    );
+    report.far_tiers = build.stats.tiers.len();
+    report.far_quads = build.stats.opaque_quads;
+    report.far_vertices = build.stats.opaque_vertices;
+    report.far_water_triangles = build.stats.water_triangles;
+    report.far_bytes = build.mesh.vertex_bytes() + build.mesh.index_bytes();
+    renderer.set_far_terrain(build.mesh);
+    println!(
+        "far terrain: {} tiers, {} quads, {} vertices, {} water triangles, {:.1} ms build",
+        build.stats.tiers.len(),
+        build.stats.opaque_quads,
+        build.stats.opaque_vertices,
+        build.stats.water_triangles,
+        build.stats.build_ms,
+    );
+}
+
 /// Prints the human-readable benchmark report.
 pub fn format_report(options: &Options, report: &Report) -> String {
     let mut out = String::new();
     out.push_str("OpenBlock 512-block render-distance benchmark\n");
     out.push_str(&format!(
-        "  world: seed {}, render distance {} chunks ({} blocks), {} columns, {} sections\n",
+        "  world: seed {}, simulation {} chunks ({} blocks), visual {} chunks ({} blocks), {} columns, {} sections\n",
         options.seed,
         options.radius,
         options.radius * 16,
+        if options.no_far { 0 } else { options.view_distance },
+        if options.no_far { 0 } else { options.view_distance * 16 },
         report.columns,
         report.world_sections
     ));
@@ -584,6 +711,15 @@ pub fn format_report(options: &Options, report: &Report) -> String {
         rayon::current_num_threads()
     ));
     out.push_str(&format!(
+        "  far terrain: {:.1} ms build, {} tiers, {} quads, {} vertices, {} water triangles, {:.1} MiB\n",
+        report.far_mesh_ms,
+        report.far_tiers,
+        report.far_quads,
+        report.far_vertices,
+        report.far_water_triangles,
+        report.far_bytes as f64 / (1024.0 * 1024.0)
+    ));
+    out.push_str(&format!(
         "  frame_ms: p50 {:.2}  p95 {:.2}  p99 {:.2}  max {:.2}  mean {:.2}  -> {:.1} FPS\n",
         report.frames.p50_ms,
         report.frames.p95_ms,
@@ -593,13 +729,19 @@ pub fn format_report(options: &Options, report: &Report) -> String {
         report.frames.per_second()
     ));
     out.push_str(&format!(
-        "  last frame: {} opaque draws ({} sections + {} batches), {} vertices, culled {} sections + {} batches\n",
+        "  last frame: {} opaque draws ({} sections + {} batches + {} far), {} vertices ({} far), culled {} sections + {} batches\n",
         report.draw_calls,
         report.drawn_sections,
         report.drawn_batches,
+        report.far_draw_calls,
         report.drawn_vertices,
+        report.far_drawn_vertices,
         report.culled_sections,
         report.culled_batches
+    ));
+    out.push_str(&format!(
+        "  far draw: {} triangles, {} water draws / {} vertices\n",
+        report.far_drawn_triangles, report.far_water_draw_calls, report.far_water_vertices,
     ));
     out.push_str(&format!(
         "  passes: {} total ({} bloom), shadow draws {} ({} cascades), water draws {} ({} vertices)\n",
@@ -627,7 +769,9 @@ pub fn format_report(options: &Options, report: &Report) -> String {
 pub fn usage() -> &'static str {
     "usage: render-distance-bench [options]\n\
      options:\n\
-       --render-distance N   streaming radius in chunks, 1..=32 (default 32)\n\
+       --render-distance N   simulation/streaming radius in chunks, 1..=32 (default 32)\n\
+       --view-distance N     visual far-terrain radius in chunks, 32..=512 (default 512)\n\
+       --no-far              disable far terrain (near-world comparison)\n\
        --frames N            measured frames (default 120)\n\
        --warmup N            unmeasured warm-up frames (default 10)\n\
        --width W             target width (default 1280)\n\
@@ -644,6 +788,7 @@ pub fn usage() -> &'static str {
        --scene-time S        cloud/water animation clock in seconds (default 0)\n\
        --yaw RADIANS         camera yaw override\n\
        --pitch RADIANS       camera pitch override\n\
+       --eye-height N        camera height above the player eyes, 0..=4000 (default 18)\n\
        --png PATH            screenshot path (default /tmp/openblock-512.png)\n\
        --no-png              skip the screenshot\n\
        --data-dir DIR        keep the generated world here (default: temp dir)\n"
@@ -690,6 +835,8 @@ mod tests {
     fn defaults_are_the_512_block_profile() {
         let options = Options::default();
         assert_eq!(options.radius, 32);
+        assert_eq!(options.view_distance, 512);
+        assert!(!options.no_far);
         assert_eq!(options.frames, 120);
         assert_eq!(options.width, 1280);
         assert_eq!(options.height, 720);
@@ -704,6 +851,7 @@ mod tests {
     fn flags_override_and_validate() {
         let options = options_from_flags(&flags(&[
             ("render-distance", "16"),
+            ("view-distance", "64"),
             ("frames", "3"),
             ("warmup", "0"),
             ("width", "640"),
@@ -719,6 +867,7 @@ mod tests {
         ]))
         .expect("flags parse");
         assert_eq!(options.radius, 16);
+        assert_eq!(options.view_distance, 64);
         assert_eq!(options.frames, 3);
         assert!(options.full_detail);
         assert_eq!(options.png, None);
@@ -750,6 +899,10 @@ mod tests {
         assert!(options_from_flags(&flags(&[("scene-time", "-1")])).is_err());
         assert!(options_from_flags(&flags(&[("render-distance", "0")])).is_err());
         assert!(options_from_flags(&flags(&[("render-distance", "33")])).is_err());
+        assert!(options_from_flags(&flags(&[("view-distance", "31")])).is_err());
+        assert!(options_from_flags(&flags(&[("view-distance", "513")])).is_err());
+        assert!(options_from_flags(&flags(&[("view-distance", "512")])).is_ok());
+        assert!(options_from_flags(&flags(&[("no-far", "")])).expect("no-far").no_far);
         assert!(options_from_flags(&flags(&[("frames", "0")])).is_err());
         assert!(options_from_flags(&flags(&[("width", "0")])).is_err());
         assert!(options_from_flags(&flags(&[("nope", "1")])).is_err());
@@ -793,8 +946,10 @@ mod tests {
             "OS:",
             "stream:",
             "mesh+upload:",
+            "far terrain:",
             "frame_ms:",
             "last frame:",
+            "far draw:",
             "passes:",
             "memory:",
             "png:",

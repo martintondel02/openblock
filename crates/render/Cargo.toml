@@ -24,3 +24,4 @@ font8x8.workspace = true
 ab_glyph.workspace = true
 winit.workspace = true
 png.workspace = true
+rayon.workspace = true

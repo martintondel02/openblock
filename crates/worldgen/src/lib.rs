@@ -1152,6 +1152,22 @@ pub struct CaveDebugStats {
     pub ravine_blocks: u32,
 }
 
+/// One fast column sample: terrain surface height plus dominant biome.
+///
+/// This is the cheap, side-effect-free subset of [`Generator::height_at`] and
+/// [`Generator::biome_at`] computed from one shared climate evaluation. It is
+/// intended for visual-only heightfields (far terrain) that need tens of
+/// thousands of samples per rebuild; it never runs caves, features, trees,
+/// structures or lighting and must not be used for gameplay authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceSample {
+    /// Y of the topmost terrain block (the same value as
+    /// [`Generator::height_at`]).
+    pub height: i32,
+    /// Dominant biome (the same value as [`Generator::biome_at`]).
+    pub biome: Biome,
+}
+
 /// A deterministic terrain generator for one world seed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Generator {
@@ -1271,6 +1287,21 @@ impl Generator {
     /// [`Self::generate_chunk`].
     pub fn height_at(&self, x: i32, z: i32) -> i32 {
         column_sample(self.seed, x, z).height
+    }
+
+    /// Fast combined surface height and biome for one world-space column.
+    ///
+    /// Equivalent to calling [`Self::height_at`] and [`Self::biome_at`], but
+    /// evaluates the shared climate fields once instead of twice. The result
+    /// is a pure function of the seed and coordinates: no caches, caving,
+    /// features, trees or lighting run. Designed for visual-only far terrain;
+    /// gameplay must continue to use the generated world.
+    pub fn surface_sample(&self, x: i32, z: i32) -> SurfaceSample {
+        let sample = column_sample(self.seed, x, z);
+        SurfaceSample {
+            height: sample.height,
+            biome: sample.biome,
+        }
     }
 
     /// The deterministic structure placement for one chunk, if any.
@@ -4344,6 +4375,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn surface_sample_matches_height_and_biome_at_on_a_grid() {
+        // The fast visual sampler reuses the same shared column evaluation as
+        // the gameplay height/biome functions, so the two must agree exactly
+        // (not merely within a tolerance) on every tested column.
+        for seed in [0u64, 42, 0xDEAD_BEEF_CAFE] {
+            let generator = Generator::new(seed);
+            let mut checked = 0usize;
+            for z in (-600..=600).step_by(37) {
+                for x in (-600..=600).step_by(41) {
+                    let sample = generator.surface_sample(x, z);
+                    assert_eq!(
+                        sample.height,
+                        generator.height_at(x, z),
+                        "height mismatch at ({x}, {z})"
+                    );
+                    assert_eq!(sample.biome, generator.biome_at(x, z), "biome mismatch at ({x}, {z})");
+                    assert!((super::MIN_HEIGHT..=super::MAX_HEIGHT).contains(&sample.height));
+                    checked += 1;
+                }
+            }
+            assert!(checked > 900, "sample grid was too small ({checked})");
+        }
+    }
+
+    #[test]
+    fn surface_sample_is_deterministic_and_seed_sensitive() {
+        let columns = [(-3, 7), (0, 0), (511, -1024), (4096, 8192), (-17, -23)];
+        let first = Generator::new(42);
+        let second = Generator::new(42);
+        let other = Generator::new(43);
+        for (x, z) in columns {
+            assert_eq!(first.surface_sample(x, z), second.surface_sample(x, z));
+        }
+        assert!(
+            columns
+                .iter()
+                .any(|(x, z)| first.surface_sample(*x, *z).height != other.surface_sample(*x, *z).height),
+            "different seeds must not produce an identical height field"
+        );
     }
 
     #[test]

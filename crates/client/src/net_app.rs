@@ -29,6 +29,7 @@ use ob_core::config::{Action, load_settings, save_settings};
 use ob_math::{BlockPos, ChunkPos, SectionPos, WorldVec};
 use ob_render::{
     BlockOutline, Camera, Environment, LodBatchKey, LodConfig, Renderer, SceneParams, TextureSource, UiFrame,
+    far_plane_for_view_distance,
 };
 use ob_server::ContainerState;
 use ob_sim::{Player, PlayerInput, REACH};
@@ -207,6 +208,7 @@ impl ApplicationHandler for NetApp {
             fullscreen: false,
             applied_render_distance,
             lod: LodState::new(LodConfig::for_render_distance(applied_render_distance)),
+            far_terrain: crate::far_terrain::FarTerrainState::new(),
             rolling_frame_ms: Vec::new(),
             window_size,
             debug_stats: DebugStats::default(),
@@ -756,6 +758,8 @@ struct NetGameState {
     /// Distance-LOD state; multiplayer uses the same near/far policy and the
     /// same worker pool as single-player.
     lod: LodState,
+    /// Visual-only far terrain. The seed comes from the handshake server info.
+    far_terrain: crate::far_terrain::FarTerrainState,
     started: Instant,
     auto_exit: Option<Duration>,
     frame_times: Vec<f32>,
@@ -1192,6 +1196,7 @@ impl NetGameState {
 
     fn clear_world_render(&mut self) {
         self.lod.reset(&mut self.renderer, &mut self.mesh_scheduler);
+        self.far_terrain.reset(&mut self.renderer);
         self.renderer.clear_meshes();
         self.meshes.clear();
         self.mesh_scheduler = MeshScheduler::new(self.mesh_workers, Arc::clone(&self.registry));
@@ -1997,7 +2002,23 @@ impl NetGameState {
             .client
             .as_ref()
             .map_or(self.ui.settings.render_distance_chunks, NetworkClient::render_radius);
-        camera.far = (radius as f32 * 16.0 + 48.0).max(128.0);
+        camera.far = far_plane_for_view_distance(self.ui.settings.view_distance_chunks);
+        // The far terrain seed comes from the handshake server info; while
+        // connecting (or after a disconnect) the mesh is cleared rather than
+        // generated from a guessed seed.
+        let far_seed = self.client.as_ref().map(|client| client.server_info().seed);
+        let playing = self.client.as_ref().is_some_and(|client| client.state().is_playing());
+        if let (Some(seed), true) = (far_seed, playing) {
+            self.far_terrain.maintain(
+                &mut self.renderer,
+                seed,
+                self.ui.settings.view_distance_chunks,
+                radius,
+                [camera.position.x, camera.position.z],
+            );
+        } else if self.far_terrain.center().is_some() || self.far_terrain.is_building() {
+            self.far_terrain.reset(&mut self.renderer);
+        }
         let outline = self
             .mining
             .targeted_block()
@@ -2365,6 +2386,14 @@ impl NetGameState {
             target,
             seed,
             render_distance: self.ui.settings.render_distance_chunks,
+            view_distance: self.ui.settings.view_distance_chunks,
+            full_detail_radius: self.lod.config().full_detail_radius_chunks,
+            far_tiers: self.far_terrain.stats().map_or(0, |stats| stats.tiers.len()),
+            far_quads: self.far_terrain.stats().map_or(0, |stats| stats.opaque_quads),
+            far_vertices: self.far_terrain.stats().map_or(0, |stats| stats.opaque_vertices),
+            far_build_ms: self.far_terrain.stats().map_or(0.0, |stats| stats.build_ms as f32),
+            far_center: self.far_terrain.center(),
+            far_rebuilding: self.far_terrain.is_building(),
             loaded_chunks: loaded,
             drawn_sections: render_stats.sections as usize,
             cached_sections: self.meshes.len(),
@@ -2813,6 +2842,7 @@ impl NetGameState {
                     .set_graphics(crate::graphics_settings_from_settings(&self.ui.settings));
             }
             SettingsRow::ReducedMotion
+            | SettingsRow::ViewDistance
             | SettingsRow::ShowHud
             | SettingsRow::DebugOverlay
             | SettingsRow::Fov

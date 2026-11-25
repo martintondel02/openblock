@@ -307,6 +307,25 @@ impl OffscreenRenderer {
         self.scene.lod_vertex_count()
     }
 
+    /// Uploads (or clears, for an empty mesh) the visual-only far-terrain mesh.
+    ///
+    /// Mirrors [`crate::Renderer::set_far_terrain`]. Screenshots, the F2 path
+    /// and the offscreen benchmark use this to include the same 8,192-block
+    /// horizon the windowed client draws.
+    pub fn set_far_terrain(&mut self, mesh: crate::FarTerrainMesh) {
+        self.scene.set_far_terrain(&self.device, &self.queue, mesh);
+    }
+
+    /// Removes the far-terrain mesh.
+    pub fn clear_far_terrain(&mut self) {
+        self.scene.clear_far_terrain();
+    }
+
+    /// World-space bounds of the uploaded far mesh, if any.
+    pub fn far_terrain_bounds(&self) -> Option<([f32; 3], [f32; 3])> {
+        self.scene.far_terrain_bounds()
+    }
+
     /// Rebuilds the cached GPU meshes for every non-empty loaded section.
     ///
     /// Returns the number of cached sections and vertices. The benchmark path

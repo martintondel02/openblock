@@ -183,23 +183,44 @@ let amount = 1.0 - exp(-fog_density * h * d * d);
 color = mix(color, sky_color(dir) , amount);
 ```
 
-`fog_end` is the render distance, and the curve is tuned so opacity is ≥ 0.9 there.
-For the v1.1 512-block radius the CPU supplies `(fog_start, fog_end)` as
+`fog_end` tracks the camera far plane, and the curve is tuned so opacity is ≥ 0.9 there.
+For near/legacy far planes the CPU supplies `(fog_start, fog_end)` as
 `max(far − 160, 0.55 × far)` and `0.95 × far`: 400–532 blocks at a 32-chunk radius.
 Smoothstep reaches 0.93 opacity at the 512-block world edge while 200 blocks stays
 perfectly clear, so the horizon reads as terrain fading into sky rather than a grey wall.
 At short render distances the historical 55% start is preserved so the last streamed ring
-still dissolves. Shader modules and packs must read `Camera.fog` and must not hardcode
-distances; the same uniform drives opaque, cutout and entity fog.
+still dissolves.
 
-**Shader work implied by the v1.1 LOD.** Shadow cascades are unchanged in count and
-distance (§3.3.1): far surface-shell batches are opaque geometry and must be included in
-the same cascades as near sections, so cascade 3 remains useful to 96 blocks. Water stays in
-the surface shell and keeps its normal material; a future translucent pass must keep far
-water sorted separately rather than folding it into the opaque batch. Distance fog is the
-only blend between near and far tiers — there is deliberately no LOD cross-fade, because the
-shell preserves the silhouette; a shader that adds dithering or TAA must not treat the tier
-seam as a depth discontinuity.
+For the v1.3 visual horizon the far plane is much longer than the 512-block
+simulated world. Far planes above 1,000 blocks use `0.12 × far` to `0.95 × far`:
+at the 8,320-block maximum the haze starts at 998 blocks and reaches the horizon
+colour at 7,904 blocks. The near world uses the *same* range, so the 512-block
+seam cannot carry a different amount of haze than the far mesh. The 12% start is
+far beyond the 512-block simulation radius at the maximum setting, and the
+fragment shader still reads only `Camera.fog`. Shader modules and packs must not
+hardcode distances; the same uniform drives opaque, cutout, entity, near-water
+and far-terrain fog.
+
+**Far-terrain material and draw.** The v1.3 visual far mesh stores position,
+linear albedo and a heightfield normal per vertex; there are no texture or
+shadow samples. Its fragment stage applies the same sun direction, world-light
+tint and fog uniform as the near world, using `0.78 + 0.22 × max(n·sun, 0)` for
+direct/ambient mix and no cascade visibility. Far water is alpha blended with a
+cheap sky-reflect tint and sun highlight. Both pipelines are created once in
+`SceneRenderer::new`; far terrain casts no shadows, and only one far opaque and
+one far water draw are issued.
+
+**Shader work implied by the LOD.** Shadow cascades are unchanged in count and
+distance (§3.3.1): far surface-shell batches are opaque geometry and are included in
+the same cascades as near sections, so cascade 3 remains useful to 96 blocks. The
+v1.3 far heightfield is deliberately excluded from the shadow pass (it may extend
+8,192 blocks, far beyond any cascade) and receives no shadow map lookup. Water in
+the near surface shell keeps its normal material; far water is a separate
+translucent draw issued before the sorted near water, because it is farther than
+every near section and batch. Distance fog is the only blend between near and far
+tiers — there is deliberately no LOD cross-fade or dithering, because the shell and
+heightfield preserve the silhouette; a shader that adds dithering or TAA must not
+treat the tier seam as a depth discontinuity.
 (REQ-VIS-008). Underwater and lava override the parameters per fluid, with a Beer-Lambert
 absorption on the water colour; blindness and darkness effects scale the exponent and are
 driven by gameplay effect state, never by the shader.
@@ -586,9 +607,9 @@ covered by a test or a measured number in
 | # | Pass | Target | Notes |
 | ---: | --- | --- | --- |
 | 1 | sun shadow, once per active cascade | `Depth32Float` 2D array, 2048² (`low`/`medium` 1024²) | depth only, alpha-cut-out foliage, entities included |
-| 2 | opaque world (sections, far batches, entities) | `Rgba16Float` HDR + `Depth32Float` | HDR cleared to the horizon, depth cleared to 1.0 |
+| 2 | opaque world (sections, far batches, far terrain, entities) | `Rgba16Float` HDR + `Depth32Float` | HDR cleared to the horizon, depth cleared to 1.0; far terrain draws after near geometry |
 | 3 | sky background fill | HDR + depth, no depth write | `LessEqual` at z = 1.0, so only background pixels run clouds/stars |
-| 4 | water + block outline | HDR + depth, no depth write | water alpha blend, back-to-front; outline after water |
+| 4 | water + block outline | HDR + depth, no depth write | far water first, then near water alpha blend back-to-front; outline after water |
 | 5 | bloom threshold + 2 downsamples | `Rgba16Float` mips at ½, ¼, ⅛ | threshold 1.0, soft knee, 4-tap box |
 | 6 | post | LDR surface / offscreen `Rgba8UnormSrgb` | ACES fit, bloom, FXAA-lite, saturation, vignette |
 | 7 | UI | same LDR target, after post | text and HUD stay crisp and are never tonemapped |
@@ -721,9 +742,11 @@ reset). Presets map as follows:
 | Ultra | ultra 2×2048², 5×5 near | high | high | on | on |
 
 The settings screen has a Graphics tab with rows for the preset, shadows, clouds, water,
-cloud coverage, bloom and FXAA. Adjusting an individual row marks the preset Custom. F3
-reports the preset, shadow mode, resolution, cascade count and PCF mode, plus the pass,
-water, shadow, bloom and memory counters. The offscreen tools accept the same settings
+cloud coverage, bloom and FXAA, and a Display tab with **Simulation distance** and
+**View distance** rows (the latter shows `N chunks / 16N blocks` and a one-time GPU note
+above 128 chunks). Adjusting an individual row marks the preset Custom. F3 reports the
+preset, shadow mode, resolution, cascade count and PCF mode, plus the pass, water, shadow,
+bloom and memory counters and the far-terrain tier/quad/build/centre line. The offscreen tools accept the same settings
 (`--graphics`, `--shadows`, `--clouds`, `--water`, `--bloom/--no-bloom`,
 `--fxaa/--no-fxaa`), so screenshots and benchmarks use the exact playable configuration.
 
@@ -731,20 +754,25 @@ water, shadow, bloom and memory counters. The offscreen tools accept the same se
 
 Unit tests cover the settings round-trip/clamps, preset mapping, the shadow sphere fit,
 texel snapping, split scaling, AABB culling, the 512-byte uniform layout, the 32-byte post
-layout, opaque/water mesh split parity, far-batch water, and the CPU tonemap. GPU tests
+layout, opaque/water mesh split parity, far-batch water, far-terrain tier coverage/overlap,
+the 512-chunk quad budget, far-mesh determinism and the CPU tonemap. GPU tests
 (run on RADV and skippable with `OPENBLOCK_NO_GPU_TESTS`) cover the shadow pass writing
 casters, shadows darkening terrain, water drawing in its own pass, water-only sections,
-water receiving shadows, far-batch water, cloud determinism and motion, every preset
-rendering with sane colours, post-target resize (including 1×1), and a wgpu validation
-error scope that must stay clean across shadow + water + post frames. The ignored water
+water receiving shadows, far-batch water, the far opaque and far-water pipelines drawing
+into the shared HDR/depth targets and clearing cleanly, cloud determinism and motion, every
+preset rendering with sane colours, post-target resize (including 1×1), and a wgpu
+validation error scope that must stay clean across shadow + water + post frames. The ignored water
 screenshot test writes `/tmp/openblock-shaders-water.png`; the benchmark provides day,
 dusk, night and sky captures.
 
 Remaining limitations are listed with their measured cost in
 [08-measurements](../plan/08-measurements.md): far-cascade PCF reduction, AABB shadow
 proxies beyond 64 m, no water reflection/refraction/foam/underwater volume, fixed exposure,
-FXAA-lite instead of TAA, and offscreen readback inflating the benchmark tail. The High
-1080p/90 FPS aspirational target is not met; Ultra 1080p/60 FPS is met at p50 but not p95.
+FXAA-lite instead of TAA, offscreen readback inflating the benchmark tail, and the far-terrain
+style seam/coarse water described in [1.3-far-terrain](../plan/1.3-far-terrain.md#10-limitations).
+The High 1080p/90 FPS aspirational target is not met; Ultra 1080p/60 FPS is met at p50 but not
+p95. The v1.3 512-chunk visual horizon reaches 63.7 FPS p50 / 63.3 FPS p95 at 1080p High in the
+offscreen-readback harness (see [1.3-far-terrain](../plan/1.3-far-terrain.md#8-measurements)).
 
 ## 4. Data structures and formats
 

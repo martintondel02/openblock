@@ -25,7 +25,7 @@ use ob_core::config::{
 use ob_math::{BlockPos, ChunkPos, N_SECTIONS, SEA_LEVEL, SECTION_SIZE, SectionPos, WorldVec};
 use ob_render::{
     BlockOutline, Camera, DAY_LENGTH_TICKS, EntityInstance, Environment, LodBatchKey, LodConfig, OffscreenRenderer,
-    Renderer, SceneParams, TextureSource, UiFrame, far_plane_for_render_distance,
+    Renderer, SceneParams, TextureSource, UiFrame, far_plane_for_view_distance,
 };
 use ob_server::{
     CHEST_SLOTS, DedicatedServer, FurnaceSlot, GameMode as HostGameMode, Host, HostConfig, ItemEntity, ItemStack,
@@ -41,6 +41,7 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 pub mod containers;
 pub mod crafting;
+pub(crate) mod far_terrain;
 pub mod frontend;
 pub mod interaction;
 pub mod inventory;
@@ -110,8 +111,10 @@ pub struct ClientOptions {
     pub world: String,
     /// Optional data directory override.
     pub data_dir: Option<std::path::PathBuf>,
-    /// Streaming radius in chunks.
+    /// Simulation (full-detail/streaming) radius in chunks.
     pub render_distance_chunks: i32,
+    /// Visual render distance including far terrain, in chunks.
+    pub view_distance_chunks: i32,
     /// Start in fly mode.
     pub fly: bool,
     /// Force the X11/XWayland backend on Linux (diagnostics and capture).
@@ -216,6 +219,8 @@ pub struct ClientOptions {
     pub saw_seed: bool,
     /// Whether `--data-dir` was passed explicitly (the title is bypassed).
     pub saw_data_dir: bool,
+    /// Whether `--view-distance` was passed explicitly (a run-only override).
+    pub saw_view_distance: bool,
 }
 
 impl Default for ClientOptions {
@@ -225,6 +230,7 @@ impl Default for ClientOptions {
             world: "world".to_string(),
             data_dir: None,
             render_distance_chunks: 6,
+            view_distance_chunks: ob_core::config::DEFAULT_VIEW_DISTANCE,
             fly: false,
             force_x11: false,
             screenshot: None,
@@ -275,6 +281,7 @@ impl Default for ClientOptions {
             saw_world: false,
             saw_seed: false,
             saw_data_dir: false,
+            saw_view_distance: false,
         }
     }
 }
@@ -711,7 +718,18 @@ fn screenshot_name_tags_demo_inner(
     let eye = player.eye();
     let mut camera = Camera::new(eye, player.yaw, player.pitch);
     camera.fov_y = settings.fov_degrees.to_radians();
-    camera.far = 256.0;
+    camera.far = far_plane_for_view_distance(settings.view_distance_chunks);
+    let far_build = crate::far_terrain::build_now(
+        host.world().seed(),
+        [camera.position.x, camera.position.z],
+        settings.view_distance_chunks,
+        host.render_distance_chunks(),
+    );
+    log::info!(
+        "name-tag demo far terrain: {}",
+        crate::far_terrain::describe_build(&far_build)
+    );
+    renderer.set_far_terrain(far_build.mesh);
     let forward = camera.forward();
     let right = camera.right();
     let at = |distance: f32, offset: f32| -> [f64; 3] {
@@ -1005,7 +1023,19 @@ fn screenshot_network_demo_inner(
     let screen = ui_screen(physical, settings.ui_scale_percent);
     let eye = client.player().eye();
     let mut camera = Camera::new(eye, client.player().yaw, client.player().pitch);
-    camera.far = far_plane_for_render_distance(client.render_radius());
+    camera.far = far_plane_for_view_distance(settings.view_distance_chunks);
+    let far_build = crate::far_terrain::build_now(
+        client.server_info().seed,
+        [camera.position.x, camera.position.z],
+        settings.view_distance_chunks,
+        client.render_radius(),
+    );
+    log::info!(
+        "network demo far terrain: {}",
+        crate::far_terrain::describe_build(&far_build)
+    );
+    let far_stats = far_build.stats.clone();
+    renderer.set_far_terrain(far_build.mesh);
     let environment = Environment::from_ticks(client.server_tick() + client.day_ticks() / 4, client.day_ticks());
     let now = Instant::now();
     let entities = client.entity_instances(now);
@@ -1053,6 +1083,14 @@ fn screenshot_network_demo_inner(
         target: None,
         seed,
         render_distance: client.render_radius(),
+        view_distance: settings.view_distance_chunks,
+        full_detail_radius: LodConfig::for_render_distance(client.render_radius()).full_detail_radius_chunks,
+        far_tiers: far_stats.tiers.len(),
+        far_quads: far_stats.opaque_quads,
+        far_vertices: far_stats.opaque_vertices,
+        far_build_ms: far_stats.build_ms as f32,
+        far_center: Some(far_stats.center),
+        far_rebuilding: false,
         loaded_chunks: client.loaded_chunks(),
         drawn_sections: render_stats.sections as usize,
         cached_sections: renderer.cached_mesh_count(),
@@ -1298,10 +1336,25 @@ fn screenshot_with_mode(
         (player.eye(), player.yaw, player.pitch)
     };
     let mut camera = Camera::new(eye, yaw, pitch);
-    camera.far = far_plane_for_render_distance(host.render_distance_chunks());
+    camera.far = far_plane_for_view_distance(settings.view_distance_chunks);
 
     let (mut renderer, texture_source, font_source) = create_offscreen_renderer(options, &settings, &data_dir, None)?;
     log_texture_source(&texture_source);
+    // Screenshots and F3 audits include the same visual horizon as the window.
+    // Building it synchronously here is intentional: the capture is a one-shot
+    // process, and the build cost is reported for every mode.
+    let far_build = crate::far_terrain::build_now(
+        host.world().seed(),
+        [camera.position.x, camera.position.z],
+        settings.view_distance_chunks,
+        host.render_distance_chunks(),
+    );
+    log::info!(
+        "screenshot far terrain: {}",
+        crate::far_terrain::describe_build(&far_build)
+    );
+    let far_stats = far_build.stats.clone();
+    renderer.set_far_terrain(far_build.mesh);
 
     // Compose a showcase frame: HUD, inventory or death screen over the world.
     // Screenshot mode is also the headless verification path for the UI
@@ -1559,6 +1612,7 @@ fn screenshot_with_mode(
                 options,
                 &texture_source,
                 debug_render_stats.unwrap_or_default(),
+                Some(&far_stats),
             );
             let layout = ui_state::debug_overlay_layout(screen, &stats);
             draw_debug_overlay(&mut frame, &stats, screen);
@@ -1597,6 +1651,7 @@ fn screenshot_with_mode(
                     options,
                     &texture_source,
                     debug_render_stats.unwrap_or_default(),
+                    Some(&far_stats),
                 );
                 draw_debug_overlay(&mut frame, &stats, screen);
                 log::info!(
@@ -1856,6 +1911,7 @@ fn screenshot_with_mode(
 /// and render counters come from the real host and renderer; the frame-rate
 /// fields are fixed because the screenshot has no frame loop, and the movement
 /// label is the idle `walk` state. The result is stable for a given seed.
+#[allow(clippy::too_many_arguments)] // screenshot capture bundles the full frame context
 fn screenshot_debug_stats(
     host: &Host,
     registry: &Registry,
@@ -1864,6 +1920,7 @@ fn screenshot_debug_stats(
     options: &ClientOptions,
     texture_source: &TextureSource,
     render_stats: ob_render::RenderStats,
+    far_stats: Option<&ob_render::FarTerrainStats>,
 ) -> DebugStats {
     let player = host.player();
     let eye = player.eye();
@@ -1910,6 +1967,14 @@ fn screenshot_debug_stats(
         target,
         seed: host.world().seed(),
         render_distance: host.render_distance_chunks(),
+        view_distance: settings.view_distance_chunks,
+        full_detail_radius: LodConfig::for_render_distance(host.render_distance_chunks()).full_detail_radius_chunks,
+        far_tiers: far_stats.map_or(0, |stats| stats.tiers.len()),
+        far_quads: far_stats.map_or(0, |stats| stats.opaque_quads),
+        far_vertices: far_stats.map_or(0, |stats| stats.opaque_vertices),
+        far_build_ms: far_stats.map_or(0.0, |stats| stats.build_ms as f32),
+        far_center: far_stats.map(|stats| stats.center),
+        far_rebuilding: false,
         loaded_chunks: host.world().chunk_count(),
         drawn_sections: render_stats.sections as usize,
         cached_sections: renderer.cached_mesh_count(),
@@ -2925,6 +2990,8 @@ struct GameState {
     meshes: HashMap<SectionPos, usize>,
     /// Distance-LOD state shared with the multiplayer runtime.
     lod: LodState,
+    /// Visual-only far-terrain mesh and background rebuild policy.
+    far_terrain: far_terrain::FarTerrainState,
     /// True while the initial near ring is still streaming/meshing.
     initial_load: bool,
     /// Initial near-ring radius in chunks (smaller than the full setting).
@@ -3799,6 +3866,7 @@ impl GameState {
                     .set_graphics(graphics_settings_from_settings(&self.ui.settings));
             }
             SettingsRow::ReducedMotion
+            | SettingsRow::ViewDistance
             | SettingsRow::ShowHud
             | SettingsRow::DebugOverlay
             | SettingsRow::Fov
@@ -3982,6 +4050,14 @@ impl GameState {
             target,
             seed: self.host.world().seed(),
             render_distance: self.host.render_distance_chunks(),
+            view_distance: self.ui.settings.view_distance_chunks,
+            full_detail_radius: self.lod.config().full_detail_radius_chunks,
+            far_tiers: self.far_terrain.stats().map_or(0, |stats| stats.tiers.len()),
+            far_quads: self.far_terrain.stats().map_or(0, |stats| stats.opaque_quads),
+            far_vertices: self.far_terrain.stats().map_or(0, |stats| stats.opaque_vertices),
+            far_build_ms: self.far_terrain.stats().map_or(0.0, |stats| stats.build_ms as f32),
+            far_center: self.far_terrain.center(),
+            far_rebuilding: self.far_terrain.is_building(),
             loaded_chunks: self.host.world().chunk_count(),
             drawn_sections: render_stats.sections as usize,
             cached_sections: self.meshes.len(),
@@ -4580,7 +4656,17 @@ impl GameState {
         let blend = 1.0 - (-dt.as_secs_f32() * 12.0).exp();
         self.current_fov += (target_fov - self.current_fov) * blend;
         camera.fov_y = self.current_fov.to_radians();
-        camera.far = far_plane_for_render_distance(self.host.render_distance_chunks());
+        // The camera far plane covers the visual horizon, not the simulated
+        // radius. Near streaming and full-detail geometry still stop at
+        // `render_distance_chunks`; the extra depth range is for far terrain.
+        camera.far = far_plane_for_view_distance(self.ui.settings.view_distance_chunks);
+        self.far_terrain.maintain(
+            &mut self.renderer,
+            self.host.world().seed(),
+            self.ui.settings.view_distance_chunks,
+            self.host.render_distance_chunks(),
+            [camera.position.x, camera.position.z],
+        );
         self.stream_and_mesh();
         // Keep the window title in sync with the effective render distance.
         if self.applied_render_distance != self.host.render_distance_chunks() {
@@ -4648,6 +4734,16 @@ impl GameState {
         // Minecraftia override or a font discovered in <data>/fonts/.
         let resolved_font = ui_font::resolve_ui_font_for_settings(&self.ui.settings, &self.data_dir);
         ui_font::install_ui_font(&mut renderer, &resolved_font);
+        // F2 must capture the same visual horizon as the window, including the
+        // far terrain that is not part of the streamed near world.
+        let far_build = far_terrain::build_now(
+            self.host.world().seed(),
+            [camera.position.x, camera.position.z],
+            self.ui.settings.view_distance_chunks,
+            self.host.render_distance_chunks(),
+        );
+        log::info!("F2 far terrain: {}", far_terrain::describe_build(&far_build));
+        renderer.set_far_terrain(far_build.mesh);
         // Build the UI for the offscreen target size so the HUD is included.
         let ui_frame = if ui.is_some() {
             self.build_ui_frame_at([SCREENSHOT_WIDTH as f32, SCREENSHOT_HEIGHT as f32])
@@ -5756,6 +5852,7 @@ impl ApplicationHandler for App {
             last_save: Instant::now(),
             meshes: HashMap::new(),
             lod: LodState::new(lod_config),
+            far_terrain: far_terrain::FarTerrainState::new(),
             initial_load: true,
             initial_target_radius,
             loading_progress: 0.0,
@@ -6473,6 +6570,9 @@ fn effective_settings(options: &ClientOptions) -> (Settings, PathBuf) {
     if options.render_distance_chunks != ClientOptions::default().render_distance_chunks {
         settings.render_distance_chunks = options.render_distance_chunks;
     }
+    if options.saw_view_distance {
+        settings.view_distance_chunks = options.view_distance_chunks;
+    }
     if let Some(style) = options.texture_style {
         settings.texture_style = style;
     }
@@ -6865,6 +6965,21 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
                         ob_core::config::MAX_RENDER_DISTANCE
                     ));
                 }
+            }
+            "view-distance" => {
+                options.view_distance_chunks = value
+                    .parse()
+                    .map_err(|_| format!("invalid --view-distance value '{value}'"))?;
+                if !(ob_core::config::MIN_VIEW_DISTANCE..=ob_core::config::MAX_VIEW_DISTANCE)
+                    .contains(&options.view_distance_chunks)
+                {
+                    return Err(format!(
+                        "--view-distance must be between {} and {} chunks",
+                        ob_core::config::MIN_VIEW_DISTANCE,
+                        ob_core::config::MAX_VIEW_DISTANCE
+                    ));
+                }
+                options.saw_view_distance = true;
             }
             "fly" => options.fly = true,
             "x11" => options.force_x11 = true,
@@ -8191,6 +8306,48 @@ mod tests {
             .expect_err("unknown variant");
             assert!(error.contains("unknown --") && error.contains("variant"));
         }
+    }
+
+    #[test]
+    fn view_distance_flag_is_run_only_and_does_not_change_simulation_radius() {
+        let dir = std::env::temp_dir().join(format!(
+            "openblock-view-distance-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("temp settings dir");
+        let options = options_from_args(&[
+            ("view-distance".to_string(), "512".to_string()),
+            ("render-distance".to_string(), "16".to_string()),
+            ("data-dir".to_string(), dir.to_string_lossy().into_owned()),
+        ])
+        .expect("view distance parses");
+        assert!(options.saw_view_distance);
+        assert_eq!(options.view_distance_chunks, 512);
+        assert_eq!(options.render_distance_chunks, 16);
+        let (settings, _) = effective_settings(&options);
+        assert_eq!(settings.view_distance_chunks, 512);
+        assert_eq!(settings.render_distance_chunks, 16);
+
+        for value in ["31", "513", "many", ""] {
+            let error = options_from_args(&[("view-distance".to_string(), value.to_string())])
+                .expect_err("invalid view distance must fail");
+            assert!(error.contains("--view-distance"), "{value}: {error}");
+        }
+        let options = options_from_args(&[
+            ("view-distance".to_string(), "32".to_string()),
+            ("data-dir".to_string(), dir.to_string_lossy().into_owned()),
+        ])
+        .expect("minimum view distance parses");
+        let (settings, _) = effective_settings(&options);
+        assert_eq!(settings.view_distance_chunks, 32);
+        assert_eq!(
+            settings.render_distance_chunks,
+            ClientOptions::default().render_distance_chunks
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

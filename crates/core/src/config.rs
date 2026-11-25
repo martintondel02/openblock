@@ -1214,13 +1214,27 @@ pub fn remember_recent_server(list: &mut Vec<RecentServer>, address: &str, name:
     list.truncate(MAX_RECENT_SERVERS);
 }
 
-/// Smallest supported render distance in chunks.
+/// Smallest supported simulation (full-detail/streaming) distance in chunks.
 pub const MIN_RENDER_DISTANCE: i32 = 2;
-/// Largest render distance offered by the settings screen.
+/// Largest simulation (full-detail/streaming) distance in chunks.
 ///
 /// 32 chunks is a 512-block radius, the v1.1 playable target. The vertical
 /// streaming radius is unchanged; only the horizontal column count grows.
+/// This remains the radius with authoritative simulation, streaming and full
+/// geometry; the visual-only far terrain extends beyond it up to
+/// [`MAX_VIEW_DISTANCE`].
 pub const MAX_RENDER_DISTANCE: i32 = 32;
+/// Smallest supported visual render distance in chunks.
+///
+/// The visual radius may not drop below the current 512-block horizon, so the
+/// far-terrain tier always starts at or beyond the simulated world.
+pub const MIN_VIEW_DISTANCE: i32 = 32;
+/// Largest supported visual render distance in chunks (512 chunks = 8,192 blocks).
+pub const MAX_VIEW_DISTANCE: i32 = 512;
+/// Default visual render distance in chunks (2,048 blocks).
+pub const DEFAULT_VIEW_DISTANCE: i32 = 128;
+/// View distance above which the settings screen warns about GPU cost.
+pub const VIEW_DISTANCE_WARNING_CHUNKS: i32 = 128;
 /// Smallest supported vertical field of view in degrees.
 pub const MIN_FOV_DEGREES: f32 = 30.0;
 /// Largest supported vertical field of view in degrees.
@@ -1273,8 +1287,16 @@ pub fn normalise_ui_scale_percent(value: u16) -> u16 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Streaming radius in chunks.
+    /// Simulation (full-detail/streaming) radius in chunks.
     pub render_distance_chunks: i32,
+    /// Visual render distance in chunks, including visual-only far terrain.
+    ///
+    /// The simulated world and full-detail geometry stop at
+    /// [`Self::render_distance_chunks`]; the low-poly heightfield extends to
+    /// this radius (2..=512 chunks, 8,192 blocks at the maximum). Far terrain
+    /// has no gameplay authority and does not affect streaming, collision,
+    /// spawning or persistence.
+    pub view_distance_chunks: i32,
     /// Vertical field of view in degrees.
     pub fov_degrees: f32,
     /// Mouse look multiplier (1.0 = default).
@@ -1344,6 +1366,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             render_distance_chunks: 6,
+            view_distance_chunks: DEFAULT_VIEW_DISTANCE,
             fov_degrees: 70.0,
             mouse_sensitivity: 1.0,
             ui_scale_percent: UI_SCALE_AUTO,
@@ -1381,6 +1404,10 @@ impl Settings {
         self.render_distance_chunks = self
             .render_distance_chunks
             .clamp(MIN_RENDER_DISTANCE, MAX_RENDER_DISTANCE);
+        self.view_distance_chunks = self
+            .view_distance_chunks
+            .clamp(MIN_VIEW_DISTANCE, MAX_VIEW_DISTANCE)
+            .max(self.render_distance_chunks);
         if !self.fov_degrees.is_finite() {
             self.fov_degrees = Settings::default().fov_degrees;
         }
@@ -1950,6 +1977,10 @@ mod tests {
         assert_eq!(loaded.graphics_preset, GraphicsPreset::High);
         assert_eq!(loaded.shadow_quality, ShadowQuality::High);
         assert!(loaded.bloom);
+        // A 1.2 config has no view distance; it must load as the documented
+        // default instead of failing deserialisation or shrinking to 0.
+        assert_eq!(loaded.view_distance_chunks, DEFAULT_VIEW_DISTANCE);
+        assert_eq!(loaded.render_distance_chunks, 8);
     }
 
     #[test]
@@ -1986,6 +2017,36 @@ mod tests {
         settings.render_distance_chunks = 999;
         assert!(settings.clamp());
         assert_eq!(settings.render_distance_chunks, MAX_RENDER_DISTANCE);
+    }
+
+    #[test]
+    fn view_distance_supports_the_512_chunk_target_and_clamps() {
+        assert_eq!(MIN_VIEW_DISTANCE, 32);
+        assert_eq!(MAX_VIEW_DISTANCE, 512);
+        let mut settings = Settings {
+            view_distance_chunks: 512,
+            ..Settings::default()
+        };
+        assert!(!settings.clamp());
+        assert_eq!(settings.view_distance_chunks, 512);
+
+        settings.view_distance_chunks = 0;
+        assert!(settings.clamp());
+        assert_eq!(settings.view_distance_chunks, MIN_VIEW_DISTANCE);
+        settings.view_distance_chunks = 999;
+        assert!(settings.clamp());
+        assert_eq!(settings.view_distance_chunks, MAX_VIEW_DISTANCE);
+        settings.view_distance_chunks = -4;
+        settings.render_distance_chunks = 3;
+        assert!(settings.clamp());
+        assert_eq!(settings.view_distance_chunks, MIN_VIEW_DISTANCE);
+        assert_eq!(settings.render_distance_chunks, 3);
+
+        // The visual radius can never fall below the simulated radius.
+        settings.view_distance_chunks = 32;
+        settings.render_distance_chunks = 32;
+        assert!(!settings.clamp());
+        assert_eq!(settings.view_distance_chunks, 32);
     }
 
     #[test]

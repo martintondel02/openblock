@@ -710,6 +710,7 @@ impl MenuRuntime {
                     .set_graphics(crate::graphics_settings_from_settings(&self.ui.settings));
             }
             SettingsRow::RenderDistance
+            | SettingsRow::ViewDistance
             | SettingsRow::Fov
             | SettingsRow::MouseSensitivity
             | SettingsRow::ReducedMotion

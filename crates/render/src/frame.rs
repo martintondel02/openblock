@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use ob_math::SectionPos;
 
 use crate::entities::{EntitiesRenderer, EntityInstance};
+use crate::far_terrain::{self, FarTerrainMesh, GpuFarTerrain};
 use crate::frustum::{aabb_visible, aabb_within_distance, section_visible};
 use crate::graphics::{GraphicsSettings, ShadowConfig};
 use crate::lod::LodBatchKey;
@@ -482,6 +483,8 @@ pub(crate) struct SceneRenderer {
     shadow_sampler: wgpu::Sampler,
     pipeline: wgpu::RenderPipeline,
     water_pipeline: wgpu::RenderPipeline,
+    far_pipeline: wgpu::RenderPipeline,
+    far_water_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
@@ -496,6 +499,7 @@ pub(crate) struct SceneRenderer {
     entities: EntitiesRenderer,
     meshes: HashMap<SectionPos, GpuMesh>,
     lod_batches: HashMap<LodBatchKey, GpuLodBatch>,
+    far_terrain: Option<GpuFarTerrain>,
     stats: RenderStats,
 }
 
@@ -552,6 +556,9 @@ impl SceneRenderer {
         let shadow_proxies = ShadowProxies::new(device, queue, &shadow_cascade_buffers);
         let world_pipeline = pipeline::create_pipeline(device, pipeline::HDR_FORMAT, &bind_group_layout);
         let water_pipeline = pipeline::create_water_pipeline(device, pipeline::HDR_FORMAT, &bind_group_layout);
+        let far_pipeline = far_terrain::create_far_terrain_pipeline(device, pipeline::HDR_FORMAT, &bind_group_layout);
+        let far_water_pipeline =
+            far_terrain::create_far_water_pipeline(device, pipeline::HDR_FORMAT, &bind_group_layout);
         let sky_pipeline = pipeline::create_sky_pipeline(device, pipeline::HDR_FORMAT, &bind_group_layout);
         let outline_pipeline = pipeline::create_outline_pipeline(device, pipeline::HDR_FORMAT, &bind_group_layout);
         let shadow_pipeline = pipeline::create_shadow_pipeline(device, &shadow_bind_group_layout);
@@ -590,6 +597,8 @@ impl SceneRenderer {
             shadow_sampler,
             pipeline: world_pipeline,
             water_pipeline,
+            far_pipeline,
+            far_water_pipeline,
             sky_pipeline,
             outline_pipeline,
             shadow_pipeline,
@@ -604,6 +613,7 @@ impl SceneRenderer {
             entities,
             meshes: HashMap::new(),
             lod_batches: HashMap::new(),
+            far_terrain: None,
             stats: RenderStats::default(),
         })
     }
@@ -769,6 +779,21 @@ impl SceneRenderer {
     /// Total vertices held by uploaded far-LOD batches (opaque and water).
     pub(crate) fn lod_vertex_count(&self) -> u64 {
         self.lod_batches.values().map(GpuLodBatch::total_vertex_count).sum()
+    }
+
+    /// Uploads or clears the visual-only far-terrain heightfield.
+    pub(crate) fn set_far_terrain(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh: FarTerrainMesh) {
+        self.far_terrain = GpuFarTerrain::from_mesh(device, queue, &mesh);
+    }
+
+    /// Removes the far-terrain mesh.
+    pub(crate) fn clear_far_terrain(&mut self) {
+        self.far_terrain = None;
+    }
+
+    /// World-space bounds of the current far mesh.
+    pub(crate) fn far_terrain_bounds(&self) -> Option<([f32; 3], [f32; 3])> {
+        self.far_terrain.as_ref().map(|far| (far.min, far.max))
     }
 
     /// Replaces the dropped-item entities drawn with the world.
@@ -1007,6 +1032,26 @@ impl SceneRenderer {
                 stats.lod_batches += 1;
                 stats.lod_vertices += u64::from(batch.vertex_count);
             }
+            // Visual-only far terrain is drawn after the near world and far
+            // batches, so early depth rejection removes every far fragment
+            // hidden behind full-detail geometry. It is not part of the shadow
+            // pass and never influences simulation or streaming.
+            if let Some(far) = &self.far_terrain
+                && far.index_count > 0
+                && aabb_visible(&frustum, far.min, far.max)
+                && aabb_within_distance(eye, far.min, far.max, draw_distance)
+            {
+                pass.set_pipeline(&self.far_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, far.vertex_buffer.slice(..));
+                pass.set_index_buffer(far.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..far.index_count, 0, 0..1);
+                stats.draw_calls += 1;
+                stats.vertices += u64::from(far.vertex_count);
+                stats.far_draw_calls += 1;
+                stats.far_vertices += u64::from(far.vertex_count);
+                stats.far_triangles += u64::from(far.index_count / 3);
+            }
             self.entities.draw(&mut pass, &self.bind_group);
             stats.passes += 1;
         }
@@ -1046,7 +1091,12 @@ impl SceneRenderer {
 
         // --- 4. Water and outline ------------------------------------------
         let water = self.collect_water(&frustum, &order, &lod_order, eye, draw_distance);
-        if !water.is_empty() || outline_vertices.is_some() {
+        let far_water = self.far_terrain.as_ref().filter(|far| {
+            far.water_index_count > 0
+                && aabb_visible(&frustum, far.min, far.max)
+                && aabb_within_distance(eye, far.min, far.max, draw_distance)
+        });
+        if !water.is_empty() || far_water.is_some() || outline_vertices.is_some() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("water"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1070,6 +1120,22 @@ impl SceneRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if let Some(far) = far_water {
+                // The far water surface is farther than every near section or
+                // batch, so drawing it before the back-to-front near water
+                // keeps the transparent pass visually ordered without a sort.
+                pass.set_pipeline(&self.far_water_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                if let (Some(vertex_buffer), Some(index_buffer)) = (&far.water_vertex_buffer, &far.water_index_buffer) {
+                    pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                    pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..far.water_index_count, 0, 0..1);
+                    stats.water_draw_calls += 1;
+                    stats.water_vertices += u64::from(far.water_vertex_count);
+                    stats.far_water_draw_calls += 1;
+                    stats.far_water_vertices += u64::from(far.water_vertex_count);
+                }
+            }
             if !water.is_empty() {
                 pass.set_pipeline(&self.water_pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
