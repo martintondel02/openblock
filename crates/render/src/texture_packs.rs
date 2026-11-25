@@ -1445,7 +1445,7 @@ mod classic {
             "chest_side" => chest_side(size, seed),
             "chest_front" => chest_front(size, seed),
             "torch" | "farmland_dry" | "farmland_wet" | "wheat_0" | "wheat_1" | "wheat_2" | "wheat_3"
-            | "bed_foot_top" | "bed_foot_side" | "bed_head_top" | "bed_head_side" => {
+            | "bed_foot_top" | "bed_foot_side" | "bed_head_top" | "bed_head_side" | "fire" => {
                 super::extras::layer(TexturePackStyle::Classic, name, size, seed)
             }
             _ => debug(size),
@@ -2195,7 +2195,7 @@ mod painterly {
             "chest_side" => chest_side(size, seed),
             "chest_front" => chest_front(size, seed),
             "torch" | "farmland_dry" | "farmland_wet" | "wheat_0" | "wheat_1" | "wheat_2" | "wheat_3"
-            | "bed_foot_top" | "bed_foot_side" | "bed_head_top" | "bed_head_side" => {
+            | "bed_foot_top" | "bed_foot_side" | "bed_head_top" | "bed_head_side" | "fire" => {
                 super::extras::layer(TexturePackStyle::Painterly, name, size, seed)
             }
             _ => debug(size),
@@ -2884,7 +2884,7 @@ mod lush {
             "chest_side" => chest_side(size, seed),
             "chest_front" => chest_front(size, seed),
             "torch" | "farmland_dry" | "farmland_wet" | "wheat_0" | "wheat_1" | "wheat_2" | "wheat_3"
-            | "bed_foot_top" | "bed_foot_side" | "bed_head_top" | "bed_head_side" => {
+            | "bed_foot_top" | "bed_foot_side" | "bed_head_top" | "bed_head_side" | "fire" => {
                 super::extras::layer(TexturePackStyle::Lush, name, size, seed)
             }
             _ => debug(size),
@@ -3659,7 +3659,7 @@ mod minimal {
             "chest_side" => chest_side(size, seed),
             "chest_front" => chest_front(size, seed),
             "torch" | "farmland_dry" | "farmland_wet" | "wheat_0" | "wheat_1" | "wheat_2" | "wheat_3"
-            | "bed_foot_top" | "bed_foot_side" | "bed_head_top" | "bed_head_side" => {
+            | "bed_foot_top" | "bed_foot_side" | "bed_head_top" | "bed_head_side" | "fire" => {
                 super::extras::layer(TexturePackStyle::Minimal, name, size, seed)
             }
             _ => debug(size),
@@ -4231,6 +4231,7 @@ mod extras {
             "wheat_3" => wheat(size, seed, &palette, 3),
             "bed_foot_top" | "bed_head_top" => bed_top(size, seed, &palette, name == "bed_foot_top"),
             "bed_foot_side" | "bed_head_side" => bed_side(size, seed, &palette, name == "bed_foot_side"),
+            "fire" => fire(size, seed),
             _ => Canvas::new(size, [0, 0, 0]),
         }
     }
@@ -4279,6 +4280,69 @@ mod extras {
                     put(&mut canvas, x, y, [236, 150, 52]);
                 }
             }
+        }
+        canvas
+    }
+
+    /// One animated-looking flame cut-out.
+    ///
+    /// The shape is a ragged teardrop with a hot yellow core and an orange/red
+    /// rim. The renderer animates the cut-out by wobbling the sampled UV and
+    /// modulating the alpha threshold with time (see `shader.wgsl`), so a single
+    /// 16²/32² layer reads as a moving flame without a texture atlas or a second
+    /// layer. Alpha is binary: transparent or fully opaque, which keeps the
+    /// cross-quad cut-out crisp through the mip chain.
+    fn fire(size: u32, seed: u32) -> Canvas {
+        let mut canvas = Canvas::new(size, [0, 0, 0]);
+        clear(&mut canvas);
+        let edge = size as i32;
+        let center = edge / 2;
+        let bright = [255, 238, 158];
+        let hot = [250, 176, 54];
+        let warm = [232, 104, 26];
+        let deep = [168, 42, 14];
+        for y in 0..edge {
+            // ny: 0 at the tip, 256 at the base.
+            let ny = (y * 256) / (edge - 1).max(1);
+            // Half-width grows towards the base; the tip stays thin.
+            let half_width = ((18 + 92 * ny / 256) * edge / 256).max(1);
+            // A slow lateral sway makes the silhouette asymmetric.
+            let noise = i32::from(periodic_noise(seed, 0, y as u32, size, 4)) - 128;
+            let sway = noise * edge / 2048 * (256 - ny) / 256;
+            let cx = center + sway;
+            for x in 0..edge {
+                let dx = (x - cx).abs();
+                if dx > half_width {
+                    continue;
+                }
+                let grain = (hash_noise(seed ^ 0xF1, x as u32, y as u32) & 0xff) as i32;
+                // Ragged tip and occasional gaps keep the flame from reading as
+                // a solid triangle.
+                if grain < (256 - ny) / 5 + 18 {
+                    continue;
+                }
+                if dx > half_width - 1 && grain < 96 {
+                    continue;
+                }
+                let centrality = (half_width - dx) * 255 / half_width.max(1);
+                let heat = (centrality + ny * 90 / 256).min(255);
+                let colour = if heat > 205 {
+                    bright
+                } else if heat > 150 {
+                    hot
+                } else if heat > 90 {
+                    warm
+                } else {
+                    deep
+                };
+                put(&mut canvas, x, y, offset(colour, grain / 24 - 6));
+            }
+        }
+        // A couple of detached sparks above the flame.
+        for spark in 0..(edge / 8).max(1) {
+            let x = center + (hash_noise(seed ^ 0xA7, spark as u32, 0) % (edge as u32 / 3).max(1)) as i32 - edge / 6;
+            let y = (hash_noise(seed ^ 0x5D, 0, spark as u32) % (edge as u32 / 4).max(1)) as i32 + 1;
+            put(&mut canvas, x, y, hot);
         }
         canvas
     }
@@ -4398,6 +4462,43 @@ mod tests {
     use super::*;
     use crate::textures::BlockTextureArray;
 
+    #[test]
+    fn fire_layer_is_a_visible_alpha_cutout_flame() {
+        for style in TexturePackStyle::ALL {
+            let pack = TexturePack::generate(style);
+            let layer = pack.layer(0, catalogue::FIRE.0 as usize).expect("fire layer exists");
+            let edge = style.resolution() as usize;
+            let mut opaque = 0usize;
+            let mut rows = Vec::new();
+            for y in 0..edge {
+                let mut row = 0usize;
+                for x in 0..edge {
+                    let offset = (y * edge + x) * 4;
+                    if layer[offset + 3] > 0 {
+                        row += 1;
+                    }
+                }
+                opaque += row;
+                rows.push(row);
+            }
+            let coverage = opaque as f64 / (edge * edge) as f64;
+            eprintln!("{style:?} fire coverage {coverage:.2} rows {rows:?}");
+            assert!(
+                (0.15..0.75).contains(&coverage),
+                "{style:?} fire coverage {coverage:.2} (rows {rows:?})"
+            );
+            assert!(
+                rows[0] + rows[1] + rows[2] > 0,
+                "{style:?} fire must reach the tip (rows {rows:?})"
+            );
+            assert!(rows[edge - 1] > 0, "{style:?} fire must have a base");
+            assert!(
+                rows[edge / 2] > 0,
+                "{style:?} fire must have a full body (rows {rows:?})"
+            );
+        }
+    }
+
     /// FNV-1a over one layer, used to check distinctness.
     fn layer_hash(bytes: &[u8]) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -4476,6 +4577,7 @@ mod tests {
                     assert_eq!(bytes.len(), (edge * edge * 4) as usize);
                     let is_cut_out = layer == catalogue::LEAVES.0 as usize
                         || layer == catalogue::TORCH.0 as usize
+                        || layer == catalogue::FIRE.0 as usize
                         || (catalogue::WHEAT_0.0 as usize..=catalogue::WHEAT_3.0 as usize).contains(&layer);
                     for texel in bytes.as_chunks::<4>().0 {
                         if is_cut_out && level == 0 {

@@ -953,6 +953,7 @@ impl MenuRuntime {
             ui: Some(&frame),
             outline: None,
             time_seconds: 0.0,
+            ..SceneParams::default()
         };
         if let Err(error) = self.renderer.render_scene(&camera, &scene) {
             log::error!("menu render error: {error}");
@@ -1068,6 +1069,7 @@ fn screenshot_menu_inner(
             ui: Some(&frame),
             outline: None,
             time_seconds: 0.0,
+            ..SceneParams::default()
         },
     )?;
     let rgba = renderer.read_rgba();

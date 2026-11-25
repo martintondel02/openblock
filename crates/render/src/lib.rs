@@ -27,6 +27,7 @@ pub mod lod;
 pub mod mesh;
 pub mod offscreen;
 pub mod outline;
+pub mod particles;
 mod pipeline;
 pub mod resource_pack;
 pub mod shadow;
@@ -43,7 +44,7 @@ use ob_math::{Mat4, SectionPos, WorldVec};
 use winit::window::Window;
 
 pub use entities::{EntityInstance, entity_layer, entity_layers};
-pub use environment::{DAY_LENGTH_TICKS, Environment, EnvironmentVisual};
+pub use environment::{DAY_LENGTH_TICKS, Environment, EnvironmentVisual, WeatherPrecipitation, WeatherVisual};
 pub use far_terrain::{
     FAR_RECENTER_HYSTERESIS, FAR_TIER_BOUNDARIES, FAR_TIER_CELLS, FAR_TIER_OVERLAP_CELLS, FarBiome, FarSample,
     FarTerrainBuild, FarTerrainConfig, FarTerrainMesh, FarTerrainStats, FarTerrainVertex, FarTier, FarTierStats,
@@ -63,6 +64,10 @@ pub use lod::{
 pub use mesh::{MesherStats, SNAPSHOT_SIZE, SectionSnapshot, mesh_section, mesh_section_with_stats};
 pub use offscreen::OffscreenRenderer;
 pub use outline::{BlockOutline, DEFAULT_EDGE_COLOR, DEFAULT_INFLATION, OUTLINE_VERTEX_COUNT, OutlineVertex};
+pub use particles::{
+    MAX_PARTICLES, MAX_PRECIPITATION, Particle, ParticleInstance, ParticleKind, ParticleSystem, Precipitation,
+    RAIN_PARTICLES, SNOW_PARTICLES, WeatherParticles, precipitation_target, weather_wind,
+};
 pub use resource_pack::{ResourcePackLayers, TextureLoadError, TextureSource, load_resource_pack};
 pub use shadow::{MAX_SHADOW_CASCADES, ShadowCascade, ShadowCascades};
 pub use textures::{TexturePack, TexturePackStyle};
@@ -227,6 +232,16 @@ pub struct SceneParams<'a> {
     /// windowed client passes its elapsed time, screenshots and benchmarks pass
     /// a fixed value so captures are reproducible.
     pub time_seconds: f32,
+    /// Storm/sky/fog presentation derived from the authoritative weather state.
+    ///
+    /// `Default` is clear weather, which renders exactly the v1.4 look.
+    pub weather: WeatherVisual,
+    /// Optional instanced particle packet for this frame.
+    ///
+    /// The CPU simulation belongs to the client; the renderer uploads the slice
+    /// once and draws every instance with one call. `None` and an empty slice
+    /// record no particle pass.
+    pub particles: Option<&'a [ParticleInstance]>,
 }
 
 impl<'a> SceneParams<'a> {
@@ -237,6 +252,8 @@ impl<'a> SceneParams<'a> {
             ui: None,
             outline: None,
             time_seconds: 0.0,
+            weather: WeatherVisual::default(),
+            particles: None,
         }
     }
 
@@ -255,6 +272,18 @@ impl<'a> SceneParams<'a> {
     /// Sets the animation clock.
     pub fn with_time_seconds(mut self, seconds: f32) -> Self {
         self.time_seconds = seconds;
+        self
+    }
+
+    /// Attaches a weather presentation state.
+    pub fn with_weather(mut self, weather: WeatherVisual) -> Self {
+        self.weather = weather;
+        self
+    }
+
+    /// Attaches one frame of instanced particles.
+    pub fn with_particles(mut self, particles: &'a [ParticleInstance]) -> Self {
+        self.particles = Some(particles);
         self
     }
 }
@@ -407,6 +436,10 @@ pub struct RenderStats {
     pub fsr_passes: u32,
     /// SSAO raw and blur passes recorded this frame (0 on Low/Medium).
     pub ssao_passes: u32,
+    /// Instanced particle billboards submitted this frame.
+    pub particle_instances: u32,
+    /// Draw calls issued for particles (0 or 1).
+    pub particle_draw_calls: u32,
 }
 
 /// Errors from renderer initialisation or presentation.
@@ -816,6 +849,7 @@ impl Renderer {
                 ui,
                 outline: None,
                 time_seconds: 0.0,
+                ..SceneParams::default()
             },
         )
     }

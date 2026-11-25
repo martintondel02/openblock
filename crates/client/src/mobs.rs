@@ -59,6 +59,10 @@ pub struct MobVisual {
     pub variant: u8,
     /// Whether the baby half-scale applies.
     pub baby: bool,
+    /// Creeper fuse swell `0..=1`; `0` for every non-explosive mob.
+    pub fuse: f32,
+    /// White flash pulse during the fuse `0..=1` (visual only).
+    pub fuse_flash: f32,
 }
 
 /// Fixed palette per species.
@@ -154,10 +158,38 @@ pub fn mob_instances(registry: &Registry, mobs: &[MobEntity], elapsed: f32) -> V
                 moving: speed > WALK_SPEED_THRESHOLD,
                 variant: entity.mob.variant.min(3),
                 baby: entity.mob.is_baby(),
+                fuse: creeper_fuse(entity.mob.kind, entity.mob.fuse_timer, registry),
+                fuse_flash: creeper_flash(entity.mob.kind, entity.mob.fuse_timer, registry),
             }
         })
         .collect();
     mob_instances_from_visuals(registry, &visuals)
+}
+
+/// Normalised creeper fuse progress `0..=1` (`0` for every other species).
+fn creeper_fuse(kind: MobKind, timer: f64, registry: &Registry) -> f32 {
+    if kind != MobKind::Creeper || !timer.is_finite() || timer <= 0.0 {
+        return 0.0;
+    }
+    let total = match registry.mob(kind).attack {
+        ob_content::MobAttack::Explosive { fuse, .. } => fuse.max(0.05),
+        _ => 1.5,
+    };
+    (1.0 - timer / total).clamp(0.0, 1.0) as f32
+}
+
+/// Fast white pulse for the last second of a creeper fuse.
+fn creeper_flash(kind: MobKind, timer: f64, registry: &Registry) -> f32 {
+    if kind != MobKind::Creeper || !timer.is_finite() || timer <= 0.0 {
+        return 0.0;
+    }
+    let total = match registry.mob(kind).attack {
+        ob_content::MobAttack::Explosive { fuse, .. } => fuse.max(0.05),
+        _ => 1.5,
+    };
+    let fuse = (1.0 - timer / total).clamp(0.0, 1.0) as f32;
+    let pulse = ((fuse * 18.0) * std::f32::consts::TAU * 0.5 + 0.5).sin() * 0.5 + 0.5;
+    (fuse * pulse * 1.35).clamp(0.0, 1.0)
 }
 
 /// Composes cubes for already-interpolated mob poses.
@@ -276,6 +308,22 @@ fn compose_mob(registry: &Registry, visual: &MobVisual, out: &mut Vec<EntityInst
             cube.position[1] = visual.pos.y as f32 + (cube.position[1] - visual.pos.y as f32) * 0.5;
             cube.position[2] = visual.pos.z as f32 + (cube.position[2] - visual.pos.z as f32) * 0.5;
             cube.scale *= 0.5;
+        }
+    }
+    if visual.fuse > 0.0 {
+        // Creeper fuse: swell around the feet and flash white-hot near the end.
+        // The server owns the fuse timer; this is presentation only.
+        let swell = 1.0 + 0.30 * visual.fuse.clamp(0.0, 1.0);
+        let flash = visual.fuse_flash.clamp(0.0, 1.0);
+        for cube in &mut out[start..] {
+            cube.position[0] = visual.pos.x as f32 + (cube.position[0] - visual.pos.x as f32) * swell;
+            cube.position[1] = visual.pos.y as f32 + (cube.position[1] - visual.pos.y as f32) * swell;
+            cube.position[2] = visual.pos.z as f32 + (cube.position[2] - visual.pos.z as f32) * swell;
+            cube.scale *= swell;
+            for (channel, tint) in cube.tint.iter_mut().enumerate() {
+                let target = if channel == 2 { 0.92 } else { 1.0 };
+                *tint += (target - *tint) * flash * 0.75;
+            }
         }
     }
 }
@@ -517,6 +565,8 @@ impl MobRenderCache {
                     moving: cached.moving,
                     variant: cached.variant,
                     baby: cached.baby,
+                    fuse: 0.0,
+                    fuse_flash: 0.0,
                 })
             })
             .collect()

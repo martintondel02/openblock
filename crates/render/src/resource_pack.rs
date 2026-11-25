@@ -435,6 +435,9 @@ fn candidate_files(name: &str) -> &'static [&'static str] {
         "chest_top" => &["chest_top.png"],
         "chest_side" => &["chest_side.png"],
         "chest_front" => &["chest_front.png"],
+        // Vanilla animates fire with two frames under `textures/block`; either
+        // frame is a usable still, and a plain `fire.png` is accepted too.
+        "fire" => &["fire_0.png", "fire_1.png", "fire.png"],
         // 1.2 Light & Home layers. Farmland and wheat use the vanilla names;
         // beds usually live under `entity/bed` in a pack, so their block layers
         // commonly fall back to the procedural catalogue.
@@ -838,7 +841,7 @@ mod tests {
     use super::*;
 
     /// Non-debug catalogue files and the NAMES index they feed, in pack order.
-    const PACK_FILES: [(&str, &str); 37] = [
+    const PACK_FILES: [(&str, &str); 38] = [
         ("grass_top", "grass_block_top.png"),
         ("grass_side", "grass_block_side.png"),
         ("dirt", "dirt.png"),
@@ -876,6 +879,7 @@ mod tests {
         ("bed_foot_side", "bed_foot_side.png"),
         ("bed_head_top", "bed_head_top.png"),
         ("bed_head_side", "bed_head_side.png"),
+        ("fire", "fire_0.png"),
     ];
 
     /// Scratch directory that is removed when the test finishes.
@@ -1492,6 +1496,7 @@ mod tests {
                 "bed_head_side.png",
                 layer_colour(ob_content::textures::BED_HEAD_SIDE.0 as usize),
             ),
+            ("fire_0.png", layer_colour(ob_content::textures::FIRE.0 as usize)),
         ];
         for (file, colour) in files {
             write_solid(&block_dir.join(file), 16, colour);

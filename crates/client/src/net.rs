@@ -64,10 +64,10 @@ use std::time::{Duration, Instant};
 use ob_content::{BlockId, Registry};
 use ob_math::{Aabb, BlockPos, ChunkPos, LocalPos, N_SECTIONS, SectionPos, WORLD_MAX_Y, WORLD_MIN_Y, WorldVec};
 use ob_protocol::{
-    ClientMessage, LIGHT_CELLS, LIGHT_SECTION_FORMAT, MAX_CHAT_LEN, MAX_FRAME_LEN, MAX_LIGHT_SECTIONS_PER_UPDATE,
-    PROTOCOL_VERSION, PlayerSnapshot, ProtocolError, RateLimit, ServerMessage, content_fingerprint, decode_chunk,
-    decode_light_words, decode_payload, encode_client_frame, manifest_matches, validate_chat_text,
-    validate_player_name, write_message,
+    ClientMessage, EntityKind, LIGHT_CELLS, LIGHT_SECTION_FORMAT, MAX_CHAT_LEN, MAX_FRAME_LEN,
+    MAX_LIGHT_SECTIONS_PER_UPDATE, PROTOCOL_VERSION, PlayerSnapshot, PrecipitationKind, ProtocolError, RateLimit,
+    ServerMessage, WeatherPhase, content_fingerprint, decode_chunk, decode_light_words, decode_payload,
+    encode_client_frame, manifest_matches, validate_chat_text, validate_player_name, write_message,
 };
 use ob_render::EntityInstance;
 use ob_server::{ItemStack, MOB_ATTACK_REACH};
@@ -78,6 +78,7 @@ use crate::containers::{ClickButton, ContainerSnapshot, SlotId};
 use crate::net_state::{
     CursorStack, RemoteClickOutcome, RemoteContainers, ReplicatedEntities, SurvivalState, friendly_action_rejection,
 };
+use crate::weather::WeatherSnapshot;
 
 /// Default TCP connect and handshake timeout.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1052,6 +1053,44 @@ pub enum NetEvent {
         /// Restored hunger.
         hunger: f32,
     },
+    /// The authoritative weather state changed (or the first sync arrived).
+    WeatherSynced {
+        /// Current phase.
+        phase: WeatherPhase,
+        /// Ramp intensity `0..=1`.
+        intensity: f32,
+        /// Ticks left in the phase.
+        remaining_ticks: u32,
+        /// Storm epoch.
+        epoch: u64,
+        /// Precipitation at the local column.
+        precipitation: PrecipitationKind,
+        /// Biome at the local column.
+        biome: String,
+        /// Gameplay-light factor.
+        weather_factor: f32,
+    },
+    /// An arrow projectile spawned (skeleton shot), for the bow audio cue.
+    ProjectileSpawned {
+        /// Spawn position.
+        pos: [f64; 3],
+    },
+    /// An arrow projectile despawned (impact or timeout), for the impact cue.
+    ProjectileDespawned {
+        /// Position at the last snapshot before removal.
+        pos: [f64; 3],
+    },
+    /// One lightning strike. `pos` is the flash centre, `block` the struck block.
+    LightningStrike {
+        /// Strike centre.
+        pos: [f64; 3],
+        /// Struck block.
+        block: [i32; 3],
+        /// Whether the strike started a fire.
+        ignited: bool,
+        /// Whether a visible flash should render.
+        flash: bool,
+    },
     /// Result of one melee attack intent.
     AttackResult {
         /// Target mob id.
@@ -1346,6 +1385,8 @@ pub struct NetworkClient {
     clock: Option<ServerClock>,
     /// Latest personalised sleep state (`None` until the first `SleepState`).
     sleep: Option<SleepView>,
+    /// Latest authoritative weather state (`None` until the first `WeatherSync`).
+    weather: Option<WeatherSnapshot>,
     /// Counters for the dense-light replication path.
     light_stats: LightSyncStats,
     ping_ms: Option<u32>,
@@ -1594,6 +1635,7 @@ impl NetworkClient {
             last_server_state: None,
             clock: None,
             sleep: None,
+            weather: None,
             light_stats: LightSyncStats::default(),
             ping_ms: None,
             pending_ping: None,
@@ -1628,6 +1670,11 @@ impl NetworkClient {
         client.maintain_chunks(8);
         client.send_ping();
         Ok(client)
+    }
+
+    /// Latest authoritative weather state, or `None` before the first sync.
+    pub fn weather(&self) -> Option<&WeatherSnapshot> {
+        self.weather.as_ref()
     }
 
     /// Server metadata captured during the handshake.
@@ -2669,6 +2716,54 @@ impl NetworkClient {
                     });
                 }
             }
+            ServerMessage::WeatherSync {
+                phase,
+                intensity,
+                remaining_ticks,
+                epoch,
+                precipitation,
+                biome,
+                weather_factor,
+            } => {
+                let snapshot = WeatherSnapshot::new(
+                    phase,
+                    intensity,
+                    remaining_ticks,
+                    epoch,
+                    precipitation,
+                    biome.clone(),
+                    weather_factor,
+                );
+                self.weather = Some(snapshot.clone());
+                events.push(NetEvent::WeatherSynced {
+                    phase,
+                    intensity: snapshot.intensity,
+                    remaining_ticks,
+                    epoch,
+                    precipitation,
+                    biome,
+                    weather_factor: snapshot.weather_factor,
+                });
+            }
+            ServerMessage::LightningStrike {
+                pos,
+                block,
+                ignited,
+                flash,
+            } => {
+                // Presentation only: the server already applied damage and
+                // ignition. Reject non-finite positions rather than feeding them
+                // to the flash/shake/audio math.
+                if !pos.iter().all(|value| value.is_finite()) {
+                    return;
+                }
+                events.push(NetEvent::LightningStrike {
+                    pos,
+                    block,
+                    ignited,
+                    flash,
+                });
+            }
             ServerMessage::TimeSync {
                 tick,
                 day_phase,
@@ -2817,6 +2912,9 @@ impl NetworkClient {
                 variant,
                 baby,
             } => {
+                if matches!(kind, EntityKind::Projectile { .. }) && pos.iter().all(|value| value.is_finite()) {
+                    events.push(NetEvent::ProjectileSpawned { pos });
+                }
                 self.entities.apply_spawn(
                     &self.registry,
                     ob_protocol::EntitySnapshot {
@@ -2839,6 +2937,20 @@ impl NetworkClient {
                 self.entities.apply_state(&self.registry, &entities, Instant::now());
             }
             ServerMessage::EntityDespawn { ids, reason } => {
+                // Capture arrow positions before the entries are removed so the
+                // client can place the impact cue in the world.
+                let now = Instant::now();
+                for id in &ids {
+                    if matches!(
+                        self.entities.kind(*id),
+                        Some(crate::net_state::ReplicatedKind::Projectile(_))
+                    ) && let Some(position) = self.entities.position(*id, now)
+                    {
+                        events.push(NetEvent::ProjectileDespawned {
+                            pos: [position.x, position.y, position.z],
+                        });
+                    }
+                }
                 self.entities.apply_despawn(&ids, reason);
             }
             ServerMessage::DamageEvent { amount, cause } => {
@@ -3043,6 +3155,7 @@ impl NetworkClient {
         self.last_server_state = None;
         self.clock = None;
         self.sleep = None;
+        self.weather = None;
         self.player.dead = false;
         self.player.health = 20.0;
         self.player.hunger = 20.0;

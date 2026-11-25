@@ -260,6 +260,126 @@ impl Environment {
             star_rotation: time_of_day * TAU,
         }
     }
+
+    /// Computes the visual state with storm darkening applied.
+    ///
+    /// This is the pure function the renderer and client tests use; windowed
+    /// and offscreen frames share it through the scene camera uniform.
+    pub fn visual_with_weather(self, weather: WeatherVisual) -> EnvironmentVisual {
+        self.visual().with_weather(weather)
+    }
+}
+
+/// Precipitation type used by the sky/fog weather adjustment.
+///
+/// The renderer intentionally does not depend on the protocol crate; the client
+/// maps `ob_protocol::PrecipitationKind` to this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WeatherPrecipitation {
+    /// Clear or a dry biome.
+    #[default]
+    None,
+    /// Liquid rain.
+    Rain,
+    /// Snow.
+    Snow,
+}
+
+impl WeatherPrecipitation {
+    /// Stable lower-case name.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Rain => "rain",
+            Self::Snow => "snow",
+        }
+    }
+
+    /// Parses the stable lower-case name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "none" | "clear" => Some(Self::None),
+            "rain" => Some(Self::Rain),
+            "snow" => Some(Self::Snow),
+            _ => None,
+        }
+    }
+}
+
+/// Renderer-side weather presentation state.
+///
+/// This is derived from the server's phase/intensity/precipitation messages and
+/// the client's local lightning-flash envelope. It never advances weather
+/// itself. The fields feed [`EnvironmentVisual::with_weather`] (sky, sun,
+/// ambient light), the scene camera uniform (fog and cloud storm
+/// factors) and the post-processing exposure flash.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeatherVisual {
+    /// Ramp intensity `0..=1`.
+    pub intensity: f32,
+    /// Storm/thunder weight `0..=1`; `0` for ordinary rain and clear weather.
+    pub storm: f32,
+    /// Precipitation at the player column.
+    pub precipitation: WeatherPrecipitation,
+    /// Local lightning flash envelope `0..=1`, decays on the client.
+    pub flash: f32,
+}
+
+impl Default for WeatherVisual {
+    fn default() -> Self {
+        Self::clear()
+    }
+}
+
+impl WeatherVisual {
+    /// A clear, flash-free weather state.
+    pub const fn clear() -> Self {
+        Self {
+            intensity: 0.0,
+            storm: 0.0,
+            precipitation: WeatherPrecipitation::None,
+            flash: 0.0,
+        }
+    }
+
+    /// Builds a sanitised state.
+    pub fn new(intensity: f32, storm: f32, precipitation: WeatherPrecipitation, flash: f32) -> Self {
+        Self {
+            intensity,
+            storm,
+            precipitation,
+            flash,
+        }
+        .sanitised()
+    }
+
+    /// Clamps every field to a finite `0..=1` value.
+    pub fn sanitised(mut self) -> Self {
+        let clamp = |value: f32| if value.is_finite() { value.clamp(0.0, 1.0) } else { 0.0 };
+        self.intensity = clamp(self.intensity);
+        self.storm = clamp(self.storm);
+        self.flash = clamp(self.flash);
+        self
+    }
+
+    /// Overall cloud/storm weight used for sky darkening and fog.
+    pub fn cloud_weight(self) -> f32 {
+        self.intensity.max(self.storm).clamp(0.0, 1.0)
+    }
+
+    /// Whether the state changes the clear-weather look at all.
+    pub fn is_active(self) -> bool {
+        self.cloud_weight() > 0.0 || self.precipitation != WeatherPrecipitation::None
+    }
+
+    /// Precipitation tint for particles and HUD swatches: linear RGB.
+    pub fn precipitation_tint(self) -> [f32; 3] {
+        match self.precipitation {
+            WeatherPrecipitation::None => [0.72, 0.80, 0.90],
+            WeatherPrecipitation::Rain => [0.52, 0.62, 0.78],
+            WeatherPrecipitation::Snow => [0.94, 0.96, 1.0],
+        }
+    }
 }
 
 /// CPU-computed sky and lighting state for one [`Environment`].
@@ -302,6 +422,67 @@ impl EnvironmentVisual {
     /// the horizon" invariant explicit at call sites and in tests.
     pub fn fog_color(&self) -> [f32; 3] {
         self.horizon
+    }
+
+    /// Applies storm darkening and desaturation to this clear-weather state.
+    ///
+    /// The clear-weather palette is multiplied down (not blended towards a
+    /// fixed grey) so a midnight storm stays darker than a noon storm. Rain and
+    /// thunder also dim direct sun, ambient skylight and the baked block-light
+    /// multiplier, which is what makes a thunderstorm read as overcast without
+    /// touching stored world light. A lightning flash is *not* applied here;
+    /// it is a post-processing exposure lift so it also brightens the sky and
+    /// particles rather than only the terrain.
+    pub fn with_weather(self, weather: WeatherVisual) -> Self {
+        let weather = weather.sanitised();
+        let cloud = weather.cloud_weight();
+        if cloud <= 0.0 && weather.precipitation == WeatherPrecipitation::None {
+            return self;
+        }
+        let storm = weather.storm.clamp(0.0, 1.0);
+        let mut visual = self;
+        // Storm overcast is modelled as desaturate-then-darken. Mixing towards
+        // a fixed grey would make a midnight storm brighter than a clear night;
+        // using the current luminance as the grey target preserves the day/night
+        // ordering while still removing the clear-sky blue.
+        let horizon_luma = luminance(visual.horizon);
+        let zenith_luma = luminance(visual.zenith);
+        let horizon_grey = [horizon_luma * 0.90, horizon_luma * 0.94, horizon_luma * 0.98];
+        let zenith_grey = [zenith_luma * 0.90, zenith_luma * 0.94, zenith_luma * 1.0];
+        let grey_mix = (0.88 * cloud).clamp(0.0, 0.94);
+        let darken = 1.0 - (0.62 * cloud + 0.10 * storm);
+        visual.horizon = [
+            ((visual.horizon[0] + (horizon_grey[0] - visual.horizon[0]) * grey_mix) * darken).clamp(0.0, 1.0),
+            ((visual.horizon[1] + (horizon_grey[1] - visual.horizon[1]) * grey_mix) * darken).clamp(0.0, 1.0),
+            ((visual.horizon[2] + (horizon_grey[2] - visual.horizon[2]) * grey_mix) * darken).clamp(0.0, 1.0),
+        ];
+        let zenith_darken = 1.0 - (0.68 * cloud + 0.12 * storm);
+        visual.zenith = [
+            ((visual.zenith[0] + (zenith_grey[0] - visual.zenith[0]) * grey_mix) * zenith_darken).clamp(0.0, 1.0),
+            ((visual.zenith[1] + (zenith_grey[1] - visual.zenith[1]) * grey_mix) * zenith_darken).clamp(0.0, 1.0),
+            ((visual.zenith[2] + (zenith_grey[2] - visual.zenith[2]) * grey_mix) * zenith_darken).clamp(0.0, 1.0),
+        ];
+        visual.sun_intensity = (visual.sun_intensity * (1.0 - (0.92 * cloud + 0.06 * storm))).max(0.0);
+        visual.ambient_light = (visual.ambient_light * (1.0 - 0.46 * cloud)).clamp(0.02, 1.0);
+        visual.daylight = (visual.daylight * (1.0 - 0.62 * cloud)).clamp(0.02, 1.0);
+        visual.star_visibility = (visual.star_visibility * (1.0 - cloud)).clamp(0.0, 1.0);
+        visual.moon_visibility = (visual.moon_visibility * (1.0 - 0.95 * cloud)).clamp(0.0, 1.0);
+        let storm_tint = [0.78, 0.83, 0.90];
+        visual.light_tint = [
+            visual.light_tint[0] * (1.0 - 0.38 * cloud) + storm_tint[0] * 0.38 * cloud,
+            visual.light_tint[1] * (1.0 - 0.38 * cloud) + storm_tint[1] * 0.38 * cloud,
+            visual.light_tint[2] * (1.0 - 0.38 * cloud) + storm_tint[2] * 0.38 * cloud,
+        ];
+        // Snow adds a cool, slightly brighter bounce to the horizon.
+        if weather.precipitation == WeatherPrecipitation::Snow {
+            let snow = 0.06 * weather.intensity;
+            visual.horizon = [
+                (visual.horizon[0] + 0.12 * snow).clamp(0.0, 1.0),
+                (visual.horizon[1] + 0.14 * snow).clamp(0.0, 1.0),
+                (visual.horizon[2] + 0.17 * snow).clamp(0.0, 1.0),
+            ];
+        }
+        visual
     }
 }
 

@@ -1,6 +1,6 @@
 # 13 — UI and UX
 
-> Status: draft for review · Last updated: 2026-11-24
+> Status: draft for review · Last updated: 2026-11-26
 > Depends on: [DEC-003](../decisions.md), [DEC-008](../decisions.md), [DEC-011](../decisions.md), [DEC-017](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-023](../decisions.md), [DEC-026](../decisions.md), [DEC-030](../decisions.md), [DEC-032](../decisions.md), [DEC-034](../decisions.md), [DEC-035](../decisions.md), [DEC-041](../decisions.md), [DEC-044](../decisions.md), [DEC-049](../decisions.md), [DEC-052](../decisions.md), [00-conventions](00-conventions.md), [02](02-engine-core.md), [03](03-rendering.md), [11](11-inventory-crafting-items.md), [17](17-persistence.md)
 > Implements: MS-05 (framework, screens, HUD, inventory interaction, localization scaffolding), MS-12 (visual polish, toasts, motion settings), MS-14 (parity polish)
 
@@ -267,7 +267,10 @@ The HUD is one screen drawn above the world and below any modal screen. Widgets 
 | Toasts | top right | Achievement, recipe, system; stacked to 5, each 100 ticks, click to open context |
 | Effect icons | top right | Status effects with duration; hidden when the inventory is open |
 | Subtitles | bottom centre, above the hotbar | Direction arrows and captions from the audio layer ([14](14-audio.md)) |
-| Debug overlay | left | FPS, frame and tick percentiles, position, chunk, light, logic counters, network stats |
+| Weather | top centre, above the crosshair | Compact chip with phase, intensity %, remaining time, gameplay-light factor, shelter and FLASH state; shown only while weather is active or flashing. F3 adds phase/tag, precipitation/biome/remaining/epoch and lightning/flash/thunder counters. Pure presentation, no input. |
+| Debug overlay | left | FPS, frame and tick percentiles, position, chunk, light, logic counters, network stats, weather lines |
+
+The weather chip is the only 1.5 HUD addition. It reuses `UiFrame` rectangles and text, takes no focus or pointer capture, hides itself when the phase is clear and the flash has decayed, and is hidden with the rest of the HUD by F1. There is no separate weather-HUD settings row; the existing F3 toggle is the detailed debug view. Rain, snow and storm lighting are presentation state from the server's `weather_sync`, never advanced by the UI.
 
 The HUD takes no focus and no pointer capture. Interactive HUD elements (toasts, chat when a key is held) temporarily push a focus scope, and releasing the key returns focus to gameplay without moving the camera. In spectator mode the HUD reduces to the action bar, chat, toasts and the spectator menu: the hotbar, health, hunger and experience are hidden because they describe an inventory the player no longer has.
 

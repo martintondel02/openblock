@@ -2069,3 +2069,98 @@ fn join_512_blocks_loopback_transfer() {
     client.shutdown();
     server.stop().expect("stop server");
 }
+
+/// The protocol v5 weather sync and lightning strike reach the client reducer
+/// and its read-only presentation snapshot.
+#[test]
+fn loopback_weather_sync_and_lightning_reach_the_client() {
+    use ob_protocol::{PrecipitationKind, WeatherPhase};
+
+    let registry = Arc::new(Registry::base());
+    let (mut loopback, top) = Loopback::start_survival(&registry, |host, registry| {
+        let spawn = host.player().pos;
+        let cx = spawn.x.floor() as i32;
+        let cz = spawn.z.floor() as i32;
+        for dz in -8..=8 {
+            for dx in -8..=8 {
+                let x = cx + dx;
+                let z = cz + dz;
+                if let Some(height) = host.world().height_at(x, z) {
+                    let pos = BlockPos::new(x, height, z);
+                    let block = host.world().get_block(pos);
+                    if host.sky_exposed(pos) && block != BlockId::AIR && !registry.block(block).fluid {
+                        return pos;
+                    }
+                }
+            }
+        }
+        panic!("no sky-exposed surface block near spawn");
+    });
+    let mut client = NetworkClient::connect(ConnectOptions::new(
+        loopback.addr().to_string(),
+        "weather-tester",
+        2,
+        Arc::clone(&registry),
+    ))
+    .expect("connect and complete handshake");
+    wait_for(&mut client, "join", |client| {
+        client.state().is_playing() && client.loaded_chunks() > 0
+    });
+
+    // The first sync may arrive during the join; force an unambiguous thunder
+    // state and wait for the 1 Hz broadcast to carry it.
+    loopback.server().set_weather_state(WeatherPhase::Thunder, 2_000, 1_000);
+    let events = wait_for(&mut client, "thunder weather sync", |client| {
+        client
+            .weather()
+            .is_some_and(|weather| weather.phase == WeatherPhase::Thunder && weather.intensity > 0.9)
+    });
+    let weather = client.weather().expect("weather snapshot");
+    assert_eq!(weather.phase, WeatherPhase::Thunder);
+    assert_eq!(weather.epoch, 0, "forcing a state does not create a new storm epoch");
+    assert!(weather.weather_factor <= 0.61);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            NetEvent::WeatherSynced {
+                phase: WeatherPhase::Thunder,
+                ..
+            }
+        )),
+        "a WeatherSynced event should have been emitted"
+    );
+    // The per-column precipitation is derived from the spawn biome; both rain
+    // and none are valid at a clear/thunder boundary, but the enum must be one
+    // of the stable tags.
+    assert!(matches!(
+        weather.precipitation,
+        PrecipitationKind::None | PrecipitationKind::Rain | PrecipitationKind::Snow
+    ));
+
+    // Force one lightning strike and wait for the one-shot event.
+    assert!(
+        loopback.server().force_lightning_at(top),
+        "the setup block should be a valid lightning target"
+    );
+    let deadline = Instant::now() + WAIT;
+    let mut strike = None;
+    while Instant::now() < deadline {
+        for event in client.poll() {
+            if let NetEvent::LightningStrike { pos, block, flash, .. } = event {
+                strike = Some((pos, block, flash));
+            }
+        }
+        if strike.is_some() {
+            break;
+        }
+        client.maintain_chunks(4);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let (pos, block, flash) = strike.expect("timed out waiting for lightning_strike");
+    assert!(pos.iter().all(|value| value.is_finite()));
+    assert_eq!(block, [top.x, top.y, top.z]);
+    assert!(flash, "a normal strike renders a visible flash");
+
+    client.shutdown();
+    loopback.stop();
+}

@@ -946,6 +946,10 @@ pub struct DebugStats {
     pub shadow_summary: String,
     /// FSR preset, internal resolution and scale, or `native`.
     pub fsr_summary: String,
+    /// Detailed weather lines for the F3 debug overlay (empty when clear).
+    pub weather: Vec<String>,
+    /// One-line compact weather summary for the reduced overlay.
+    pub weather_compact: String,
 }
 
 impl DebugStats {
@@ -1046,6 +1050,7 @@ impl DebugStats {
                 self.mobs_total,
             ),
         ];
+        lines.extend(self.weather.iter().cloned());
         if lines.len() < 15 {
             lines.resize(15, String::new());
         }
@@ -1214,6 +1219,11 @@ impl DebugStats {
                     &self.ui_scale
                 }
             ),
+            if self.weather_compact.is_empty() {
+                "Weather clear".to_string()
+            } else {
+                self.weather_compact.clone()
+            },
             format!(
                 "Chunks {}  Sec {}/{}  Draws {}  LOD {}  Tri {}",
                 self.loaded_chunks,
@@ -1329,9 +1339,9 @@ pub const DEBUG_FOOTER_SCALE: f32 = 1.2;
 /// Candidate glyph scales, largest first, used to fit narrow screens.
 pub const DEBUG_SCALES: [f32; 9] = [1.8, 1.7, 1.6, 1.5, 1.4, 1.3, 1.2, 1.1, 1.0];
 /// Section index of every line returned by [`DebugStats::left_lines`].
-pub const DEBUG_LEFT_SECTIONS: [usize; 17] = [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3];
+pub const DEBUG_LEFT_SECTIONS: [usize; 20] = [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3];
 /// Section index of every line returned by [`DebugStats::compact_left_lines`].
-pub const DEBUG_COMPACT_SECTIONS: [usize; 11] = [0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 3];
+pub const DEBUG_COMPACT_SECTIONS: [usize; 12] = [0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3];
 /// Maximum glyph scales tried for the compact F3 overlay, largest first.
 pub const DEBUG_COMPACT_SCALES: [f32; 6] = [1.4, 1.3, 1.2, 1.1, 1.0, 0.9];
 /// Logical height below which the F3 overlay uses its reduced line set.
@@ -4501,6 +4511,8 @@ mod tests {
                 .into(),
             shadow_summary: "high 2048² ×3 3×3 PCF".into(),
             fsr_summary: "Quality 1286x724 -> 1920x1080 (0.67x)".into(),
+            weather: Vec::new(),
+            weather_compact: String::new(),
         }
     }
 
@@ -5325,7 +5337,7 @@ mod tests {
                     layout.footer_y + ob_render::line_height(DEBUG_FOOTER_SCALE) <= hotbar_top,
                     "{label} F3 footer overlaps the hotbar"
                 );
-                let expected = if layout.compact { 11 } else { 17 };
+                let expected = if layout.compact { 12 } else { 17 };
                 assert_eq!(layout.left.lines.len(), expected, "{label}");
             }
         }
@@ -5339,7 +5351,7 @@ mod tests {
         let layout = debug_overlay_layout(screen, &stats);
         assert!(layout.compact, "640x360 logical needs the compact F3 set");
         assert_eq!(layout.columns, DebugColumns::LeftOnly);
-        assert_eq!(layout.left.lines.len(), 11);
+        assert_eq!(layout.left.lines.len(), 12);
         let hotbar_top = screen[1] - HOTBAR_SLOT_SIZE - 18.0;
         assert!(
             layout.left.panel.y + layout.left.panel.h < hotbar_top,
@@ -5740,6 +5752,8 @@ mod tests {
             graphics_summary: "High preset | shadows high | clouds high | water high | bloom on | FXAA on".into(),
             shadow_summary: "high 2048² ×3 3×3 PCF".into(),
             fsr_summary: "native".into(),
+            weather: Vec::new(),
+            weather_compact: String::new(),
         };
         let left = stats.left_lines();
         assert_eq!(left.len(), 17);
