@@ -6,6 +6,16 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [1.2.1] — 2026-11-25 (settings preset fix)
+
+### Fixed
+- Settings loaded from an older or hand-edited config can name a graphics preset
+  (`Low`/`Medium`/`High`/`Ultra`) while carrying stale/default individual quality
+  fields — for example a 1.0-era config gaining the 1.1 fields would report
+  "High" with low shadows/clouds/water. Loading now reapplies a non-Custom preset
+  to its quality fields; `Custom` settings keep their explicit overrides.
+- No save-format or protocol change; 1.2.0 worlds/servers unchanged.
+
 ## [1.2.0] — 2026-11-25 (Light & Home)
 
 The survival-comfort release: caves go dark and torches matter, beds end the
