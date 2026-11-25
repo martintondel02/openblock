@@ -743,6 +743,8 @@ unchanged.
 | C→S | `equip` | `hotbar_slot: u8` |
 | C→S | `respawn` | — |
 | C→S | `container_close` | — |
+| C→S | `sleep_request` | `pos: [i32; 3]` (foot or head of a bed) |
+| C→S | `wake` | — |
 | S→C | `player_vitals` | `health: f32`, `hunger: f32`, `armor_defense: u8` |
 | S→C | `inventory_sync` | `hotbar: [stack?; 9]`, `main: [stack?; 27]`, `selected: u8`, `equipment: [stack?; 4]` |
 | S→C | `selected_slot` | `slot: u8` |
@@ -758,6 +760,9 @@ unchanged.
 | S→C | `respawn` | `pos: [f64; 3]`, `health: f32`, `hunger: f32` |
 | S→C | `attack_result` | `target: u64`, `hit: bool`, `damage: f32`, `killed: bool` |
 | S→C | `action_rejected` | `action: String`, `reason: String` |
+| S→C | `light_update` | `tick: u64`, `sections: [{cx, cy, cz, format: u8, encoding: u8, data: base64}]` |
+| S→C | `time_sync` | `tick: u64`, `day_phase: u64`, `day_ticks: u64` |
+| S→C | `sleep_state` | `sleeping: bool`, `bed?: [i32; 3]`, `sleepers: [u64]`, `all_sleeping: bool`, `skip_remaining_ticks: u32` |
 
 
 #### 3.13.3 Handshake and rejection
@@ -1053,6 +1058,7 @@ hello/version/name/whitelist/cap checks
   -> hello, join, player_state(s), player_list
   -> inventory_sync, player_vitals, selected_slot
   -> death (only when reconnecting while dead), entity_snapshot
+  -> time_sync, sleep_state
   -> join broadcast to existing players; streaming and 10 Hz player_state
 ```
 
@@ -1061,9 +1067,10 @@ hello/version/name/whitelist/cap checks
 main `9..36`),
 `selected_slot`, `equipment: [Option<ItemStack>; 4]`, `game_mode`,
 `starvation_timer`, `regen_timer`, `fall_distance`, `pending_move_distance`,
-dirty flags for sync and the last damage cause. The server's default network
-mode is **survival**; `--creative`/`game_mode = "creative"` changes the default
-for players without a save, while a saved player keeps its recorded mode.
+dirty flags for sync, the last damage cause, `sleeping`, `bed` (runtime) and
+`respawn_point` (persisted). The server's default network mode is **survival**;
+`--creative`/`game_mode = "creative"` changes the default for players without a
+save, while a saved player keeps its recorded mode.
 
 ##### Survival state machine
 
@@ -1091,9 +1098,10 @@ JOIN -> PLAYING(survival|creative) -> DEAD -> RESPAWN -> PLAYING
   authority: see "Known limitations".
 * **Death:** health reaching zero sets `dead` and `respawn_pending`, sends
   `death { cause }`, closes any window, and ignores actions (movement/chat/ping
-  still work). `respawn` resets vitals and position to the host spawn and
-  **keeps inventory/equipment**; the server replies `respawn`, fresh vitals,
-  inventory sync and selected slot.
+  still work). `respawn` resets vitals and position to the player's personal bed
+  point when one is set, otherwise to the host spawn, and **keeps
+  inventory/equipment**; the server replies `respawn`, fresh vitals, inventory
+  sync and selected slot.
 * **Disconnect:** the player is moved to an in-memory offline record and
   broadcast as `leave`; a later join with the same name restores the record.
 
@@ -1141,6 +1149,23 @@ and the next-nearest eligible player may take it. Creative players do not pick
 up items. The entity is removed exactly once, which is what prevents double
 pickup; `entity_despawn { reason: "picked_up" }` is broadcast to clients that
 know it.
+
+##### Gameplay use and sleep
+
+`use_block { pos }` is no longer container-only. After the container check it
+routes to the same authoritative rules as single-player with the sender's pose
+and inventory installed: a hoe tills grass/dirt to `farmland_dry` (one
+durability), seeds plant `wheat_0` on farmland with an air cell above and
+gameplay light ≥ 9, using a crop harvests stage 3 as 1 wheat + 1–3 seeds and an
+immature crop as 1 seed, and a bed starts sleep. Every rejection is an
+`action_rejected { action: "use_block", reason }` (`needs_hoe`, `needs_seeds`,
+`occupied`, `too_dark`, `not_night`, `obstructed`, `out_of_reach`, ...);
+placement additionally rejects a torch without a solid floor and a bed whose
+second cell is occupied or unsupported before any item is consumed. Breaking
+either bed half removes both; breaking a torch's floor removes the torch.
+Server block changes caused by these multi-cell rules are broadcast as one
+`block_edit` per changed cell. See §3.13.10 for the sleep messages, light
+patches and persistence.
 
 ##### Furnace and chest windows
 
@@ -1254,7 +1279,11 @@ character boundary and evicts the oldest lines to stay within 100 lines and
   status effects.
 * Natural mob spawning in network mode anchors on one (lowest-id) alive
   player rather than every player; mobs still target the nearest living
-  survival player.
+  survival player. The 1.2 hostile rule uses `gameplay_light ≤ 7`, so torches
+  suppress spawns.
+* Sleep uses 100% of connected alive players as the denominator because this
+  milestone has no spectator mode or dimension split; creative players count.
+  A partial sleep times out after 600 ticks.
 * Furnace/chest windows are per connection, not shared: two players opening
   the same chest get independent snapshots updated by the same authoritative
   slot state; there is no lock or "in use" flag.
@@ -1291,6 +1320,108 @@ reconciliation is required in this milestone. The client must send
 handle a v1/v2 `disconnect { reason: "protocol_mismatch: ..." }` by upgrading
 the protocol crate. New client work must also add a wildcard arm for unknown
 server-message variants so future protocol additions do not break the build.
+
+#### 3.13.10 1.2 gameplay light and sleep additions (still protocol v3)
+
+**Status.** Implemented in `crates/protocol` (`LightUpdate`, `TimeSync`,
+`SleepState`, `SleepRequest`, `Wake`) and `ob_server::net`. The protocol
+version stays **3**: these are additive variants with new `"type"` tags, and the
+interim client already ignores unknown server variants (`_ => {}` in
+`crates/client/src/net.rs`). No existing payload or slot address changes.
+Versions 1/2 are still rejected at the handshake.
+
+##### `light_update`
+
+After a server edit relights a world box, affected sections are queued per
+client and sent as one batched `light_update` per tick. Each section carries its
+canonical **dense** 4,096 packed words (`[sky:4][R:4][G:4][B:4]`, `LocalPos`
+order) in one of two encodings:
+
+| `encoding` | Payload |
+| --- | --- |
+| `0` (`RAW`) | 8,192 bytes, little-endian `u16` words |
+| `1` (`ZSTD`) | zstd level 1 frame of those bytes (used when strictly smaller) |
+
+`format = 1` is the payload format; a decoder rejects any other value before
+allocating. `data` is standard padded base64 in JSON. The server:
+
+* batches at most `MAX_LIGHT_SECTIONS_PER_UPDATE = 64` sections per frame
+  (≤ ~700 KiB of base64 for incompressible sections, well under the 2 MiB frame
+  limit);
+* sends at most one batch per player per tick and rate-limits at 10/s with a
+  20-frame burst;
+* skips sections outside the player's Chebyshev interest radius and keeps a
+  per-client reliable queue, so a rate-limited client receives the latest full
+  words on a later tick rather than a stale delta;
+* never sends generated columns as `light_update`: those light words travel in
+  `chunk_data`, and the server drains their dirty marks after streaming.
+
+A client replaces the stored light of each named section wholesale, then remeshes
+that section and its snapshot-border neighbours. Light is not predicted; the
+server value always wins. Decode with `ob_protocol::decode_light_words`.
+
+##### `time_sync`
+
+`time_sync` publishes the authoritative world clock: absolute `tick`,
+`day_phase = tick % day_ticks`, and `day_ticks` (24,000). It is sent in the
+handshake, at 1 Hz, and every tick while a sleep fast-forward is running so the
+client can animate the shortened night and land exactly on sunrise.
+
+##### `sleep_request`, `wake`, `sleep_state`
+
+A bed use is a `use_block` at the foot or head (v3 convenience) or the explicit
+`sleep_request { pos }`. The server validates, in this order: actor alive, not
+already sleeping, a two-block bed with the pillow at +Z, distance ≤ 3.5 m, the
+sleep window `12,600..=23,400`, and two air cells above both bed halves. Failure
+is `action_rejected { action: "sleep", reason }` with `out_of_reach`,
+`not_night`, `obstructed`, `bed_malformed`, `not_bed`, `already_sleeping` or
+`dead`.
+
+`sleep_state` is personalised (the `bed` field belongs to the receiving
+player) and carries the sorted `sleepers` ids, whether every eligible player is
+asleep, and the fast-forward ticks left. It is sent on join, on every state
+change, every 10 ticks, and every tick during a skip. `wake` leaves the bed
+voluntarily; a Move from a sleeping client also wakes it before the position is
+applied. Damage clears that player's sleep and the shared skip; the next tick
+wakes the remaining sleepers with no skip.
+
+Multiplayer sleep uses 100% of **connected, alive** players as the denominator.
+There is no spectator mode or dimension split in this milestone, so those
+exclusions are not expressible; creative players are included. When all qualify,
+the world clock fast-forwards to the next sunrise over 100 simulated ticks
+(each tick adds `ceil(remaining/100)`), then everyone wakes at phase 0. A
+partial sleep times out after `SLEEP_REQUEST_TIMEOUT_TICKS = 600` (30 s) and
+wakes everyone.
+
+##### Persistence added by this slice
+
+* `crops.txt`: `id x y z stage age hydrated`, sorted by id. A missing file
+  (1.0/1.1 world) loads as no crops; rows whose block is no longer wheat or
+  whose chunk is not loaded are dropped with a warning.
+* `spawn.txt`: the first line remains the 1.0/1.1 world spawn `<x> <y> <z>`; an
+  additive `respawn <x> <y> <z>` line stores the personal bed point. Older
+  builds ignore the second line.
+* `network_players.txt`: an optional `r<x>,<y>,<z>` token after the game-mode
+  field stores each network player's bed respawn point. Older rows parse
+  unchanged. Sleep itself is runtime state and is not persisted: a reconnecting
+  player starts awake at its saved position.
+* `world_meta.txt`: `light_version=2`, written only after `world.obs` commits
+  (synchronous and asynchronous save paths). Deleting it forces a safe relight
+  on the next load.
+
+##### Client contract additions
+
+| Message | Client behaviour |
+| --- | --- |
+| `light_update` | decode the dense words and replace section light; remesh the section and snapshot neighbours; never predict light |
+| `time_sync` | drive the sky day/night factor and the sleep fast-forward animation; do not run a local clock |
+| `sleep_state` | show the sleep overlay when `sleeping`, list other sleepers, count down `skip_remaining_ticks`; send `wake` to leave the bed |
+| `sleep_request` | optional alternative to `use_block` on a bed; either is accepted |
+
+Known limitations: no bed facing state (pillow always +Z), no thunder/weather
+window (only the night window), no bed explosion in other dimensions (there are
+no dimensions), no spectator exclusion, and the client still needs to render the
+sleep overlay and apply light patches (owner: client wave).
 
 ## 4. Data structures and formats
 

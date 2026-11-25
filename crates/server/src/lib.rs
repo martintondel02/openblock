@@ -18,17 +18,18 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ob_content::{ArmorSlot, BlockId, ItemId, ItemType, RecipeId, Registry};
+use ob_content::{ArmorSlot, BlockId, ItemId, ItemType, RecipeId, Registry, ToolKind};
 use ob_math::{Aabb, BlockPos, ChunkPos, SEA_LEVEL, SectionPos, WorldVec};
 use ob_sim::{
-    BlockAction, MAX_HEALTH, MAX_HUNGER, Player, PlayerInput, REACH, TICK_DT, advance_vitals, apply_block_actions,
-    apply_damage, eat, fall_damage, reset_vitals, spawn_position, step_player,
+    BlockAction, MAX_HEALTH, MAX_HUNGER, Player, PlayerInput, REACH, StepEvents, TICK_DT, advance_vitals,
+    apply_block_actions, apply_damage, eat, fall_damage, reset_vitals, spawn_position, step_player,
 };
 use ob_world::{ChunkColumn, World};
 use ob_worldgen::Generator;
 use rayon::prelude::*;
 
 mod block_entities;
+mod crops;
 mod items;
 mod mobs;
 pub mod net;
@@ -38,6 +39,10 @@ mod save_worker;
 pub use save_worker::SaveReport;
 
 pub use block_entities::{CHEST_SLOTS, ContainerState, FurnaceSlot, FurnaceState};
+pub use crops::{
+    CROP_GROWTH_DRY_TICKS, CROP_GROWTH_WET_TICKS, CROP_HARVEST_SEEDS_MAX, CROP_HARVEST_SEEDS_MIN,
+    CROP_HYDRATION_INTERVAL_TICKS, CROP_HYDRATION_RADIUS, CROP_MIN_LIGHT, CropState, GRASS_SEED_DROP_MODULUS,
+};
 pub use items::ItemEntity;
 pub use mobs::{
     AttackOutcome, DAY_LENGTH_TICKS, HOSTILE_SPAWN_MAX_DISTANCE, HOSTILE_SPAWN_MIN_DISTANCE, MAX_HOSTILE_MOBS,
@@ -74,6 +79,18 @@ const SPAWN_FILE: &str = "spawn.txt";
 /// maximum keeps the host-side spawn check conservative without duplicating the
 /// structure table or adding a cross-crate dependency on its internals.
 const STRUCTURE_MAX_HALF_EXTENT: i32 = 4;
+/// First tick phase in which a bed may be used (`12,600`, dusk).
+pub const SLEEP_WINDOW_START_TICK: u64 = 12_600;
+/// Last tick phase in which a bed may be used (`23,400`, dawn).
+pub const SLEEP_WINDOW_END_TICK: u64 = 23_400;
+/// Ticks the sunrise fast-forward takes once every player is asleep.
+pub const SLEEP_FAST_FORWARD_TICKS: u32 = 100;
+/// Ticks a partial multiplayer sleep waits for the remaining players.
+pub const SLEEP_REQUEST_TIMEOUT_TICKS: u64 = 600;
+/// Maximum distance from the player to a bed they may use, in metres.
+pub const BED_USE_DISTANCE: f64 = 3.5;
+/// Weather multiplier for the light query while 1.2 has no weather machine.
+pub const CLEAR_WEATHER_FACTOR: f32 = 1.0;
 
 /// Defensive upper bound on one inventory stack.
 ///
@@ -322,6 +339,28 @@ impl From<ob_world::SaveError> for HostError {
     }
 }
 
+/// One single-player sleep session in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SleepState {
+    /// Foot block of the occupied bed (the pillow side is always +Z).
+    pub bed_foot: BlockPos,
+    /// Head block (pillow) of the occupied bed.
+    pub bed_head: BlockPos,
+    /// Tick at which the player entered the bed.
+    pub started_tick: u64,
+}
+
+/// Internal sunrise fast-forward bookkeeping shared by single- and multiplayer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SleepSkip {
+    /// Absolute tick of the next sunrise.
+    target_tick: u64,
+    /// Extra ticks added per simulated tick.
+    step: u64,
+    /// Fast-forward ticks already applied (`0..=`[`SLEEP_FAST_FORWARD_TICKS`]).
+    elapsed: u32,
+}
+
 /// The authoritative game host.
 pub struct Host {
     world: World,
@@ -357,6 +396,20 @@ pub struct Host {
     save_task: Option<SaveTask>,
     /// Result of the last completed background save (diagnostics/benchmarks).
     last_save_report: Option<SaveReport>,
+    /// Authoritative crop states keyed by the wheat block position.
+    crops: BTreeMap<BlockPos, crops::CropState>,
+    /// Next crop id (at least 1).
+    next_crop_id: u64,
+    /// Personal respawn point set by using a bed; `None` uses the world spawn.
+    respawn_point: Option<WorldVec>,
+    /// Single-player sleep session, if the internal player is in a bed.
+    sleep: Option<SleepState>,
+    /// Active sunrise fast-forward (single-player or all network players asleep).
+    sleep_skip: Option<SleepSkip>,
+    /// Tick at which a partial multiplayer sleep started waiting for others.
+    sleep_wait_start: Option<u64>,
+    /// Block changes for the network replication layer, keyed by position.
+    pending_block_updates: BTreeMap<BlockPos, BlockId>,
 }
 
 /// One background save in flight. Only one may exist: the host never overlaps
@@ -387,8 +440,18 @@ impl Host {
         let world_path = world_dir.join("world.obs");
         let mut host;
         if world_path.exists() {
-            let bytes = ob_world::read_save_file(&world_path)?;
-            let world = ob_world::from_bytes(Arc::clone(&registry), &bytes)?;
+            // `load_world_dir_with_report` applies the one-time 1.2 light
+            // migration: a 1.0/1.1 save (missing or legacy `world_meta.txt`)
+            // is relit, `world.obs` is rewritten and `light_version=2` is
+            // committed before the host starts using the world.
+            let (world, migration) = ob_world::load_world_dir_with_report(Arc::clone(&registry), &world_dir)?;
+            if migration.relit {
+                log::info!(
+                    "light migration relit {} chunks, rewrote save/meta (light_version={})",
+                    world.chunk_count(),
+                    world.light_version()
+                );
+            }
             let generator = Generator::new(world.seed());
             let (player, saved_ticks) = load_player(&world_dir, &world, &generator);
             host = Self {
@@ -419,6 +482,13 @@ impl Host {
                 network_entity_removals: Vec::new(),
                 save_task: None,
                 last_save_report: None,
+                crops: BTreeMap::new(),
+                next_crop_id: 1,
+                respawn_point: None,
+                sleep: None,
+                sleep_skip: None,
+                sleep_wait_start: None,
+                pending_block_updates: BTreeMap::new(),
             };
             host.inventory = load_inventory(&host.world_dir, &host.registry);
             host.items = items::load_items(&host.world_dir, &host.registry);
@@ -434,6 +504,9 @@ impl Host {
                 Some(spawn) => spawn,
                 None => host.resolve_spawn(),
             };
+            host.respawn_point = load_respawn_point(&host.world_dir);
+            host.crops = crops::load_crops(&host.world_dir, &host.registry, &host.world);
+            host.next_crop_id = crops::next_crop_id(&host.crops);
         } else {
             let generator = Generator::new(config.seed);
             let world = World::new(Arc::clone(&registry), config.seed);
@@ -465,6 +538,13 @@ impl Host {
                 network_entity_removals: Vec::new(),
                 save_task: None,
                 last_save_report: None,
+                crops: BTreeMap::new(),
+                next_crop_id: 1,
+                respawn_point: None,
+                sleep: None,
+                sleep_skip: None,
+                sleep_wait_start: None,
+                pending_block_updates: BTreeMap::new(),
             };
             host.ensure_streaming(3);
             // Generate the chosen candidate column before reading its surface,
@@ -611,6 +691,412 @@ impl Host {
     /// Number of completed ticks.
     pub fn tick_count(&self) -> u64 {
         self.tick_count
+    }
+
+    /// Overrides the world clock (admin/test seam).
+    ///
+    /// This is the only way to start a world at a fixed time without running
+    /// the 20-minute day cycle; the network loopback sleep tests use it to start
+    /// at night. It is not exposed on the wire and never accepts client input.
+    pub fn set_tick_count(&mut self, ticks: u64) {
+        self.tick_count = ticks;
+        self.mark_player_dirty();
+    }
+
+    /// Day factor for the 1.2 gameplay-light query (`0.0` night, `1.0` noon).
+    ///
+    /// One full day is 24,000 ticks. Daylight is full from phase 0 to 11,000,
+    /// ramps down over dusk (11,000..13,000), is zero through the night
+    /// (13,000..21,000) and ramps back up over dawn (21,000..24,000). This is
+    /// deliberately presentation-free: the world clock owns it, never the
+    /// client or the renderer.
+    pub fn day_factor(&self) -> f32 {
+        day_factor_for_phase(self.day_phase())
+    }
+
+    /// Weather multiplier for the gameplay-light query.
+    ///
+    /// 1.2 has no weather machine (1.3 owns it), so the factor is the clear
+    /// [`CLEAR_WEATHER_FACTOR`].
+    pub fn weather_factor(&self) -> f32 {
+        CLEAR_WEATHER_FACTOR
+    }
+
+    /// Whether the current tick phase allows using a bed (`12,600..=23,400`).
+    pub fn is_sleep_window(&self) -> bool {
+        (SLEEP_WINDOW_START_TICK..=SLEEP_WINDOW_END_TICK).contains(&self.day_phase())
+    }
+
+    /// Whether the host's internal (single-player) player is asleep.
+    pub fn sleeping(&self) -> bool {
+        self.sleep.is_some()
+    }
+
+    /// The active single-player sleep session, if any.
+    pub fn sleep_state(&self) -> Option<SleepState> {
+        self.sleep
+    }
+
+    /// The personal respawn point set by the last bed use, if any.
+    pub fn respawn_point(&self) -> Option<WorldVec> {
+        self.respawn_point
+    }
+
+    /// Read-only crop map keyed by wheat block position.
+    pub fn crops(&self) -> &BTreeMap<BlockPos, CropState> {
+        &self.crops
+    }
+
+    /// Number of tracked crops.
+    pub fn crop_count(&self) -> usize {
+        self.crops.len()
+    }
+
+    /// Current growth stage of the crop at `pos`, if tracked.
+    pub fn crop_stage(&self, pos: BlockPos) -> Option<u8> {
+        self.crops.get(&pos).map(|crop| crop.stage)
+    }
+
+    /// Drains authoritative block changes for the network replication layer.
+    pub fn take_block_updates(&mut self) -> Vec<(BlockPos, BlockId)> {
+        std::mem::take(&mut self.pending_block_updates).into_iter().collect()
+    }
+
+    /// Leaves a single-player bed immediately (also cancels a running skip).
+    ///
+    /// Returns whether the player was asleep.
+    pub fn wake(&mut self) -> bool {
+        if self.sleep.is_none() {
+            return false;
+        }
+        self.wake_internal();
+        true
+    }
+
+    /// Uses the selected item on the block at `pos` as the internal player.
+    ///
+    /// This is the single-player counterpart of
+    /// [`ClientMessage::UseBlock`](ob_protocol::ClientMessage::UseBlock):
+    /// tilling grass/dirt with a hoe, planting seeds on farmland, harvesting
+    /// wheat and sleeping in a bed. The network path uses the same rules
+    /// through `Host::network_use_block` with the sender's authoritative pose.
+    ///
+    /// Errors are short machine-readable strings (`out_of_reach`, `unloaded`,
+    /// `needs_hoe`, `needs_seeds`, `occupied`, `too_dark`, `not_night`,
+    /// `obstructed`, `not_interactable`, ...) so a client can show a hint.
+    pub fn use_block_at(&mut self, pos: BlockPos) -> Result<ActionOutcome, String> {
+        if self.player.dead {
+            return Err("dead".to_string());
+        }
+        self.interact_block_as_player(pos)
+    }
+
+    /// Shared block-use implementation for the installed current player.
+    ///
+    /// The network wrapper temporarily installs the sending player's pose and
+    /// inventory into the host's single-player slots, so this method is
+    /// authoritative for both modes and cannot trust client-side state.
+    fn interact_block_as_player(&mut self, pos: BlockPos) -> Result<ActionOutcome, String> {
+        if !pos.in_world() || self.world.chunk(pos.chunk()).is_none() {
+            return Err("unloaded".to_string());
+        }
+        if pos.center().distance(self.player.eye()) > REACH {
+            return Err("out_of_reach".to_string());
+        }
+        let block = self.world.get_block(pos);
+        if block == BlockId::AIR {
+            return Err("no_block".to_string());
+        }
+        let registry = Arc::clone(&self.registry);
+        let torch = registry.id_or_air("openblock:torch");
+        let grass_id = registry.id_or_air("openblock:grass");
+        let dirt_id = registry.id_or_air("openblock:dirt");
+        let bed_foot = registry.id_or_air("openblock:bed_foot");
+        let bed_head = registry.id_or_air("openblock:bed_head");
+
+        if block == torch {
+            return Err("not_interactable".to_string());
+        }
+        if block == grass_id || block == dirt_id {
+            let holds_hoe = self.selected_stack().is_some_and(|stack| {
+                self.registry
+                    .item(stack.item)
+                    .tool
+                    .is_some_and(|tool| tool.kind == ToolKind::Hoe)
+            });
+            if !holds_hoe {
+                return Err("needs_hoe".to_string());
+            }
+            let hydrated = crops::water_near(&self.world, &self.registry, pos);
+            let farmland = crops::farmland_block(&self.registry, hydrated);
+            if !self.world.set_block(pos, farmland) {
+                return Err("invalid_position".to_string());
+            }
+            let tool_broke = self.wear_selected_tool();
+            self.record_block_update(pos, farmland);
+            self.mark_player_dirty();
+            return Ok(ActionOutcome {
+                changed: true,
+                placed: Some(farmland),
+                tool_broke,
+                ..ActionOutcome::default()
+            });
+        }
+        if crops::is_farmland(&self.registry, block) {
+            let Some(seeds) = self.registry.item_id("openblock:seeds") else {
+                return Err("seeds_missing".to_string());
+            };
+            let holds_seeds = self
+                .selected_stack()
+                .is_some_and(|stack| stack.count > 0 && stack.item == seeds);
+            if !holds_seeds {
+                return Err("needs_seeds".to_string());
+            }
+            let above = pos.offset(0, 1, 0);
+            if !above.in_world() || self.world.chunk(above.chunk()).is_none() {
+                return Err("unloaded".to_string());
+            }
+            if self.world.get_block(above) != BlockId::AIR {
+                return Err("occupied".to_string());
+            }
+            let light = self
+                .world
+                .gameplay_light(above, self.day_factor(), self.weather_factor());
+            if light < CROP_MIN_LIGHT {
+                return Err("too_dark".to_string());
+            }
+            let wheat = crops::wheat_block(&self.registry, 0);
+            if !self.world.set_block(above, wheat) {
+                return Err("invalid_position".to_string());
+            }
+            if self.game_mode == GameMode::Survival && !self.consume_selected(1) {
+                // Should be unreachable because `holds_seeds` checked the
+                // selected stack; roll the world back rather than create a
+                // free crop.
+                self.world.set_block(above, BlockId::AIR);
+                return Err("missing_seeds".to_string());
+            }
+            let hydrated = crops::water_near(&self.world, &self.registry, above);
+            if hydrated {
+                let wet = crops::farmland_block(&self.registry, true);
+                if self.world.get_block(pos) != wet && self.world.set_block(pos, wet) {
+                    self.record_block_update(pos, wet);
+                }
+            }
+            let id = self.next_crop_id.max(1);
+            self.next_crop_id = self.next_crop_id.saturating_add(1).max(1);
+            self.crops.insert(
+                above,
+                CropState {
+                    id,
+                    pos: above,
+                    stage: 0,
+                    age: 0,
+                    hydrated,
+                },
+            );
+            self.record_block_update(above, wheat);
+            self.mark_player_dirty();
+            return Ok(ActionOutcome {
+                changed: true,
+                placed: Some(wheat),
+                ..ActionOutcome::default()
+            });
+        }
+        if let Some(stage) = crops::wheat_stage(&self.registry, block) {
+            self.crops.remove(&pos);
+            if !self.world.set_block(pos, BlockId::AIR) {
+                return Err("invalid_position".to_string());
+            }
+            let mut outcome = ActionOutcome {
+                changed: true,
+                broke: Some(block),
+                ..ActionOutcome::default()
+            };
+            if self.game_mode == GameMode::Survival {
+                for (item, count) in crops::harvest_drops(&self.registry, self.world.seed(), pos, stage) {
+                    let stack = ItemStack::new(item, count);
+                    self.spawn_item_entity(block_centre(pos), stack);
+                    outcome.drops.push(stack);
+                }
+            }
+            self.record_block_update(pos, BlockId::AIR);
+            self.mark_player_dirty();
+            return Ok(outcome);
+        }
+        if block == bed_foot || block == bed_head {
+            return self.sleep_in_bed_at(pos);
+        }
+        Err("not_interactable".to_string())
+    }
+
+    /// Wears the selected tool by one durability and returns it if it broke.
+    fn wear_selected_tool(&mut self) -> Option<ItemId> {
+        if self.game_mode != GameMode::Survival {
+            return None;
+        }
+        let stack = self.inventory[self.hotbar_selection]?;
+        let spec = self.registry.item(stack.item).tool?;
+        let remaining = stack.durability.unwrap_or(spec.durability);
+        if remaining <= 1 {
+            self.inventory[self.hotbar_selection] = None;
+            Some(stack.item)
+        } else {
+            self.inventory[self.hotbar_selection] = Some(stack.with_durability(Some(remaining - 1)));
+            None
+        }
+    }
+
+    /// Records one authoritative block change for network replication.
+    fn record_block_update(&mut self, pos: BlockPos, block: BlockId) {
+        self.pending_block_updates.insert(pos, block);
+    }
+
+    /// Resolves a bed block to its `(foot, head)` pair (pillow always +Z).
+    fn bed_pair(&self, pos: BlockPos) -> Result<(BlockPos, BlockPos), String> {
+        let foot_id = self.registry.id_or_air("openblock:bed_foot");
+        let head_id = self.registry.id_or_air("openblock:bed_head");
+        let block = self.world.get_block(pos);
+        if block == foot_id {
+            let head = pos.offset(0, 0, 1);
+            if self.world.get_block(head) == head_id {
+                Ok((pos, head))
+            } else {
+                Err("bed_malformed".to_string())
+            }
+        } else if block == head_id {
+            let foot = pos.offset(0, 0, -1);
+            if self.world.get_block(foot) == foot_id {
+                Ok((foot, pos))
+            } else {
+                Err("bed_malformed".to_string())
+            }
+        } else {
+            Err("not_bed".to_string())
+        }
+    }
+
+    /// Whether the two cells above a bed block are air (the player can lie down).
+    fn bed_is_clear(&self, pos: BlockPos) -> bool {
+        for dy in 1..=2 {
+            let above = pos.offset(0, dy, 0);
+            if !above.in_world() || self.world.get_block(above) != BlockId::AIR {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Distance from the player's feet to the nearer bed half.
+    fn bed_distance(&self, foot: BlockPos, head: BlockPos) -> f64 {
+        self.player
+            .pos
+            .distance(foot.center())
+            .min(self.player.pos.distance(head.center()))
+    }
+
+    /// Enters a bed as the internal single-player player.
+    fn sleep_in_bed_at(&mut self, pos: BlockPos) -> Result<ActionOutcome, String> {
+        if self.sleep.is_some() {
+            return Err("already_sleeping".to_string());
+        }
+        let (foot, head) = self.bed_pair(pos)?;
+        if self.bed_distance(foot, head) > BED_USE_DISTANCE {
+            return Err("out_of_reach".to_string());
+        }
+        // The first use of a valid bed sets the personal respawn point even when
+        // it is too early to sleep (spec 08 §3.10); the sleep itself still needs
+        // the night window and an unobstructed bed.
+        self.respawn_point = Some(bed_respawn_position(foot));
+        self.mark_player_dirty();
+        if !self.is_sleep_window() {
+            return Err("not_night".to_string());
+        }
+        if !self.bed_is_clear(foot) || !self.bed_is_clear(head) {
+            return Err("obstructed".to_string());
+        }
+        self.sleep = Some(SleepState {
+            bed_foot: foot,
+            bed_head: head,
+            started_tick: self.tick_count,
+        });
+        self.start_sleep_skip();
+        self.mark_player_dirty();
+        Ok(ActionOutcome {
+            changed: true,
+            ..ActionOutcome::default()
+        })
+    }
+
+    /// Starts the 100-tick sunrise fast-forward for the internal player.
+    fn start_sleep_skip(&mut self) {
+        let remaining = ticks_to_next_sunrise(self.day_phase());
+        if remaining == 0 {
+            return;
+        }
+        let step = remaining.div_ceil(u64::from(SLEEP_FAST_FORWARD_TICKS)).max(1);
+        self.sleep_skip = Some(SleepSkip {
+            target_tick: self.tick_count.saturating_add(remaining),
+            step,
+            elapsed: 0,
+        });
+    }
+
+    /// Advances the internal player's sunrise skip and validates the bed.
+    fn advance_single_sleep(&mut self) {
+        let Some(session) = self.sleep else {
+            return;
+        };
+        if self.player.dead {
+            self.wake_internal();
+            return;
+        }
+        let foot = self.world.get_block(session.bed_foot);
+        let head = self.world.get_block(session.bed_head);
+        if foot != self.registry.id_or_air("openblock:bed_foot")
+            || head != self.registry.id_or_air("openblock:bed_head")
+        {
+            self.wake_internal();
+            return;
+        }
+        let Some(mut skip) = self.sleep_skip else {
+            self.start_sleep_skip();
+            return;
+        };
+        self.tick_count = self.tick_count.saturating_add(skip.step).min(skip.target_tick);
+        skip.elapsed = skip.elapsed.saturating_add(1);
+        if self.tick_count >= skip.target_tick || skip.elapsed >= SLEEP_FAST_FORWARD_TICKS {
+            self.tick_count = skip.target_tick;
+            self.wake_internal();
+        } else {
+            self.sleep_skip = Some(skip);
+        }
+    }
+
+    /// Wakes the internal player and cancels any skip.
+    fn wake_internal(&mut self) {
+        self.sleep = None;
+        self.sleep_skip = None;
+        self.player.velocity = WorldVec::ZERO;
+        self.mark_player_dirty();
+    }
+
+    /// Advances crop growth and records the resulting block updates.
+    fn tick_crops(&mut self) {
+        let registry = Arc::clone(&self.registry);
+        let day = self.day_factor();
+        let weather = self.weather_factor();
+        let updates = crops::tick_crops(
+            &mut self.world,
+            &registry,
+            &mut self.crops,
+            self.tick_count,
+            day,
+            weather,
+        );
+        for (pos, block) in updates {
+            self.record_block_update(pos, block);
+        }
     }
 
     /// Host configuration.
@@ -1480,6 +1966,9 @@ impl Host {
         outcome.dealt = apply_damage(&mut self.player, mitigated);
         if outcome.dealt > 0.0 {
             outcome.armor_broke = self.wear_armor();
+            if self.sleep.is_some() {
+                self.wake_internal();
+            }
         }
         self.mark_player_dirty();
         outcome
@@ -1603,18 +2092,19 @@ impl Host {
         broken
     }
 
-    /// Respawns at the spawn point found when the host opened.
+    /// Respawns at the personal bed point when set, otherwise at the world spawn.
     ///
     /// Vitals are reset, velocity is cleared and the player is marked dirty.
     /// The inventory, look direction and game mode are kept, and chunks around
-    /// the spawn are streamed immediately so the player does not fall through
+    /// the point are streamed immediately so the player does not fall through
     /// an unloaded world.
     pub fn respawn(&mut self) {
-        self.player.pos = self.spawn;
+        let target = self.respawn_point.unwrap_or(self.spawn);
+        self.player.pos = target;
         self.player.velocity = WorldVec::ZERO;
         self.player.on_ground = false;
         reset_vitals(&mut self.player);
-        self.ensure_streaming(2);
+        self.ensure_streaming_around(target, 2, 16);
         self.mark_player_dirty();
     }
 
@@ -1625,8 +2115,19 @@ impl Host {
     /// tick and no damage applies. Every stored furnace also advances one tick,
     /// whether or not its chunk is currently streamed.
     pub fn tick(&mut self, input: &PlayerInput) {
-        let events = step_player(&self.world, &mut self.player, input, TICK_DT);
+        // A sleeping player is frozen: client input is ignored and gravity does
+        // not pull them off the bed. Mobs can still hit them, which routes
+        // through `damage_with_outcome` and wakes them.
+        let sleeping = self.sleep.is_some();
+        let events = if sleeping {
+            StepEvents::default()
+        } else {
+            step_player(&self.world, &mut self.player, input, TICK_DT)
+        };
         self.tick_count += 1;
+        if sleeping {
+            self.advance_single_sleep();
+        }
         match self.game_mode {
             GameMode::Survival => {
                 if !self.player.dead {
@@ -1664,6 +2165,10 @@ impl Host {
         self.tick_mobs();
         self.tick_furnaces();
         self.tick_items(TICK_DT);
+        self.tick_crops();
+        // Single-player clients read block/light changes from the world; the
+        // replication queue is a network-only side channel.
+        self.pending_block_updates.clear();
         self.mark_player_dirty();
     }
 
@@ -1769,14 +2274,68 @@ impl Host {
         if self.game_mode == GameMode::Creative {
             let break_target = self.break_target(action);
             let place_target = self.placement_cell(action);
-            outcome.changed = apply_block_actions(&mut self.world, &self.player, action);
+            let mut action = *action;
+            if action.place_block
+                && action.place != BlockId::AIR
+                && let Some(target) = place_target
+            {
+                let torch = self.registry.id_or_air("openblock:torch");
+                if action.place == torch {
+                    let floor = target.offset(0, -1, 0);
+                    if !floor.in_world() || !self.world.is_solid(floor) {
+                        return outcome;
+                    }
+                }
+                let bed_foot = self.registry.id_or_air("openblock:bed_foot");
+                let bed_head = self.registry.id_or_air("openblock:bed_head");
+                if action.place == bed_foot || action.place == bed_head {
+                    if !self.place_bed_pair_creative(target, action.place) {
+                        return outcome;
+                    }
+                    outcome.changed = true;
+                    outcome.placed = Some(action.place);
+                    action.place_block = false;
+                }
+            }
+            outcome.changed |= apply_block_actions(&mut self.world, &self.player, &action);
             if outcome.changed {
                 if let Some((pos, block)) = break_target
                     && self.world.get_block(pos) == BlockId::AIR
                 {
                     // Creative breaks drop no block loot; container contents are
-                    // discarded with the block.
+                    // discarded with the block. Multi-cell support rules still
+                    // apply: a bed loses both halves, farmland loses its crop,
+                    // and a torch loses its floor.
                     self.remove_block_entity(pos, block);
+                    let registry = Arc::clone(&self.registry);
+                    let bed_foot = registry.id_or_air("openblock:bed_foot");
+                    let bed_head = registry.id_or_air("openblock:bed_head");
+                    if block == bed_foot || block == bed_head {
+                        let (foot, head) = if block == bed_foot {
+                            (pos, pos.offset(0, 0, 1))
+                        } else {
+                            (pos.offset(0, 0, -1), pos)
+                        };
+                        if foot.in_world() && self.world.set_block(foot, BlockId::AIR) {
+                            self.record_block_update(foot, BlockId::AIR);
+                        }
+                        if head.in_world() && self.world.set_block(head, BlockId::AIR) {
+                            self.record_block_update(head, BlockId::AIR);
+                        }
+                    }
+                    if crops::is_farmland(&registry, block) {
+                        let above = pos.offset(0, 1, 0);
+                        if crops::wheat_stage(&registry, self.world.get_block(above)).is_some() {
+                            self.crops.remove(&above);
+                            self.world.set_block(above, BlockId::AIR);
+                            self.record_block_update(above, BlockId::AIR);
+                        }
+                    }
+                    let above = pos.offset(0, 1, 0);
+                    if self.world.get_block(above) == registry.id_or_air("openblock:torch") {
+                        self.world.set_block(above, BlockId::AIR);
+                        self.record_block_update(above, BlockId::AIR);
+                    }
                 }
                 if let Some(pos) = place_target
                     && self.world.get_block(pos) == action.place
@@ -1829,26 +2388,107 @@ impl Host {
         let block = self.world.get_block(hit);
         let held = self.selected_stack();
         let held_item = held.map(|stack| stack.item);
-        if block == BlockId::AIR || !self.registry.block(block).breakable() || !self.world.set_block(hit, BlockId::AIR)
-        {
+        if block == BlockId::AIR || !self.registry.block(block).breakable() {
+            return outcome;
+        }
+        let registry = Arc::clone(&self.registry);
+        let wheat_stage = crops::wheat_stage(&registry, block);
+        let farmland = crops::is_farmland(&registry, block);
+        let bed =
+            if block == registry.id_or_air("openblock:bed_foot") || block == registry.id_or_air("openblock:bed_head") {
+                self.bed_pair(hit).ok()
+            } else {
+                None
+            };
+        if !self.world.set_block(hit, BlockId::AIR) {
             return outcome;
         }
         outcome.changed = true;
         outcome.broke = Some(block);
+        self.record_block_update(hit, BlockId::AIR);
+        let torch = registry.id_or_air("openblock:torch");
+        let mut handled_special = false;
+
+        if let Some(stage) = wheat_stage {
+            // A wheat crop never drops its block item: mature crops yield wheat
+            // plus seeds, immature crops yield one seed.
+            self.crops.remove(&hit);
+            if self.registry.can_drop(block, held_item) {
+                for (item, count) in crops::harvest_drops(&registry, self.world.seed(), hit, stage) {
+                    outcome.drops.push(ItemStack::new(item, count));
+                }
+            }
+            handled_special = true;
+        } else if farmland {
+            // Breaking farmland removes the crop above and drops dirt, not a
+            // farmland block item. The crop's own deterministic harvest roll is
+            // preserved for the seed count.
+            let above = hit.offset(0, 1, 0);
+            let crop_block = self.world.get_block(above);
+            if let Some(stage) = crops::wheat_stage(&registry, crop_block) {
+                self.crops.remove(&above);
+                self.world.set_block(above, BlockId::AIR);
+                self.record_block_update(above, BlockId::AIR);
+                if self.registry.can_drop(crop_block, held_item) {
+                    for (item, count) in crops::harvest_drops(&registry, self.world.seed(), above, stage) {
+                        outcome.drops.push(ItemStack::new(item, count));
+                    }
+                }
+            }
+            if self.registry.can_drop(block, held_item)
+                && let Some(dirt) = registry.item_id("openblock:dirt")
+            {
+                outcome.drops.push(ItemStack::new(dirt, 1));
+            }
+            handled_special = true;
+        }
+
+        // Removing either half of a bed removes both; only the broken half
+        // yields the single bed item.
+        if let Some((foot, head)) = bed {
+            let partner = if hit == foot { head } else { foot };
+            if self.world.set_block(partner, BlockId::AIR) {
+                self.record_block_update(partner, BlockId::AIR);
+            }
+        }
+
         // A tiered block still breaks with a hand or an under-tier tool, but
         // yields no loot (Minecraft-like).
-        if self.registry.can_drop(block, held_item) {
+        if !handled_special && self.registry.can_drop(block, held_item) {
             if let Some((item, count)) = self.registry.block_drop(block) {
                 outcome.drops.push(ItemStack::new(item, count));
             }
-            let leaves = self.registry.id_or_air("openblock:leaves");
+            let grass = registry.id_or_air("openblock:grass");
+            if block == grass
+                && crops::grass_seed_drop(self.world.seed(), hit)
+                && let Some(seeds) = registry.item_id("openblock:seeds")
+            {
+                outcome.drops.push(ItemStack::new(seeds, 1));
+            }
+            let leaves = registry.id_or_air("openblock:leaves");
             if block == leaves
                 && apple_drop(self.world.seed(), hit)
-                && let Some(apple) = self.registry.item_id("openblock:apple")
+                && let Some(apple) = registry.item_id("openblock:apple")
             {
                 outcome.drops.push(ItemStack::new(apple, 1));
             }
         }
+
+        // A torch needs the solid floor under it; breaking that support removes
+        // the torch too and relights the box around it. `World::set_block`
+        // already schedules the relight.
+        let above = hit.offset(0, 1, 0);
+        if self.world.get_block(above) == torch && self.registry.can_drop(torch, held_item) {
+            self.world.set_block(above, BlockId::AIR);
+            self.record_block_update(above, BlockId::AIR);
+            if let Some((item, count)) = self.registry.block_drop(torch) {
+                outcome.drops.push(ItemStack::new(item, count));
+            }
+        } else if self.world.get_block(above) == torch {
+            self.world.set_block(above, BlockId::AIR);
+            self.record_block_update(above, BlockId::AIR);
+        }
+
         // Furnace and chest contents drop regardless of the tool tier and join
         // the same entity-spawning path as block loot.
         outcome.drops.extend(self.take_block_entity_contents(hit, block));
@@ -1900,6 +2540,48 @@ impl Host {
         if !matches_selection || self.registry.block(block).fluid {
             return outcome;
         }
+        let torch = self.registry.id_or_air("openblock:torch");
+        let bed_foot = self.registry.id_or_air("openblock:bed_foot");
+        let bed_head = self.registry.id_or_air("openblock:bed_head");
+        if block == torch {
+            // Floor torch only in 1.2: the support block underneath must be
+            // solid. Wall torches are deliberately out of scope.
+            let floor = target.offset(0, -1, 0);
+            if !floor.in_world() || !self.world.is_solid(floor) {
+                return outcome;
+            }
+        }
+        if block == bed_foot || block == bed_head {
+            let (foot, head) = if block == bed_foot {
+                (target, target.offset(0, 0, 1))
+            } else {
+                (target.offset(0, 0, -1), target)
+            };
+            if !foot.in_world()
+                || !head.in_world()
+                || self.world.chunk(foot.chunk()).is_none()
+                || self.world.chunk(head.chunk()).is_none()
+                || self.world.get_block(foot) != BlockId::AIR
+                || self.world.get_block(head) != BlockId::AIR
+                || !self.world.is_solid(foot.offset(0, -1, 0))
+                || !self.world.is_solid(head.offset(0, -1, 0))
+                || Aabb::block(foot).intersects(&self.player.aabb())
+                || Aabb::block(head).intersects(&self.player.aabb())
+            {
+                return outcome;
+            }
+            if !self.world.set_block(foot, bed_foot) || !self.world.set_block(head, bed_head) {
+                return outcome;
+            }
+            let consumed = self.consume_selected(1);
+            debug_assert!(consumed, "a matching selected bed stack must be consumable");
+            self.record_block_update(foot, bed_foot);
+            self.record_block_update(head, bed_head);
+            outcome.changed = true;
+            outcome.placed = Some(block);
+            self.mark_player_dirty();
+            return outcome;
+        }
         if !self.world.set_block(target, block) {
             return outcome;
         }
@@ -1907,9 +2589,41 @@ impl Host {
         debug_assert!(consumed, "a matching selected stack must be consumable");
         outcome.changed = true;
         outcome.placed = Some(block);
+        self.record_block_update(target, block);
         self.register_block_entity(target, block);
         self.mark_player_dirty();
         outcome
+    }
+
+    /// Places a two-block bed in creative mode without consuming an item.
+    fn place_bed_pair_creative(&mut self, target: BlockPos, block: BlockId) -> bool {
+        let bed_foot = self.registry.id_or_air("openblock:bed_foot");
+        let bed_head = self.registry.id_or_air("openblock:bed_head");
+        let (foot, head) = if block == bed_foot {
+            (target, target.offset(0, 0, 1))
+        } else {
+            (target.offset(0, 0, -1), target)
+        };
+        if !foot.in_world()
+            || !head.in_world()
+            || self.world.chunk(foot.chunk()).is_none()
+            || self.world.chunk(head.chunk()).is_none()
+            || self.world.get_block(foot) != BlockId::AIR
+            || self.world.get_block(head) != BlockId::AIR
+            || !self.world.is_solid(foot.offset(0, -1, 0))
+            || !self.world.is_solid(head.offset(0, -1, 0))
+            || Aabb::block(foot).intersects(&self.player.aabb())
+            || Aabb::block(head).intersects(&self.player.aabb())
+        {
+            return false;
+        }
+        if !self.world.set_block(foot, bed_foot) || !self.world.set_block(head, bed_head) {
+            return false;
+        }
+        self.record_block_update(foot, bed_foot);
+        self.record_block_update(head, bed_head);
+        self.mark_player_dirty();
+        true
     }
 
     /// The block a break action would remove, resolved before the action.
@@ -2016,11 +2730,75 @@ impl Host {
         if self.world.chunk(pos.chunk()).is_none() {
             return false;
         }
+        let registry = Arc::clone(&self.registry);
+        let bed_foot = registry.id_or_air("openblock:bed_foot");
+        let bed_head = registry.id_or_air("openblock:bed_head");
+        let torch = registry.id_or_air("openblock:torch");
+
+        if block == bed_foot || block == bed_head {
+            let (foot, head) = if block == bed_foot {
+                (pos, pos.offset(0, 0, 1))
+            } else {
+                (pos.offset(0, 0, -1), pos)
+            };
+            if !foot.in_world()
+                || !head.in_world()
+                || self.world.chunk(foot.chunk()).is_none()
+                || self.world.chunk(head.chunk()).is_none()
+                || self.world.get_block(foot) != BlockId::AIR
+                || self.world.get_block(head) != BlockId::AIR
+                || !self.world.is_solid(foot.offset(0, -1, 0))
+                || !self.world.is_solid(head.offset(0, -1, 0))
+            {
+                return false;
+            }
+            if !self.world.set_block(foot, bed_foot) || !self.world.set_block(head, bed_head) {
+                return false;
+            }
+            self.record_block_update(foot, bed_foot);
+            self.record_block_update(head, bed_head);
+            return true;
+        }
+        if block == torch {
+            let floor = pos.offset(0, -1, 0);
+            if !floor.in_world() || !self.world.is_solid(floor) {
+                return false;
+            }
+        }
+        let bed = if current == bed_foot || current == bed_head {
+            self.bed_pair(pos).ok()
+        } else {
+            None
+        };
         if !self.world.set_block(pos, block) {
             return false;
         }
+        self.record_block_update(pos, block);
         if block == BlockId::AIR {
             self.remove_block_entity(pos, current);
+            if crops::wheat_stage(&registry, current).is_some() {
+                self.crops.remove(&pos);
+            }
+            if crops::is_farmland(&registry, current) {
+                let above = pos.offset(0, 1, 0);
+                if crops::wheat_stage(&registry, self.world.get_block(above)).is_some() {
+                    self.crops.remove(&above);
+                    if self.world.set_block(above, BlockId::AIR) {
+                        self.record_block_update(above, BlockId::AIR);
+                    }
+                }
+            }
+            if let Some((foot, head)) = bed {
+                let partner = if pos == foot { head } else { foot };
+                if self.world.set_block(partner, BlockId::AIR) {
+                    self.record_block_update(partner, BlockId::AIR);
+                }
+            }
+            // Breaking the floor under a torch removes the torch.
+            let above = pos.offset(0, 1, 0);
+            if self.world.get_block(above) == torch && self.world.set_block(above, BlockId::AIR) {
+                self.record_block_update(above, BlockId::AIR);
+            }
         } else {
             self.register_block_entity(pos, block);
         }
@@ -2170,7 +2948,11 @@ impl Host {
         block_entities::prune_block_entities(&self.world, &self.registry, &mut self.furnaces, &mut self.chests);
         Ok(vec![
             ("player.txt", player_state(&self.player, self.tick_count).into_bytes()),
-            (SPAWN_FILE, spawn_state(&self.spawn).into_bytes()),
+            (
+                SPAWN_FILE,
+                spawn_state(&self.spawn, self.respawn_point.as_ref()).into_bytes(),
+            ),
+            (crops::CROPS_FILE, crops::crops_state(&self.crops).into_bytes()),
             (
                 "inventory.txt",
                 inventory_state(&self.registry, &self.inventory).into_bytes(),
@@ -2257,6 +3039,12 @@ impl Host {
 
         let write_started = Instant::now();
         save_worker::commit(&self.world_dir, &sidecars, &world)?;
+        // The light marker is written only after every rename (including
+        // world.obs) succeeded, so it can never claim a migration the
+        // committed snapshot does not have. Unknown keys survive.
+        let mut meta = ob_world::read_world_meta(&self.world_dir)?.unwrap_or_default();
+        meta.light_version = self.world.light_version();
+        ob_world::write_world_meta(&self.world_dir, &meta)?;
         let write_ms = write_started.elapsed().as_secs_f64() * 1000.0;
 
         let sidecar_bytes: u64 = sidecars.iter().map(|(_, bytes)| bytes.len() as u64).sum();
@@ -2302,6 +3090,7 @@ impl Host {
             dir: self.world_dir.clone(),
             snapshot,
             sidecars,
+            light_version: self.world.light_version(),
         };
         let join = save_worker::spawn(job)?;
         self.save_task = Some(SaveTask {
@@ -2428,6 +3217,11 @@ impl Host {
     pub fn state_hash(&self) -> u64 {
         let mut hasher = StableHasher::new();
         hasher.write_u64(self.world.seed());
+        // Light is a deterministic consequence of the block set, but it is also
+        // persisted and can be migrated, so hashing it catches a broken relight
+        // or a save/load that changes the field without changing any block.
+        hasher.write_u8(0xF5);
+        hasher.write_u64(self.world.light_hash());
         hasher.write_u64(self.tick_count);
         hasher.write_i64((self.player.pos.x * 1000.0) as i64);
         hasher.write_i64((self.player.pos.y * 1000.0) as i64);
@@ -2446,6 +3240,17 @@ impl Host {
         hasher.write_i64(quantize(self.spawn.x));
         hasher.write_i64(quantize(self.spawn.y));
         hasher.write_i64(quantize(self.spawn.z));
+        // Personal bed respawn point: persisted in the additive spawn.txt line.
+        hasher.write_u8(0xF6);
+        match self.respawn_point {
+            Some(point) => {
+                hasher.write_u8(1);
+                hasher.write_i64(quantize(point.x));
+                hasher.write_i64(quantize(point.y));
+                hasher.write_i64(quantize(point.z));
+            }
+            None => hasher.write_u8(0),
+        }
         for (slot, stack) in self.inventory.iter().enumerate() {
             let Some(stack) = stack else {
                 continue;
@@ -2534,6 +3339,20 @@ impl Host {
         for slot in &self.equipment {
             hash_optional_stack(&mut hasher, &self.registry, slot);
         }
+        // Crops sorted by id, covering exactly the persisted crops.txt fields.
+        hasher.write_u8(0xF7);
+        let mut crop_states: Vec<&CropState> = self.crops.values().collect();
+        crop_states.sort_by_key(|crop| crop.id);
+        hasher.write_u64(crop_states.len() as u64);
+        for crop in crop_states {
+            hasher.write_u64(crop.id);
+            hasher.write_i32(crop.pos.x);
+            hasher.write_i32(crop.pos.y);
+            hasher.write_i32(crop.pos.z);
+            hasher.write_u8(crop.stage);
+            hasher.write_u64(u64::from(crop.age));
+            hasher.write_u8(crop.hydrated as u8);
+        }
         let mut chunks: Vec<_> = self.world.chunks().collect();
         chunks.sort_by_key(|(pos, _)| (pos.x, pos.z));
         for (pos, _chunk) in chunks {
@@ -2597,6 +3416,35 @@ fn world_dir(config: &HostConfig) -> PathBuf {
         .unwrap_or_else(ob_core::data_dir)
         .join("worlds")
         .join(&config.world_name)
+}
+
+/// Day factor for one tick phase (`0.0` night, `1.0` noon).
+pub fn day_factor_for_phase(phase: u64) -> f32 {
+    let phase = phase % ob_protocol::DAY_LENGTH_TICKS;
+    if phase < 11_000 {
+        1.0
+    } else if phase < 13_000 {
+        (13_000 - phase) as f32 / 2_000.0
+    } else if phase < 21_000 {
+        0.0
+    } else {
+        (phase - 21_000) as f32 / 3_000.0
+    }
+}
+
+/// Ticks from `phase` to the next sunrise (the next `0` phase).
+pub fn ticks_to_next_sunrise(phase: u64) -> u64 {
+    let phase = phase % ob_protocol::DAY_LENGTH_TICKS;
+    if phase == 0 {
+        ob_protocol::DAY_LENGTH_TICKS
+    } else {
+        ob_protocol::DAY_LENGTH_TICKS - phase
+    }
+}
+
+/// Feet position used when respawning at a bed: the air cell on top of the foot.
+fn bed_respawn_position(foot: BlockPos) -> WorldVec {
+    WorldVec::new(foot.x as f64 + 0.5, foot.y as f64 + 1.0, foot.z as f64 + 0.5)
 }
 
 fn find_spawn(world: &World, generator: &Generator) -> WorldVec {
@@ -2669,9 +3517,54 @@ pub(crate) fn read_sidecar(path: &Path) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-/// Serialized world spawn: three whitespace-separated finite coordinates.
-fn spawn_state(spawn: &WorldVec) -> String {
-    format!("{:?} {:?} {:?}\n", spawn.x, spawn.y, spawn.z)
+/// Serialized world spawn plus the optional personal bed respawn line.
+///
+/// The first line keeps the 1.0/1.1 format (three finite coordinates), so an
+/// older build still reads the world spawn and ignores the additive second
+/// line:
+///
+/// ```text
+/// <x> <y> <z>
+/// respawn <x> <y> <z>
+/// ```
+fn spawn_state(spawn: &WorldVec, respawn: Option<&WorldVec>) -> String {
+    let mut text = format!("{:?} {:?} {:?}\n", spawn.x, spawn.y, spawn.z);
+    if let Some(respawn) = respawn {
+        text.push_str(&format!("respawn {:?} {:?} {:?}\n", respawn.x, respawn.y, respawn.z));
+    }
+    text
+}
+
+/// Loads the optional personal respawn line from `spawn.txt`.
+///
+/// Missing files, malformed lines and out-of-range values are ignored; the
+/// world-spawn line remains authoritative for the first line.
+fn load_respawn_point(world_dir: &Path) -> Option<WorldVec> {
+    let path = world_dir.join(SPAWN_FILE);
+    let text = read_sidecar(&path).ok()?;
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.first() != Some(&"respawn") || fields.len() != 4 {
+            continue;
+        }
+        let (Ok(x), Ok(y), Ok(z)) = (
+            fields[1].parse::<f64>(),
+            fields[2].parse::<f64>(),
+            fields[3].parse::<f64>(),
+        ) else {
+            continue;
+        };
+        if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+            continue;
+        }
+        let y_min = f64::from(ob_math::WORLD_MIN_Y) - 32.0;
+        let y_max = f64::from(ob_math::WORLD_MAX_Y) + 256.0;
+        if x.abs() <= 30_000_000.0 && z.abs() <= 30_000_000.0 && (y_min..=y_max).contains(&y) {
+            return Some(WorldVec::new(x, y, z));
+        }
+        log::warn!("{}: ignoring out-of-range respawn point", path.display());
+    }
+    None
 }
 
 /// Loads `spawn.txt`, ignoring malformed or out-of-range coordinates.
@@ -3239,7 +4132,7 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use ob_content::{ArmorSlot, BlockId, ItemId, MobKind, RecipeId, Registry};
-    use ob_math::{BlockPos, CHUNK_SIZE, ChunkPos, WORLD_MAX_Y, WORLD_MIN_Y, WorldVec};
+    use ob_math::{BlockPos, CHUNK_SIZE, ChunkPos, SectionPos, WORLD_MAX_Y, WORLD_MIN_Y, WorldVec};
     use ob_sim::{BlockAction, MAX_HEALTH, MAX_HUNGER, MobAi, PlayerInput, REACH};
     use ob_world::ChunkColumn;
     use ob_worldgen::Generator;
@@ -7270,5 +8163,520 @@ mod tests {
         assert!(!host.save_in_flight());
         drop(host);
         Host::open(Arc::new(Registry::base()), test_config(dir.path(), 9)).expect("save opens");
+    }
+    /// Gives `count` of a content item and selects it in the hotbar.
+    fn select_item(host: &mut Host, name: &str, count: u8) -> ItemId {
+        let item = host
+            .registry()
+            .item_id(name)
+            .unwrap_or_else(|| panic!("missing item {name}"));
+        if !host.inventory().iter().flatten().any(|stack| stack.item == item) {
+            assert_eq!(host.give_item(item, count), 0, "inventory must accept {name}");
+        }
+        let slot = host
+            .inventory()
+            .iter()
+            .position(|stack| stack.is_some_and(|stack| stack.item == item))
+            .expect("item is in the inventory");
+        host.set_hotbar_selection(slot);
+        item
+    }
+
+    /// Builds a 3×3 stone platform at `y` with air above and returns its centre.
+    fn platform(host: &mut Host, x: i32, y: i32, z: i32) -> BlockPos {
+        let stone = host.registry().id_or_air("openblock:stone");
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                assert!(host.world_mut().set_block(BlockPos::new(x + dx, y, z + dz), stone));
+                assert!(
+                    host.world_mut()
+                        .set_block(BlockPos::new(x + dx, y + 1, z + dz), BlockId::AIR)
+                );
+                assert!(
+                    host.world_mut()
+                        .set_block(BlockPos::new(x + dx, y + 2, z + dz), BlockId::AIR)
+                );
+            }
+        }
+        BlockPos::new(x, y, z)
+    }
+
+    #[test]
+    fn torch_requires_a_floor_and_breaking_the_floor_removes_it() {
+        let (dir, mut host) = survival_host("torch", 42);
+        converge(&mut host);
+        let spawn = host.spawn();
+        let x = spawn.x.floor() as i32 + 2;
+        let z = spawn.z.floor() as i32;
+        let floor = platform(&mut host, x, 100, z);
+        let torch_item = select_item(&mut host, "openblock:torch", 8);
+        let torch = host.registry().id_or_air("openblock:torch");
+
+        // No floor under the target: the placement is rejected without consuming
+        // the torch item.
+        let floating = BlockPos::new(x, 110, z);
+        assert!(host.world_mut().set_block(floating, BlockId::AIR));
+        let before = host.inventory_slot(host.hotbar_selection()).map(|stack| stack.count);
+        assert!(!host.place_selected_at(floating, torch).changed);
+        assert_eq!(
+            host.inventory_slot(host.hotbar_selection()).map(|stack| stack.count),
+            before
+        );
+
+        // A solid floor makes it valid.
+        let target = floor.offset(0, 1, 0);
+        let placed = host.place_selected_at(target, torch);
+        assert!(placed.changed);
+        assert_eq!(host.world().get_block(target), torch);
+        assert_eq!(host.world().block_light(target), 14, "torch emits level 14");
+        assert_eq!(
+            host.world().block_light(floor.offset(0, 8, 0)),
+            7,
+            "light falls one per block"
+        );
+        let lit_hash = host.world().light_hash();
+
+        // Breaking the support removes the torch and relights.
+        let broken = host.break_block_at(floor);
+        assert_eq!(host.world().get_block(target), BlockId::AIR);
+        assert!(
+            broken.drops.iter().any(|drop| drop.item == torch_item),
+            "the torch drops"
+        );
+        assert_ne!(
+            host.world().light_hash(),
+            lit_hash,
+            "removing the torch relights the box"
+        );
+
+        // Persistence: place again and round-trip the save.
+        let floor = platform(&mut host, x, 100, z);
+        let target = floor.offset(0, 1, 0);
+        assert!(host.place_selected_at(target, torch).changed);
+        let hash = host.state_hash();
+        host.save().expect("save torch");
+        drop(host);
+        let reopened = Host::open(Arc::new(Registry::base()), test_config(dir.path(), 42)).expect("reopen");
+        assert_eq!(reopened.world().get_block(target), torch);
+        assert_eq!(reopened.world().block_light(target), 14, "torch light persists");
+        assert_eq!(reopened.state_hash(), hash, "torch light must round-trip");
+    }
+
+    #[test]
+    fn hoe_seeds_hydration_growth_and_harvest_are_persisted() {
+        let (dir, mut host) = survival_host("farming", 44);
+        converge(&mut host);
+        let spawn = host.spawn();
+        let x = spawn.x.floor() as i32 + 3;
+        let z = spawn.z.floor() as i32 - 1;
+        let ground = platform(&mut host, x, 100, z);
+        let dirt = host.registry().id_or_air("openblock:dirt");
+        assert!(host.world_mut().set_block(ground, dirt));
+        let crop_pos = ground.offset(0, 1, 0);
+        host.player_mut().pos = WorldVec::new(x as f64 + 0.5, 101.0, z as f64 + 0.5);
+
+        let _hoe = select_item(&mut host, "openblock:wood_hoe", 1);
+        let outcome = host.use_block_at(ground).expect("till dirt");
+        assert!(outcome.changed);
+        assert_eq!(
+            host.inventory_slot(host.hotbar_selection())
+                .and_then(|stack| stack.durability),
+            Some(58),
+            "tilling wears the hoe by one"
+        );
+        assert_eq!(
+            host.world().get_block(ground),
+            host.registry().id_or_air("openblock:farmland_dry")
+        );
+
+        select_item(&mut host, "openblock:seeds", 8);
+        let outcome = host.use_block_at(ground).expect("plant seeds");
+        assert!(outcome.changed);
+        assert_eq!(
+            host.world().get_block(crop_pos),
+            host.registry().id_or_air("openblock:wheat_0")
+        );
+        assert_eq!(host.crop_count(), 1);
+        assert_eq!(host.crops()[&crop_pos].stage, 0);
+
+        // Water within four blocks hydrates on the next 20-tick pass.
+        let water = host.registry().id_or_air("openblock:water");
+        assert!(host.world_mut().set_block(BlockPos::new(x + 3, 100, z), water));
+        host.set_tick_count(19);
+        host.tick(&PlayerInput::default());
+        assert!(host.crops()[&crop_pos].hydrated);
+        assert_eq!(
+            host.world().get_block(ground),
+            host.registry().id_or_air("openblock:farmland_wet")
+        );
+        assert_eq!(host.crops()[&crop_pos].age, 1);
+
+        // Advance to the stage boundary deterministically.
+        {
+            let crop = host.crops.get_mut(&crop_pos).expect("crop state");
+            crop.age = crate::CROP_GROWTH_WET_TICKS - 1;
+            crop.hydrated = true;
+        }
+        host.set_tick_count(19);
+        host.tick(&PlayerInput::default());
+        assert_eq!(
+            host.world().get_block(crop_pos),
+            host.registry().id_or_air("openblock:wheat_1")
+        );
+        assert_eq!(host.crops()[&crop_pos].stage, 1);
+
+        // Save/reload mid-growth keeps the exact state. Stream around the new
+        // player position first so both sides hash the same resident set.
+        converge(&mut host);
+        let hash = host.state_hash();
+        host.save().expect("save crop");
+        drop(host);
+        let mut reopened = Host::open(Arc::new(Registry::base()), test_config(dir.path(), 44)).expect("reopen");
+        converge(&mut reopened);
+        assert_eq!(reopened.crop_count(), 1);
+        assert_eq!(reopened.crops()[&crop_pos].stage, 1);
+        assert_eq!(reopened.state_hash(), hash, "crop state must round-trip");
+        let mut host = reopened;
+        host.set_game_mode(GameMode::Survival);
+
+        // Mature harvest: 1 wheat + 1..=3 seeds.
+        let wheat_3 = host.registry().id_or_air("openblock:wheat_3");
+        assert!(host.world_mut().set_block(crop_pos, wheat_3));
+        host.crops.get_mut(&crop_pos).expect("crop").stage = 3;
+        let outcome = host.use_block_at(crop_pos).expect("harvest wheat");
+        assert!(outcome.changed);
+        assert_eq!(host.world().get_block(crop_pos), BlockId::AIR);
+        assert_eq!(host.crop_count(), 0);
+        let wheat = host.registry().item_id("openblock:wheat").expect("wheat");
+        let seeds = host.registry().item_id("openblock:seeds").expect("seeds");
+        assert_eq!(
+            outcome
+                .drops
+                .iter()
+                .filter(|drop| drop.item == wheat)
+                .map(|drop| drop.count)
+                .sum::<u8>(),
+            1
+        );
+        let seed_count: u8 = outcome
+            .drops
+            .iter()
+            .filter(|drop| drop.item == seeds)
+            .map(|drop| drop.count)
+            .sum();
+        assert!((1..=3).contains(&seed_count), "harvest seeds {seed_count}");
+
+        // Breaking immature wheat yields one seed and no wheat item.
+        let wheat_2 = host.registry().id_or_air("openblock:wheat_2");
+        assert!(host.world_mut().set_block(crop_pos, wheat_2));
+        host.crops.insert(
+            crop_pos,
+            crate::CropState {
+                id: 99,
+                pos: crop_pos,
+                stage: 2,
+                age: 0,
+                hydrated: false,
+            },
+        );
+        let broken = host.break_block_at(crop_pos);
+        assert!(!broken.drops.iter().any(|drop| drop.item == wheat));
+        assert_eq!(
+            broken
+                .drops
+                .iter()
+                .filter(|drop| drop.item == seeds)
+                .map(|drop| drop.count)
+                .sum::<u8>(),
+            1
+        );
+
+        // Grass has a deterministic 12.5% seed drop.
+        let grass = host.registry().id_or_air("openblock:grass");
+        assert!(host.world_mut().set_block(crop_pos, grass));
+        let broken = host.break_block_at(crop_pos);
+        let expected_seed = crate::crops::grass_seed_drop(host.world().seed(), crop_pos);
+        assert_eq!(broken.drops.iter().any(|drop| drop.item == seeds), expected_seed);
+    }
+
+    #[test]
+    fn bed_sleep_fast_forwards_and_sets_the_personal_respawn() {
+        let (dir, mut host) = open_host("sleep", 45);
+        converge(&mut host);
+        let spawn = host.spawn();
+        let x = spawn.x.floor() as i32 + 3;
+        let z = spawn.z.floor() as i32;
+        let floor = platform(&mut host, x, 100, z);
+        let foot = floor.offset(0, 1, 0);
+        let head = foot.offset(0, 0, 1);
+        let bed_foot = host.registry().id_or_air("openblock:bed_foot");
+        let bed_head = host.registry().id_or_air("openblock:bed_head");
+        assert!(host.world_mut().set_block(foot, bed_foot));
+        assert!(host.world_mut().set_block(head, bed_head));
+        host.player_mut().pos = WorldVec::new(x as f64 + 0.5, 101.0, z as f64 + 0.5);
+        host.set_tick_count(13_500);
+
+        let outcome = host.use_block_at(foot).expect("sleep in bed");
+        assert!(outcome.changed);
+        assert!(host.sleeping());
+        assert_eq!(host.sleep_state().expect("session").bed_foot, foot);
+        assert!(host.respawn_point().is_some());
+
+        for _ in 0..crate::SLEEP_FAST_FORWARD_TICKS {
+            host.tick(&PlayerInput::default());
+        }
+        assert!(!host.sleeping(), "sunrise wakes the player");
+        assert_eq!(host.day_phase(), 0, "the skip lands exactly on sunrise");
+        assert_eq!(host.tick_count(), crate::DAY_LENGTH_TICKS);
+
+        // Death respawns at the bed point, and the point persists.
+        host.set_game_mode(GameMode::Survival);
+        host.player_mut().pos = WorldVec::new(x as f64 + 0.5, 120.0, z as f64 + 0.5);
+        host.damage(1_000.0);
+        assert!(host.is_dead());
+        host.respawn();
+        assert_eq!(host.player().pos, host.respawn_point().expect("personal respawn"));
+        let hash = host.state_hash();
+        host.save().expect("save respawn");
+        drop(host);
+        let mut reopened = Host::open(Arc::new(Registry::base()), test_config(dir.path(), 45)).expect("reopen");
+        converge(&mut reopened);
+        assert_eq!(
+            reopened.respawn_point(),
+            Some(WorldVec::new(x as f64 + 0.5, 102.0, z as f64 + 0.5))
+        );
+        assert_eq!(reopened.state_hash(), hash, "respawn point must round-trip");
+
+        // Daytime and obstructed beds are refused with stable reasons.
+        reopened.set_tick_count(6_000);
+        assert_eq!(reopened.use_block_at(foot).unwrap_err(), "not_night");
+        reopened.set_tick_count(13_500);
+        let stone = reopened.registry().id_or_air("openblock:stone");
+        assert!(reopened.world_mut().set_block(foot.offset(0, 1, 0), stone));
+        assert_eq!(reopened.use_block_at(foot).unwrap_err(), "obstructed");
+        assert!(reopened.world_mut().set_block(foot.offset(0, 1, 0), BlockId::AIR));
+
+        // Damage wakes a sleeper and cancels the skip.
+        reopened.set_game_mode(GameMode::Survival);
+        reopened.use_block_at(foot).expect("sleep again");
+        let before_skip = reopened.tick_count();
+        reopened.damage(1.0);
+        assert!(!reopened.sleeping(), "damage wakes the player");
+        for _ in 0..10 {
+            reopened.tick(&PlayerInput::default());
+        }
+        assert!(
+            reopened.tick_count() < before_skip + 200,
+            "a cancelled skip must not advance to sunrise"
+        );
+
+        // Removing the bed wakes the next tick.
+        reopened.set_game_mode(GameMode::Creative);
+        reopened.set_tick_count(13_500);
+        reopened.use_block_at(foot).expect("sleep a third time");
+        assert!(reopened.world_mut().set_block(foot, BlockId::AIR));
+        reopened.tick(&PlayerInput::default());
+        assert!(!reopened.sleeping(), "a removed bed wakes the player");
+    }
+
+    #[test]
+    fn gameplay_light_suppresses_hostile_spawns_over_the_night() {
+        let (_dir, mut host) = open_host("mob-light", 46);
+        converge(&mut host);
+        let spawn = host.spawn();
+        let x = spawn.x.floor() as i32;
+        let z = spawn.z.floor() as i32;
+        // A sealed 21×21 room with a torch in the centre.
+        let stone = host.registry().id_or_air("openblock:stone");
+        for dz in -10..=10 {
+            for dx in -10..=10 {
+                assert!(host.world_mut().set_block(BlockPos::new(x + dx, 100, z + dz), stone));
+            }
+        }
+        for dy in 101..=104 {
+            for d in -10..=10 {
+                assert!(host.world_mut().set_block(BlockPos::new(x + d, dy, z - 10), stone));
+                assert!(host.world_mut().set_block(BlockPos::new(x + d, dy, z + 10), stone));
+                assert!(host.world_mut().set_block(BlockPos::new(x - 10, dy, z + d), stone));
+                assert!(host.world_mut().set_block(BlockPos::new(x + 10, dy, z + d), stone));
+            }
+        }
+        for dz in -10..=10 {
+            for dx in -10..=10 {
+                assert!(host.world_mut().set_block(BlockPos::new(x + dx, 105, z + dz), stone));
+            }
+        }
+        let torch_pos = BlockPos::new(x, 101, z);
+        let torch = host.registry().id_or_air("openblock:torch");
+        assert!(host.world_mut().set_block(torch_pos, torch));
+        let dark = BlockPos::new(x + 9, 101, z + 9);
+        assert!(host.world().sky_light(dark) <= 2, "the roof must keep the room dark");
+        assert_eq!(host.world().block_light(torch_pos), 14);
+
+        for phase in [12_600u64, 13_500, 15_000, 18_000, 22_000] {
+            host.set_tick_count(phase);
+            assert!(
+                !host.hostile_spawn_light_ok(torch_pos),
+                "torch light 14 must suppress hostiles at phase {phase}"
+            );
+            assert!(
+                !host.hostile_spawn_light_ok(BlockPos::new(x + 1, 101, z)),
+                "a cell next to the torch is still too bright"
+            );
+            assert!(
+                host.hostile_spawn_light_ok(dark),
+                "the unlit part of the room is spawnable at phase {phase}"
+            );
+        }
+
+        // Breaking the torch makes the source cell spawnable again at night.
+        host.set_tick_count(15_000);
+        assert!(host.world_mut().set_block(torch_pos, BlockId::AIR));
+        assert!(host.hostile_spawn_light_ok(torch_pos));
+    }
+
+    #[test]
+    fn light_and_crop_state_are_in_the_state_hash_and_dirty_sections() {
+        let (_dir, mut host) = open_host("light-hash", 47);
+        converge(&mut host);
+        let spawn = host.spawn();
+        let chunk = BlockPos::new(spawn.x.floor() as i32, 0, spawn.z.floor() as i32).chunk();
+        let x = chunk.x * CHUNK_SIZE + 14;
+        let z = chunk.z * CHUNK_SIZE + 8;
+        let pos = BlockPos::new(x, 100, z);
+        assert!(host.world_mut().set_block(pos, BlockId::AIR));
+        let _ = host.take_dirty_sections();
+        let before_hash = host.state_hash();
+        let before_light = host.world().light_hash();
+        let torch = host.registry().id_or_air("openblock:torch");
+        assert!(host.world_mut().set_block(pos, torch));
+        // The torch reaches two blocks into the next chunk column.
+        assert!(host.world().block_light(pos.offset(2, 0, 0)) > 0);
+        let dirty = host.take_dirty_sections();
+        assert!(
+            dirty.contains(&SectionPos::new(chunk.x + 1, 100 / 16, chunk.z)),
+            "light reaching the neighbour section must mark it dirty: {dirty:?}"
+        );
+        let unique: HashSet<SectionPos> = dirty.iter().copied().collect();
+        assert_eq!(unique.len(), dirty.len(), "dirty sections are a set, never duplicated");
+        assert_ne!(host.state_hash(), before_hash, "light participates in the state hash");
+        assert!(host.world_mut().set_block(pos, BlockId::AIR));
+        assert_eq!(
+            host.world().light_hash(),
+            before_light,
+            "removing a lone torch restores the previous light field exactly"
+        );
+    }
+
+    #[test]
+    fn world_meta_is_written_after_save_and_missing_marker_relights() {
+        let (dir, mut host) = open_host("meta", 48);
+        converge(&mut host);
+        host.save().expect("save with marker");
+        let meta_path = test_world_dir(&dir).join(ob_world::WORLD_META_FILE);
+        let text = std::fs::read_to_string(&meta_path).expect("meta written");
+        assert!(text.contains("light_version=2"), "{text}");
+        let saved_chunks = host.world().chunk_count();
+        drop(host);
+
+        // A legacy save has no marker: the loader relights once, rewrites the
+        // save and commits light_version=2.
+        std::fs::remove_file(&meta_path).expect("remove marker");
+        let mut migrated =
+            Host::open(Arc::new(Registry::base()), test_config(dir.path(), 48)).expect("relight on load");
+        converge(&mut migrated);
+        assert_eq!(migrated.world().light_version(), ob_world::LIGHT_VERSION);
+        assert_eq!(migrated.world().chunk_count(), saved_chunks);
+        let migrated_light = migrated.world().light_hash();
+        let migrated_hash = migrated.state_hash();
+        let text = std::fs::read_to_string(&meta_path).expect("meta rewritten");
+        assert!(text.contains("light_version=2"), "{text}");
+        drop(migrated);
+
+        // A second load sees the marker, skips relight and preserves the field
+        // exactly: the marker is consistent with the committed save.
+        let mut reopened = Host::open(Arc::new(Registry::base()), test_config(dir.path(), 48)).expect("marked load");
+        converge(&mut reopened);
+        assert_eq!(
+            reopened.world().light_hash(),
+            migrated_light,
+            "no relight on a marked save"
+        );
+        assert_eq!(reopened.state_hash(), migrated_hash, "marked save round-trips");
+    }
+    #[test]
+    fn network_damage_wakes_every_sleeper_and_cancels_the_skip() {
+        let (_dir, mut host) = open_host("net-sleep-damage", 49);
+        converge(&mut host);
+        let spawn = host.spawn();
+        let x = spawn.x.floor() as i32 + 2;
+        let z = spawn.z.floor() as i32;
+        let floor = platform(&mut host, x, 100, z);
+        let foot = floor.offset(0, 1, 0);
+        let head = foot.offset(0, 0, 1);
+        let bed_foot = host.registry().id_or_air("openblock:bed_foot");
+        let bed_head = host.registry().id_or_air("openblock:bed_head");
+        assert!(host.world_mut().set_block(foot, bed_foot));
+        assert!(host.world_mut().set_block(head, bed_head));
+        host.set_tick_count(13_500);
+
+        let alice = host
+            .join_network_player(1, "alice", GameMode::Survival)
+            .expect("alice joins")
+            .id;
+        let bob = host
+            .join_network_player(2, "bob", GameMode::Survival)
+            .expect("bob joins")
+            .id;
+        for id in [alice, bob] {
+            host.network_player_mut(id).expect("player").pos = WorldVec::new(x as f64 + 0.5, 101.0, z as f64 + 0.5);
+            host.network_sleep_request(id, foot).expect("valid bed");
+        }
+        host.tick_network();
+        assert!(host.network_sleep_snapshot().all_sleeping);
+        assert!(host.network_sleep_snapshot().skip_remaining_ticks > 0);
+
+        let outcome = host.damage_network_player(alice, 1.0, "mob").expect("damage applies");
+        assert!(outcome.dealt > 0.0);
+        assert!(host.network_sleep_snapshot().sleepers.is_empty());
+        assert!(!host.network_player_sleeping(alice));
+        assert!(!host.network_player_sleeping(bob), "damage wakes the whole session");
+        assert_eq!(host.network_sleep_snapshot().skip_remaining_ticks, 0);
+        assert!(!host.network_sleep_snapshot().all_sleeping);
+    }
+
+    #[test]
+    fn crop_stage_changes_are_queued_as_block_updates() {
+        let (_dir, mut host) = open_host("crop-repl", 50);
+        converge(&mut host);
+        let spawn = host.spawn();
+        let x = spawn.x.floor() as i32 + 2;
+        let z = spawn.z.floor() as i32;
+        let floor = platform(&mut host, x, 100, z);
+        let dirt = host.registry().id_or_air("openblock:dirt");
+        assert!(host.world_mut().set_block(floor, dirt));
+        let crop_pos = floor.offset(0, 1, 0);
+        let wheat_0 = host.registry().id_or_air("openblock:wheat_0");
+        let wheat_1 = host.registry().id_or_air("openblock:wheat_1");
+        assert!(host.world_mut().set_block(crop_pos, wheat_0));
+        let torch = host.registry().id_or_air("openblock:torch");
+        assert!(host.world_mut().set_block(crop_pos.offset(1, 0, 0), torch));
+        host.crops.insert(
+            crop_pos,
+            crate::CropState {
+                id: 7,
+                pos: crop_pos,
+                stage: 0,
+                age: crate::CROP_GROWTH_WET_TICKS - 1,
+                hydrated: true,
+            },
+        );
+        host.set_tick_count(19);
+        host.tick_crops();
+        let updates = host.take_block_updates();
+        assert!(
+            updates.contains(&(crop_pos, wheat_1)),
+            "a stage change must be queued for the network broadcast: {updates:?}"
+        );
     }
 }

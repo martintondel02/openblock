@@ -56,6 +56,17 @@
 //! [`ItemStackDto`], [`ContainerKind`], [`EntityKind`] and [`DespawnReason`] for
 //! the payload shapes.
 //!
+//! # Light and sleep (still v3)
+//!
+//! The 1.2 gameplay slice adds additive v3 messages without changing any
+//! existing payload: [`ServerMessage::LightUpdate`] carries compressed dense
+//! sky+RGB words for the sections a relight changed (see [`LightSectionDto`]
+//! and [`encode_light_words`]); [`ServerMessage::TimeSync`] publishes the
+//! authoritative world clock; and [`ServerMessage::SleepState`] plus
+//! [`ClientMessage::SleepRequest`]/[`ClientMessage::Wake`] drive bed sleep and
+//! the 100-tick sunrise fast-forward. Clients that do not understand a new
+//! variant must ignore it (the interim client already has a catch-all arm).
+//!
 //! # Chunk snapshots
 //!
 //! [`encode_chunk`] writes a deterministic paletted column with per-section
@@ -84,6 +95,7 @@
 mod base64;
 pub mod chunk;
 pub mod frame;
+pub mod light;
 pub mod limits;
 pub mod message;
 
@@ -93,12 +105,16 @@ pub use frame::{
     encode_client_frame, encode_frame, encode_frame_with_limit, encode_server_frame, read_frame, read_message,
     write_frame, write_message, write_message_with_limit,
 };
+pub use light::{
+    LIGHT_CELLS, LIGHT_ENCODING_RAW, LIGHT_ENCODING_ZSTD, LIGHT_SECTION_FORMAT, LIGHT_WORDS_BYTES,
+    MAX_LIGHT_SECTION_BYTES, decode_light_words, encode_light_words,
+};
 pub use limits::RateLimit;
 pub use message::{
     BlockDescriptor, CHEST_WINDOW_SLOTS, ClientMessage, ContainerKind, DAY_LENGTH_TICKS, DespawnReason,
     EQUIPMENT_SLOT_START, EQUIPMENT_SLOTS, EntityKind, EntitySnapshot, EntityStateEntry, FURNACE_WINDOW_SLOTS,
-    FurnaceProgress, HOTBAR_SLOTS, INVENTORY_SLOTS, ItemStackDto, MAIN_SLOT_START, MAIN_SLOTS, MAX_CHAT_LEN,
-    MAX_MOTD_LEN, MAX_NAME_LEN, PROTOCOL_VERSION, PlayerSnapshot, SLOT_WINDOW_START, ServerMessage, block_manifest,
-    content_fingerprint, default_max_frame_len, manifest_matches, sanitise_motd, validate_chat_text,
-    validate_player_name,
+    FurnaceProgress, HOTBAR_SLOTS, INVENTORY_SLOTS, ItemStackDto, LightSectionDto, MAIN_SLOT_START, MAIN_SLOTS,
+    MAX_CHAT_LEN, MAX_LIGHT_SECTIONS_PER_UPDATE, MAX_MOTD_LEN, MAX_NAME_LEN, PROTOCOL_VERSION, PlayerSnapshot,
+    SLOT_WINDOW_START, ServerMessage, block_manifest, content_fingerprint, default_max_frame_len, manifest_matches,
+    sanitise_motd, validate_chat_text, validate_player_name,
 };

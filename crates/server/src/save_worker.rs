@@ -82,6 +82,11 @@ pub(crate) struct SaveJob {
     pub snapshot: WorldSnapshot,
     /// Serialized sidecars in commit order (`world.obs` is appended last).
     pub sidecars: Vec<(&'static str, Vec<u8>)>,
+    /// Light semantics version to persist in `world_meta.txt` **after** the
+    /// world snapshot commits. The marker must never claim a migration the
+    /// committed `world.obs` does not have, so it is written only once every
+    /// rename succeeded.
+    pub light_version: u32,
 }
 
 /// Starts a named save thread and returns its join handle.
@@ -101,6 +106,7 @@ fn run(job: SaveJob) -> Result<SaveReport, SaveFailure> {
     let write_started = Instant::now();
     std::fs::create_dir_all(&job.dir)?;
     commit(&job.dir, &job.sidecars, &world)?;
+    write_light_meta(&job.dir, job.light_version)?;
     let write_ms = write_started.elapsed().as_secs_f64() * 1000.0;
 
     let sidecar_bytes = job.sidecars.iter().map(|(_, bytes)| bytes.len() as u64).sum();
@@ -113,6 +119,18 @@ fn run(job: SaveJob) -> Result<SaveReport, SaveFailure> {
         write_ms,
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
     })
+}
+
+/// Writes the additive `world_meta.txt` marker after a successful commit.
+///
+/// Existing unknown keys and comments survive. A failure is reported to the
+/// host; the world snapshot itself is already valid, and the missing marker
+/// only causes a safe relight on the next load.
+fn write_light_meta(dir: &Path, light_version: u32) -> Result<(), SaveFailure> {
+    let mut meta = ob_world::read_world_meta(dir)?.unwrap_or_default();
+    meta.light_version = light_version;
+    ob_world::write_world_meta(dir, &meta)?;
+    Ok(())
 }
 
 /// Stages every payload, fsyncs it, then renames sidecars first and the world

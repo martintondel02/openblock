@@ -32,6 +32,12 @@ pub const MAX_CHAT_LEN: usize = 256;
 pub const MAX_MOTD_LEN: usize = 128;
 /// Ticks in one full in-game day at 20 Hz (24,000 ticks = 20 minutes).
 pub const DAY_LENGTH_TICKS: u64 = 24_000;
+/// Maximum sections batched into one [`ServerMessage::LightUpdate`].
+///
+/// A dense section is at most 8 KiB before zstd/base64, so 64 sections stay
+/// well inside the 2 MiB frame limit; the server sends at most one batch per
+/// player per tick and applies a per-client rate limit on top.
+pub const MAX_LIGHT_SECTIONS_PER_UPDATE: usize = 64;
 
 /// One block type as advertised during the handshake.
 ///
@@ -179,6 +185,30 @@ pub struct EntityStateEntry {
     pub stack: Option<ItemStackDto>,
 }
 
+/// One section's dense sky+RGB light words in a [`ServerMessage::LightUpdate`].
+///
+/// `encoding` is [`crate::LIGHT_ENCODING_RAW`] (little-endian `u16` words) or
+/// [`crate::LIGHT_ENCODING_ZSTD`]; `format` is
+/// [`crate::LIGHT_SECTION_FORMAT`]. Decode the payload with
+/// [`crate::decode_light_words`]. Words are in canonical `LocalPos::from_index`
+/// order, exactly like the dense light encoding of a chunk snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LightSectionDto {
+    /// Section X coordinate (world section grid).
+    pub cx: i32,
+    /// Section Y coordinate (world section grid).
+    pub cy: i32,
+    /// Section Z coordinate (world section grid).
+    pub cz: i32,
+    /// Payload format; must be [`crate::LIGHT_SECTION_FORMAT`].
+    pub format: u8,
+    /// Payload encoding, raw or zstd.
+    pub encoding: u8,
+    /// Encoded dense light words.
+    #[serde(with = "crate::base64::base64_bytes")]
+    pub data: std::vec::Vec<u8>,
+}
+
 /// Why the server removed an entity from a client's interest set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -238,11 +268,26 @@ pub enum ClientMessage {
         /// Hotbar slot index.
         slot: u8,
     },
-    /// Interacts with a block: opens a furnace or chest window.
+    /// Interacts with a block: opens a furnace or chest window, or uses the
+    /// selected item on it (hoe on grass/dirt, seeds on farmland, harvest a
+    /// crop, sleep in a bed). The server validates distance, support, light and
+    /// item state itself; nothing in this message is trusted beyond `pos`.
     UseBlock {
         /// Block position.
         pos: [i32; 3],
     },
+    /// Requests sleep in the bed at `pos` (foot or head block).
+    ///
+    /// Equivalent to [`ClientMessage::UseBlock`] on a bed for v3 clients; the
+    /// explicit variant lets a client express intent without also triggering a
+    /// container interaction. The server checks reach, the sleep window,
+    /// obstruction and the other players' sleep state.
+    SleepRequest {
+        /// Foot or head block position of the bed.
+        pos: [i32; 3],
+    },
+    /// Leaves a bed or cancels a pending sleep fast-forward.
+    Wake,
     /// Melee attack intent.
     Attack {
         /// Explicit mob entity id. When omitted/`null`, the server raycasts
@@ -509,6 +554,48 @@ pub enum ServerMessage {
         /// Short machine-readable reason.
         reason: String,
     },
+    /// Dense light patches for sections whose stored light changed after a
+    /// server edit or relight.
+    ///
+    /// The server batches changes per tick, sends at most
+    /// [`MAX_LIGHT_SECTIONS_PER_UPDATE`] sections in one message, skips players
+    /// outside the section's interest radius and applies a per-client rate
+    /// limit. Clients replace the stored light of each section wholesale.
+    LightUpdate {
+        /// Server tick at which the batch was produced.
+        tick: u64,
+        /// Changed sections. Empty batches are never sent.
+        sections: std::vec::Vec<LightSectionDto>,
+    },
+    /// Authoritative world clock, used by the client to render the day/night
+    /// cycle and to follow a sleep fast-forward.
+    TimeSync {
+        /// Authoritative ticks since world creation.
+        tick: u64,
+        /// `tick % day_ticks` (the day phase).
+        day_phase: u64,
+        /// Ticks in one full day (currently [`DAY_LENGTH_TICKS`]).
+        day_ticks: u64,
+    },
+    /// Sleep state of the receiving player and the rest of the session.
+    ///
+    /// `sleepers` is sorted ascending. `all_sleeping` is true only when every
+    /// eligible (connected, alive, non-spectator) player is in a bed. The
+    /// server still waits for the 100-tick sunrise fast-forward; the field tells
+    /// the client whether the skip is running. `skip_remaining_ticks` counts the
+    /// fast-forward ticks left (`0` when no skip is active).
+    SleepState {
+        /// Whether the receiving player is asleep.
+        sleeping: bool,
+        /// Receiving player's bed foot position, if asleep.
+        bed: Option<[i32; 3]>,
+        /// Connected players currently asleep, ascending.
+        sleepers: std::vec::Vec<u64>,
+        /// Whether every eligible player is asleep.
+        all_sleeping: bool,
+        /// Fast-forward ticks remaining in the 100-tick sunrise skip.
+        skip_remaining_ticks: u32,
+    },
     /// A relayed chat line.
     Chat {
         /// Display name of the sender (`server` for console messages).
@@ -708,6 +795,8 @@ mod tests {
             ClientMessage::Equip { hotbar_slot: 2 },
             ClientMessage::Respawn,
             ClientMessage::ContainerClose,
+            ClientMessage::SleepRequest { pos: [4, 65, -7] },
+            ClientMessage::Wake,
         ];
         for message in messages {
             let json = serde_json::to_string(&message).expect("serialise client message");
@@ -810,6 +899,43 @@ mod tests {
                 action: "block_edit".to_string(),
                 reason: "out_of_reach".to_string(),
             },
+            ServerMessage::LightUpdate {
+                tick: 42,
+                sections: vec![
+                    crate::LightSectionDto {
+                        cx: 0,
+                        cy: 4,
+                        cz: -1,
+                        format: crate::LIGHT_SECTION_FORMAT,
+                        encoding: crate::LIGHT_ENCODING_RAW,
+                        data: crate::encode_light_words(&vec![0x0F5A; crate::LIGHT_CELLS])
+                            .expect("light words")
+                            .1,
+                    },
+                    crate::LightSectionDto {
+                        cx: 2,
+                        cy: -2,
+                        cz: 3,
+                        format: crate::LIGHT_SECTION_FORMAT,
+                        encoding: crate::LIGHT_ENCODING_ZSTD,
+                        data: crate::encode_light_words(&vec![0u16; crate::LIGHT_CELLS])
+                            .expect("light words")
+                            .1,
+                    },
+                ],
+            },
+            ServerMessage::TimeSync {
+                tick: 24_500,
+                day_phase: 500,
+                day_ticks: DAY_LENGTH_TICKS,
+            },
+            ServerMessage::SleepState {
+                sleeping: true,
+                bed: Some([10, 64, -3]),
+                sleepers: vec![1, 2, 3],
+                all_sleeping: true,
+                skip_remaining_ticks: 63,
+            },
         ];
         for message in messages {
             let json = serde_json::to_string(&message).expect("serialise server message");
@@ -860,6 +986,47 @@ mod tests {
         assert_eq!(EQUIPMENT_SLOTS, 4);
         assert_eq!(EQUIPMENT_SLOT_START + EQUIPMENT_SLOTS as u16, 40);
         assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(MAX_LIGHT_SECTIONS_PER_UPDATE, 64);
+    }
+
+    #[test]
+    fn light_and_sleep_wire_tags_are_stable() {
+        let light = ServerMessage::LightUpdate {
+            tick: 7,
+            sections: vec![crate::LightSectionDto {
+                cx: 1,
+                cy: 2,
+                cz: 3,
+                format: crate::LIGHT_SECTION_FORMAT,
+                encoding: crate::LIGHT_ENCODING_RAW,
+                data: vec![0, 0, 1, 0],
+            }],
+        };
+        let json = serde_json::to_value(&light).expect("json");
+        assert_eq!(json["type"], "light_update");
+        assert_eq!(json["sections"][0]["cx"], 1);
+        assert_eq!(json["sections"][0]["format"], 1);
+
+        let sleep = serde_json::to_value(&ClientMessage::SleepRequest { pos: [1, 2, 3] }).expect("json");
+        assert_eq!(sleep["type"], "sleep_request");
+        let wake = serde_json::to_value(&ClientMessage::Wake).expect("json");
+        assert_eq!(wake["type"], "wake");
+        let state = serde_json::to_value(&ServerMessage::SleepState {
+            sleeping: false,
+            bed: None,
+            sleepers: vec![],
+            all_sleeping: false,
+            skip_remaining_ticks: 0,
+        })
+        .expect("json");
+        assert_eq!(state["type"], "sleep_state");
+        let time = serde_json::to_value(&ServerMessage::TimeSync {
+            tick: 1,
+            day_phase: 1,
+            day_ticks: DAY_LENGTH_TICKS,
+        })
+        .expect("json");
+        assert_eq!(time["type"], "time_sync");
     }
 
     #[test]

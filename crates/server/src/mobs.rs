@@ -93,6 +93,12 @@ pub const NIGHT_START_TICK: u64 = 13_000;
 pub const NIGHT_END_TICK: u64 = 23_000;
 /// Vertical player coordinate below which hostiles may spawn underground.
 pub const HOSTILE_CAVE_PLAYER_Y: f64 = 40.0;
+/// Highest gameplay light at which a hostile may naturally spawn.
+///
+/// The 1.2 rule replaces the old depth-only check with
+/// `World::gameplay_light(pos, day, weather) <= 7`, so a torch-lit room suppresses
+/// monsters even underground while an unlit cave stays spawnable.
+pub const HOSTILE_SPAWN_MAX_LIGHT: u8 = 7;
 /// Vertical search radius for a cave floor around an underground player.
 const CAVE_SEARCH_VERTICAL: i32 = 16;
 
@@ -188,6 +194,16 @@ impl Host {
     /// Whether the tick phase is night (`13_000..23_000`).
     pub fn is_night(&self) -> bool {
         (NIGHT_START_TICK..NIGHT_END_TICK).contains(&self.day_phase())
+    }
+
+    /// Whether the gameplay light at a candidate floor allows a hostile spawn.
+    ///
+    /// This is `World::gameplay_light(pos, day_factor, weather_factor) <=
+    /// HOSTILE_SPAWN_MAX_LIGHT` (the 1.2 rule). A torch at level 14 suppresses
+    /// spawns in its ~7-block radius; daylight and a lit room suppress surface
+    /// monsters as well.
+    pub fn hostile_spawn_light_ok(&self, pos: BlockPos) -> bool {
+        self.world.gameplay_light(pos, self.day_factor(), self.weather_factor()) <= HOSTILE_SPAWN_MAX_LIGHT
     }
 
     /// Spawns one mob directly, bypassing natural-spawn rules.
@@ -496,6 +512,10 @@ impl Host {
         } else {
             self.grass_floor_at(x, z)?
         };
+        let feet = BlockPos::new(x, feet_y.floor() as i32, z);
+        if hostile && !self.hostile_spawn_light_ok(feet) {
+            return None;
+        }
         let kind = if hostile {
             MobKind::Zombie
         } else {

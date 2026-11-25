@@ -12,10 +12,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ob_content::{BlockId, ItemId, MobKind, Registry};
-use ob_math::{Aabb, BlockPos, WorldVec};
+use ob_math::{Aabb, BlockPos, LocalPos, WorldVec};
 use ob_protocol::{
-    ClientMessage, ContainerKind, DespawnReason, EntityKind, ItemStackDto, MAX_FRAME_LEN, PROTOCOL_VERSION,
-    ServerMessage, read_message, write_message,
+    ClientMessage, ContainerKind, DespawnReason, EntityKind, ItemStackDto, LIGHT_ENCODING_RAW, LIGHT_ENCODING_ZSTD,
+    LIGHT_SECTION_FORMAT, MAX_FRAME_LEN, MAX_LIGHT_SECTIONS_PER_UPDATE, PROTOCOL_VERSION, ServerMessage,
+    decode_light_words, read_message, write_message,
 };
 use ob_server::{DedicatedServer, GameMode, Host, HostConfig, NetConfig};
 
@@ -70,6 +71,11 @@ impl TestServer {
     }
 
     fn start_with_interval(label: &str, game_mode: GameMode, save_interval_seconds: u64) -> Self {
+        Self::start_with_interval_at(label, game_mode, save_interval_seconds, 0)
+    }
+
+    /// Starts at a fixed world tick (used by the sleep tests to begin at night).
+    fn start_with_interval_at(label: &str, game_mode: GameMode, save_interval_seconds: u64, start_tick: u64) -> Self {
         let dir = TempDir::new(label);
         let registry = Arc::new(Registry::base());
         let host_config = HostConfig {
@@ -79,7 +85,10 @@ impl TestServer {
             render_distance_chunks: 2,
             generate_budget: 8,
         };
-        let host = Host::open(Arc::clone(&registry), host_config.clone()).expect("open test world");
+        let mut host = Host::open(Arc::clone(&registry), host_config.clone()).expect("open test world");
+        if start_tick != 0 {
+            host.set_tick_count(start_tick);
+        }
         let spawn = host.spawn();
         let net_config = NetConfig {
             listen: "127.0.0.1:0".parse::<SocketAddr>().expect("ephemeral loopback"),
@@ -178,6 +187,101 @@ impl TestClient {
             }
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
         }
+    }
+
+    /// Sends a creative block edit and reports whether it was accepted.
+    fn try_place_block(&mut self, pos: [i32; 3], block: u16) -> bool {
+        self.send(ClientMessage::BlockEdit { pos, block });
+        let deadline = Instant::now() + WAIT;
+        loop {
+            match self.recv() {
+                ServerMessage::BlockEdit {
+                    pos: edited,
+                    block: placed,
+                    ..
+                } if edited == pos && placed == block => {
+                    return true;
+                }
+                ServerMessage::ActionRejected { action, reason } if action == "block_edit" => {
+                    let _ = reason;
+                    return false;
+                }
+                _ => {}
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for block edit at {pos:?}");
+        }
+    }
+
+    /// Sends a creative block edit and panics if the server rejects it.
+    fn place_block(&mut self, pos: [i32; 3], block: u16) {
+        assert!(self.try_place_block(pos, block), "block edit at {pos:?} was rejected");
+    }
+
+    /// Walks a network player from `start` to `target` with server-legal steps.
+    fn move_to(&mut self, start: WorldVec, target: WorldVec) {
+        let deadline = Instant::now() + WAIT;
+        let mut current = start;
+        while current.distance(target) > 0.25 {
+            assert!(
+                Instant::now() < deadline,
+                "could not move the test player to {target:?}"
+            );
+            let dx = (target.x - current.x).clamp(-1.9, 1.9);
+            let dy = (target.y - current.y).clamp(-4.5, 4.5);
+            let dz = (target.z - current.z).clamp(-1.9, 1.9);
+            current = WorldVec::new(current.x + dx, current.y + dy, current.z + dz);
+            self.send(ClientMessage::Move {
+                pos: [current.x, current.y, current.z],
+                yaw: 0.0,
+                pitch: 0.0,
+            });
+            std::thread::sleep(Duration::from_millis(60));
+        }
+    }
+
+    /// Waits for an `InventorySync` that contains `item` in the hotbar.
+    fn wait_hotbar_slot(&mut self, item: &str) -> u8 {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let ServerMessage::InventorySync { hotbar, .. } = self.recv()
+                && let Some(slot) = slot_of(&hotbar, item)
+            {
+                return slot;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {item} in the hotbar");
+        }
+    }
+
+    /// Waits for the next `BlockEdit` at `pos` and returns its block id.
+    fn wait_block_edit(&mut self, pos: [i32; 3]) -> u16 {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let ServerMessage::BlockEdit { pos: edited, block, .. } = self.recv()
+                && edited == pos
+            {
+                return block;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for a block edit at {pos:?}"
+            );
+        }
+    }
+
+    /// Waits for a `LightUpdate` and returns its sections.
+    fn next_light_update(&mut self) -> Vec<ob_protocol::LightSectionDto> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let ServerMessage::LightUpdate { sections, .. } = self.recv() {
+                return sections;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for LightUpdate");
+        }
+    }
+
+    /// Waits for a `SleepState` matching `predicate`.
+    fn sleep_state_until(&mut self, what: &str, predicate: impl FnMut(&ServerMessage) -> bool) -> ServerMessage {
+        self.recv_until_in(what, WAIT, predicate)
     }
 
     fn expect_disconnect(&mut self, contains: &str) -> String {
@@ -1436,4 +1540,184 @@ fn creative_network_mode_keeps_instant_edits_and_immunity() {
     assert!(!player.dead);
     assert_eq!(player.health, 20.0);
     server.stop();
+}
+/// Decodes a `LightUpdate` section and returns the packed word at `pos`.
+fn light_word_in_sections(sections: &[ob_protocol::LightSectionDto], pos: BlockPos) -> Option<u16> {
+    let section = pos.section();
+    let dto = sections
+        .iter()
+        .find(|dto| dto.cx == section.x && dto.cy == section.y && dto.cz == section.z)?;
+    assert_eq!(dto.format, LIGHT_SECTION_FORMAT);
+    let words = decode_light_words(dto.encoding, &dto.data).expect("valid light words");
+    assert_eq!(words.len(), ob_protocol::LIGHT_CELLS);
+    let local = LocalPos {
+        x: (pos.x - section.x * 16) as u8,
+        y: (pos.y - section.y * 16) as u8,
+        z: (pos.z - section.z * 16) as u8,
+    };
+    Some(words[local.index()])
+}
+
+#[test]
+fn light_update_round_trips_dense_sections_over_loopback() {
+    let server = TestServer::start_with_mode("light-update", GameMode::Creative);
+    let mut alice = TestClient::connect(server.addr());
+    let joined = join(&server, &mut alice, "alice");
+    let spawn = server.spawn;
+    let sx = spawn.x.floor() as i32;
+    let sz = spawn.z.floor() as i32;
+    let stone = server.registry.id("openblock:stone").expect("stone").0;
+    let torch = server.registry.id("openblock:torch").expect("torch").0;
+    let build = WorldVec::new(sx as f64 + 0.5, 100.0, sz as f64 + 0.5);
+    alice.move_to(spawn, build);
+    wait_player_position(&server, joined.id, build);
+    let base = [sx, 100, sz];
+    alice.place_block(base, stone);
+    alice.place_block([sx, 101, sz], torch);
+    let sections = alice.next_light_update();
+    assert!(!sections.is_empty());
+    assert!(sections.len() <= MAX_LIGHT_SECTIONS_PER_UPDATE);
+    for dto in &sections {
+        assert_eq!(dto.format, LIGHT_SECTION_FORMAT);
+        assert!(dto.encoding == LIGHT_ENCODING_RAW || dto.encoding == LIGHT_ENCODING_ZSTD);
+    }
+    let pos = BlockPos::new(sx, 101, sz);
+    let word = light_word_in_sections(&sections, pos).expect("torch section is in the batch");
+    assert_eq!((word >> 8) & 0xF, 14, "red block light at the torch");
+    assert_eq!((word >> 4) & 0xF, 14, "green block light at the torch");
+    assert_eq!(word & 0xF, 14, "blue block light at the torch");
+}
+
+#[test]
+fn multiplayer_sleep_requires_every_player_and_fast_forwards_to_sunrise() {
+    let mut server = TestServer::start_with_interval_at("sleep-loopback", GameMode::Creative, 3_600, 15_000);
+    let mut alice = TestClient::connect(server.addr());
+    let alice_joined = join(&server, &mut alice, "alice");
+    let mut bob = TestClient::connect(server.addr());
+    let bob_joined = join(&server, &mut bob, "bob");
+
+    let spawn = server.spawn;
+    let sx = spawn.x.floor() as i32;
+    let sz = spawn.z.floor() as i32;
+    let stone = server.registry.id("openblock:stone").expect("stone").0;
+    let bed_foot = server.registry.id("openblock:bed_foot").expect("bed_foot").0;
+    // Both players move next to the future bed (client-authoritative movement),
+    // then a floating platform high above the terrain keeps the bed cells clear
+    // of trees and slopes.
+    let near_foot = WorldVec::new(sx as f64 + 0.5, 102.0, sz as f64 + 0.5);
+    let near_head = WorldVec::new(sx as f64 + 0.5, 102.0, sz as f64 + 1.5);
+    alice.move_to(spawn, near_foot);
+    bob.move_to(spawn, near_head);
+    wait_player_position(&server, alice_joined.id, near_foot);
+    wait_player_position(&server, bob_joined.id, near_head);
+    alice.place_block([sx, 100, sz], stone);
+    alice.place_block([sx, 100, sz + 1], stone);
+    alice.place_block([sx, 101, sz], bed_foot);
+
+    alice.send(ClientMessage::SleepRequest { pos: [sx, 101, sz] });
+    let state = alice.sleep_state_until("alice asleep", |message| {
+        matches!(
+            message,
+            ServerMessage::SleepState {
+                sleeping: true,
+                all_sleeping: false,
+                ..
+            }
+        )
+    });
+    let ServerMessage::SleepState { sleepers, bed, .. } = state else {
+        unreachable!()
+    };
+    assert_eq!(sleepers, vec![alice_joined.id]);
+    assert_eq!(bed, Some([sx, 101, sz]));
+
+    bob.send(ClientMessage::SleepRequest { pos: [sx, 101, sz] });
+    bob.sleep_state_until("everyone asleep", |message| {
+        matches!(
+            message,
+            ServerMessage::SleepState {
+                sleeping: true,
+                all_sleeping: true,
+                ..
+            }
+        )
+    });
+    let sunrise = bob.recv_until("sunrise TimeSync", |message| {
+        matches!(message, ServerMessage::TimeSync { day_phase: 0, .. })
+    });
+    let ServerMessage::TimeSync { tick, .. } = sunrise else {
+        unreachable!()
+    };
+    assert!(tick >= 24_000, "fast-forward reaches sunrise, got {tick}");
+    bob.sleep_state_until("woken at sunrise", |message| {
+        matches!(
+            message,
+            ServerMessage::SleepState {
+                sleeping: false,
+                all_sleeping: false,
+                ..
+            }
+        )
+    });
+
+    // The bed respawn point persists in the network-player sidecar.
+    server.stop();
+    let text = std::fs::read_to_string(server.world_dir().join("network_players.txt")).expect("network players");
+    assert!(text.contains(" r"), "respawn token written: {text}");
+    let host = server.reopen();
+    let alice_record = host.saved_network_player("alice").expect("alice record");
+    assert_eq!(
+        alice_record.respawn_point,
+        Some(WorldVec::new(sx as f64 + 0.5, 102.0, sz as f64 + 0.5))
+    );
+    let bob_record = host.saved_network_player("bob").expect("bob record");
+    assert!(bob_record.respawn_point.is_some());
+}
+#[test]
+fn farming_use_block_updates_replicate_to_clients() {
+    let server = TestServer::start_with_mode("farming-sync", GameMode::Creative);
+    let mut alice = TestClient::connect(server.addr());
+    let joined = join(&server, &mut alice, "alice");
+    let spawn = server.spawn;
+    let sx = spawn.x.floor() as i32;
+    let sz = spawn.z.floor() as i32;
+    let near = WorldVec::new(sx as f64 + 0.5, 200.0, sz as f64 + 0.5);
+    alice.move_to(spawn, near);
+    wait_player_position(&server, joined.id, near);
+
+    let dirt = server.registry.id("openblock:dirt").expect("dirt").0;
+    let stone = server.registry.id("openblock:stone").expect("stone").0;
+    let torch = server.registry.id("openblock:torch").expect("torch").0;
+    let farmland_dry = server.registry.id("openblock:farmland_dry").expect("farmland").0;
+    let wheat_0 = server.registry.id("openblock:wheat_0").expect("wheat_0").0;
+
+    let soil = [sx, 198, sz];
+    alice.place_block(soil, dirt);
+    // A lit torch beside the crop keeps the planting light rule satisfied.
+    alice.place_block([sx + 1, 197, sz], stone);
+    alice.place_block([sx + 1, 198, sz], torch);
+
+    assert!(server.server().give_network_item(joined.id, "openblock:wood_hoe", 1));
+    let hoe_slot = alice.wait_hotbar_slot("openblock:wood_hoe");
+    alice.send(ClientMessage::SelectSlot { slot: hoe_slot });
+    alice.recv_until(
+        "hoe selected",
+        |message| matches!(message, ServerMessage::SelectedSlot { slot } if *slot == hoe_slot),
+    );
+    alice.send(ClientMessage::UseBlock { pos: soil });
+    assert_eq!(alice.wait_block_edit(soil), farmland_dry);
+
+    assert!(server.server().give_network_item(joined.id, "openblock:seeds", 4));
+    let seeds_slot = alice.wait_hotbar_slot("openblock:seeds");
+    alice.send(ClientMessage::SelectSlot { slot: seeds_slot });
+    alice.recv_until(
+        "seeds selected",
+        |message| matches!(message, ServerMessage::SelectedSlot { slot } if *slot == seeds_slot),
+    );
+    alice.send(ClientMessage::UseBlock { pos: soil });
+    assert_eq!(alice.wait_block_edit([sx, 199, sz]), wheat_0);
+
+    // Harvesting the immature crop removes the block and replicates the edit.
+    alice.send(ClientMessage::UseBlock { pos: [sx, 199, sz] });
+    assert_eq!(alice.wait_block_edit([sx, 199, sz]), 0);
 }
