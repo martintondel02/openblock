@@ -2267,12 +2267,76 @@ mod tests {
             "openblock:copper_ore",
             "openblock:furnace",
             "openblock:chest",
+            "openblock:torch",
+            "openblock:farmland_dry",
+            "openblock:farmland_wet",
+            "openblock:wheat_0",
+            "openblock:wheat_1",
+            "openblock:wheat_2",
+            "openblock:wheat_3",
+            "openblock:bed_foot",
+            "openblock:bed_head",
         ] {
             assert!(
                 items.iter().any(|id| registry.block(*id).id == name),
                 "{name} must appear in the creative inventory"
             );
         }
+    }
+
+    #[test]
+    fn creative_palette_appends_the_1_2_blocks_in_content_order() {
+        let registry = Registry::base();
+        let items = inventory_blocks(&registry);
+        let position = |name: &str| {
+            let id = registry.id(name).unwrap_or_else(|| panic!("missing {name}"));
+            items
+                .iter()
+                .position(|candidate| *candidate == id)
+                .unwrap_or_else(|| panic!("{name} must be in the creative palette"))
+        };
+        let order = [
+            "openblock:torch",
+            "openblock:farmland_dry",
+            "openblock:farmland_wet",
+            "openblock:wheat_0",
+            "openblock:wheat_1",
+            "openblock:wheat_2",
+            "openblock:wheat_3",
+            "openblock:bed_foot",
+            "openblock:bed_head",
+        ];
+        let positions: Vec<usize> = order.iter().map(|name| position(name)).collect();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "1.2 blocks must follow the append-only content order: {positions:?}"
+        );
+        // The 36-slot survival inventory and creative palette share the same
+        // block-item icon path, so every new block item resolves an icon.
+        for name in order {
+            let block = registry.id(name).expect("new block");
+            let item = registry.item_for_block(block).expect("block item");
+            assert!(item_icon_for(&registry, item).is_some(), "{name} icon");
+            assert!(!display_name(name).is_empty(), "{name} name");
+        }
+        // Non-block 1.2 items keep procedural icons and tool durability hints.
+        for name in [
+            "openblock:seeds",
+            "openblock:wheat",
+            "openblock:bread",
+            "openblock:wood_hoe",
+            "openblock:stone_hoe",
+            "openblock:iron_hoe",
+        ] {
+            let item = registry.item_id(name).expect("new item");
+            assert!(item_icon_for(&registry, item).is_some(), "{name} icon");
+            assert!(!item_info_hint(&registry, item, None).is_empty(), "{name} hint");
+        }
+        let iron_hoe = registry.item_id("openblock:iron_hoe").expect("iron hoe");
+        let hint = item_info_hint(&registry, iron_hoe, None);
+        assert!(hint.contains("Durability 250/250"), "got {hint}");
+        let bread = registry.item_id("openblock:bread").expect("bread");
+        assert_eq!(item_info_hint(&registry, bread, None), "Food +5 hunger");
     }
 
     #[test]

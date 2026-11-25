@@ -3948,6 +3948,110 @@ pub fn death_button_rects(screen: [f32; 2]) -> [UiRect; 2] {
     ]
 }
 
+/// Presentation model for the 1.2 sleep overlay.
+///
+/// Both runtimes build this from authoritative state: the single-player host's
+/// [`ob_server::Host::sleep_state`] or the multiplayer `SleepState` message. The
+/// overlay intentionally shows no hotbar/crosshair interactions while asleep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SleepOverlay {
+    /// Players currently in a bed.
+    pub sleepers: usize,
+    /// Eligible players in the session (1 in single-player).
+    pub total: usize,
+    /// Whether the sunrise fast-forward is running.
+    pub all_sleeping: bool,
+    /// Authoritative fast-forward ticks remaining (`0` when waiting).
+    pub skip_remaining_ticks: u32,
+    /// Wake instruction drawn below the countdown.
+    pub hint: String,
+}
+
+impl SleepOverlay {
+    /// `1/2 players sleeping` line.
+    pub fn count_text(&self) -> String {
+        let total = self.total.max(self.sleepers);
+        format!("{}/{} players sleeping", self.sleepers, total)
+    }
+
+    /// Countdown or waiting line.
+    pub fn status_text(&self) -> String {
+        if self.all_sleeping {
+            if self.skip_remaining_ticks == 0 {
+                "Waking up...".to_string()
+            } else {
+                format!("Waking in {} ticks", self.skip_remaining_ticks)
+            }
+        } else {
+            "Waiting for other players".to_string()
+        }
+    }
+
+    /// `0..=1` progress for the sunrise bar; zero while waiting.
+    pub fn progress(&self) -> f32 {
+        if !self.all_sleeping {
+            return 0.0;
+        }
+        (1.0 - (self.skip_remaining_ticks as f32 / 100.0)).clamp(0.0, 1.0)
+    }
+}
+
+/// Draws the sleep dimmer/panel over the world.
+///
+/// Layout is compact-safe: the panel is clamped inside 960x540 and the text
+/// scales down below 500 logical pixels high.
+pub fn draw_sleep_overlay(frame: &mut UiFrame, overlay: &SleepOverlay, screen: [f32; 2]) {
+    let [width, height] = screen;
+    frame.rect(0.0, 0.0, width, height, [0.01, 0.02, 0.05, 0.62]);
+    let compact = height < 500.0;
+    let panel_w = (width * 0.55).clamp(280.0, 540.0);
+    let panel_h = if compact { 150.0 } else { 188.0 };
+    let x = (width - panel_w) * 0.5;
+    let y = (height - panel_h) * 0.5;
+    frame.rect(x, y, panel_w, panel_h, [0.04, 0.05, 0.10, 0.97]);
+    frame.rect(x, y, panel_w, 2.0, [0.55, 0.68, 0.95, 0.9]);
+    frame.title_text_centered(
+        width * 0.5,
+        y + if compact { 14.0 } else { 20.0 },
+        if compact { 2.4 } else { 3.0 },
+        [0.86, 0.90, 1.0, 1.0],
+        "Sleeping",
+    );
+    frame.text_centered(
+        width * 0.5,
+        y + if compact { 64.0 } else { 80.0 },
+        if compact { 1.2 } else { 1.5 },
+        [0.88, 0.92, 0.99, 0.96],
+        &overlay.count_text(),
+    );
+    frame.text_centered(
+        width * 0.5,
+        y + if compact { 84.0 } else { 106.0 },
+        if compact { 1.3 } else { 1.6 },
+        [0.98, 0.84, 0.52, 0.98],
+        &overlay.status_text(),
+    );
+    let bar_x = x + panel_w * 0.18;
+    let bar_y = y + if compact { 108.0 } else { 136.0 };
+    let bar_w = panel_w * 0.64;
+    let bar_h = if compact { 5.0 } else { 7.0 };
+    frame.rect(bar_x, bar_y, bar_w, bar_h, [0.10, 0.12, 0.18, 1.0]);
+    frame.rect(
+        bar_x,
+        bar_y,
+        bar_w * overlay.progress().clamp(0.0, 1.0),
+        bar_h,
+        [0.58, 0.76, 0.98, 1.0],
+    );
+    frame.text_centered(
+        width * 0.5,
+        y + panel_h - if compact { 27.0 } else { 32.0 },
+        1.0,
+        [0.72, 0.78, 0.88, 0.90],
+        &overlay.hint,
+    );
+}
+
 /// Draws the modal death screen over the world and HUD.
 pub fn draw_death_screen(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2]) {
     draw_death_screen_custom(
@@ -5918,6 +6022,59 @@ mod tests {
                 );
                 assert_eq!(state.settings.render_distance_chunks, 5);
             }
+        }
+    }
+
+    #[test]
+    fn sleep_overlay_reports_sleeper_count_countdown_and_progress() {
+        let waiting = SleepOverlay {
+            sleepers: 1,
+            total: 2,
+            all_sleeping: false,
+            skip_remaining_ticks: 0,
+            hint: "Move or press Esc to wake".to_string(),
+        };
+        assert_eq!(waiting.count_text(), "1/2 players sleeping");
+        assert_eq!(waiting.status_text(), "Waiting for other players");
+        assert_eq!(waiting.progress(), 0.0);
+
+        let skipping = SleepOverlay {
+            sleepers: 2,
+            total: 2,
+            all_sleeping: true,
+            skip_remaining_ticks: 40,
+            hint: "Move or press Esc to wake".to_string(),
+        };
+        assert_eq!(skipping.count_text(), "2/2 players sleeping");
+        assert_eq!(skipping.status_text(), "Waking in 40 ticks");
+        assert!((skipping.progress() - 0.6).abs() < 1e-6);
+
+        let finishing = SleepOverlay {
+            skip_remaining_ticks: 0,
+            ..skipping
+        };
+        assert_eq!(finishing.status_text(), "Waking up...");
+        assert_eq!(finishing.progress(), 1.0);
+    }
+
+    #[test]
+    fn sleep_overlay_draws_on_720p_and_compact_540p_targets() {
+        for screen in [[1280.0_f32, 720.0], [960.0, 540.0]] {
+            let overlay = SleepOverlay {
+                sleepers: 1,
+                total: 3,
+                all_sleeping: false,
+                skip_remaining_ticks: 0,
+                hint: "Move or press Esc to wake".to_string(),
+            };
+            let mut frame = UiFrame::new(screen[0], screen[1]);
+            draw_sleep_overlay(&mut frame, &overlay, screen);
+            let (_, quads) = frame.measure();
+            assert!(quads >= 8, "sleep overlay must draw a dimmer and panel: {quads}");
+            // Panel geometry is centred and inside the logical screen.
+            let panel_w = (screen[0] * 0.55).clamp(280.0, 540.0);
+            let x = (screen[0] - panel_w) * 0.5;
+            assert!(x >= 0.0 && x + panel_w <= screen[0]);
         }
     }
 

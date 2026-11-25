@@ -1246,7 +1246,16 @@ pub fn friendly_action_rejection(action: &str, reason: &str) -> String {
         "inventory_full" => "Your inventory is full",
         "not_edible_or_full" => "Not edible or hunger is full",
         "not_equippable" => "That item cannot be equipped",
-        "not_dead" => "You are not dead",
+        "needs_hoe" => "Hold a hoe to till grass or dirt",
+        "needs_seeds" => "Hold seeds to plant on farmland",
+        "seeds_missing" | "missing_seeds" => "Seeds are not available in this content pack",
+        "too_dark" => "Too dark to plant here - crops need light 9",
+        "not_night" => "You can only sleep at night",
+        "obstructed" => "The bed is obstructed",
+        "bed_malformed" => "That bed is broken",
+        "not_interactable" => "That block cannot be used",
+        "sleeping" | "already_sleeping" => "You are already sleeping",
+        "not_bed" => "That is not a bed",
         "no_target" => "Nothing is in reach",
         "cooldown" => "Slow down",
         "rate_limited" => "Slow down",
@@ -1256,7 +1265,12 @@ pub fn friendly_action_rejection(action: &str, reason: &str) -> String {
         other => other,
     };
     let action = action.trim();
-    if action.is_empty() || matches!(text, "You are dead" | "Not connected") {
+    // Gameplay-use hints are shown verbatim: the action tag is useful for
+    // debugging edit/inventory rejections but reads as noise in a toast.
+    if action.is_empty()
+        || matches!(action, "use_block" | "sleep_request" | "sleep")
+        || matches!(text, "You are dead" | "Not connected")
+    {
         text.to_string()
     } else {
         format!("{text} ({action})")
@@ -1938,6 +1952,14 @@ mod tests {
             "not_equippable",
             "not_dead",
             "no_target",
+            "needs_hoe",
+            "needs_seeds",
+            "too_dark",
+            "not_night",
+            "obstructed",
+            "bed_malformed",
+            "not_interactable",
+            "sleeping",
             "unknown_reason",
         ];
         for reason in reasons {
@@ -1951,6 +1973,14 @@ mod tests {
         assert_eq!(
             friendly_action_rejection("inventory_move", "stale_revision"),
             "The container changed; try again (inventory_move)"
+        );
+        assert_eq!(
+            friendly_action_rejection("use_block", "needs_hoe"),
+            "Hold a hoe to till grass or dirt"
+        );
+        assert_eq!(
+            friendly_action_rejection("use_block", "not_night"),
+            "You can only sleep at night"
         );
     }
 }

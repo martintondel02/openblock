@@ -40,6 +40,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::containers::{self, ClickButton, ContainerKind, ContainerSession, SlotId};
+use crate::interaction;
 use crate::inventory;
 use crate::lod_state::LodState;
 use crate::mesh_scheduler::MeshScheduler;
@@ -235,6 +236,8 @@ impl ApplicationHandler for NetApp {
             container_selected: SlotId::FurnaceInput,
             footstep_distance: 0.0,
             was_in_water: false,
+            was_sleeping: false,
+            last_bed: None,
             log_network: true,
         };
         let fullscreen = state.ui.settings.fullscreen;
@@ -385,7 +388,7 @@ impl ApplicationHandler for NetApp {
                                 Screen::Playing => {}
                             },
                             Action::Crafting => {
-                                if matches!(state.ui.screen, Screen::Playing | Screen::Inventory) {
+                                if !state.sleeping() && matches!(state.ui.screen, Screen::Playing | Screen::Inventory) {
                                     state.ui.toasts.push_warning(CRAFTING_HINT);
                                 }
                             }
@@ -419,7 +422,7 @@ impl ApplicationHandler for NetApp {
                                 state.handle_escape();
                             }
                             Action::Fly => {
-                                if state.ui.screen == Screen::Playing && state.client_playing() {
+                                if !state.sleeping() && state.ui.screen == Screen::Playing && state.client_playing() {
                                     state
                                         .ui
                                         .toasts
@@ -794,6 +797,10 @@ struct NetGameState {
     container_selected: SlotId,
     footstep_distance: f64,
     was_in_water: bool,
+    /// Previous frame's sleep state, for start/wake toasts.
+    was_sleeping: bool,
+    /// Last bed the player was seen sleeping in (death-screen respawn hint).
+    last_bed: Option<[i32; 3]>,
     log_network: bool,
 }
 
@@ -813,6 +820,19 @@ impl NetGameState {
     /// Whether gameplay input may change the world or the player.
     fn can_act(&self) -> bool {
         self.client_playing() && !self.client_dead() && self.failure.is_none()
+    }
+
+    /// Whether the replicated player is currently in a bed.
+    fn sleeping(&self) -> bool {
+        self.client.as_ref().is_some_and(NetworkClient::sleeping)
+    }
+
+    /// Sends one authoritative wake intent and stops gameplay holds.
+    fn wake_from_sleep(&mut self) {
+        if let Some(client) = &mut self.client {
+            client.send_wake();
+        }
+        self.cancel_mining();
     }
 
     fn chat_active(&self) -> bool {
@@ -949,6 +969,11 @@ impl NetGameState {
     fn handle_escape(&mut self) {
         if self.client_dead() {
             self.ui.focus_death_buttons();
+            return;
+        }
+        if self.ui.screen == Screen::Playing && self.sleeping() {
+            self.wake_from_sleep();
+            self.ui.toasts.push("Waking up");
             return;
         }
         match self.ui.screen {
@@ -1180,6 +1205,12 @@ impl NetGameState {
                 NetEvent::Chat { .. } => {}
                 NetEvent::Disconnected { reason } => self.fail_connection(reason),
                 NetEvent::Damage { amount, cause } => {
+                    if self.sleeping() {
+                        // The server already wakes a damaged sleeper; the
+                        // explicit intent keeps the overlay and skip in sync
+                        // even if the state message is delayed.
+                        self.wake_from_sleep();
+                    }
                     self.damage_flash.trigger();
                     if !self.ui.settings.reduced_motion {
                         self.camera_shake = DAMAGE_SHAKE_RADIANS;
@@ -1239,6 +1270,37 @@ impl NetGameState {
         }
     }
 
+    /// Tracks authoritative sleep transitions for toasts and the death hint.
+    fn update_sleep_state(&mut self) {
+        if self.client.is_none() {
+            self.was_sleeping = false;
+            return;
+        }
+        let sleeping = self.sleeping();
+        if sleeping != self.was_sleeping {
+            if sleeping {
+                self.ui.toasts.push("Sleeping - press Esc or move to wake");
+                // The server freezes a sleeping player; drop any residual
+                // local velocity so no stray Move wakes them by accident.
+                if let Some(client) = &mut self.client {
+                    client.player_mut().velocity = WorldVec::ZERO;
+                }
+                self.cancel_mining();
+            } else {
+                self.ui.toasts.push_success("You woke up");
+            }
+            self.was_sleeping = sleeping;
+        }
+        if let Some(bed) = self
+            .client
+            .as_ref()
+            .and_then(|client| client.sleep_view())
+            .and_then(|sleep| sleep.bed)
+        {
+            self.last_bed = Some(bed);
+        }
+    }
+
     fn begin_death_screen(&mut self, cause: &str) {
         if self.ui.screen == Screen::Death {
             return;
@@ -1277,7 +1339,11 @@ impl NetGameState {
         self.attack_ready = None;
         self.footstep_distance = 0.0;
         self.was_in_water = self.in_water();
-        self.ui.toasts.push_success("Respawned at the world spawn");
+        if self.last_bed.is_some() {
+            self.ui.toasts.push_success("Respawned at your bed");
+        } else {
+            self.ui.toasts.push_success("Respawned at the world spawn");
+        }
         self.capture_pointer();
         self.update_title();
     }
@@ -1309,7 +1375,7 @@ impl NetGameState {
     }
 
     fn select_hotbar(&mut self, slot: usize) {
-        if !self.can_act() {
+        if !self.can_act() || self.sleeping() {
             return;
         }
         if let Some(client) = &mut self.client
@@ -1330,7 +1396,7 @@ impl NetGameState {
     }
 
     fn open_inventory(&mut self) {
-        if !self.can_act() {
+        if !self.can_act() || self.sleeping() {
             return;
         }
         self.cancel_mining();
@@ -1642,7 +1708,7 @@ impl NetGameState {
     }
 
     fn start_mining(&mut self) {
-        if !self.captured || self.ui.screen != Screen::Playing || !self.can_act() {
+        if !self.captured || self.ui.screen != Screen::Playing || !self.can_act() || self.sleeping() {
             return;
         }
         self.mouse_left = true;
@@ -1653,7 +1719,7 @@ impl NetGameState {
     }
 
     fn try_attack_mob(&mut self, id: u64) {
-        if self.attack_ready.is_some_and(|ready| ready.elapsed() < ATTACK_COOLDOWN) {
+        if self.sleeping() || self.attack_ready.is_some_and(|ready| ready.elapsed() < ATTACK_COOLDOWN) {
             return;
         }
         let Some(client) = &mut self.client else {
@@ -1671,7 +1737,8 @@ impl NetGameState {
     /// authoritative `block_edit`. The block change is predicted visually; the
     /// inventory count, drops and tool wear arrive only through server sync.
     fn update_mining(&mut self, dt: Duration) {
-        if self.ui.screen != Screen::Playing || !self.captured || !self.mouse_left || !self.can_act() {
+        if self.ui.screen != Screen::Playing || !self.captured || !self.mouse_left || !self.can_act() || self.sleeping()
+        {
             self.mining.stop();
             return;
         }
@@ -1740,7 +1807,7 @@ impl NetGameState {
 
     /// Right-click: container interaction first, then eat, then placement.
     fn use_or_place(&mut self) {
-        if !self.captured || self.ui.screen != Screen::Playing || !self.can_act() {
+        if !self.captured || self.ui.screen != Screen::Playing || !self.can_act() || self.sleeping() {
             return;
         }
         let (hit, selected, hunger) = {
@@ -1751,25 +1818,39 @@ impl NetGameState {
             let hit = client
                 .world()
                 .raycast(player.eye(), player.forward(), REACH)
-                .map(|hit| {
-                    let block = client.world().get_block(hit.block);
-                    (hit.block, self.registry.block(block).id)
-                });
+                .map(|hit| (hit.block, client.world().get_block(hit.block)));
             (hit, client.selected_stack(), client.hunger())
         };
-        if let Some((pos, block_name)) = hit {
-            match block_name {
-                "openblock:crafting_table" => {
+        if let Some((pos, target)) = hit {
+            match interaction::route_use(&self.registry, target, selected, false) {
+                interaction::UseRoute::CraftingTable => {
                     self.ui.toasts.push_warning(CRAFTING_HINT);
                     return;
                 }
-                "openblock:furnace" | "openblock:chest" => {
+                interaction::UseRoute::Container => {
                     if let Some(client) = &mut self.client {
                         let _ = client.use_block(pos);
                     }
                     return;
                 }
-                _ => {}
+                interaction::UseRoute::UseBlock => {
+                    let bed = matches!(
+                        self.registry.block(target).id,
+                        "openblock:bed_foot" | "openblock:bed_head"
+                    );
+                    let sent = self.client.as_mut().is_some_and(|client| {
+                        if bed {
+                            client.send_sleep_request(pos)
+                        } else {
+                            client.use_block(pos)
+                        }
+                    });
+                    if !sent {
+                        self.ui.toasts.push_warning("Could not send that action");
+                    }
+                    return;
+                }
+                interaction::UseRoute::Place => {}
             }
         }
         if inventory::should_eat(&self.registry, selected, hunger) {
@@ -1837,6 +1918,7 @@ impl NetGameState {
             }
         }
         self.handle_net_events(events);
+        self.update_sleep_state();
         if let Some(reason) = disconnected
             && self.failure.is_none()
         {
@@ -1921,11 +2003,10 @@ impl NetGameState {
             .targeted_block()
             .map(|block| BlockOutline::for_block([block.x, block.y, block.z]));
         if self.client.as_ref().is_some_and(|client| client.state().is_playing()) {
-            let server_tick = self.client.as_ref().map_or(0, NetworkClient::server_tick);
-            let environment = Environment::from_ticks(
-                server_tick + ob_render::DAY_LENGTH_TICKS / 4,
-                ob_render::DAY_LENGTH_TICKS,
-            );
+            let (server_tick, day_ticks) = self.client.as_ref().map_or((0, ob_render::DAY_LENGTH_TICKS), |client| {
+                (client.server_tick(), client.day_ticks())
+            });
+            let environment = Environment::from_ticks(server_tick + day_ticks / 4, day_ticks);
             self.log_network_once();
             let now = Instant::now();
             let mut entities = self
@@ -2020,6 +2101,11 @@ impl NetGameState {
         input.jump = self.keys[4];
         input.sneak = self.keys[5];
         input.sprint = self.keys[6];
+        // Movement wakes a sleeping player. The server wakes on the Move that
+        // follows; sending `wake` first makes the overlay disappear promptly.
+        if self.sleeping() && (input.forward != 0.0 || input.strafe != 0.0 || input.jump) {
+            self.wake_from_sleep();
+        }
         let Some(client) = &mut self.client else {
             return;
         };
@@ -2252,11 +2338,7 @@ impl NetGameState {
             .client
             .as_ref()
             .map(|client| {
-                Environment::from_ticks(
-                    client.server_tick() + ob_render::DAY_LENGTH_TICKS / 4,
-                    ob_render::DAY_LENGTH_TICKS,
-                )
-                .time_of_day
+                Environment::from_ticks(client.day_phase() + client.day_ticks() / 4, client.day_ticks()).time_of_day
             })
             .unwrap_or(0.5);
         let (health, hunger, defense, mobs, passive, hostile, items) = match &self.client {
@@ -2333,7 +2415,7 @@ impl NetGameState {
             mobs_total: mobs,
             mobs_passive: passive,
             mobs_hostile: hostile,
-            day_phase: self.client.as_ref().map_or(0, |client| client.server_tick() % 24_000),
+            day_phase: self.client.as_ref().map_or(0, NetworkClient::day_phase),
             day: time_of_day > 0.25 && time_of_day < 0.75,
             defense,
             graphics_summary: self.renderer.graphics().summary(),
@@ -2369,7 +2451,8 @@ impl NetGameState {
     fn build_ui_frame(&self) -> Option<UiFrame> {
         let screen = self.window_screen();
         let mut frame = UiFrame::new(screen[0], screen[1]);
-        let playing = self.ui.screen == Screen::Playing;
+        let sleeping = self.ui.screen == Screen::Playing && self.sleeping();
+        let playing = self.ui.screen == Screen::Playing && !sleeping;
         let inventory_open = self.ui.screen == Screen::Inventory;
         let container_open = matches!(self.ui.screen, Screen::Furnace | Screen::Chest);
         let death_open = self.ui.screen == Screen::Death;
@@ -2464,7 +2547,7 @@ impl NetGameState {
                 screen[1] - 26.0,
                 1.5,
                 [0.85, 0.89, 0.94, 0.85],
-                "Multiplayer survival - LMB mine/attack, RMB use/place, E inventory",
+                "Multiplayer survival - LMB mine/attack, RMB use/eat/place, E inventory",
             );
         }
         if inventory_open && let Some(client) = &self.client {
@@ -2542,6 +2625,8 @@ impl NetGameState {
                 .is_some_and(|client| client.survival().respawn_requested);
             let note = if awaiting {
                 "Waiting for the server to respawn you..."
+            } else if self.last_bed.is_some() {
+                "The server keeps your inventory - respawn at your bed"
             } else {
                 DEATH_NOTE
             };
@@ -2594,6 +2679,19 @@ impl NetGameState {
                 hovered: self.connect_hovered,
             };
             net_ui::draw_connect_panel(&mut frame, &panel, screen);
+        }
+        if sleeping
+            && let Some(client) = &self.client
+            && let Some(sleep) = client.sleep_view()
+        {
+            let overlay = crate::ui_state::SleepOverlay {
+                sleepers: sleep.sleeper_count(),
+                total: client.player_count(),
+                all_sleeping: sleep.all_sleeping,
+                skip_remaining_ticks: sleep.skip_remaining_ticks,
+                hint: "Move or press Esc to wake".to_string(),
+            };
+            crate::ui_state::draw_sleep_overlay(&mut frame, &overlay, screen);
         }
         if self.ui.debug_overlay && self.ui.screen != Screen::Settings {
             crate::draw_debug_overlay(&mut frame, &self.debug_stats, screen);
