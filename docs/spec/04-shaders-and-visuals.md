@@ -579,7 +579,7 @@ This section is the authoritative description of what the 1.1 shader wave ships.
 long-term design in §3.1–3.12 remains the target; the deviations below are deliberate
 budget decisions for a 512-block radius on integrated Vulkan hardware, and every one is
 covered by a test or a measured number in
-[08-measurements](../../plan/08-measurements.md#2026-11-25--v11-high-quality-built-in-shaders-hdr-sun-shadows-water-clouds-post).
+[08-measurements](../plan/08-measurements.md#2026-11-25--v11-high-quality-built-in-shaders-hdr-sun-shadows-water-clouds-post).
 
 #### 3.13.1 Passes, targets and ownership
 
@@ -741,7 +741,7 @@ screenshot test writes `/tmp/openblock-shaders-water.png`; the benchmark provide
 dusk, night and sky captures.
 
 Remaining limitations are listed with their measured cost in
-[08-measurements](../../plan/08-measurements.md): far-cascade PCF reduction, AABB shadow
+[08-measurements](../plan/08-measurements.md): far-cascade PCF reduction, AABB shadow
 proxies beyond 64 m, no water reflection/refraction/foam/underwater volume, fixed exposure,
 FXAA-lite instead of TAA, and offscreen readback inflating the benchmark tail. The High
 1080p/90 FPS aspirational target is not met; Ultra 1080p/60 FPS is met at p50 but not p95.

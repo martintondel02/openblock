@@ -43,6 +43,15 @@
     <content_attribute id="social-chat">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="1.1.0" date="2026-11-25" type="stable">
+      <description>
+        <p>The Reach release: 512-block render distance with distance LOD and
+        adaptive streaming, an HDR shader pipeline with sun-shadow cascades,
+        translucent water, procedural clouds, bloom/ACES/FXAA and graphics
+        presets, deterministic worldgen structures, async saves and append-only
+        save compatibility.</p>
+      </description>
+    </release>
     <release version="1.0.2" date="2026-11-25" type="stable">
       <description>
         <p>Minecraft-style UI font: body/HUD/menu/chat text now uses a bundled

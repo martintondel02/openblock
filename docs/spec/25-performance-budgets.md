@@ -569,7 +569,7 @@ draw count), clouds high plus water high adding ~0.2–0.8 ms, bloom ~0.1–0.2 
 ~0.2–0.6 ms. The full per-feature table, screenshots and the deviation list (far-cascade
 single-tap PCF, AABB shadow proxies beyond 64 m, no SSR/refraction/foam/underwater volume,
 fixed exposure, FXAA-lite instead of TAA) live in
-[08-measurements §v1.1 shaders](../../plan/08-measurements.md#2026-11-25--v11-high-quality-built-in-shaders-hdr-sun-shadows-water-clouds-post).
+[08-measurements §v1.1 shaders](../plan/08-measurements.md#2026-11-25--v11-high-quality-built-in-shaders-hdr-sun-shadows-water-clouds-post).
 The gate tables in §3.4 and §5.1 remain the long-term target; a future gate run must use
 GPU timestamp queries and the p95 methodology of §3.7 before it can replace this report.
 

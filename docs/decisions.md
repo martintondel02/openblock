@@ -297,13 +297,18 @@ and phones — we deliberately do not.
 ### DEC-018 — LOD is visual-only and ships after 1.0
 **Status:** settled · **Reversal cost:** low · **Owner:** MS-12
 
-At a 512-block **client** render distance, no LOD is required for parity; the MVP
-and 1.0 ship full-detail sections out to the render distance. Dedicated servers
-default to a 256-block render distance (equal to simulation distance); 512 blocks
-is an opt-in server setting with a published cost ([DEC-052](#dec-052--dedicated-servers-default-to-a-256-block-render-distance)).
-Beyond-view terrain (impostor/heightfield LOD, optional GPU generation) is
-**visual only**: it never feeds collision, spawning, drops, ore knowledge or
-anti-cheat, so a generation mismatch can never become a gameplay bug or exploit.
+1.0 shipped full-detail sections to the render distance, but measured draw/vertex
+cost at 512 blocks made that untenable. Since **1.1**, the client renders full
+sections within 10 chunks and **surface-shell, visual-only LOD batches** beyond
+(merged 2×2-chunk top-of-column geometry). The LOD remains **visual only**: it
+never feeds collision, spawning, drops, ore knowledge or anti-cheat, so a
+generation mismatch can never become a gameplay bug or exploit; far caves/deep
+geometry are intentionally absent from the LOD. Dedicated servers default to a
+256-block render distance (equal to simulation distance); 512 blocks is an
+opt-in server setting with a published cost
+([DEC-052](#dec-052--dedicated-servers-default-to-a-256-block-render-distance)).
+Beyond-view terrain (impostor/heightfield LOD at 128+ chunks, optional GPU
+generation) remains the MS-12/MS-20 target.
 
 *Why:* LOD becomes mandatory at 128+ chunks, not 32; and client-side generated
 terrain leaks ungenerated ore to clients, as Weft's design demonstrates.

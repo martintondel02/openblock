@@ -973,7 +973,7 @@ Rust quick benchmarks still run as before.
 - Headless smoke (seed 42, save format 4): `1dba6105028ba6e5` across fresh runs
   (the previous `33875a6597c2ce7b` predates the spawn sidecar/hash change).
   1.0.1 completes the state hash over persisted yaw/pitch/flying and canonical
-  angles, so the current seed-42 hash is `7a4532e2ee387d5f` (still deterministic
+  angles, so the current seed-42 hash is `eba0c42219691190` (still deterministic
   across fresh runs and save/reload).
 - Multiplayer load gate (8 clients / 60 s): tick p50/p95/p99
   0.061/0.124/0.163 ms, 20.0 TPS, 0 overruns >35 ms, RSS 22.3 MiB; 10-minute
