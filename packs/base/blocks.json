@@ -145,7 +145,13 @@
         "side": "leaves",
         "bottom": "leaves"
       },
-      "hardness": 0.2
+      "hardness": 0.2,
+      "attenuation": [
+        1,
+        1,
+        1
+      ],
+      "sky_attenuation": 1
     },
     {
       "id": "openblock:bedrock",
@@ -374,6 +380,198 @@
       "hardness": 2.5,
       "preferred_tool": "axe",
       "required_tier": 0
+    },
+    {
+      "id": "openblock:torch",
+      "solid": false,
+      "opaque": false,
+      "fluid": false,
+      "color": [
+        1.0,
+        0.78,
+        0.32
+      ],
+      "textures": {
+        "top": "torch",
+        "side": "torch",
+        "bottom": "torch"
+      },
+      "hardness": 0.0,
+      "required_tier": 0,
+      "emission": [
+        14,
+        14,
+        14
+      ],
+      "attenuation": [
+        0,
+        0,
+        0
+      ],
+      "sky_attenuation": 0,
+      "shape": "cross"
+    },
+    {
+      "id": "openblock:farmland_dry",
+      "solid": true,
+      "opaque": true,
+      "fluid": false,
+      "color": [
+        0.36,
+        0.24,
+        0.14
+      ],
+      "textures": {
+        "top": "farmland_dry",
+        "side": "farmland_dry",
+        "bottom": "farmland_dry"
+      },
+      "hardness": 0.6,
+      "preferred_tool": "shovel",
+      "required_tier": 0
+    },
+    {
+      "id": "openblock:farmland_wet",
+      "solid": true,
+      "opaque": true,
+      "fluid": false,
+      "color": [
+        0.23,
+        0.16,
+        0.1
+      ],
+      "textures": {
+        "top": "farmland_wet",
+        "side": "farmland_wet",
+        "bottom": "farmland_wet"
+      },
+      "hardness": 0.6,
+      "preferred_tool": "shovel",
+      "required_tier": 0
+    },
+    {
+      "id": "openblock:wheat_0",
+      "solid": false,
+      "opaque": false,
+      "fluid": false,
+      "color": [
+        0.42,
+        0.62,
+        0.22
+      ],
+      "textures": {
+        "top": "wheat_0",
+        "side": "wheat_0",
+        "bottom": "wheat_0"
+      },
+      "hardness": 0.0,
+      "required_tier": 0,
+      "shape": "cross"
+    },
+    {
+      "id": "openblock:wheat_1",
+      "solid": false,
+      "opaque": false,
+      "fluid": false,
+      "color": [
+        0.52,
+        0.66,
+        0.24
+      ],
+      "textures": {
+        "top": "wheat_1",
+        "side": "wheat_1",
+        "bottom": "wheat_1"
+      },
+      "hardness": 0.0,
+      "required_tier": 0,
+      "shape": "cross"
+    },
+    {
+      "id": "openblock:wheat_2",
+      "solid": false,
+      "opaque": false,
+      "fluid": false,
+      "color": [
+        0.64,
+        0.68,
+        0.26
+      ],
+      "textures": {
+        "top": "wheat_2",
+        "side": "wheat_2",
+        "bottom": "wheat_2"
+      },
+      "hardness": 0.0,
+      "required_tier": 0,
+      "shape": "cross"
+    },
+    {
+      "id": "openblock:wheat_3",
+      "solid": false,
+      "opaque": false,
+      "fluid": false,
+      "color": [
+        0.76,
+        0.66,
+        0.28
+      ],
+      "textures": {
+        "top": "wheat_3",
+        "side": "wheat_3",
+        "bottom": "wheat_3"
+      },
+      "hardness": 0.0,
+      "required_tier": 0,
+      "shape": "cross"
+    },
+    {
+      "id": "openblock:bed_foot",
+      "solid": true,
+      "opaque": false,
+      "fluid": false,
+      "color": [
+        0.55,
+        0.12,
+        0.12
+      ],
+      "textures": {
+        "top": "bed_foot_top",
+        "side": "bed_foot_side",
+        "bottom": "planks"
+      },
+      "hardness": 0.2,
+      "required_tier": 0,
+      "attenuation": [
+        1,
+        1,
+        1
+      ],
+      "sky_attenuation": 1
+    },
+    {
+      "id": "openblock:bed_head",
+      "solid": true,
+      "opaque": false,
+      "fluid": false,
+      "color": [
+        0.66,
+        0.22,
+        0.21
+      ],
+      "textures": {
+        "top": "bed_head_top",
+        "side": "bed_head_side",
+        "bottom": "planks"
+      },
+      "hardness": 0.2,
+      "required_tier": 0,
+      "attenuation": [
+        1,
+        1,
+        1
+      ],
+      "sky_attenuation": 1
     }
   ]
 }

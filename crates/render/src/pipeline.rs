@@ -847,7 +847,7 @@ fn chunk_vertex_buffers() -> [Option<wgpu::VertexBufferLayout<'static>>; 1] {
             shader_location: 2,
         },
         wgpu::VertexAttribute {
-            format: wgpu::VertexFormat::Float32,
+            format: wgpu::VertexFormat::Uint32,
             offset: 24,
             shader_location: 3,
         },

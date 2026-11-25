@@ -329,22 +329,152 @@ impl Section {
         self.light = Light::uniform_sky(15);
     }
 
-    /// Re-derives the section light from the registry's opacity rules and the
-    /// vertical sky occlusion handled by [`crate::chunk::ChunkColumn`].
+    /// Clears the block-light channels while preserving sky light.
+    ///
+    /// Used when seed light is recomputed after generation or a migration; the
+    /// sky channel is left untouched because the caller owns the column loop.
+    pub fn clear_block_light(&mut self) {
+        if let Some(uniform) = self.light.uniform_value() {
+            let sky = uniform >> 12;
+            self.light = Light::Uniform(sky << 12);
+            return;
+        }
+        let mut dense = [0u16; BLOCK_COUNT];
+        for (index, word) in dense.iter_mut().enumerate() {
+            *word = self.light.get(LocalPos::from_index(index)) & 0xF000;
+        }
+        self.light = Light::Dense(Box::new(dense));
+    }
+
+    /// Clears the sky and/or RGB block-light nibbles inside a local box.
+    ///
+    /// `min` and `max` are inclusive section-local coordinates. Keeping this
+    /// on `Section` avoids one `World`/section lookup and hash invalidation per
+    /// cell when an edit relights a 31³ box.
+    pub(crate) fn clear_light_box(&mut self, min: [u8; 3], max: [u8; 3], sky: bool, block: bool) {
+        if !sky && !block {
+            return;
+        }
+        if let Some(word) = self.light.uniform_value() {
+            let mut cleared = word;
+            if sky {
+                cleared &= 0x0FFF;
+            }
+            if block {
+                cleared &= 0xF000;
+            }
+            if cleared == word {
+                return;
+            }
+            let whole_section = min == [0, 0, 0] && max == [SECTION_SIZE as u8 - 1; 3];
+            if whole_section {
+                self.light = Light::Uniform(cleared);
+                return;
+            }
+            // Clearing only part of a uniform section must not darken the
+            // cells outside the box: promote and apply the cleared word only
+            // inside [min, max].
+            let mut data = Box::new([word; BLOCK_COUNT]);
+            for y in min[1]..=max[1] {
+                for z in min[2]..=max[2] {
+                    for x in min[0]..=max[0] {
+                        data[LocalPos { x, y, z }.index()] = cleared;
+                    }
+                }
+            }
+            self.light = Light::Dense(data);
+            return;
+        }
+        let data = match &mut self.light {
+            Light::Dense(data) => data,
+            Light::Uniform(_) => return,
+        };
+        for y in min[1]..=max[1] {
+            for z in min[2]..=max[2] {
+                for x in min[0]..=max[0] {
+                    let index = LocalPos { x, y, z }.index();
+                    let word = &mut data[index];
+                    if sky {
+                        *word &= 0x0FFF;
+                    }
+                    if block {
+                        *word &= 0xF000;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Clears the sky nibble of every cell while preserving RGB block light.
+    ///
+    /// Used by the sky relight volume for a section proven fully opaque: no
+    /// cell there can hold sky light, and the whole-section clear avoids 4,096
+    /// per-cell writes when a column passes through solid rock.
+    pub(crate) fn clear_sky(&mut self) {
+        match &mut self.light {
+            Light::Uniform(word) => *word &= 0x0FFF,
+            Light::Dense(data) => {
+                for word in data.iter_mut() {
+                    *word &= 0x0FFF;
+                }
+            }
+        }
+    }
+
+    /// Replaces the light container with a uniform sky value, dropping block
+    /// light. Used by the column seeder before block-light sources are re-added.
+    pub(crate) fn reset_light_uniform_sky(&mut self, sky: u8) {
+        self.light = Light::uniform_sky(sky);
+    }
+
+    /// Whether every block in this section stops sky light completely.
+    ///
+    /// Such a section can never store a non-zero sky level, so the column
+    /// seeder may reset the whole container to uniform zero without touching
+    /// 4,096 cells. Sections with air, water, leaves or crops are not opaque
+    /// and are cleared column by column instead; this is what keeps a shaft
+    /// column's light alive when a later solid column is processed.
+    pub(crate) fn sky_is_opaque(&self, registry: &Registry) -> bool {
+        match &self.storage {
+            SectionStorage::Uniform(id) => registry.block(*id).sky_attenuation >= 15,
+            SectionStorage::Bits4 { palette, .. }
+            | SectionStorage::Bits8 { palette, .. }
+            | SectionStorage::Bits16 { palette, .. } => {
+                palette.iter().all(|id| registry.block(*id).sky_attenuation >= 15)
+            }
+        }
+    }
+
+    /// Whether this section's palette contains any emissive block type.
+    ///
+    /// Bulk generation has no light sources, so scanning 4,096 cells per solid
+    /// section just to prove that is wasteful. A uniform section checks one id
+    /// and a paletted section checks its (usually tiny) palette.
+    pub fn may_have_emitters(&self, registry: &Registry) -> bool {
+        match &self.storage {
+            SectionStorage::Uniform(id) => registry.block(*id).emission != [0, 0, 0],
+            SectionStorage::Bits4 { palette, .. }
+            | SectionStorage::Bits8 { palette, .. }
+            | SectionStorage::Bits16 { palette, .. } => {
+                palette.iter().any(|id| registry.block(*id).emission != [0, 0, 0])
+            }
+        }
+    }
+
+    /// Re-derives section-local sky light from `BlockType::sky_attenuation`.
+    ///
+    /// This is a per-cell approximation kept for callers that only have one
+    /// section (hand-built fixtures and the worldgen benchmark's debug path).
+    /// Column-aware generation and the live world use
+    /// [`crate::ChunkColumn::finalise`], which performs the running top-down
+    /// subtraction across all 24 sections; that is what makes caves dark.
     ///
     /// The result is built through [`Light::from_fn`], which collapses to a
-    /// compact uniform container when every block receives the same sky light
-    /// (fully solid or fully open sections).
+    /// compact uniform container when every block receives the same sky light.
     pub fn seed_sky_light(&mut self, registry: &Registry) {
         let light = Light::from_fn(|pos| {
             let block = registry.block(self.get(pos));
-            let sky: u8 = if block.opaque {
-                0
-            } else if block.fluid {
-                12
-            } else {
-                15
-            };
+            let sky = 15u8.saturating_sub(block.sky_attenuation);
             // Only the sky nibble is reseeded; existing block light is kept.
             let (red, green, blue) = self.light().block_rgb(pos);
             (u16::from(sky) << 12) | (u16::from(red) << 8) | (u16::from(green) << 4) | u16::from(blue)
@@ -440,7 +570,7 @@ mod tests {
 
         let mut fluid = Section::uniform(water);
         fluid.seed_sky_light(&registry);
-        assert_eq!(fluid.light().uniform_value(), Some(12 << 12));
+        assert_eq!(fluid.light().uniform_value(), Some(14 << 12));
         assert_eq!(fluid.light().heap_bytes(), 0);
 
         // One opaque block among open air is not uniform and must stay dense.

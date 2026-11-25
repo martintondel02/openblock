@@ -358,6 +358,137 @@ Resolution order is biome over dimension over pack default. Unknown IDs are a pa
 
 A steady-state tick writes 3 bytes for time; a quiet tick with no weather change writes nothing beyond the delta. The client advances `day_time` locally every tick and reconciles: a difference above 20 ticks snaps, otherwise it slews by one tick per tick so the sky never visibly jumps. Weather intensity is interpolated toward the replicated target at `1/200` per tick. `day_length` is sent once at join and on change, so a client can compute moon phase without a field of its own.
 
+### 3.18 1.2 implementation status (Light & Home)
+
+The 1.2 vertical slice implements the CPU field described in §3.1–§3.7 for the
+shipping 2 B/block container. The save format stays **v4**; the wire format is
+owned by the 1.2 protocol slice and is not changed by this engine.
+
+**Content properties.** `BlockType` now carries `emission: [u8;3]`,
+`attenuation: [u8;3]`, `sky_attenuation: u8` and `shape`. The base pack uses
+air `0/0/0`, opaque blocks `15/15/15`, water and leaves `1/1/1` (block and sky),
+wheat `0/0/0`, beds block `1/1/1` and sky `1`, and the torch `14/14/14`
+emission, `0` attenuation and `0` sky attenuation. The JSON pack schema accepts
+the same fields plus `shape: "cube" | "cross"`; values outside 0–15 fail with
+`PackError::InvalidLight`. Omitted light fields derive from the material class
+(opaque → 15, fluid → 1, otherwise 0) so every 1.1 pack loads unchanged.
+
+**Seeding and propagation.** `ChunkColumn::finalise` seeds each XZ column
+top-down with a running level, so an opaque cell zeroes the column below; it
+then runs a local 16-bucket sky BFS for overhangs and shafts and seeds block
+emitters through the same per-channel `max(1, attenuation)` BFS. Uniform
+sections stay `Light::Uniform`: fully opaque rock is cleared as a whole section,
+air sections already holding the running level are skipped, and only a column
+that actually needs a different value is written. A transparent section is
+never collapsed from a single column, because that erased a shaft written by an
+earlier column in the same section. After insertion, `World::insert_chunk`
+compares the four chunk borders section by section: a pair of equal uniform
+sections costs one word comparison, and only genuinely different border cells
+are seeded into a bounded BFS. There is therefore no seam for sky or block light
+in resident chunks.
+
+**Edits.** `World::set_block` relights a 31³ box around the changed block. It
+distinguishes sky from block-light property changes:
+
+* sky changes rebuild the 31³ box and, when its bottom plane changed, the
+  31×31 column volume below it. A sealed shaft therefore darkens a cave farther
+  below the box as well as the column directly under it, and a removed roof
+  restores it;
+* block-light changes clear and re-seed only the RGB channels, with sources
+  found by palette, not by scanning every air cell;
+* a sky-opacity change under an opaque roof with no stored sky in the edited
+  cell or its six neighbours skips the column pass entirely;
+* a dark box with no emitters and no lit border skips the block pass entirely.
+
+The box is bounded and deterministic. Measured on the development reference
+(`ob_world` release-optimised dev profile): torch place/remove p50 0.14 ms,
+p99 0.15 ms; dark-room stone edit p50 0.09 ms; open-sky roof edit p50 0.83 ms,
+p99 0.92 ms. All ordinary edits are inside the 1 ms target. A sky-opacity edit
+whose 31³ box bottom changes additionally rebuilds the column volume below it;
+the deliberately deep 8×8 cave fixture measures p50 1.83 ms, p99 1.90 ms. That
+is the known worst case and is accepted for rare shaft/roof edits pending a
+removal-BFS or lazy-tail optimisation. A per-tick batching queue is not needed
+for 1.2; the server may call `World::set_block` directly. If a future edit mixes
+several channels and exceeds the budget, the same `relight_edit` entry point can
+be wrapped in the §3.7 component queue without changing stored formats.
+
+`World::set_block` also marks every section whose light changed dirty, so a
+mesh worker using `World::take_dirty_sections` remeshes the neighbour section
+that reads light through the snapshot border. `relight_around(pos)` and
+`relight_all()` expose the same paths to tools and the migration loader.
+
+**Gameplay query.** The server-facing signature is:
+
+```rust
+impl World {
+    pub fn light_sample(&self, pos: BlockPos) -> LightSample; // sky, r, g, b
+    pub fn sky_light(&self, pos: BlockPos) -> u8;             // 0..=15
+    pub fn block_light(&self, pos: BlockPos) -> u8;           // max(r,g,b)
+    pub fn gameplay_light(&self, pos: BlockPos, day_factor: f32, weather_factor: f32) -> u8;
+}
+```
+
+`gameplay_light` evaluates `max(floor(sky × day_factor × weather_factor),
+max(R,G,B))` without mutating stored light, exactly as §3.1 requires. The host
+already owns the clock and weather phase; spawning, crop growth and future fire
+checks should pass the current values (`weather_factor` 1.0 clear, 0.8 rain,
+0.6 thunder). The base thresholds live in the 1.2 server slice
+(hostile spawn ≤ 7, crop growth ≥ 9), not in the world crate.
+
+**Persistence, version and migration.** `world.obs` remains v4 and carries the
+packed words unchanged. A new additive sidecar, `world_meta.txt`, contains:
+
+```text
+# OpenBlock world metadata (additive; safe to delete to force a light relight)
+light_version=2
+```
+
+Unknown lines are preserved. `ob_world::load_world_dir` / `save_world_dir` are
+the directory-level entry points: a missing marker or `light_version < 2`
+relights every resident column once, rewrites `world.obs` (still v4) with the
+corrected words and writes `light_version=2`; a second load trusts the marker
+and does not relight. A raw `from_bytes` caller cannot see the sidecar, so it
+reports `World::light_version() == 1` and must call `World::relight_all()` or use
+the directory loader. A world saved through `save_world_dir` writes
+`light_version=2` immediately. `World::light_hash()` is a cached deterministic
+checksum over the canonical per-cell words (representation-independent,
+invalidated by any light write) so save/load and migration tests can assert
+light equality without hashing every section on every call.
+
+**Host integration is not in this slice.** `Host::open` still loads with
+`read_save_file` + `from_bytes` (`crates/server/src/lib.rs:390-391`) and the save
+path still calls `to_bytes_checked`/`commit` directly, so an existing 1.0/1.1
+world opened by the shipping game keeps its fake light and no `world_meta.txt`
+is written. This is a release gate, not an optional follow-up:
+
+1. Replace the `Host::open` load with
+   `ob_world::load_world_dir_with_report(registry, &world_dir)`, log the
+   `LightMigration` result, and keep raw `from_bytes` only for network chunk
+   payloads.
+2. After the world save commits, call `ob_world::write_world_meta` with
+   `WorldMeta { light_version: LIGHT_VERSION, .. }` (or use `save_world_dir` for
+   the synchronous path). The async path must write the marker only after the
+   `world.obs` rename.
+3. Add `self.world.light_hash()` to `Host::state_hash` when the release fixtures
+   are regenerated; the current seed-42 smoke hash `eba0c42219691190` is
+   unchanged because light is not hashed there yet.
+
+The same server slice must call `World::gameplay_light` for hostile spawn
+(`≤ 7`) and crop growth (`≥ 9`), and the client slice must consume the dirty
+sections produced by light changes. No protocol message is added by this engine.
+
+**Known limits in this slice.** Client speculative light (§3.9), worker
+components/batching (§3.7), and asynchronous light jobs are not implemented;
+all propagation is synchronous. Unloading a chunk does not run a removal BFS in
+its surviving neighbours, so light from a torch in an unloaded column can remain
+visible in a still-resident neighbour until that column reloads and reconciles;
+ordinary resident streaming, edits and save/load are seam-free. The deep
+sky-tail edit above is the only measured path above the 1 ms budget. The
+renderer collapses RGB to the brightest channel in its 8-bit block-light vertex
+byte (coloured emitters are 1.3+); the gameplay query keeps all three channels.
+A dimension with no sky is not exposed by 1.2 content yet, so the
+`has_sky == false` rule remains specified but unexercised.
+
 ## 4. Data structures and formats
 
 ```rust

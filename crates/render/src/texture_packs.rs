@@ -1444,6 +1444,10 @@ mod classic {
             "chest_top" => chest_top(size, seed),
             "chest_side" => chest_side(size, seed),
             "chest_front" => chest_front(size, seed),
+            "torch" | "farmland_dry" | "farmland_wet" | "wheat_0" | "wheat_1" | "wheat_2" | "wheat_3"
+            | "bed_foot_top" | "bed_foot_side" | "bed_head_top" | "bed_head_side" => {
+                super::extras::layer(TexturePackStyle::Classic, name, size, seed)
+            }
             _ => debug(size),
         }
     }
@@ -2190,6 +2194,10 @@ mod painterly {
             "chest_top" => chest_top(size, seed),
             "chest_side" => chest_side(size, seed),
             "chest_front" => chest_front(size, seed),
+            "torch" | "farmland_dry" | "farmland_wet" | "wheat_0" | "wheat_1" | "wheat_2" | "wheat_3"
+            | "bed_foot_top" | "bed_foot_side" | "bed_head_top" | "bed_head_side" => {
+                super::extras::layer(TexturePackStyle::Painterly, name, size, seed)
+            }
             _ => debug(size),
         }
     }
@@ -2875,6 +2883,10 @@ mod lush {
             "chest_top" => chest_top(size, seed),
             "chest_side" => chest_side(size, seed),
             "chest_front" => chest_front(size, seed),
+            "torch" | "farmland_dry" | "farmland_wet" | "wheat_0" | "wheat_1" | "wheat_2" | "wheat_3"
+            | "bed_foot_top" | "bed_foot_side" | "bed_head_top" | "bed_head_side" => {
+                super::extras::layer(TexturePackStyle::Lush, name, size, seed)
+            }
             _ => debug(size),
         }
     }
@@ -3646,6 +3658,10 @@ mod minimal {
             "chest_top" => chest_top(size, seed),
             "chest_side" => chest_side(size, seed),
             "chest_front" => chest_front(size, seed),
+            "torch" | "farmland_dry" | "farmland_wet" | "wheat_0" | "wheat_1" | "wheat_2" | "wheat_3"
+            | "bed_foot_top" | "bed_foot_side" | "bed_head_top" | "bed_head_side" => {
+                super::extras::layer(TexturePackStyle::Minimal, name, size, seed)
+            }
             _ => debug(size),
         }
     }
@@ -4107,6 +4123,269 @@ mod minimal {
     }
 }
 
+/// Procedural fallback layers for the 1.2 "Light & Home" catalogue.
+///
+/// These are deliberately style-aware but share one implementation: the four
+/// built-in styles only change the palette, so a new layer cannot accidentally
+/// fall back to the debug grid in one style. Torch and wheat layers are
+/// alpha-cut-out; farmland and bed layers are opaque.
+mod extras {
+    use super::*;
+
+    struct Palette {
+        dirt: [u8; 3],
+        wet: [u8; 3],
+        stem: [u8; 3],
+        stem_dark: [u8; 3],
+        grain: [u8; 3],
+        grain_light: [u8; 3],
+        blanket: [u8; 3],
+        blanket_dark: [u8; 3],
+        pillow: [u8; 3],
+        wood: [u8; 3],
+        wood_dark: [u8; 3],
+    }
+
+    fn palette(style: TexturePackStyle) -> Palette {
+        match style {
+            TexturePackStyle::Classic => Palette {
+                dirt: [138, 98, 64],
+                wet: [86, 62, 42],
+                stem: [92, 148, 58],
+                stem_dark: [62, 110, 40],
+                grain: [196, 168, 76],
+                grain_light: [226, 202, 106],
+                blanket: [168, 42, 44],
+                blanket_dark: [116, 27, 31],
+                pillow: [224, 218, 204],
+                wood: [157, 112, 63],
+                wood_dark: [101, 69, 39],
+            },
+            TexturePackStyle::Painterly => Palette {
+                dirt: [151, 108, 71],
+                wet: [91, 68, 48],
+                stem: [103, 162, 63],
+                stem_dark: [70, 120, 44],
+                grain: [212, 182, 84],
+                grain_light: [241, 219, 124],
+                blanket: [182, 50, 56],
+                blanket_dark: [122, 31, 38],
+                pillow: [235, 229, 216],
+                wood: [172, 126, 74],
+                wood_dark: [112, 78, 45],
+            },
+            TexturePackStyle::Lush => Palette {
+                dirt: [126, 92, 58],
+                wet: [70, 58, 40],
+                stem: [82, 158, 55],
+                stem_dark: [52, 116, 38],
+                grain: [198, 178, 70],
+                grain_light: [234, 216, 98],
+                blanket: [156, 46, 54],
+                blanket_dark: [105, 29, 36],
+                pillow: [230, 226, 208],
+                wood: [146, 106, 61],
+                wood_dark: [92, 64, 37],
+            },
+            TexturePackStyle::Minimal => Palette {
+                dirt: [139, 102, 70],
+                wet: [84, 62, 44],
+                stem: [98, 152, 64],
+                stem_dark: [66, 112, 44],
+                grain: [200, 176, 80],
+                grain_light: [226, 204, 112],
+                blanket: [166, 46, 50],
+                blanket_dark: [116, 30, 34],
+                pillow: [226, 222, 210],
+                wood: [158, 116, 70],
+                wood_dark: [104, 73, 42],
+            },
+        }
+    }
+
+    /// Writes an opaque pixel (the canvas starts fully transparent for cut-outs).
+    fn put(canvas: &mut Canvas, x: i32, y: i32, color: [u8; 3]) {
+        canvas.set(x, y, color);
+        canvas.set_alpha(x, y, 255);
+    }
+
+    /// Clears every alpha value so only explicitly painted texels survive.
+    fn clear(canvas: &mut Canvas) {
+        for y in 0..canvas.size as i32 {
+            for x in 0..canvas.size as i32 {
+                canvas.set_alpha(x, y, 0);
+            }
+        }
+    }
+
+    /// One 1.2 layer for `style`.
+    pub(super) fn layer(style: TexturePackStyle, name: &str, size: u32, seed: u32) -> Canvas {
+        let palette = palette(style);
+        match name {
+            "torch" => torch(size, seed, &palette),
+            "farmland_dry" => farmland(size, seed, &palette, false),
+            "farmland_wet" => farmland(size, seed, &palette, true),
+            "wheat_0" => wheat(size, seed, &palette, 0),
+            "wheat_1" => wheat(size, seed, &palette, 1),
+            "wheat_2" => wheat(size, seed, &palette, 2),
+            "wheat_3" => wheat(size, seed, &palette, 3),
+            "bed_foot_top" | "bed_head_top" => bed_top(size, seed, &palette, name == "bed_foot_top"),
+            "bed_foot_side" | "bed_head_side" => bed_side(size, seed, &palette, name == "bed_foot_side"),
+            _ => Canvas::new(size, [0, 0, 0]),
+        }
+    }
+
+    fn torch(size: u32, seed: u32, palette: &Palette) -> Canvas {
+        let mut canvas = Canvas::new(size, [0, 0, 0]);
+        clear(&mut canvas);
+        let edge = size as i32;
+        let center = edge / 2;
+        let stick_half = (edge / 16).max(1);
+        let stick_top = (edge / 4).max(1);
+        let stick_bottom = edge - 2;
+        for y in stick_top..stick_bottom {
+            let grain = i32::from(periodic_noise(seed ^ 0x51, y as u32, 0, size, 4)) / 24;
+            for dx in -stick_half..=stick_half {
+                put(&mut canvas, center + dx, y, offset(palette.wood, grain - dx * 4));
+            }
+        }
+        // Flame: a small orange/yellow plume with a brighter core.
+        let flame_bottom = stick_top;
+        for y in (edge / 16).max(0)..flame_bottom {
+            let t = flame_bottom - y;
+            let half = (1 + t / 3).min(edge / 5);
+            for dx in -half..=half {
+                let hot = dx.abs() <= half / 2 && y < flame_bottom - 1;
+                let color = if hot {
+                    [255, 224, 116]
+                } else if y > flame_bottom / 2 {
+                    [238, 126, 38]
+                } else {
+                    [204, 82, 26]
+                };
+                put(
+                    &mut canvas,
+                    center + dx,
+                    y,
+                    offset(color, (hash_noise(seed, dx as u32, y as u32) % 8) as i32 - 4),
+                );
+            }
+        }
+        // A few ember specks around the flame keep the silhouette readable.
+        for y in 0..flame_bottom {
+            for x in 0..edge {
+                if (x - center).abs() > stick_half + 2 && hash_noise(seed ^ 0xF1, x as u32, y as u32).is_multiple_of(17)
+                {
+                    put(&mut canvas, x, y, [236, 150, 52]);
+                }
+            }
+        }
+        canvas
+    }
+
+    fn farmland(size: u32, seed: u32, palette: &Palette, wet: bool) -> Canvas {
+        let base = if wet { palette.wet } else { palette.dirt };
+        Canvas::from_fn(size, |x, y| {
+            let fine = i32::from(periodic_noise(seed, x, y, size, 8)) / 18 - 7;
+            let broad = i32::from(periodic_noise(seed ^ 0x7F, x, y, size, 2)) / 24 - 5;
+            // Three horizontal furrows and a darker ridge between them.
+            let row = (y * 4 / size) as i32;
+            let furrow = if y % (size / 4).max(1) == 0 { -22 } else { 0 };
+            let ridge = match row {
+                0 | 2 => 6,
+                _ => 0,
+            };
+            offset(base, fine + broad + furrow + ridge)
+        })
+    }
+
+    fn wheat(size: u32, seed: u32, palette: &Palette, stage: u32) -> Canvas {
+        let mut canvas = Canvas::new(size, [0, 0, 0]);
+        clear(&mut canvas);
+        let edge = size as i32;
+        let base_y = edge - 1;
+        let height = (edge as u32 * (5 + stage * 3) / 16).max(2) as i32;
+        let blades = 3 + stage as usize;
+        for blade in 0..blades {
+            let spread = edge / (blades as i32 + 2);
+            let x = edge / 2 + (blade as i32 - blades as i32 / 2) * spread;
+            let lean = if blade % 2 == 0 { 1 } else { -1 } * (1 + stage as i32 / 2);
+            let blade_height = height + (hash_noise(seed, blade as u32, stage) % 3) as i32 - 1;
+            for step in 0..blade_height.max(1) {
+                let px = if step == blade_height - 1 { x + lean } else { x };
+                let color = offset(palette.stem, -step / 3);
+                put(&mut canvas, px, base_y - step, color);
+            }
+            if stage >= 1 {
+                // Grain head: two or three rows of kernels on the top.
+                let head = (stage.min(3) + 1) as i32;
+                for row in 0..head {
+                    for dx in -1..=1 {
+                        let color = if (row + dx) % 2 == 0 {
+                            palette.grain
+                        } else {
+                            palette.grain_light
+                        };
+                        put(&mut canvas, x + lean + dx, base_y - blade_height + row, color);
+                    }
+                }
+            }
+        }
+        // A short green crown at the base breaks up the flat bottom edge.
+        for x in 0..edge {
+            if !hash_noise(seed ^ 0xA7, x as u32, 0).is_multiple_of(3) {
+                put(&mut canvas, x, base_y, offset(palette.stem_dark, -2));
+            }
+        }
+        canvas
+    }
+
+    fn bed_top(size: u32, seed: u32, palette: &Palette, foot: bool) -> Canvas {
+        Canvas::from_fn(size, |x, y| {
+            let edge = size as i32;
+            let border = (edge / 16).max(1);
+            let inset =
+                x < border as u32 || y < border as u32 || x >= size - border as u32 || y >= size - border as u32;
+            if inset {
+                return palette.blanket_dark;
+            }
+            // Pillow at the head end; the foot has the folded blanket edge.
+            if foot && y < size / 4 {
+                let noise = i32::from(periodic_noise(seed ^ 0x12, x, y, size, 4)) / 22 - 5;
+                return offset(palette.pillow, noise);
+            }
+            let fold = if !foot && y > size - size / 5 { -18 } else { 0 };
+            let weave = i32::from(periodic_noise(seed, x / 2, y / 2, size.max(2), 4)) / 26 - 4;
+            offset(palette.blanket, weave + fold)
+        })
+    }
+
+    fn bed_side(size: u32, seed: u32, palette: &Palette, foot: bool) -> Canvas {
+        Canvas::from_fn(size, |x, y| {
+            let edge = size as i32;
+            let top = edge / 3;
+            if y < top as u32 {
+                // Blanket drape over the wooden frame.
+                let noise = i32::from(periodic_noise(seed ^ 0x33, x, y, size, 4)) / 24 - 5;
+                let seam = if y == top as u32 - 1 { -20 } else { 0 };
+                offset(palette.blanket, noise + seam)
+            } else if y < (top + 2) as u32 {
+                palette.blanket_dark
+            } else {
+                // Visible wooden slats below the blanket.
+                let slat = if y % (size / 4).max(1) == 0 { -16 } else { 0 };
+                let grain = i32::from(periodic_noise(seed ^ 0x44, x, y, size, 8)) / 22 - 5;
+                let pillow = if foot && y > size - size / 5 { 8 } else { 0 };
+                if y == (edge - 1) as u32 {
+                    palette.wood_dark
+                } else {
+                    offset(palette.wood, slat + grain + pillow)
+                }
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -4195,14 +4474,16 @@ mod tests {
                 for layer in 0..LAYER_COUNT {
                     let bytes = pack.layer(level, layer).expect("layer exists");
                     assert_eq!(bytes.len(), (edge * edge * 4) as usize);
-                    let is_leaves = layer == catalogue::LEAVES.0 as usize;
+                    let is_cut_out = layer == catalogue::LEAVES.0 as usize
+                        || layer == catalogue::TORCH.0 as usize
+                        || (catalogue::WHEAT_0.0 as usize..=catalogue::WHEAT_3.0 as usize).contains(&layer);
                     for texel in bytes.as_chunks::<4>().0 {
-                        if is_leaves && level == 0 {
+                        if is_cut_out && level == 0 {
                             assert!(
                                 texel[3] == 0 || texel[3] == 255,
-                                "leaf cut-out alpha must be binary at mip 0 in {style:?}"
+                                "cut-out alpha must be binary at mip 0 in {style:?}"
                             );
-                        } else if !is_leaves {
+                        } else if !is_cut_out {
                             assert_eq!(texel[3], 255, "{style:?} layer {layer} must stay opaque");
                         }
                     }

@@ -274,25 +274,37 @@ mod tests {
     }
 
     #[test]
-    fn generation_is_deterministic_and_only_leaves_are_cut_out() {
+    fn generation_is_deterministic_and_cut_out_layers_are_binary() {
         let first = generate_texture_data();
         let second = generate_texture_data();
         assert_eq!(first, second);
-        let leaves = catalogue::LEAVES.0 as usize;
-        let mut had_hole = false;
-        let mut had_solid = false;
+        let cut_out = [
+            catalogue::LEAVES.0 as usize,
+            catalogue::TORCH.0 as usize,
+            catalogue::WHEAT_0.0 as usize,
+            catalogue::WHEAT_1.0 as usize,
+            catalogue::WHEAT_2.0 as usize,
+            catalogue::WHEAT_3.0 as usize,
+        ];
+        let mut holes = [false; 6];
+        let mut solids = [false; 6];
         for (index, texel) in first.as_chunks::<4>().0.iter().enumerate() {
             let layer = index / (TEXTURE_SIZE * TEXTURE_SIZE) as usize;
-            if layer == leaves {
-                assert!(texel[3] == 0 || texel[3] == 255);
-                had_hole |= texel[3] == 0;
-                had_solid |= texel[3] == 255;
+            if let Some(slot) = cut_out.iter().position(|candidate| *candidate == layer) {
+                assert!(texel[3] == 0 || texel[3] == 255, "layer {layer} alpha must be binary");
+                holes[slot] |= texel[3] == 0;
+                solids[slot] |= texel[3] == 255;
             } else {
                 assert_eq!(texel[3], 255, "layer {layer} must stay opaque");
             }
         }
-        assert!(had_hole, "leaf cut-outs should punch transparent holes");
-        assert!(had_solid, "leaf cut-outs should leave most of the tile opaque");
+        for (slot, name) in ["leaves", "torch", "wheat_0", "wheat_1", "wheat_2", "wheat_3"]
+            .iter()
+            .enumerate()
+        {
+            assert!(holes[slot], "{name} cut-out should punch transparent holes");
+            assert!(solids[slot], "{name} cut-out should leave solid texels");
+        }
     }
 
     #[test]

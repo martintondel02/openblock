@@ -55,7 +55,7 @@
 //! identical bytes.
 
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ob_content::{BlockId, BlockType, Registry};
@@ -76,6 +76,13 @@ use crate::world::World;
 const MAGIC: &[u8; 4] = b"OBSV";
 /// Snapshot format version written by this build.
 const VERSION: u16 = 4;
+
+/// Current light semantics version written to the additive `world_meta.txt`.
+///
+/// Version 1 is every 1.0/1.1 save: per-section fake sky light with no vertical
+/// occlusion. Version 2 is the 1.2 column-seeded engine; the directory loader
+/// relights a world once when it sees a missing or older marker.
+pub const LIGHT_VERSION: u32 = 2;
 /// Bytes before the first chunk in a v1 stream: magic, version, seed, count.
 const V1_HEADER_LEN: usize = 4 + 2 + 8 + 4;
 /// Bytes before the compressed payload in a v2 stream.
@@ -189,6 +196,13 @@ pub enum SaveError {
         /// Configured maximum.
         max: u64,
     },
+    /// A world or sidecar file could not be read or written.
+    Io {
+        /// Path that failed.
+        path: PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for SaveError {
@@ -209,11 +223,162 @@ impl std::fmt::Display for SaveError {
             SaveError::SaveFileTooLarge { len, max } => {
                 write!(f, "world snapshot of {len} bytes exceeds the {max}-byte file limit")
             }
+            SaveError::Io { path, source } => write!(f, "{}: {source}", path.display()),
         }
     }
 }
 
-impl std::error::Error for SaveError {}
+impl std::error::Error for SaveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// File name of the additive world metadata sidecar.
+///
+/// It lives next to `world.obs`, never inside it: the v4 save format stays
+/// byte-compatible with 1.0/1.1, and a world without the sidecar is treated as
+/// pre-1.2 and relit once.
+pub const WORLD_META_FILE: &str = "world_meta.txt";
+
+/// Additive world-level metadata stored in [`WORLD_META_FILE`].
+///
+/// Unknown keys and comments are preserved verbatim so later waves can append
+/// fields without this loader dropping them.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WorldMeta {
+    /// Light semantics version: 0/1 = 1.0/1.1 fake per-section sky light,
+    /// 2 = the 1.2 column-seeded engine (see [`LIGHT_VERSION`]).
+    pub light_version: u32,
+    /// Lines this build does not interpret, preserved when rewriting.
+    pub extra_lines: Vec<String>,
+}
+
+/// Result of the one-time directory-level light migration.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LightMigration {
+    /// Whether the loaded world was relit.
+    pub relit: bool,
+    /// Whether `world.obs` was rewritten with the new light.
+    pub save_rewritten: bool,
+    /// Whether `world_meta.txt` was written or upgraded.
+    pub meta_written: bool,
+}
+
+/// Reads the additive world metadata, if present.
+///
+/// A missing file is `Ok(None)` (pre-1.2 world). A present file without a
+/// `light_version` key is version 0. Unknown keys are kept in
+/// [`WorldMeta::extra_lines`].
+pub fn read_world_meta(dir: &Path) -> Result<Option<WorldMeta>, SaveError> {
+    let path = dir.join(WORLD_META_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(SaveError::Io { path, source }),
+    };
+    let mut meta = WorldMeta::default();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("light_version=") {
+            meta.light_version = value.trim().parse().unwrap_or(0);
+        } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            meta.extra_lines.push(line.to_owned());
+        }
+    }
+    Ok(Some(meta))
+}
+
+/// Writes the additive world metadata atomically.
+pub fn write_world_meta(dir: &Path, meta: &WorldMeta) -> Result<(), SaveError> {
+    std::fs::create_dir_all(dir).map_err(|source| SaveError::Io {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    let mut text = String::from("# OpenBlock world metadata (additive; safe to delete to force a light relight)\n");
+    text.push_str(&format!("light_version={}\n", meta.light_version));
+    for line in &meta.extra_lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    write_file_atomic(&dir.join(WORLD_META_FILE), text.as_bytes()).map_err(|source| SaveError::Io {
+        path: dir.join(WORLD_META_FILE),
+        source,
+    })
+}
+
+/// Writes bytes to `path` through a sibling temporary file and an atomic rename.
+fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("world");
+    let temp = path.with_file_name(format!(".{file_name}.tmp"));
+    {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&temp, path)
+}
+
+/// Loads a world directory, applying the one-time 1.2 light migration.
+///
+/// A missing or legacy `light_version` marker relights every resident column,
+/// rewrites `world.obs` with the corrected light (still format v4) and writes
+/// `world_meta.txt` with `light_version=2`. A second load sees the marker and
+/// does not relight. A raw [`from_bytes`] caller bypasses this policy and sees
+/// [`World::light_version`](crate::World::light_version) == 1.
+pub fn load_world_dir(registry: Arc<Registry>, dir: &Path) -> Result<World, SaveError> {
+    load_world_dir_with_report(registry, dir).map(|(world, _)| world)
+}
+
+/// [`load_world_dir`] with a report of what the migration did (tests/tools).
+pub fn load_world_dir_with_report(registry: Arc<Registry>, dir: &Path) -> Result<(World, LightMigration), SaveError> {
+    let save_path = dir.join("world.obs");
+    let bytes = read_save_file(&save_path).map_err(|source| SaveError::Io {
+        path: save_path.clone(),
+        source,
+    })?;
+    let mut world = from_bytes(registry, &bytes)?;
+    let meta = read_world_meta(dir)?;
+    let mut migration = LightMigration::default();
+    let needs_relight = meta.as_ref().is_none_or(|meta| meta.light_version < LIGHT_VERSION);
+    if needs_relight {
+        world.relight_all();
+        let relit = to_bytes_checked(&world)?;
+        write_file_atomic(&save_path, &relit).map_err(|source| SaveError::Io {
+            path: save_path,
+            source,
+        })?;
+        migration.save_rewritten = true;
+        let mut meta = meta.unwrap_or_default();
+        meta.light_version = LIGHT_VERSION;
+        write_world_meta(dir, &meta)?;
+        migration.meta_written = true;
+        migration.relit = true;
+    } else {
+        world.set_light_version(LIGHT_VERSION);
+    }
+    Ok((world, migration))
+}
+
+/// Saves a world directory (v4 snapshot plus the additive light marker).
+///
+/// New 1.2 worlds call this and therefore write `light_version=2` immediately,
+/// so they never pay a relight on the next load. Existing sidecar keys survive.
+pub fn save_world_dir(world: &World, dir: &Path) -> Result<(), SaveError> {
+    let bytes = to_bytes_checked(world)?;
+    let save_path = dir.join("world.obs");
+    write_file_atomic(&save_path, &bytes).map_err(|source| SaveError::Io {
+        path: save_path,
+        source,
+    })?;
+    let mut meta = read_world_meta(dir)?.unwrap_or_default();
+    meta.light_version = world.light_version();
+    write_world_meta(dir, &meta)
+}
 
 /// Bookkeeping type kept for source compatibility with the v0.0.1 world API.
 ///
@@ -934,12 +1099,17 @@ fn read_payload(
         for _ in 0..N_SECTIONS {
             sections.push(read_section(reader, &registry, light_encoding)?);
         }
-        world.insert_chunk(ChunkColumn::from_sections(pos, sections));
+        world.insert_loaded_chunk(ChunkColumn::from_sections(pos, sections));
     }
 
     if reader.remaining() != 0 {
         return Err(SaveError::InvalidFormat("trailing bytes after chunks"));
     }
+    // A raw v4 stream carries no light-version marker. The directory loader
+    // consults world_meta.txt and relights when it is absent or below 2; a
+    // direct from_bytes caller sees version 1 (legacy) so it does not silently
+    // trust 1.0/1.1 fake sky light.
+    world.set_light_version(1);
     Ok(world)
 }
 
@@ -1432,7 +1602,9 @@ mod tests {
     fn compact_world(registry: &Arc<Registry>) -> World {
         let mut world = World::new(Arc::clone(registry), 9);
         let mut column = ChunkColumn::new(ChunkPos::new(0, 0));
-        // All sections stay uniform air, with compact uniform-zero lights.
+        // All sections stay uniform air, with compact uniform-zero lights. This
+        // fixture is about the save encoding, not about lighting; insert it as
+        // authoritative rather than letting the world reseed it.
         for index in 0..N_SECTIONS {
             let y = WORLD_MIN_Y / 16 + index as i32;
             let section = column
@@ -1440,7 +1612,7 @@ mod tests {
                 .expect("section belongs to the column");
             *section.light_mut() = Light::uniform_sky(0);
         }
-        world.insert_chunk(column);
+        world.insert_loaded_chunk(column);
         world
     }
 
@@ -1689,7 +1861,7 @@ mod tests {
             .expect("section belongs to the column");
         *dense.light_mut() = Light::from_uniform(0);
         dense.light_mut().set_sky(LocalPos { x: 0, y: 0, z: 0 }, 7);
-        world.insert_chunk(column);
+        world.insert_loaded_chunk(column);
 
         let payload = encode_payload(&world, write_section);
         assert_eq!(u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]), 1);
@@ -2331,5 +2503,157 @@ mod tests {
             registry_fingerprint(&packed),
             "packs/base/blocks.json must stay in sync with Registry::base()"
         );
+    }
+
+    fn unique_world_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("ob-light-migration-{}-{label}-{id}", std::process::id()))
+    }
+
+    /// A hand-built "1.0/1.1" world: a sealed cave whose light is the old fake
+    /// per-section sky 15. A correct loader must turn every cave cell sky 0.
+    fn fake_light_cave_world(registry: &Arc<Registry>, pos: ChunkPos) -> (World, BlockPos) {
+        let stone = block(registry, "openblock:stone");
+        let mut column = ChunkColumn::new(pos);
+        let (ox, oz) = pos.origin();
+        for y in 50..70 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    column.set_block(BlockPos::new(ox + x, y, oz + z), stone);
+                }
+            }
+        }
+        for y in 64..=66 {
+            for z in 4..=10 {
+                for x in 4..=10 {
+                    column.set_block(BlockPos::new(ox + x, y, oz + z), BlockId::AIR);
+                }
+            }
+        }
+        for index in 0..N_SECTIONS {
+            let y = WORLD_MIN_Y / 16 + index as i32;
+            let section = column
+                .section_mut(SectionPos::new(pos.x, y, pos.z))
+                .expect("section belongs to the column");
+            *section.light_mut() = Light::uniform_sky(15);
+        }
+        column.recompute_heightmap();
+        let mut world = World::new(Arc::clone(registry), 42);
+        world.insert_loaded_chunk(column);
+        (world, BlockPos::new(ox + 7, 65, oz + 7))
+    }
+
+    #[test]
+    fn world_meta_round_trips_and_preserves_unknown_lines() {
+        let dir = unique_world_dir("meta-round-trip");
+        std::fs::create_dir_all(&dir).expect("create world dir");
+        let meta = WorldMeta {
+            light_version: 2,
+            extra_lines: vec!["future_key=kept".to_owned()],
+        };
+        write_world_meta(&dir, &meta).expect("write meta");
+        let read = read_world_meta(&dir).expect("read meta").expect("meta exists");
+        assert_eq!(read, meta);
+        let text = std::fs::read_to_string(dir.join(WORLD_META_FILE)).expect("meta text");
+        assert!(text.contains("light_version=2"));
+        assert!(text.contains("future_key=kept"));
+
+        // A file without the key is version 0, never an error.
+        std::fs::write(dir.join(WORLD_META_FILE), "# old sidecar\nunknown=1\n").expect("write legacy meta");
+        let legacy = read_world_meta(&dir).expect("legacy meta").expect("exists");
+        assert_eq!(legacy.light_version, 0);
+        assert_eq!(legacy.extra_lines, vec!["unknown=1"]);
+        std::fs::remove_dir_all(&dir).expect("remove temp world");
+    }
+
+    #[test]
+    fn legacy_fake_light_world_is_relit_once_and_reloaded_without_relight() {
+        let current = base_registry();
+        // The 1.0.2-era registry: air through the crafting table. A v4 save
+        // written with it is accepted by prefix and then migrated.
+        let mut old_blocks: Vec<_> = current.iter().map(|(_, block)| block.clone()).collect();
+        old_blocks.truncate(15);
+        let old_registry = Arc::new(Registry::from_blocks(old_blocks).expect("old registry is valid"));
+        let (fake_world, cave) = fake_light_cave_world(&old_registry, ChunkPos::new(0, 0));
+        assert_eq!(fake_world.sky_light(cave), 15, "the 1.0 fixture starts fake-lit");
+
+        let dir = unique_world_dir("legacy-relight");
+        std::fs::create_dir_all(&dir).expect("create world dir");
+        std::fs::write(dir.join("world.obs"), to_bytes(&fake_world)).expect("write fake save");
+        assert!(!dir.join(WORLD_META_FILE).exists());
+
+        let (world, migration) =
+            load_world_dir_with_report(Arc::clone(&current), &dir).expect("legacy world loads and migrates");
+        assert!(migration.relit && migration.save_rewritten && migration.meta_written);
+        assert_eq!(world.light_version(), LIGHT_VERSION);
+        assert_eq!(world.sky_light(cave), 0, "the sealed cave is dark after migration");
+        assert_eq!(world.block_light(cave), 0);
+
+        let meta = read_world_meta(&dir).expect("read meta").expect("marker written");
+        assert_eq!(meta.light_version, LIGHT_VERSION);
+        let rewritten = std::fs::read(dir.join("world.obs")).expect("rewritten save");
+        assert_eq!(u16::from_le_bytes([rewritten[4], rewritten[5]]), 4, "v4 is preserved");
+        assert_ne!(rewritten, to_bytes(&fake_world), "migration persisted the relit light");
+
+        // The reload trusts the marker and does not relight. The cave still
+        // reads dark because the first migration saved the corrected words.
+        let (reloaded, second) = load_world_dir_with_report(Arc::clone(&current), &dir).expect("relit world reloads");
+        assert!(!second.relit && !second.save_rewritten && !second.meta_written);
+        assert_eq!(reloaded.sky_light(cave), 0);
+        assert_eq!(reloaded.light_hash(), world.light_hash());
+        std::fs::remove_dir_all(&dir).expect("remove temp world");
+    }
+
+    #[test]
+    fn a_v2_marker_prevents_a_second_relight_even_for_a_legacy_light_payload() {
+        let registry = base_registry();
+        let (fake_world, cave) = fake_light_cave_world(&registry, ChunkPos::new(2, -1));
+        let dir = unique_world_dir("marker-trust");
+        std::fs::create_dir_all(&dir).expect("create world dir");
+        std::fs::write(dir.join("world.obs"), to_bytes(&fake_world)).expect("write fake save");
+        write_world_meta(
+            &dir,
+            &WorldMeta {
+                light_version: LIGHT_VERSION,
+                extra_lines: Vec::new(),
+            },
+        )
+        .expect("write marker");
+
+        let (world, migration) = load_world_dir_with_report(Arc::clone(&registry), &dir).expect("marked world loads");
+        assert!(!migration.relit, "a v2 marker must suppress migration");
+        assert_eq!(world.sky_light(cave), 15, "the loader trusted the stored light");
+        assert_eq!(world.light_version(), LIGHT_VERSION);
+        std::fs::remove_dir_all(&dir).expect("remove temp world");
+    }
+
+    #[test]
+    fn new_worlds_write_the_v2_marker_and_save_format_4() {
+        let registry = base_registry();
+        let (world, cave) = {
+            // A correctly seeded world, as a 1.2 host creates it.
+            let mut world = World::new(Arc::clone(&registry), 42);
+            let (fake, _) = fake_light_cave_world(&registry, ChunkPos::new(0, 0));
+            for (_, chunk) in fake.chunks() {
+                world.insert_loaded_chunk(chunk.clone());
+            }
+            world.relight_all();
+            (world, BlockPos::new(7, 65, 7))
+        };
+        assert_eq!(world.light_version(), LIGHT_VERSION);
+        let dir = unique_world_dir("new-world");
+        std::fs::create_dir_all(&dir).expect("create world dir");
+        save_world_dir(&world, &dir).expect("save new world");
+        let meta = read_world_meta(&dir).expect("read meta").expect("marker exists");
+        assert_eq!(meta.light_version, LIGHT_VERSION, "new worlds write v2 immediately");
+        let bytes = std::fs::read(dir.join("world.obs")).expect("read save");
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 4);
+
+        let (loaded, migration) = load_world_dir_with_report(Arc::clone(&registry), &dir).expect("new world reloads");
+        assert!(!migration.relit, "a new 1.2 world must not relight");
+        assert_eq!(loaded.sky_light(cave), 0);
+        std::fs::remove_dir_all(&dir).expect("remove temp world");
     }
 }
