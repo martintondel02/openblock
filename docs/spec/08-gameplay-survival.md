@@ -530,3 +530,40 @@ current server-authoritative behaviour and are covered by unit/integration tests
 - **Tests.** `ob_sim::attack_charge_damage_and_xp_curve_are_fixed`,
   `ob_server::tests::survival_attacks_wear_tools_and_break_at_zero`, the paced
   loopback attack tests and `ob_server/tests/danger14.rs`.
+
+## Appendix C — 1.5 weather, lightning and fire survival rules (2026-11-26)
+
+This appendix records the server-authoritative 1.5 slice; the full damage-type,
+difficulty and gamerule design in §3.11 remains the target.
+
+- **Weather light.** Crops and hostile spawning call the same
+  `World::gameplay_light(pos, day_factor, weather_factor)` with
+  `weather_factor = 1.0` clear, `0.8` rain/snow and `0.6` thunder. (Fire uses
+  precipitation/sky exposure, not the light factor.) Stored light and the light
+  hash do not change when a storm starts or ends. A surface at noon therefore
+  drops from 15 to 12 in rain and 9 in thunder; torches keep their block light.
+- **Rain hydration.** A planted crop on an open-sky column whose worldgen
+  precipitation is rain is hydrated at the regular 20-tick hydration check,
+  exactly like water within the 4-block radius. The farmland block still swaps
+  `farmland_dry ↔ farmland_wet`; a mature crop does not age. Snow and desert
+  columns do not hydrate.
+- **Fire damage.** `openblock:fire` is non-solid and deals 1 HP/s to any player
+  or mob whose AABB overlaps the cell, applied once per 20 ticks. Player damage
+  goes through the armor formula and wears one durability per event; creative
+  players are immune. Fire death for a mob drops nothing.
+- **Fire placement.** Survival item placement consumes one fire item and
+  creative placement places it without consuming; both use `ignite_fire`, so the
+  new cell gets the normal 160-tick timer and the 64-world/8-chunk caps are
+  enforced. Breaking or exploding the fire removes its timer with the block.
+- **Lightning damage.** A strike deals up to 10 HP at the centre with a linear
+  falloff to 0 HP at 3 m, through the same armor path (`lightning` cause). It
+  can ignite fire in the air above the struck solid block; the fire caps apply.
+- **Death and persistence.** A lightning or fire death uses the existing
+  death/respawn flow for players. Resident fire timers and weather persist; the
+  world clock is in additive `level.txt` (see [18](18-networking-multiplayer.md)
+  Appendix C). Neither effect mutates `player.txt` layout. Streaming an unloaded
+  chunk discards its blocks, so the timer is dropped with them rather than
+  pretending the cell still exists.
+- **Authority.** Weather set/cycle methods and forced strikes are host/admin
+  surfaces, never client messages. Clients receive `weather_sync` and
+  `lightning_strike` and must render, not decide.

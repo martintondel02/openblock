@@ -489,6 +489,78 @@ byte (coloured emitters are 1.3+); the gameplay query keeps all three channels.
 A dimension with no sky is not exposed by 1.2 content yet, so the
 `has_sky == false` rule remains specified but unexercised.
 
+### 3.19 1.5 implementation status (Weather & Danger server slice)
+
+The shipping 1.5 server slice implements one server-authoritative overworld
+weather machine and its gameplay effects. The normative per-dimension and
+content-table design above is unchanged; this section records the interim
+constants and the deliberate deviations.
+
+**State machine and determinism.** `crates/server/src/weather.rs` owns
+`WeatherState { phase, remaining_ticks, intensity_permille, epoch }`.
+Durations are inclusive: `Clear` 12,000–72,000, `Precipitating` 3,000–12,000 and
+`Thunder` 3,600–12,000 ticks. `Precipitating` transitions to thunder with 15%
+probability and to clear with 85%; `Thunder` transitions to rain with 30% and
+to clear with 70%. Duration and transition are drawn from
+`mix64(seed ^ WEATHER_STREAM ^ epoch)` (`WEATHER_STREAM =
+0x5745_4154_4845_5201`; `mix64` is the splitmix64 finaliser), the epoch
+increments on every transition and persists. Intensity is integer permille and
+ramps by 5/tick toward the target `0.65–1.0` (rain) or `0.85–1.0` (thunder), so
+a full ramp takes 200 ticks and save/reload is exact. `Host::weather_factor()`
+is the phase constant `1.0/0.8/0.6`; it is passed to `gameplay_light` and never
+written into stored light. `Host::set_weather_cycle(false)` is the
+`do_weather_cycle` equivalent; `Host::set_weather_state` is an admin/test seam
+and is not on the wire.
+
+**Persistence.** Weather and the world clock live in the additive `level.txt`
+v1 described by [18](18-networking-multiplayer.md) Appendix C, not in
+`level.json`. `time` from `player.txt` seeds a world without `level.txt`; once
+present, `level.txt` is authoritative. `state_hash` covers the weather tuple
+(and every fire timer) so a save/load reproduces the storm. `world.obs` remains
+v4 and only appends the fire block id.
+
+**Precipitation.** `ob_worldgen::Biome::temperature_c` and
+`Biome::precipitation` are pure functions of biome and surface height:
+plains +15 °C rain, forest +13 °C rain, desert +30 °C none, snowy taiga −8 °C
+snow, mountains +5 °C rain below the snow line (−3 °C snow at/above it). The
+server exposes `Host::precipitation_at(x,z)` without generating a chunk; clear
+weather reports `None`. Rain hydrates planted crops on open-sky rain columns
+(through the existing crop hydration interval) and, like snow, extinguishes
+open-sky fire; the heightmap — not derived light — decides exposure.
+
+**Lightning.** During thunder the per-tick roll is `intensity / 2,400` (full
+storm ≈ one strike per 2,400 ticks). Candidates are sorted resident,
+precipitating, sky-exposed surface columns within 48 blocks of an active
+player (solid, non-fluid top block, air above and a non-zero sky-light sample);
+a second deterministic hash picks one. Damage is `10 × (1 − d/3)` HP through the
+normal armor path, and the strike may place `openblock:fire` in the air above
+the struck solid block, subject to the fire caps. One
+`LightningEvent`/`lightning_strike` is emitted per strike; the fire placement
+is an ordinary `block_edit`. Content tables for transformations and redstone
+pulses are not implemented.
+
+**Fire.** `openblock:fire` is append-only id 29: non-solid `Cross`, emission
+15, no collision, 160-tick burn. Its block item appends after the frozen 1.2/1.3
+catalogue (id 71), so no existing item id moves. Normal survival and creative
+item placement routes through `Host::ignite_fire`, so it consumes one item in
+survival, gets a timer and obeys both caps. Every 40 ticks a 25% deterministic
+roll turns one flammable six-neighbour (planks/log/leaves/crafting table/chest/
+beds) into fire, consuming it; caps are 64 active cells world-wide and 8 per
+chunk. Players/mobs in a fire cell take 1 HP/s (applied once per 20 ticks). Rain,
+snow or adjacent water extinguishes. Timers persist in `fire.txt`; block ids
+persist in `world.obs`. This deliberately replaces the earlier "fires are
+transient and cleared on load" note so a reload cannot leave an untimed
+permanent fire block. There is no `do_fire_tick` gamerule in this slice, and a
+streaming unload drops the fire timer with the discarded block instead of
+freezing it.
+
+**Tests.** `weather::tests`, `fire::tests`, `crops::tests::rain_hydrates…`,
+the `lib.rs` fire-placement tests, `server/tests/weather_fire.rs` (9 integration
+tests) and the v5 loopback test in `server/tests/net_survival.rs` cover
+determinism, probabilities, ramp, freeze, persistence, per-column precipitation,
+hydration, extinguish, both caps, light emission, item/creative placement,
+damage, ignition and reconnect.
+
 ## 4. Data structures and formats
 
 ```rust

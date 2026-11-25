@@ -714,3 +714,26 @@ refuse births.
 `mobs.txt` rows append `variant love cooldown growth persistent` to the 1.0
 `id kind x y z yaw health age`; 8-field rows load with neutral defaults.
 `MobEntity` replication carries `variant` and `baby` in spawn/state DTOs.
+
+## Appendix C — 1.5 weather, lightning and fire effects on entities (2026-11-26)
+
+Weather and fire are host systems, not entity kinds; no new `MobKind`, entity id
+or sidecar row is added.
+
+- **Lightning.** A strike damages every player and mob within 3 m with
+  `10 × (1 − d/3)` HP (armor applies to players). Mob deaths from lightning are
+  removed from `mobs` and replicated as despawns with no drops or XP. The
+  effect is deterministic and ordered by the host tick: player damage, mob
+  damage, optional fire ignition, then one `lightning_strike` event.
+- **Fire.** A mob whose AABB overlaps an `openblock:fire` block loses 1 HP/s,
+  applied once per 20 ticks through the same health field as daylight burn.
+  Fire deaths drop nothing; a mob is removed once and its id is sent in the
+  normal despawn/interest diff.
+- **Daylight and weather interaction.** Mobs keep burning in daylight when
+  sky-exposed; rain and thunder do not extinguish that daylight rule in this
+  slice, and hostile spawning still uses gameplay light with the 0.8/0.6
+  weather factor, so a thunderstorm darkens the surface and increases spawn
+  pressure through the existing `<= 7` rule.
+- **Persistence.** Mobs remain in `mobs.txt` with the 1.3 columns; fire timers
+  live in `fire.txt` and weather in `level.txt`. No mob record stores fire or
+  lightning state.

@@ -441,6 +441,79 @@ impl std::fmt::Display for Biome {
     }
 }
 
+/// The precipitation a column receives during a storm.
+///
+/// This is a pure worldgen classification: it reads the biome and surface
+/// height (never a loaded chunk), so the server and a client can ask about any
+/// column without generating it. Dry biomes (`desert`) receive nothing; cold
+/// biomes (`snowy_taiga`, high `mountains`) receive snow; the rest receive rain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Precipitation {
+    /// No precipitation (clear weather or a dry biome).
+    None,
+    /// Liquid rain.
+    Rain,
+    /// Snow.
+    Snow,
+}
+
+impl Precipitation {
+    /// Stable lower-case name used by the protocol and diagnostics.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Rain => "rain",
+            Self::Snow => "snow",
+        }
+    }
+
+    /// Whether any precipitation falls.
+    pub const fn is_some(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+impl Biome {
+    /// Representative surface temperature for this biome at `surface_y`, in °C.
+    ///
+    /// The five biomes use fixed representative values rather than the
+    /// continuous climate noise: the gameplay rule only needs the snow/rain
+    /// boundary (`<= 0 °C`). Mountains use the worldgen snow line so a visually
+    /// snow-capped peak also precipitates snow. The result is a pure function of
+    /// the biome and the surface height.
+    pub const fn temperature_c(self, surface_y: i32) -> f32 {
+        match self {
+            Self::Plains => 15.0,
+            Self::Forest => 13.0,
+            Self::Desert => 30.0,
+            Self::SnowyTaiga => -8.0,
+            Self::Mountains => {
+                if surface_y >= SNOW_LINE {
+                    -3.0
+                } else {
+                    5.0
+                }
+            }
+        }
+    }
+
+    /// Precipitation type for this biome at `surface_y`.
+    ///
+    /// `desert` is dry regardless of temperature; a biome at or below `0 °C`
+    /// precipitates snow and a warmer one rain. This is the single authority
+    /// for the server's per-column snow/rain/none query.
+    pub const fn precipitation(self, surface_y: i32) -> Precipitation {
+        if matches!(self, Self::Desert) {
+            return Precipitation::None;
+        }
+        if self.temperature_c(surface_y) <= 0.0 {
+            Precipitation::Snow
+        } else {
+            Precipitation::Rain
+        }
+    }
+}
+
 /// A player-visible structure kind built from the base block palette.
 ///
 /// Structures are engine constants in this slice rather than content data (the
@@ -1331,6 +1404,26 @@ impl Generator {
             height: sample.height,
             biome: sample.biome,
         }
+    }
+
+    /// Precipitation type at world-space block XZ, without loading a chunk.
+    ///
+    /// Equivalent to `surface_sample(x, z)` followed by
+    /// [`Biome::precipitation`](Biome::precipitation). It is a pure function of
+    /// the seed, column and surface height; trees, caves and player edits do not
+    /// participate. The server uses it for the per-column rain/snow/none query
+    /// and the client can use it for particles outside the streamed area.
+    pub fn precipitation_at(&self, x: i32, z: i32) -> Precipitation {
+        let sample = self.surface_sample(x, z);
+        sample.biome.precipitation(sample.height)
+    }
+
+    /// Representative surface temperature at world-space block XZ, in °C.
+    ///
+    /// Pure worldgen helper; see [`Biome::temperature_c`].
+    pub fn temperature_c_at(&self, x: i32, z: i32) -> f32 {
+        let sample = self.surface_sample(x, z);
+        sample.biome.temperature_c(sample.height)
     }
 
     /// The deterministic structure placement for one chunk, if any.
@@ -4453,6 +4546,50 @@ mod tests {
                 .any(|(x, z)| first.surface_sample(*x, *z).height != other.surface_sample(*x, *z).height),
             "different seeds must not produce an identical height field"
         );
+    }
+
+    #[test]
+    fn precipitation_follows_biome_temperature_and_dry_biomes() {
+        use super::{Biome, Precipitation};
+
+        assert_eq!(Biome::Plains.temperature_c(70), 15.0);
+        assert_eq!(Biome::SnowyTaiga.precipitation(70), Precipitation::Snow);
+        assert_eq!(Biome::Desert.precipitation(70), Precipitation::None);
+        assert_eq!(Biome::Plains.precipitation(70), Precipitation::Rain);
+        assert_eq!(Biome::Forest.precipitation(70), Precipitation::Rain);
+        assert_eq!(Biome::Mountains.precipitation(60), Precipitation::Rain);
+        assert_eq!(Biome::Mountains.precipitation(super::SNOW_LINE), Precipitation::Snow);
+        for biome in Biome::ALL {
+            for height in [40, 70, 100, 150] {
+                let precipitation = biome.precipitation(height);
+                let temperature = biome.temperature_c(height);
+                match precipitation {
+                    Precipitation::None => assert_eq!(biome, Biome::Desert),
+                    Precipitation::Rain => assert!(temperature > 0.0, "{biome:?}@{height} rain must be warm"),
+                    Precipitation::Snow => assert!(temperature <= 0.0, "{biome:?}@{height} snow must be cold"),
+                }
+            }
+        }
+
+        let generator = Generator::new(42);
+        for (x, z) in [(0, 0), (123, -456), (-2048, 900)] {
+            let sample = generator.surface_sample(x, z);
+            assert_eq!(
+                generator.precipitation_at(x, z),
+                sample.biome.precipitation(sample.height)
+            );
+            assert_eq!(
+                generator.temperature_c_at(x, z),
+                sample.biome.temperature_c(sample.height)
+            );
+            assert_eq!(
+                generator.precipitation_at(x, z),
+                Generator::new(42).precipitation_at(x, z)
+            );
+        }
+        assert_eq!(Precipitation::Rain.name(), "rain");
+        assert!(Precipitation::Snow.is_some());
+        assert!(!Precipitation::None.is_some());
     }
 
     #[test]

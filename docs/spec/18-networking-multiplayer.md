@@ -1637,3 +1637,60 @@ namespace bit, and clients must not interpret either.
 attacks, network breeding + `xp_sync`, arrow entity replication from a skeleton,
 mob sync and reconnect; `ob_client/tests/net_loopback.rs` covers replicated
 breeding/XP/projectile state reducers and a paced authoritative kill.
+
+## Appendix C — Protocol v5 weather slice (2026-11-26)
+
+`PROTOCOL_VERSION` is **5** in both `ob_protocol` and `ob_core`. Version 4 and
+older peers are rejected before state exchange with
+`protocol_mismatch: server protocol 5, client sent N; 1.4 and older clients must
+upgrade to a 1.5+ build`. JSON/TCP framing, the 2 MiB frame cap, chunk/light
+codecs, inventory addressing and the `EntitySnapshot` handshake are unchanged.
+
+### C.1 New messages and enums
+
+| Direction | Message | Fields |
+| --- | --- | --- |
+| S→C | `weather_sync` | `phase` (`clear`/`precipitating`/`thunder`), `intensity` (0.0–1.0), `remaining_ticks`, `epoch`, `precipitation` (`none`/`rain`/`snow`), `biome`, `weather_factor` (1.0/0.8/0.6) |
+| S→C | `lightning_strike` | `pos` (world-space strike centre), `block` (struck solid block), `ignited` (bool), `flash` (bool) |
+
+`weather_sync` is sent once during the join sequence after `entity_snapshot`
+and then every 20 ticks (1 s) per player. The phase/intensity/remaining/epoch
+are global; `precipitation` and `biome` are resolved at the receiving player's
+feet column, so rain and snow can coexist in one storm. `weather_factor` is the
+exact multiplier the server used in its gameplay-light query, allowing a client
+to reproduce crop/spawn lighting without guessing between phases.
+
+`lightning_strike` is a one-shot visual/audio cue. Any fire placement caused by
+the strike arrives as an ordinary broadcast `block_edit` (base id **29** for
+`openblock:fire`); clients must not infer a strike from an edit burst or an edit
+from a strike. `flash` is currently always true; a later slice may cull far
+flashes per player.
+
+### C.2 Persistence and determinism
+
+- Weather/time live in the additive `level.txt` v1 sidecar (`version=1`,
+  `time`, `weather_phase`, `weather_remaining`, `weather_intensity` in
+  permille, `weather_epoch`). Missing files keep the `player.txt` clock and
+  start deterministic clear weather; once present, `level.txt` overrides
+  `player.txt`. Unsupported/malformed files fall back with a warning.
+- Fire timers live in `fire.txt` (`x y z remaining`, sorted); the fire block
+  id is in `world.obs` v4. Both are additive; no existing row layout changes.
+  Normal item and creative placement of `openblock:fire` goes through the same
+  timed, capped host ignition path as lightning/spread. Only resident cells are
+  saved; streaming an unloaded chunk discards the block and timer together.
+- Lightning scheduling and candidate order are deterministic from the
+  domain-separated `seed ^ WEATHER_STREAM ^ epoch ^ tick` roll and the sorted
+  candidate columns, so a reconnect or reload resumes the same stream. The host
+  `state_hash` covers weather and fire timers.
+- The server sends `weather_sync` at the 1 s cadence even when unchanged, which
+  is small and bounded; a future bit-packed transport can switch to change-only
+  deltas without changing the semantics.
+
+### C.3 Verification
+
+`ob_protocol::message::tests::weather_wire_tags_and_names_are_stable` pins the
+wire tags, enum names and round-trip. The server loopback test
+`protocol_v5_weather_sync_lightning_fire_and_reconnect_are_authoritative`
+asserts an initial sync, a forced thunder sync, a forced strike followed by the
+fire `block_edit`, reconnect sync and save/reload weather stability. Host-level
+tests cover determinism, rates, persistence, caps, hydration and extinguishing.

@@ -1,4 +1,4 @@
-//! Loopback integration tests for protocol v4 server-authoritative survival.
+//! Loopback integration tests for protocol v5 server-authoritative survival.
 //!
 //! Each test starts a real dedicated server on `127.0.0.1:0` with a temporary
 //! world, connects raw `std::net::TcpStream` clients and exchanges the public
@@ -15,8 +15,8 @@ use ob_content::{BlockId, ItemId, MobKind, Registry};
 use ob_math::{Aabb, BlockPos, LocalPos, WorldVec};
 use ob_protocol::{
     ClientMessage, ContainerKind, DespawnReason, EntityKind, ItemStackDto, LIGHT_ENCODING_RAW, LIGHT_ENCODING_ZSTD,
-    LIGHT_SECTION_FORMAT, MAX_FRAME_LEN, MAX_LIGHT_SECTIONS_PER_UPDATE, PROTOCOL_VERSION, ServerMessage,
-    decode_light_words, read_message, write_message,
+    LIGHT_SECTION_FORMAT, MAX_FRAME_LEN, MAX_LIGHT_SECTIONS_PER_UPDATE, PROTOCOL_VERSION, PrecipitationKind,
+    ServerMessage, WeatherPhase, decode_light_words, read_message, write_message,
 };
 use ob_server::{DedicatedServer, GameMode, Host, HostConfig, NetConfig};
 
@@ -1596,17 +1596,17 @@ fn thirty_six_slot_inventory_moves_equips_and_survives_reconnect() {
 }
 
 #[test]
-fn protocol_v2_client_is_rejected_with_reason() {
+fn protocol_v4_client_is_rejected_with_reason() {
     let mut server = TestServer::start("protocol");
     let mut old = TestClient::connect(server.addr());
     old.send(ClientMessage::Hello {
-        protocol: 2,
+        protocol: 4,
         name: "legacy".to_string(),
     });
     let reason = old.expect_disconnect("protocol_mismatch");
-    assert!(reason.contains("server protocol 4"), "{reason}");
+    assert!(reason.contains("server protocol 5"), "{reason}");
     assert!(reason.contains("upgrade"), "{reason}");
-    assert_eq!(ob_protocol::PROTOCOL_VERSION, 4);
+    assert_eq!(ob_protocol::PROTOCOL_VERSION, 5);
     server.stop();
 }
 
@@ -1811,4 +1811,145 @@ fn farming_use_block_updates_replicate_to_clients() {
     // Harvesting the immature crop removes the block and replicates the edit.
     alice.send(ClientMessage::UseBlock { pos: [sx, 199, sz] });
     assert_eq!(alice.wait_block_edit([sx, 199, sz]), 0);
+}
+
+#[test]
+fn protocol_v5_weather_sync_lightning_fire_and_reconnect_are_authoritative() {
+    let mut server = TestServer::start("weather-v5");
+    let mut alice = TestClient::connect(server.addr());
+    let joined = join(&server, &mut alice, "alice");
+
+    let sync = alice.recv_until("weather sync", |message| {
+        matches!(message, ServerMessage::WeatherSync { .. })
+    });
+    let ServerMessage::WeatherSync {
+        phase,
+        intensity,
+        remaining_ticks,
+        epoch,
+        precipitation,
+        biome,
+        weather_factor,
+    } = sync
+    else {
+        unreachable!()
+    };
+    let authoritative = server.server().weather_state();
+    assert_eq!(phase, authoritative.phase);
+    assert!(
+        remaining_ticks.abs_diff(authoritative.remaining_ticks) <= 60,
+        "the sync and the live state may be a few ticks apart"
+    );
+    assert_eq!(epoch, authoritative.epoch);
+    assert!((intensity - f64::from(authoritative.intensity_permille) / 1_000.0).abs() < 1e-9);
+    assert!(matches!(
+        biome.as_str(),
+        "plains" | "forest" | "desert" | "snowy_taiga" | "mountains"
+    ));
+    if phase == WeatherPhase::Clear {
+        assert_eq!(precipitation, PrecipitationKind::None);
+        assert_eq!(weather_factor, 1.0);
+    }
+
+    // Force a full thunderstorm, freeze the machine and verify the next sync.
+    server.server().set_weather_state(WeatherPhase::Thunder, 10_000, 1_000);
+    server.server().set_weather_cycle(false);
+    let sync = alice.recv_until("thunder weather sync", |message| {
+        matches!(
+            message,
+            ServerMessage::WeatherSync {
+                phase: WeatherPhase::Thunder,
+                ..
+            }
+        )
+    });
+    let ServerMessage::WeatherSync {
+        intensity,
+        remaining_ticks,
+        epoch,
+        precipitation,
+        biome,
+        weather_factor,
+        ..
+    } = sync
+    else {
+        unreachable!()
+    };
+    assert_eq!(intensity, 1.0);
+    assert!((9_990..=10_000).contains(&remaining_ticks));
+    assert_eq!(epoch, 0);
+    assert_eq!(weather_factor, 0.6);
+    assert!(
+        precipitation != PrecipitationKind::None || biome == "desert",
+        "a precipitating phase must rain/snow everywhere except a dry biome"
+    );
+
+    // Force one strike at the surface directly below the spawn feet. The
+    // broadcast must carry the flash and the following fire block edit.
+    let spawn = server.spawn;
+    let top = BlockPos::new(
+        spawn.x.floor() as i32,
+        spawn.y.floor() as i32 - 1,
+        spawn.z.floor() as i32,
+    );
+    // A stone roof directly above the future fire keeps it out of the storm, so
+    // the fire BlockEdit is observed instead of being coalesced away by rain.
+    // The admin surface writes the block without survival reach/support rules.
+    assert!(
+        server
+            .server()
+            .set_block(BlockPos::new(top.x, top.y + 2, top.z), "openblock:stone"),
+        "roof block must be writable"
+    );
+    assert!(
+        server.server().force_lightning_at(top),
+        "spawn surface must accept a strike"
+    );
+    let strike = alice.recv_until("lightning strike", |message| {
+        matches!(message, ServerMessage::LightningStrike { .. })
+    });
+    let ServerMessage::LightningStrike {
+        pos,
+        block,
+        ignited,
+        flash,
+    } = strike
+    else {
+        unreachable!()
+    };
+    assert_eq!(block, [top.x, top.y, top.z]);
+    assert!(flash);
+    assert!(pos[1] > f64::from(top.y));
+    assert!(ignited, "an air cell above a solid surface must ignite");
+    let fire_id = Registry::base().id("openblock:fire").expect("fire block id").0;
+    let fire_pos = [top.x, top.y + 1, top.z];
+    let edited = alice.wait_block_edit(fire_pos);
+    assert_eq!(edited, fire_id, "fire ignition must arrive as a BlockEdit");
+
+    // Reconnect: the new session sees the same frozen storm and fire.
+    drop(alice);
+    let mut bob = TestClient::connect(server.addr());
+    join(&server, &mut bob, "bob");
+    let sync = bob.recv_until("weather sync after reconnect", |message| {
+        matches!(message, ServerMessage::WeatherSync { .. })
+    });
+    let ServerMessage::WeatherSync { phase, epoch, .. } = sync else {
+        unreachable!()
+    };
+    assert_eq!(phase, WeatherPhase::Thunder);
+    assert_eq!(epoch, 0);
+
+    let expected = server.server().weather_state();
+    assert!(server.server().block_at(top.offset(0, 1, 0)).is_some());
+    server.stop();
+    let reopened = server.reopen();
+    assert_eq!(reopened.weather(), &expected, "weather must survive save/reload");
+    assert_eq!(
+        reopened.registry().id_or_air("openblock:fire"),
+        reopened
+            .world()
+            .get_block(BlockPos::new(fire_pos[0], fire_pos[1], fire_pos[2]))
+    );
+    assert!(reopened.tick_count() > 0);
+    assert!(joined.id != 0);
 }

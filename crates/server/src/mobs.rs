@@ -861,6 +861,7 @@ impl Host {
         let furnace = self.registry.id_or_air("openblock:furnace");
         let bed_foot = self.registry.id_or_air("openblock:bed_foot");
         let bed_head = self.registry.id_or_air("openblock:bed_head");
+        let fire = self.registry.id_or_air("openblock:fire");
         let mut destroyed = 0usize;
         'blocks: for dy in -radius..=radius {
             for dz in -radius..=radius {
@@ -888,6 +889,9 @@ impl Host {
                     if self.world.set_block(pos, BlockId::AIR) {
                         self.crops.remove(&pos);
                         self.crops.remove(&pos.offset(0, 1, 0));
+                        if block == fire {
+                            self.fires.remove(&pos);
+                        }
                         self.record_block_update(pos, BlockId::AIR);
                         destroyed += 1;
                         if destroyed >= ob_sim::EXPLOSION_MAX_BLOCKS {

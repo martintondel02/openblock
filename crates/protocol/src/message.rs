@@ -17,12 +17,14 @@ use crate::frame::MAX_FRAME_LEN;
 
 /// The protocol version implemented by this crate.
 ///
-/// Version 4 adds the 1.3 danger slice: `InteractEntity`, `InteractResult`,
-/// `XpSync`, `Explosion`, projectile entity kinds, mob breeding/baby DTO fields
-/// and charged-attack result fields. Versions 1–3 are rejected with
-/// `protocol_mismatch` before any session state is exchanged. Framing, chunk and
-/// light messages are unchanged.
-pub const PROTOCOL_VERSION: u16 = 4;
+/// Version 5 adds the 1.5 weather slice: [`ServerMessage::WeatherSync`] and
+/// [`ServerMessage::LightningStrike`], plus the [`WeatherPhase`] and
+/// [`PrecipitationKind`] payload enums. Version 4 added the 1.3 danger slice
+/// (`InteractEntity`, `InteractResult`, `XpSync`, `Explosion`, projectile entity
+/// kinds, breeding/baby fields and charged-attack results). Versions 1–4 are
+/// rejected with `protocol_mismatch` before any session state is exchanged.
+/// Framing, chunk and light messages are unchanged.
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Maximum number of bytes in a player name.
 pub const MAX_NAME_LEN: usize = 32;
@@ -120,6 +122,70 @@ pub enum ContainerKind {
     Furnace,
     /// A chest with [`CHEST_WINDOW_SLOTS`] slots.
     Chest,
+}
+
+/// Authoritative weather phase of one world (protocol v5).
+///
+/// The server advances this machine; clients only render it. Durations and
+/// transition probabilities live in the host, never in the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeatherPhase {
+    /// No precipitation; `intensity` ramps down to zero.
+    Clear,
+    /// Rain or snow at `0.65..=1.0` intensity.
+    Precipitating,
+    /// Rain or snow plus lightning at `0.85..=1.0` intensity.
+    Thunder,
+}
+
+impl WeatherPhase {
+    /// Stable lower-case name, identical to the JSON tag.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Clear => "clear",
+            Self::Precipitating => "precipitating",
+            Self::Thunder => "thunder",
+        }
+    }
+
+    /// Parses the stable lower-case name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "clear" => Some(Self::Clear),
+            "precipitating" => Some(Self::Precipitating),
+            "thunder" => Some(Self::Thunder),
+            _ => None,
+        }
+    }
+}
+
+/// Per-column precipitation type reported by [`ServerMessage::WeatherSync`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrecipitationKind {
+    /// No precipitation: clear weather or a dry biome (desert).
+    None,
+    /// Liquid rain.
+    Rain,
+    /// Snow.
+    Snow,
+}
+
+impl PrecipitationKind {
+    /// Stable lower-case name, identical to the JSON tag.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Rain => "rain",
+            Self::Snow => "snow",
+        }
+    }
+
+    /// Whether any precipitation is falling.
+    pub const fn is_some(self) -> bool {
+        !matches!(self, Self::None)
+    }
 }
 
 /// Furnace progress fields mirrored to a client with an open window.
@@ -642,6 +708,47 @@ pub enum ServerMessage {
         /// Changed sections. Empty batches are never sent.
         sections: std::vec::Vec<LightSectionDto>,
     },
+    /// Authoritative weather state for the receiving player's column (protocol
+    /// v5).
+    ///
+    /// The phase, intensity, remaining ticks and storm epoch are global. The
+    /// precipitation kind and biome name are resolved at the receiving player's
+    /// feet column, so two players in different biomes can see rain and snow at
+    /// the same time. `weather_factor` is the value the server uses in its
+    /// gameplay-light query (`1.0` clear, `0.8` rain, `0.6` thunder). Clients must
+    /// render particles/flash from these fields and must not advance the
+    /// machine themselves.
+    WeatherSync {
+        /// Current phase.
+        phase: WeatherPhase,
+        /// Ramp intensity `0.0..=1.0` (rain `0.65..=1.0`, thunder `0.85..=1.0`).
+        intensity: f64,
+        /// Ticks left in the current phase.
+        remaining_ticks: u32,
+        /// Storm epoch, incremented on every phase transition.
+        epoch: u64,
+        /// Precipitation at the receiving player's column.
+        precipitation: PrecipitationKind,
+        /// Worldgen biome name at the receiving player's column.
+        biome: String,
+        /// Gameplay-light multiplier (`1.0`/`0.8`/`0.6`).
+        weather_factor: f64,
+    },
+    /// One lightning strike (protocol v5).
+    ///
+    /// `flash` is true for the visible flash; `ignited` is true when the strike
+    /// placed a fire block. Clients derive thunder audio delay from the distance
+    /// to `pos` (343 m/s); the server does not schedule audio.
+    LightningStrike {
+        /// Strike centre for the flash, in world space.
+        pos: [f64; 3],
+        /// Struck block position (the sky-exposed solid top block).
+        block: [i32; 3],
+        /// Whether the strike placed fire.
+        ignited: bool,
+        /// Whether clients should render a visible flash.
+        flash: bool,
+    },
     /// Authoritative world clock, used by the client to render the day/night
     /// cycle and to follow a sleep fast-forward.
     TimeSync {
@@ -1023,6 +1130,21 @@ mod tests {
                     },
                 ],
             },
+            ServerMessage::WeatherSync {
+                phase: WeatherPhase::Thunder,
+                intensity: 0.875,
+                remaining_ticks: 4_200,
+                epoch: 9,
+                precipitation: PrecipitationKind::Snow,
+                biome: "snowy_taiga".to_string(),
+                weather_factor: 0.6,
+            },
+            ServerMessage::LightningStrike {
+                pos: [12.5, 70.0, -3.5],
+                block: [12, 69, -4],
+                ignited: true,
+                flash: true,
+            },
             ServerMessage::TimeSync {
                 tick: 24_500,
                 day_phase: 500,
@@ -1086,7 +1208,7 @@ mod tests {
         assert_eq!(INVENTORY_SLOTS, 36);
         assert_eq!(EQUIPMENT_SLOTS, 4);
         assert_eq!(EQUIPMENT_SLOT_START + EQUIPMENT_SLOTS as u16, 40);
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
         assert_eq!(MAX_LIGHT_SECTIONS_PER_UPDATE, 64);
     }
 
@@ -1128,6 +1250,56 @@ mod tests {
         })
         .expect("json");
         assert_eq!(time["type"], "time_sync");
+    }
+
+    #[test]
+    fn weather_wire_tags_and_names_are_stable() {
+        let sync = ServerMessage::WeatherSync {
+            phase: WeatherPhase::Precipitating,
+            intensity: 0.7,
+            remaining_ticks: 3_000,
+            epoch: 4,
+            precipitation: PrecipitationKind::Rain,
+            biome: "plains".to_string(),
+            weather_factor: 0.8,
+        };
+        let json = serde_json::to_value(&sync).expect("json");
+        assert_eq!(json["type"], "weather_sync");
+        assert_eq!(json["phase"], "precipitating");
+        assert_eq!(json["precipitation"], "rain");
+        assert_eq!(json["weather_factor"], 0.8);
+        let decoded: ServerMessage = serde_json::from_value(json).expect("decode weather sync");
+        assert_eq!(decoded, sync);
+
+        let strike = ServerMessage::LightningStrike {
+            pos: [1.0, 2.0, 3.0],
+            block: [1, 1, 3],
+            ignited: false,
+            flash: true,
+        };
+        let json = serde_json::to_value(&strike).expect("json");
+        assert_eq!(json["type"], "lightning_strike");
+        assert_eq!(json["ignited"], false);
+        assert_eq!(json["flash"], true);
+        let decoded: ServerMessage = serde_json::from_value(json).expect("decode strike");
+        assert_eq!(decoded, strike);
+
+        for phase in [WeatherPhase::Clear, WeatherPhase::Precipitating, WeatherPhase::Thunder] {
+            assert_eq!(WeatherPhase::from_name(phase.name()), Some(phase));
+            assert_eq!(
+                serde_json::to_value(phase).expect("phase"),
+                serde_json::Value::String(phase.name().to_string())
+            );
+        }
+        assert_eq!(WeatherPhase::from_name("hail"), None);
+        for kind in [
+            PrecipitationKind::None,
+            PrecipitationKind::Rain,
+            PrecipitationKind::Snow,
+        ] {
+            assert_eq!(kind.name(), serde_json::to_value(kind).expect("kind").as_str().unwrap());
+            assert_eq!(kind.is_some(), !matches!(kind, PrecipitationKind::None));
+        }
     }
 
     #[test]

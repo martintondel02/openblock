@@ -15,7 +15,7 @@
 //! Query methods on [`DedicatedServer`] lock briefly and are intended for tests,
 //! the console and future admin surfaces.
 //!
-//! # Protocol v4 survival
+//! # Protocol v5 survival
 //!
 //! Network players are server-authoritative for survival state: vitals,
 //! inventory, equipment, block actions, combat, item pickup, death/respawn and
@@ -59,8 +59,8 @@ use ob_protocol::{
     BlockDescriptor, ClientMessage, ContainerKind, DespawnReason, EQUIPMENT_SLOTS, EntityKind, EntitySnapshot,
     EntityStateEntry, FurnaceProgress, HOTBAR_SLOTS, ItemStackDto, LIGHT_SECTION_FORMAT, LightSectionDto, MAIN_SLOTS,
     MAX_FRAME_LEN, MAX_LIGHT_SECTIONS_PER_UPDATE, PROTOCOL_VERSION, PlayerSnapshot, RateLimit, SLOT_WINDOW_START,
-    ServerMessage, block_manifest, content_fingerprint, decode_payload, encode_chunk_checked, encode_light_words,
-    encode_server_frame, read_frame, sanitise_motd, validate_chat_text, validate_player_name,
+    ServerMessage, WeatherPhase, block_manifest, content_fingerprint, decode_payload, encode_chunk_checked,
+    encode_light_words, encode_server_frame, read_frame, sanitise_motd, validate_chat_text, validate_player_name,
 };
 use ob_sim::REACH;
 
@@ -92,8 +92,11 @@ pub const DEFAULT_SAVE_INTERVAL_SECONDS: u64 = 60;
 pub const MAX_QUEUED_FRAMES: usize = 256;
 /// Maximum concurrent handshakes (a small bound against connection floods).
 pub const MAX_CONCURRENT_HANDSHAKES: usize = 32;
-/// Default network game mode (survival in protocol v4).
+/// Default network game mode (survival in protocol v4+).
 pub const DEFAULT_NETWORK_GAME_MODE: GameMode = GameMode::Survival;
+/// Weather sync cadence. One second is cheap (one small frame per player) and
+/// keeps a late joiner's sky consistent even without a phase change event.
+pub const WEATHER_SYNC_INTERVAL_TICKS: u64 = 20;
 
 /// One simulation tick (20 Hz).
 const TICK_INTERVAL: Duration = Duration::from_millis(50);
@@ -793,6 +796,52 @@ impl DedicatedServer {
         lock(&self.shared.core).tick_count
     }
 
+    /// Cloned authoritative weather state (admin/test surface).
+    pub fn weather_state(&self) -> crate::WeatherState {
+        lock(&self.shared.core).host.weather().clone()
+    }
+
+    /// Forces a weather state (admin/test surface). The next `WeatherSync` is
+    /// delivered within [`WEATHER_SYNC_INTERVAL_TICKS`].
+    pub fn set_weather_state(&self, phase: WeatherPhase, remaining_ticks: u32, intensity_permille: u16) {
+        let mut core = lock(&self.shared.core);
+        core.host.set_weather_state(phase, remaining_ticks, intensity_permille);
+        core.dirty = true;
+    }
+
+    /// Writes one authoritative block directly (admin/test surface).
+    ///
+    /// Bypasses survival placement rules (reach, support, held item) but still
+    /// relights through `World::set_block`; used by the weather loopback test to
+    /// build an isolated roof. Never reachable from the wire.
+    pub fn set_block(&self, pos: BlockPos, block: &str) -> bool {
+        let mut core = lock(&self.shared.core);
+        let Some(block) = core.host.registry().id(block) else {
+            return false;
+        };
+        let changed = core.host.world_mut().set_block(pos, block);
+        if changed {
+            core.dirty = true;
+        }
+        changed
+    }
+
+    /// Enables or freezes the weather machine (admin/test surface).
+    pub fn set_weather_cycle(&self, enabled: bool) {
+        lock(&self.shared.core).host.set_weather_cycle(enabled);
+    }
+
+    /// Forces one lightning strike on a valid surface block (admin/test
+    /// surface). The effects and the protocol cue use the normal host path.
+    pub fn force_lightning_at(&self, top: BlockPos) -> bool {
+        let mut core = lock(&self.shared.core);
+        let struck = core.host.force_lightning_at(top).is_some();
+        if struck {
+            core.dirty = true;
+        }
+        struck
+    }
+
     /// Most recent one-second TPS measurement.
     pub fn tps(&self) -> f32 {
         lock(&self.shared.core).tps
@@ -1065,7 +1114,7 @@ fn handshake(shared: Arc<Shared>, stream: TcpStream) {
         reject_handshake(
             &stream,
             &format!(
-                "protocol_mismatch: server protocol {PROTOCOL_VERSION}, client sent {protocol}; 1.3 and older clients must upgrade to a 1.4+ build"
+                "protocol_mismatch: server protocol {PROTOCOL_VERSION}, client sent {protocol}; 1.4 and older clients must upgrade to a 1.5+ build"
             ),
         );
         return;
@@ -1186,6 +1235,7 @@ fn handshake(shared: Arc<Shared>, stream: TcpStream) {
     }
     let (entities, known_entities) = initial_entities(&core.host, net_player.pos);
     initial.push(ServerMessage::EntitySnapshot { entities });
+    initial.push(weather_sync_message(&core.host, net_player.pos));
     initial.push(time_sync_message(&core.host));
     initial.push(sleep_state_message(&core.host, id, &core.host.network_sleep_snapshot()));
 
@@ -1465,6 +1515,33 @@ fn time_sync_message(host: &Host) -> ServerMessage {
         tick: host.tick_count(),
         day_phase: host.day_phase(),
         day_ticks: ob_protocol::DAY_LENGTH_TICKS,
+    }
+}
+
+/// Builds one player's authoritative weather sync.
+///
+/// The phase/intensity/remaining/epoch are global; precipitation and biome are
+/// resolved at the receiving player's feet column so rain and snow can coexist.
+/// Intensity and the light factor are converted from fixed-point permille to
+/// clean decimal `f64` values (a raw `f32` would serialise as 0.8000000119).
+fn weather_sync_message(host: &Host, pos: WorldVec) -> ServerMessage {
+    let x = pos.x.floor() as i32;
+    let z = pos.z.floor() as i32;
+    let precipitation = host.precipitation_at(x, z);
+    let weather = host.weather();
+    let weather_factor = match weather.phase {
+        WeatherPhase::Clear => 1.0,
+        WeatherPhase::Precipitating => 0.8,
+        WeatherPhase::Thunder => 0.6,
+    };
+    ServerMessage::WeatherSync {
+        phase: weather.phase,
+        intensity: f64::from(weather.intensity_permille) / 1_000.0,
+        remaining_ticks: weather.remaining_ticks,
+        epoch: weather.epoch,
+        precipitation,
+        biome: host.biome_name_at(x, z).to_string(),
+        weather_factor,
     }
 }
 
@@ -2690,6 +2767,7 @@ impl Core {
         self.relay_damage_events();
         self.relay_entity_removals();
         self.relay_explosions();
+        self.relay_lightning();
         // Crop growth and hydration run inside `tick_network`; publish their
         // block changes before generated-chunk dirty sections are discarded.
         self.broadcast_block_updates(0);
@@ -2710,6 +2788,9 @@ impl Core {
         }
         if skipping || sleep_changed || self.tick_count.is_multiple_of(TIME_SYNC_INTERVAL_TICKS) {
             self.broadcast_time_sync();
+        }
+        if self.tick_count.is_multiple_of(WEATHER_SYNC_INTERVAL_TICKS) {
+            self.broadcast_weather_sync();
         }
         self.sync_players();
         self.maybe_autosave(now);
@@ -2833,6 +2914,33 @@ impl Core {
                 },
                 None,
             );
+        }
+    }
+
+    /// Relays lightning strikes produced by the host weather tick.
+    fn relay_lightning(&mut self) {
+        for strike in self.host.take_lightning_events() {
+            self.broadcast(
+                &ServerMessage::LightningStrike {
+                    pos: [strike.pos.x, strike.pos.y, strike.pos.z],
+                    block: [strike.block.x, strike.block.y, strike.block.z],
+                    ignited: strike.ignited,
+                    flash: strike.flash,
+                },
+                None,
+            );
+        }
+    }
+
+    /// Sends every player their per-column weather sync.
+    fn broadcast_weather_sync(&mut self) {
+        let ids: Vec<u64> = self.players.keys().copied().collect();
+        for id in ids {
+            let Some(player) = self.players.get(&id) else {
+                continue;
+            };
+            let message = weather_sync_message(&self.host, player.pos);
+            self.send(id, message);
         }
     }
 

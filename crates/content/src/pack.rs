@@ -486,6 +486,9 @@ struct RawBlock {
     /// 0 otherwise.
     #[serde(default)]
     sky_attenuation: Option<u8>,
+    /// Whether fire can spread to this block; omitted means not flammable.
+    #[serde(default)]
+    flammable: bool,
     /// Rendered shape; omitted means a full cube.
     #[serde(default)]
     shape: Option<BlockShape>,
@@ -602,6 +605,7 @@ fn build_blocks(path: &Path, raw_blocks: &[RawBlock]) -> Result<Vec<BlockType>, 
             emission,
             attenuation,
             sky_attenuation,
+            flammable: raw.flammable,
             shape: raw.shape.unwrap_or_default(),
         });
     }
@@ -878,6 +882,7 @@ mod tests {
         assert_eq!(expected.emission, actual.emission);
         assert_eq!(expected.attenuation, actual.attenuation);
         assert_eq!(expected.sky_attenuation, actual.sky_attenuation);
+        assert_eq!(expected.flammable, actual.flammable);
         assert_eq!(expected.shape, actual.shape);
     }
 
@@ -893,7 +898,7 @@ mod tests {
             assert_block_eq(base_block, loaded_block);
         }
         assert_eq!(loaded.id("openblock:air"), Some(BlockId(0)));
-        assert_eq!(loaded.len(), 29);
+        assert_eq!(loaded.len(), 30);
         let loaded_torch = loaded.block(loaded.id("openblock:torch").unwrap());
         assert_eq!(loaded_torch.emission, [14, 14, 14]);
         assert_eq!(loaded_torch.shape, BlockShape::Cross);
