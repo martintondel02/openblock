@@ -18,7 +18,7 @@
 %global debug_package %{nil}
 
 Name:           openblock
-Version:        1.2.1
+Version:        1.3.0
 Release:        1%{?dist}
 Summary:        Fast, self-hostable voxel sandbox with survival and multiplayer
 

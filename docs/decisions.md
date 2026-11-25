@@ -275,10 +275,16 @@ ordering) is the optimisation path, not GPU recomputation.
 First-party pipeline: forward+ clustered shading, PBR-lite materials for
 entities and items, stylised voxel shading with baked AO, GTAO, SSR water,
 volumetric fog/clouds, HDR with tone mapping, and **TAA with render scale** as
-the default anti-aliasing/reconstruction path. DLSS/FSR/XeSS are optional
-*external* components users install; no binary-only SDK is vendored or
-redistributed in this repository (their licenses forbid source redistribution and
-would contaminate the MIT/Apache grant).
+the default anti-aliasing/reconstruction path. DLSS and the FSR 2/3 / XeSS
+**binary SDKs** are optional external components users install; no binary-only
+SDK is vendored or redistributed in this repository (their licenses forbid
+source redistribution and would contaminate the MIT/Apache grant).
+
+**Amendment (1.3):** the **source-available, MIT-licensed FidelityFX Super
+Resolution 1.0** algorithm (`ffx_fsr1.h` EASU+RCAS) is an exception: OpenBlock
+ships a WGSL port with the AMD MIT notice in `crates/render/assets/fsr/` and a
+matching REUSE annotation. It is a spatial upscaler, not a temporal
+reconstruction SDK, and is off by default; FSR 2/3 remain external-only.
 
 ### DEC-017 — Texture arrays + offline KTX2/BC compression
 **Status:** settled · **Reversal cost:** medium · **Owner:** MS-04

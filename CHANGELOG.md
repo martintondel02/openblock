@@ -6,6 +6,73 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [1.3.0] — 2026-11-25 (Far Horizons: 512-chunk view + FSR)
+
+The reach release: the world is now visible **512 chunks (8,192 blocks)** away
+through visual-only far-terrain LOD, with optional FSR 1.0 upscaling. Simulation
+and full-detail streaming stay at the configured 2–32 chunk radius; save format
+4 and protocol 3 are unchanged.
+
+### Added — 512-chunk visual render distance
+- New `view_distance_chunks` setting (32..=512, default 128, up to **8,192
+  blocks**) plus `--view-distance`; the existing render-distance row is now
+  labelled "Simulation distance" (2..=32). Display row shows both chunks and
+  blocks, steps by 16, warns once above 128 and notes visual-only/GPU cost.
+- Tiered far-terrain heightfield LOD (8/16/32/64/128 m cells) out to 512 chunks
+  around the camera, with 1.5-cell tier overlap, seam offsets, biome/slope/snow/
+  beach/seabed colours, curvature shading, sea-level water with alpha, long-range
+  fog to the 8,320-block far plane, and no gameplay authority.
+- Client-side background builder: one build in flight, 96 m recenter hysteresis,
+  350 ms throttle, stale-result discard on teleports; ~48k quads / 3.8 MiB /
+  8 ms off-thread at 512 chunks; ~1–2 draws; no holes/seams on the horizon.
+- Deterministic `Generator::surface_sample(x,z)` (height+biome exactly matching
+  `height_at`/`biome_at`, no features/caves) used by single-player and
+  multiplayer (seed from the handshake); far terrain never feeds collision,
+  spawning, drops or anti-cheat.
+- F3 now shows view/simulation/near-full chunks, far tier counts, quads,
+  vertices, build time, centre and rebuild state.
+- Measured (High, 512-chunk view, 512-block sim, readback): 720p near-only
+  10.59 ms p50 / 94.4 FPS → far 11.19 ms / 89.3 FPS; 1080p 14.85 / 67.1 →
+  15.70 ms / 63.7 FPS. Far terrain costs +0.60/+0.85 ms; RSS 269–279 MiB.
+- `render-distance-bench --view-distance`, `--eye-height`, `--no-far`; new
+  far-terrain specs/measurements.
+
+### Added — FSR 1.0 render scaling
+- Ported AMD FidelityFX Super Resolution 1.0 (EASU + RCAS, MIT) to WGSL with the
+  AMD notice in `crates/render/assets/fsr/`; REUSE annotation and DEC-016
+  amendment for this source-only MIT exception (FSR 2/3 remain external).
+- Frame graph keeps display size and render size separate: HDR/depth/bloom/post
+  render at the FSR scale, EASU+RCAS upscale to the surface, and UI stays native;
+  windowed/offscreen paths share it, resize/quality changes reallocate targets,
+  unsupported formats fall back once with a log.
+- `Settings.fsr_quality` (Off/Ultra Quality/Quality/Balanced/Performance,
+  independent of presets, default Off), Graphics-tab FSR row with live internal
+  resolution, F3 line, `--fsr` run-only CLI, benchmark flag.
+- Honest measurement on the reference iGPU: FSR is 47–68% **slower** than native
+  at 512-chunk view (EASU+RCAS alone 3.5 ms at 720p / 7.8 ms at 1080p; the scene
+  is not fill-bound and the shadow map owns bandwidth), so it ships off by
+  default for this GPU, with measured details in the docs.
+
+### Verification
+- `cargo test --workspace --all-targets`: **989+ passed, 0 failed, 18 ignored**
+  (plus FSR/far-terrain GPU tests); clippy `-D warnings`, fmt, rustdoc,
+  architecture/docs checks, smoke, quick load gate and backup/restore green;
+  CI covers Fedora 44/45, Ubuntu, Windows and macOS.
+- New v1.3.0 screenshots: 512-chunk day/dusk/high-angle/1080p, F3, and FSR
+  native/quality/performance plus settings/F3 UI.
+
+### Known limitations
+- Far terrain is visual only: style seam at the 512-block near boundary from
+  high/flying views, no LOD cross-fade, coarse distant coastlines/water, no
+  trees/caves far out, ~5 MiB main-thread upload on rebuild; standard D32 depth
+  at an 8,320-block far plane.
+- FSR 1 is spatial-only (no temporal history/motion vectors), 8-bit sRGB output
+  only, RCAS fixed at 0.20 stops, ~8.3 MB intermediate at 1080p, and slower than
+  native on the measured iGPU; no dynamic resolution.
+- 1.2 limits (no weather, crops pause in unloaded columns, no bone meal/tool
+  tiers beyond iron/offhand/wall torches, server memory growth) remain; next is
+  the 1.3 gameplay wave (weather, new mobs, breeding, XP, loot).
+
 ## [1.2.1] — 2026-11-25 (settings preset fix)
 
 ### Fixed
