@@ -986,14 +986,24 @@ mod tests {
             Err(TextureLoadError::PackNotFound { .. })
         ));
 
-        // Non-UTF-8 path components are legal on Unix and must load normally.
+        // Non-UTF-8 path components are legal on Linux (but not on every
+        // filesystem; macOS rejects invalid UTF-8 byte sequences with EILSEQ).
+        // Where the platform can create the directory, the loader must load it
+        // normally; where it cannot, the loader must still fail gracefully.
         let root = TempDir::new();
         let weird = root.path.join(OsString::from_vec(vec![b'p', 0x80, b'x']));
         let block_dir = weird.join("assets/minecraft/textures/block");
-        write_standard_pack(&block_dir, 16, true);
-        let layers = load_resource_pack(&weird).expect("a non-UTF-8 path must load");
-        assert_eq!(layers.size, 16);
-        assert!(!layers.source.to_string_lossy().is_empty());
+        if std::fs::create_dir_all(&block_dir).is_ok() {
+            write_standard_pack(&block_dir, 16, true);
+            let layers = load_resource_pack(&weird).expect("a non-UTF-8 path must load");
+            assert_eq!(layers.size, 16);
+            assert!(!layers.source.to_string_lossy().is_empty());
+        } else {
+            assert!(matches!(
+                load_resource_pack(&weird),
+                Err(TextureLoadError::PackNotFound { .. } | TextureLoadError::Io { .. })
+            ));
+        }
 
         // `..` components resolve against the caller's path and stay inside the
         // pack the caller named; no panic and no unexpected absolute path.

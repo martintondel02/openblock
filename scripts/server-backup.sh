@@ -117,7 +117,7 @@ archive_name=${world_name//[^A-Za-z0-9._-]/_}
 mkdir -p -- "$dest" || die "cannot create backup directory: $dest"
 dest=$(cd -- "$dest" && pwd -P)
 
-if command -v zstd >/dev/null 2>&1 && tar --help 2>/dev/null | grep -q -- '--zstd'; then
+if command -v zstd >/dev/null 2>&1 && tar --help 2>/dev/null > "$tmp/help.txt" && grep -q -- '--zstd' "$tmp/help.txt"; then
     ext=tar.zst
     compression=zstd
     list_cmd=(tar --zstd -tf)

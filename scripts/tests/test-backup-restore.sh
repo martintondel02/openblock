@@ -61,7 +61,8 @@ done
 pass "archives are mode 600"
 
 newest=${archives[1]}
-tar -tf "$newest" | grep -Fxq 'world/world.obs' || fail "archive lacks world/world.obs"
+tar -tf "$newest" > "$work/listing.txt" || fail "cannot list archive"
+grep -Fxq 'world/world.obs' "$work/listing.txt" || fail "archive lacks world/world.obs"
 pass "archive contains world/world.obs"
 
 # 3. Restore and compare the world payload byte-for-byte.
