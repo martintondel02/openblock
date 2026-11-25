@@ -215,11 +215,15 @@ impl<'a> SceneParams<'a> {
 }
 
 /// One renderable vertex: world position, tile UV, texture-array layer and
-/// baked light factor.
+/// packed sky/block light.
 ///
-/// The layout is 28 bytes: `position` 12, `uv` 8, `layer` 4, `light` 4. Normals
-/// are reconstructed from screen-space derivatives in the fragment shader, so
-/// the vertex format stays unchanged from 1.0.
+/// The layout is 32 bytes: `position` 12, `uv` 8, `layer` 4, packed light 4,
+/// reserved 4. Packed light stores sky in the low byte and block light (the
+/// brightest RGB channel) in the next byte, both scaled to `0..=255` after face
+/// brightness, per-corner ambient occlusion and the per-quad tint are folded
+/// in. Normals are reconstructed from screen-space derivatives in the fragment
+/// shader. The reserved word keeps the stride 4-byte aligned at 32 bytes and is
+/// available for a future second light attribute without changing the stride.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub struct Vertex {
@@ -229,12 +233,41 @@ pub struct Vertex {
     pub uv: [f32; 2],
     /// Index into the block texture array.
     pub layer: u32,
-    /// Baked light: face brightness times per-corner ambient occlusion.
-    pub light: f32,
+    /// Packed light: `sky | block << 8`, each `0..=255`.
+    pub light: u32,
+    /// Reserved (zero) so the vertex stride stays 32 bytes.
+    pub reserved: u32,
+}
+
+impl Vertex {
+    /// Packs byte-scaled sky and block-light values.
+    pub const fn pack_light(sky: u8, block: u8) -> u32 {
+        sky as u32 | ((block as u32) << 8)
+    }
+
+    /// Sky-light byte of this vertex (`0..=255`).
+    pub const fn sky_byte(self) -> u8 {
+        (self.light & 0xFF) as u8
+    }
+
+    /// Block-light byte of this vertex (`0..=255`).
+    pub const fn block_byte(self) -> u8 {
+        ((self.light >> 8) & 0xFF) as u8
+    }
+
+    /// Normalised sky light used by tests and shader parity checks.
+    pub fn sky(&self) -> f32 {
+        f32::from(self.sky_byte()) / 255.0
+    }
+
+    /// Normalised block light used by tests and shader parity checks.
+    pub fn block(&self) -> f32 {
+        f32::from(self.block_byte()) / 255.0
+    }
 }
 
 // Keep the vertex layout and shader attribute offsets in sync.
-const _: () = assert!(std::mem::size_of::<Vertex>() == 28);
+const _: () = assert!(std::mem::size_of::<Vertex>() == 32);
 
 /// A CPU-side mesh for one section.
 ///
@@ -750,12 +783,13 @@ mod tests {
 
     #[test]
     fn vertex_layout_matches_the_shader() {
-        assert_eq!(std::mem::size_of::<Vertex>(), 28);
+        assert_eq!(std::mem::size_of::<Vertex>(), 32);
         assert_eq!(std::mem::align_of::<Vertex>(), 4);
         assert_eq!(std::mem::offset_of!(Vertex, position), 0);
         assert_eq!(std::mem::offset_of!(Vertex, uv), 12);
         assert_eq!(std::mem::offset_of!(Vertex, layer), 20);
         assert_eq!(std::mem::offset_of!(Vertex, light), 24);
+        assert_eq!(std::mem::offset_of!(Vertex, reserved), 28);
     }
 
     #[test]
@@ -764,7 +798,8 @@ mod tests {
             position: [0.0; 3],
             uv: [0.0; 2],
             layer: 0,
-            light: 1.0,
+            light: Vertex::pack_light(255, 0),
+            reserved: 0,
         };
         let mesh = MeshData {
             vertices: vec![vertex; 36],

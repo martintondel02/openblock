@@ -1,4 +1,4 @@
-//! The OpenBlock interim wire protocol v2: JSON messages and chunk snapshots.
+//! The OpenBlock interim wire protocol v3: JSON messages and chunk snapshots.
 //!
 //! **Status: implemented for the 1.0 self-hosted multiplayer milestone.** This
 //! crate is the shared contract between the dedicated server
@@ -37,11 +37,12 @@
 //! 6. chunk snapshots stream from the server and player state is broadcast at
 //!    10 Hz.
 //!
-//! # Survival state (v2)
+//! # Survival state (v3)
 //!
-//! Protocol v2 makes the server authoritative for network-player survival:
-//! vitals (`PlayerVitals`), the nine-slot hotbar plus four armor slots
-//! (`InventorySync`/`SelectedSlot`), furnace and chest windows
+//! Protocol v3 makes the server authoritative for network-player survival:
+//! vitals (`PlayerVitals`), the 36-slot player inventory (nine hotbar plus 27
+//! main stacks) and four armor slots (`InventorySync`/`SelectedSlot`), furnace
+//! and chest windows
 //! (`ContainerOpen`/`ContainerUpdate`/`ContainerClose`), damage/death/respawn
 //! (`DamageEvent`/`Death`/`Respawn`) and mob/item entity replication
 //! (`EntitySpawn`/`EntitySnapshot`/`EntityState`/`EntityDespawn`). Clients send
@@ -50,9 +51,21 @@
 //! directly.
 //!
 //! Slot addresses used by [`ClientMessage::InventoryMove`]: hotbar `0..9`,
-//! equipment `9..13`, open window `100..` ([`SLOT_WINDOW_START`]). See
+//! main inventory `9..36`, equipment `36..40`, open window `100..`
+//! ([`SLOT_WINDOW_START`]). See
 //! [`ItemStackDto`], [`ContainerKind`], [`EntityKind`] and [`DespawnReason`] for
 //! the payload shapes.
+//!
+//! # Light and sleep (still v3)
+//!
+//! The 1.2 gameplay slice adds additive v3 messages without changing any
+//! existing payload: [`ServerMessage::LightUpdate`] carries compressed dense
+//! sky+RGB words for the sections a relight changed (see [`LightSectionDto`]
+//! and [`encode_light_words`]); [`ServerMessage::TimeSync`] publishes the
+//! authoritative world clock; and [`ServerMessage::SleepState`] plus
+//! [`ClientMessage::SleepRequest`]/[`ClientMessage::Wake`] drive bed sleep and
+//! the 100-tick sunrise fast-forward. Clients that do not understand a new
+//! variant must ignore it (the interim client already has a catch-all arm).
 //!
 //! # Chunk snapshots
 //!
@@ -82,6 +95,7 @@
 mod base64;
 pub mod chunk;
 pub mod frame;
+pub mod light;
 pub mod limits;
 pub mod message;
 
@@ -91,11 +105,16 @@ pub use frame::{
     encode_client_frame, encode_frame, encode_frame_with_limit, encode_server_frame, read_frame, read_message,
     write_frame, write_message, write_message_with_limit,
 };
+pub use light::{
+    LIGHT_CELLS, LIGHT_ENCODING_RAW, LIGHT_ENCODING_ZSTD, LIGHT_SECTION_FORMAT, LIGHT_WORDS_BYTES,
+    MAX_LIGHT_SECTION_BYTES, decode_light_words, encode_light_words,
+};
 pub use limits::RateLimit;
 pub use message::{
     BlockDescriptor, CHEST_WINDOW_SLOTS, ClientMessage, ContainerKind, DAY_LENGTH_TICKS, DespawnReason,
-    EQUIPMENT_SLOTS, EntityKind, EntitySnapshot, EntityStateEntry, FURNACE_WINDOW_SLOTS, FurnaceProgress, HOTBAR_SLOTS,
-    ItemStackDto, MAX_CHAT_LEN, MAX_MOTD_LEN, MAX_NAME_LEN, PROTOCOL_VERSION, PlayerSnapshot, SLOT_WINDOW_START,
-    ServerMessage, block_manifest, content_fingerprint, default_max_frame_len, manifest_matches, sanitise_motd,
-    validate_chat_text, validate_player_name,
+    EQUIPMENT_SLOT_START, EQUIPMENT_SLOTS, EntityKind, EntitySnapshot, EntityStateEntry, FURNACE_WINDOW_SLOTS,
+    FurnaceProgress, HOTBAR_SLOTS, INVENTORY_SLOTS, ItemStackDto, LightSectionDto, MAIN_SLOT_START, MAIN_SLOTS,
+    MAX_CHAT_LEN, MAX_LIGHT_SECTIONS_PER_UPDATE, MAX_MOTD_LEN, MAX_NAME_LEN, PROTOCOL_VERSION, PlayerSnapshot,
+    SLOT_WINDOW_START, ServerMessage, block_manifest, content_fingerprint, default_max_frame_len, manifest_matches,
+    sanitise_motd, validate_chat_text, validate_player_name,
 };

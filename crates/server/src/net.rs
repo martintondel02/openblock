@@ -15,7 +15,7 @@
 //! Query methods on [`DedicatedServer`] lock briefly and are intended for tests,
 //! the console and future admin surfaces.
 //!
-//! # Protocol v2 survival
+//! # Protocol v3 survival
 //!
 //! Network players are server-authoritative for survival state: vitals,
 //! inventory, equipment, block actions, combat, item pickup, death/respawn and
@@ -54,17 +54,19 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use ob_content::{BlockId, MobKind};
-use ob_math::{BlockPos, ChunkPos, WORLD_MAX_Y, WORLD_MIN_Y, WorldVec};
+use ob_math::{BlockPos, ChunkPos, SectionPos, WORLD_MAX_Y, WORLD_MIN_Y, WorldVec};
 use ob_protocol::{
     BlockDescriptor, ClientMessage, ContainerKind, DespawnReason, EQUIPMENT_SLOTS, EntityKind, EntitySnapshot,
-    EntityStateEntry, FurnaceProgress, HOTBAR_SLOTS, ItemStackDto, MAX_FRAME_LEN, PROTOCOL_VERSION, PlayerSnapshot,
-    RateLimit, SLOT_WINDOW_START, ServerMessage, block_manifest, content_fingerprint, decode_payload,
-    encode_chunk_checked, encode_server_frame, read_frame, sanitise_motd, validate_chat_text, validate_player_name,
+    EntityStateEntry, FurnaceProgress, HOTBAR_SLOTS, ItemStackDto, LIGHT_SECTION_FORMAT, LightSectionDto, MAIN_SLOTS,
+    MAX_FRAME_LEN, MAX_LIGHT_SECTIONS_PER_UPDATE, PROTOCOL_VERSION, PlayerSnapshot, RateLimit, SLOT_WINDOW_START,
+    ServerMessage, block_manifest, content_fingerprint, decode_payload, encode_chunk_checked, encode_light_words,
+    encode_server_frame, read_frame, sanitise_motd, validate_chat_text, validate_player_name,
 };
 use ob_sim::REACH;
 
 use crate::net_players::{
-    ENTITY_INTEREST_RADIUS, MAX_CONTAINER_DISTANCE, NetworkWindowRef, ServerPlayer, stack_dto, wire_entity_id,
+    ENTITY_INTEREST_RADIUS, MAX_CONTAINER_DISTANCE, NetworkSleepSnapshot, NetworkWindowRef, ServerPlayer, stack_dto,
+    wire_entity_id,
 };
 use crate::{GameMode, Host, HostError, ItemStack};
 
@@ -90,7 +92,7 @@ pub const DEFAULT_SAVE_INTERVAL_SECONDS: u64 = 60;
 pub const MAX_QUEUED_FRAMES: usize = 256;
 /// Maximum concurrent handshakes (a small bound against connection floods).
 pub const MAX_CONCURRENT_HANDSHAKES: usize = 32;
-/// Default network game mode (survival in protocol v2).
+/// Default network game mode (survival in protocol v3).
 pub const DEFAULT_NETWORK_GAME_MODE: GameMode = GameMode::Survival;
 
 /// One simulation tick (20 Hz).
@@ -143,6 +145,14 @@ const RESPAWNS_PER_SECOND: f64 = 1.0;
 const CONTAINER_CLOSES_PER_SECOND: f64 = 10.0;
 /// Entity spawn/state/despawn replication cadence (every N ticks = 10 Hz).
 const ENTITY_SYNC_INTERVAL_TICKS: u64 = 2;
+/// LightUpdate batches accepted per second per client (burst 20).
+const LIGHT_UPDATES_PER_SECOND: f64 = 10.0;
+/// SleepState/TimeSync keep-alive cadence (10 Hz / 1 Hz respectively).
+const SLEEP_SYNC_INTERVAL_TICKS: u64 = 10;
+/// Authoritative clock cadence (1 Hz; sleep start/end is sent immediately).
+const TIME_SYNC_INTERVAL_TICKS: u64 = 20;
+/// Sleep request/wake intents accepted per second per client.
+const SLEEP_REQUESTS_PER_SECOND: f64 = 2.0;
 /// Periodic self-vitals cadence.
 const VITALS_SYNC_INTERVAL_TICKS: u64 = 10;
 /// Periodic full inventory resync when nothing changed (1 Hz at 20 Hz ticks).
@@ -540,6 +550,10 @@ struct NetPlayer {
     chat_limit: RateLimit,
     chunk_limit: RateLimit,
     ping_limit: RateLimit,
+    light_limit: RateLimit,
+    sleep_limit: RateLimit,
+    /// Sections whose light this client still needs (per-client reliable queue).
+    pending_light: std::collections::BTreeSet<SectionPos>,
     window: Option<OpenWindow>,
     known_entities: BTreeMap<u64, EntityView>,
 }
@@ -1048,7 +1062,7 @@ fn handshake(shared: Arc<Shared>, stream: TcpStream) {
         reject_handshake(
             &stream,
             &format!(
-                "protocol_mismatch: server protocol {PROTOCOL_VERSION}, client sent {protocol}; version 1 clients must upgrade"
+                "protocol_mismatch: server protocol {PROTOCOL_VERSION}, client sent {protocol}; 1.1 and older clients must upgrade to a 1.2+ build"
             ),
         );
         return;
@@ -1169,6 +1183,8 @@ fn handshake(shared: Arc<Shared>, stream: TcpStream) {
     }
     let (entities, known_entities) = initial_entities(&core.host, net_player.pos);
     initial.push(ServerMessage::EntitySnapshot { entities });
+    initial.push(time_sync_message(&core.host));
+    initial.push(sleep_state_message(&core.host, id, &core.host.network_sleep_snapshot()));
 
     let mut queued = true;
     for message in initial {
@@ -1233,6 +1249,9 @@ fn handshake(shared: Arc<Shared>, stream: TcpStream) {
         chat_limit: RateLimit::new(CHAT_PER_SECOND, 5),
         chunk_limit: RateLimit::new(CHUNK_REQUESTS_PER_SECOND, 8),
         ping_limit: RateLimit::new(10.0, 10),
+        light_limit: RateLimit::new(LIGHT_UPDATES_PER_SECOND, 20),
+        sleep_limit: RateLimit::new(SLEEP_REQUESTS_PER_SECOND, 4),
+        pending_light: std::collections::BTreeSet::new(),
         window: None,
         known_entities,
     };
@@ -1424,12 +1443,36 @@ fn inventory_sync_message(host: &Host, player: &ServerPlayer) -> ServerMessage {
     let registry = host.registry();
     let hotbar: [Option<ItemStackDto>; HOTBAR_SLOTS] =
         std::array::from_fn(|slot| stack_dto(registry, &player.inventory[slot]));
+    let main: [Option<ItemStackDto>; MAIN_SLOTS] =
+        std::array::from_fn(|slot| stack_dto(registry, &player.inventory[HOTBAR_SLOTS + slot]));
     let equipment: [Option<ItemStackDto>; EQUIPMENT_SLOTS] =
         std::array::from_fn(|slot| stack_dto(registry, &player.equipment[slot]));
     ServerMessage::InventorySync {
         hotbar,
+        main,
         selected: player.selected_slot.min(HOTBAR_SLOTS - 1) as u8,
         equipment,
+    }
+}
+
+/// Builds the authoritative world-clock message.
+fn time_sync_message(host: &Host) -> ServerMessage {
+    ServerMessage::TimeSync {
+        tick: host.tick_count(),
+        day_phase: host.day_phase(),
+        day_ticks: ob_protocol::DAY_LENGTH_TICKS,
+    }
+}
+
+/// Builds one player's `SleepState` from the host's authoritative snapshot.
+fn sleep_state_message(host: &Host, id: u64, snapshot: &NetworkSleepSnapshot) -> ServerMessage {
+    let bed = host.network_player_bed(id).map(|pos| [pos.x, pos.y, pos.z]);
+    ServerMessage::SleepState {
+        sleeping: host.network_player_sleeping(id),
+        bed,
+        sleepers: snapshot.sleepers.clone(),
+        all_sleeping: snapshot.all_sleeping,
+        skip_remaining_ticks: snapshot.skip_remaining_ticks,
     }
 }
 
@@ -1548,6 +1591,8 @@ impl Core {
             }
             ClientMessage::SelectSlot { slot } => self.handle_select_slot(id, slot, now),
             ClientMessage::UseBlock { pos } => self.handle_use_block(id, pos, now),
+            ClientMessage::SleepRequest { pos } => self.handle_sleep_request(id, pos, now),
+            ClientMessage::Wake => self.handle_wake(id, now),
             ClientMessage::Attack { target } => self.handle_attack(id, target, now),
             ClientMessage::InventoryMove {
                 from,
@@ -1581,6 +1626,13 @@ impl Core {
 
     /// Applies a client-authoritative move after validation and clamping.
     fn handle_move(&mut self, id: u64, pos: [f64; 3], yaw: f32, pitch: f32, now: Instant) {
+        // A sleeping player is frozen server-side; accepting a move wakes them
+        // (and cancels the shared skip) before the position update is applied.
+        if self.host.network_player_sleeping(id) && self.host.network_wake(id) {
+            self.dirty = true;
+            self.broadcast_sleep_state();
+            self.broadcast_time_sync();
+        }
         let Some(player) = self.players.get_mut(&id) else {
             return;
         };
@@ -1658,6 +1710,11 @@ impl Core {
             self.send_action_rejected(id, "block_edit", "dead");
             return;
         }
+        if actor.sleeping {
+            self.edits_rejected += 1;
+            self.send_action_rejected(id, "block_edit", "sleeping");
+            return;
+        }
         let creative = actor.game_mode == GameMode::Creative;
 
         if creative {
@@ -1674,14 +1731,8 @@ impl Core {
             self.edits_accepted += 1;
             self.dirty = true;
             self.close_windows_at(block_pos, "block_removed");
-            self.broadcast(
-                &ServerMessage::BlockEdit {
-                    pos,
-                    block: block.0,
-                    player: id,
-                },
-                None,
-            );
+            self.collect_light_changes();
+            self.broadcast_block_updates(id);
             return;
         }
 
@@ -1699,18 +1750,11 @@ impl Core {
             Ok(outcome) if outcome.changed => {
                 self.edits_accepted += 1;
                 self.dirty = true;
-                let new_block = outcome.placed.map_or(0, |block| block.0);
                 if outcome.broke.is_some() {
                     self.close_windows_at(block_pos, "block_removed");
                 }
-                self.broadcast(
-                    &ServerMessage::BlockEdit {
-                        pos,
-                        block: new_block,
-                        player: id,
-                    },
-                    None,
-                );
+                self.collect_light_changes();
+                self.broadcast_block_updates(id);
                 self.send_action_sync(id);
             }
             Ok(_) => {
@@ -1731,6 +1775,10 @@ impl Core {
             .get_mut(&id)
             .is_some_and(|player| player.select_limit.allow(now));
         if !allowed {
+            return;
+        }
+        if self.host.network_player_sleeping(id) {
+            self.send_action_rejected(id, "select_slot", "sleeping");
             return;
         }
         if usize::from(slot) >= HOTBAR_SLOTS {
@@ -1763,6 +1811,10 @@ impl Core {
             self.send_action_rejected(id, "use_block", "dead");
             return;
         }
+        if player.sleeping {
+            self.send_action_rejected(id, "use_block", "sleeping");
+            return;
+        }
         if !block_pos.in_world() || block_pos.center().distance(player.pos) > MAX_CONTAINER_DISTANCE {
             self.send_action_rejected(id, "use_block", "out_of_reach");
             return;
@@ -1779,7 +1831,24 @@ impl Core {
         } else if block == chest_id && self.host.chest_at(block_pos).is_some() {
             ContainerKind::Chest
         } else {
-            self.send_action_rejected(id, "use_block", "not_container");
+            // Gameplay interaction: hoe/seeds/harvest/bed. The host applies the
+            // same authoritative rules as single-player with the sender's pose
+            // and inventory installed, so reach/support/light/inventory checks
+            // cannot be bypassed by the client.
+            match self.host.network_use_block(id, block_pos) {
+                Ok(outcome) if outcome.changed => {
+                    self.dirty = true;
+                    self.collect_light_changes();
+                    self.broadcast_block_updates(id);
+                    self.send_action_sync(id);
+                    if self.host.network_player_sleeping(id) {
+                        self.broadcast_sleep_state();
+                        self.broadcast_time_sync();
+                    }
+                }
+                Ok(_) => self.send_action_rejected(id, "use_block", "rejected"),
+                Err(reason) => self.send_action_rejected(id, "use_block", &reason),
+            }
             return;
         };
 
@@ -1825,6 +1894,180 @@ impl Core {
         self.send(id, message);
     }
 
+    /// Puts a player into a bed after host validation and broadcasts the vote.
+    fn handle_sleep_request(&mut self, id: u64, pos: [i32; 3], now: Instant) {
+        let allowed = self
+            .players
+            .get_mut(&id)
+            .is_some_and(|player| player.sleep_limit.allow(now));
+        if !allowed {
+            return;
+        }
+        let block_pos = BlockPos::new(pos[0], pos[1], pos[2]);
+        match self.host.network_sleep_request(id, block_pos) {
+            Ok(()) => {
+                self.dirty = true;
+                self.close_window(id, "sleep", true);
+                self.broadcast_sleep_state();
+                self.broadcast_time_sync();
+            }
+            Err(reason) => self.send_action_rejected(id, "sleep", &reason),
+        }
+    }
+
+    /// Wakes one player (and cancels the shared skip) on request.
+    fn handle_wake(&mut self, id: u64, now: Instant) {
+        let allowed = self
+            .players
+            .get_mut(&id)
+            .is_some_and(|player| player.sleep_limit.allow(now));
+        if !allowed {
+            return;
+        }
+        if self.host.network_wake(id) {
+            self.dirty = true;
+            self.broadcast_sleep_state();
+            self.broadcast_time_sync();
+        }
+    }
+
+    /// Sends every player their authoritative `SleepState`.
+    fn broadcast_sleep_state(&mut self) {
+        if self.players.is_empty() {
+            return;
+        }
+        let snapshot = self.host.network_sleep_snapshot();
+        let ids: Vec<u64> = self.players.keys().copied().collect();
+        for id in ids {
+            let message = sleep_state_message(&self.host, id, &snapshot);
+            self.send(id, message);
+        }
+    }
+
+    /// Broadcasts the authoritative world clock.
+    fn broadcast_time_sync(&mut self) {
+        let message = time_sync_message(&self.host);
+        self.broadcast(&message, None);
+    }
+
+    /// Drains block changes from the host and broadcasts one `BlockEdit` each.
+    ///
+    /// A bed places/removes two cells, a torch can be removed with its support,
+    /// and crop growth changes one cell per stage, so the host records every
+    /// authoritative change rather than inferring a single cell from the
+    /// requested action.
+    fn broadcast_block_updates(&mut self, player: u64) {
+        let updates = self.host.take_block_updates();
+        for (pos, block) in updates {
+            self.broadcast(
+                &ServerMessage::BlockEdit {
+                    pos: [pos.x, pos.y, pos.z],
+                    block: block.0,
+                    player,
+                },
+                None,
+            );
+        }
+    }
+
+    /// Adds every dirty section to the per-player light queues for clients that
+    /// are within the configured interest radius.
+    fn collect_light_changes(&mut self) {
+        let dirty = self.host.take_dirty_sections();
+        if dirty.is_empty() || self.players.is_empty() {
+            return;
+        }
+        let radius = self.config.interest_radius_chunks;
+        for player in self.players.values_mut() {
+            for section in &dirty {
+                if section_in_interest(player.pos, *section, radius) {
+                    player.pending_light.insert(*section);
+                }
+            }
+        }
+    }
+
+    /// Discards generated-chunk dirty sections (their light arrives with the
+    /// `ChunkData` payload, never as a `LightUpdate`).
+    fn discard_dirty_sections(&mut self) {
+        let _ = self.host.take_dirty_sections();
+    }
+
+    /// Sends batched `LightUpdate` frames from each player's reliable queue.
+    ///
+    /// At most one frame per player per tick, at most
+    /// [`MAX_LIGHT_SECTIONS_PER_UPDATE`] sections per frame and at most
+    /// [`LIGHT_UPDATES_PER_SECOND`] frames per second with a 20-frame burst.
+    /// Out-of-range and unloaded sections are pruned; a rate-limited client
+    /// keeps its queue for the next tick.
+    fn flush_light_updates(&mut self, now: Instant) {
+        if self.players.is_empty() {
+            return;
+        }
+        let radius = self.config.interest_radius_chunks;
+        let ids: Vec<u64> = self.players.keys().copied().collect();
+        for id in ids {
+            let allowed = self.players.get_mut(&id).is_some_and(|player| {
+                player
+                    .pending_light
+                    .retain(|section| section_in_interest(player.pos, *section, radius));
+                player.light_limit.allow(now)
+            });
+            if !allowed {
+                continue;
+            }
+            let Some(player) = self.players.get(&id) else {
+                continue;
+            };
+            if player.pending_light.is_empty() {
+                continue;
+            }
+            let mut candidates: Vec<SectionPos> = player.pending_light.iter().copied().collect();
+            candidates.sort_by_key(|section| (section.y, section.z, section.x));
+            candidates.truncate(MAX_LIGHT_SECTIONS_PER_UPDATE);
+            let mut sections = Vec::with_capacity(candidates.len());
+            for section in &candidates {
+                let Some(loaded) = self.host.world().section(*section) else {
+                    continue;
+                };
+                let words: Vec<u16> = match loaded.light().uniform_value() {
+                    Some(word) => vec![word; ob_protocol::LIGHT_CELLS],
+                    None => loaded.light().raw().expect("non-uniform light is dense").to_vec(),
+                };
+                let Ok((encoding, data)) = encode_light_words(&words) else {
+                    continue;
+                };
+                sections.push(LightSectionDto {
+                    cx: section.x,
+                    cy: section.y,
+                    cz: section.z,
+                    format: LIGHT_SECTION_FORMAT,
+                    encoding,
+                    data,
+                });
+            }
+            if sections.is_empty() {
+                if let Some(player) = self.players.get_mut(&id) {
+                    for section in candidates {
+                        player.pending_light.remove(&section);
+                    }
+                }
+                continue;
+            }
+            let message = ServerMessage::LightUpdate {
+                tick: self.host.tick_count(),
+                sections,
+            };
+            if self.send(id, message)
+                && let Some(player) = self.players.get_mut(&id)
+            {
+                for section in candidates {
+                    player.pending_light.remove(&section);
+                }
+            }
+        }
+    }
+
     /// Closes the sending player's window on request.
     fn handle_container_close(&mut self, id: u64, now: Instant) {
         let allowed = self
@@ -1850,6 +2093,10 @@ impl Core {
         };
         if actor.dead {
             self.send_action_rejected(id, "inventory_move", "dead");
+            return;
+        }
+        if actor.sleeping {
+            self.send_action_rejected(id, "inventory_move", "sleeping");
             return;
         }
         let window = self.players.get(&id).and_then(|player| player.window.as_ref());
@@ -1892,6 +2139,10 @@ impl Core {
         if !allowed {
             return;
         }
+        if self.host.network_player_sleeping(id) {
+            self.send_action_rejected(id, "eat", "sleeping");
+            return;
+        }
         if self.host.network_eat(id) {
             self.dirty = true;
             self.send_action_sync(id);
@@ -1909,9 +2160,15 @@ impl Core {
         if !allowed {
             return;
         }
-        if self.host.network_player(id).is_some_and(|player| player.dead) {
-            self.send_action_rejected(id, "equip", "dead");
-            return;
+        if let Some(player) = self.host.network_player(id) {
+            if player.dead {
+                self.send_action_rejected(id, "equip", "dead");
+                return;
+            }
+            if player.sleeping {
+                self.send_action_rejected(id, "equip", "sleeping");
+                return;
+            }
         }
         if self.host.network_equip(id, usize::from(hotbar_slot)) {
             self.dirty = true;
@@ -1964,6 +2221,10 @@ impl Core {
             .get_mut(&id)
             .is_some_and(|player| player.attack_limit.allow(now));
         if !allowed {
+            return;
+        }
+        if self.host.network_player_sleeping(id) {
+            self.send_action_rejected(id, "attack", "sleeping");
             return;
         }
         match self.host.network_attack(id, target) {
@@ -2037,6 +2298,9 @@ impl Core {
         let world_z = f64::from(cz) * f64::from(ob_math::CHUNK_SIZE) + 8.0;
         self.host
             .ensure_streaming_around(WorldVec::new(world_x, player.pos.y, world_z), 0, 1);
+        // A requested column arrives in full (including light) below; drop the
+        // generation dirty marks so they cannot become duplicate LightUpdates.
+        self.discard_dirty_sections();
         let Some(chunk) = self.host.chunk_column(requested) else {
             return;
         };
@@ -2317,7 +2581,9 @@ impl Core {
         // The host's internal single player is intentionally unused by network
         // play; `tick_network` advances only network players, mobs, furnaces
         // and dropped items.
+        let sleep_before = self.host.network_sleep_snapshot();
         self.host.tick_network();
+        let sleep_after = self.host.network_sleep_snapshot();
         self.tick_count += 1;
         // The host tick advances persisted state even when no intent arrives:
         // the world clock (tick count/day phase), network-player hunger/regen,
@@ -2328,11 +2594,26 @@ impl Core {
         self.dirty = true;
         self.relay_damage_events();
         self.relay_entity_removals();
+        // Crop growth and hydration run inside `tick_network`; publish their
+        // block changes before generated-chunk dirty sections are discarded.
+        self.broadcast_block_updates(0);
         self.stream_chunks();
+        // Generated columns carry their light in `ChunkData`; never duplicate
+        // those sections as LightUpdate patches.
+        self.discard_dirty_sections();
+        self.flush_light_updates(now);
         self.tick_windows();
         if self.tick_count.is_multiple_of(ENTITY_SYNC_INTERVAL_TICKS) {
             self.replicate_entities();
             self.broadcast_states();
+        }
+        let sleep_changed = sleep_before != sleep_after;
+        let skipping = sleep_after.skip_remaining_ticks > 0 || sleep_before.skip_remaining_ticks > 0;
+        if sleep_changed || skipping || self.tick_count.is_multiple_of(SLEEP_SYNC_INTERVAL_TICKS) {
+            self.broadcast_sleep_state();
+        }
+        if skipping || sleep_changed || self.tick_count.is_multiple_of(TIME_SYNC_INTERVAL_TICKS) {
+            self.broadcast_time_sync();
         }
         self.sync_players();
         self.maybe_autosave(now);
@@ -2748,6 +3029,15 @@ fn entity_spawn_message(entity: EntitySnapshot) -> ServerMessage {
 /// Converts a host slot snapshot to wire DTOs.
 fn window_slot_dtos(host: &Host, slots: &[Option<ItemStack>]) -> Vec<Option<ItemStackDto>> {
     slots.iter().map(|stack| stack_dto(host.registry(), stack)).collect()
+}
+
+/// Whether a section is inside a player's interest square.
+///
+/// The 1.2 `LightUpdate` batching uses Chebyshev chunk distance; Y is always
+/// sent because a section spans 16 blocks and relights reach 15 blocks.
+fn section_in_interest(center: WorldVec, section: SectionPos, radius_chunks: i32) -> bool {
+    let chunk = BlockPos::new(center.x.floor() as i32, 0, center.z.floor() as i32).chunk();
+    (section.x - chunk.x).abs() <= radius_chunks && (section.z - chunk.z).abs() <= radius_chunks
 }
 
 /// Counts missing columns inside a player's interest square.
@@ -3224,5 +3514,35 @@ mod tests {
         config = NetConfig::default();
         config.whitelist = vec!["bad name".to_string()];
         assert!(config.validate().is_err());
+    }
+    #[test]
+    fn light_batches_are_filtered_by_chebyshev_interest() {
+        let center = WorldVec::new(0.5, 70.0, 0.5);
+        assert!(section_in_interest(center, SectionPos::new(0, 4, 0), 2));
+        assert!(section_in_interest(center, SectionPos::new(2, 4, -2), 2));
+        assert!(!section_in_interest(center, SectionPos::new(3, 4, 0), 2));
+        assert!(!section_in_interest(center, SectionPos::new(0, 4, -3), 2));
+        // Y is not filtered: a section above/below still carries light the
+        // player's 3D view can need.
+        assert!(section_in_interest(center, SectionPos::new(-2, -4, 2), 2));
+
+        let far = WorldVec::new(2000.0, 70.0, -2000.0);
+        let section = SectionPos::new(far.x.floor() as i32 / 16, 0, far.z.floor() as i32 / 16);
+        assert!(section_in_interest(far, section, 2));
+        assert!(!section_in_interest(center, section, 2));
+    }
+    #[test]
+    fn light_update_rate_limit_allows_a_batch_burst_then_refills() {
+        let start = Instant::now();
+        let mut limit = RateLimit::new(LIGHT_UPDATES_PER_SECOND, 20);
+        for _ in 0..20 {
+            assert!(limit.allow(start), "the 20-frame burst must be admitted");
+        }
+        assert!(!limit.allow(start), "the burst is bounded");
+        assert!(
+            limit.allow(start + Duration::from_millis(150)),
+            "10/s refills one frame well within 150 ms"
+        );
+        assert!(!limit.allow(start + Duration::from_millis(150)));
     }
 }

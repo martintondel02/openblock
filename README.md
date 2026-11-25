@@ -6,18 +6,18 @@
 <p align="center">
   <a href=".github/workflows/ci.yml"><img alt="CI" src="https://github.com/martintondel02/openblock/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE-MIT"><img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-1.1.0%20early%20access-orange.svg">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.2.0%20early%20access-orange.svg">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.100%2B-B7410E.svg?logo=rust">
   <img alt="Primary platform" src="https://img.shields.io/badge/platform-Fedora%2044%2F45%20%7C%20Linux-51A2DA.svg?logo=fedora">
 </p>
 
 OpenBlock is an open-source voxel sandbox: mine, build, explore and survive alone
-or with friends on servers you host yourself. **1.1.0 is an Early Access
+or with friends on servers you host yourself. **1.2.0 is an Early Access
 release**: the core survival game and self-hosted multiplayer are playable and
 tested end-to-end, while crafting-grid, lighting, farming, weather and the
 modding track are explicitly post-1.0 (see [Known limitations](#known-limitations)).
 
-![OpenBlock 1.1 at 512-block render distance with shadows and clouds](docs/img/v1.1.0-vista-day.png)
+![OpenBlock 1.2 at 512-block render distance with shadows and clouds](docs/img/v1.1.0-vista-day.png)
 
 ## What's in 1.0
 
@@ -35,13 +35,18 @@ modding track are explicitly post-1.0 (see [Known limitations](#known-limitation
 - **Self-hosted multiplayer** — dedicated server with world streaming, chat,
   player roster, avatars/name tags and **server-authoritative survival**
   (inventories, vitals, equipment, actions, containers, death/respawn,
-  persistence); protocol v2 over TCP with strict limits. No TLS yet: use it on a
+  persistence); protocol v3 over TCP with strict limits. No TLS yet: use it on a
   LAN, VPN or SSH tunnel.
 - **Audio** — 79 procedurally synthesized clips total: 77 SFX (material
   footsteps, break/place, pickup, hurt/death, eat, craft, tool break, splash,
   UI) plus two loops (wind/forest ambience and a music pad); master/SFX/music
   volumes and mute in the Audio tab. Real output on Linux via PulseAudio loaded
   at runtime; Windows/macOS build with a silent stub in 1.0.
+- **Light & Home (1.2)** — real sky/block lighting and torches, beds with
+  personal respawn and multiplayer sleep, wheat farming with hydration/growth
+  stages, bread, hoes, 36-slot inventory (hotbar + main + armor) and protocol v3
+  with authoritative light/sleep sync; 1.0/1.1 worlds migrate their fake light
+  once.
 - **512-block reach and shaders** — up to **32 chunks / 512 blocks** of view
   distance with a surface-shell LOD, adaptive streaming and measured 90+ FPS at
   720p / 60+ FPS at 1080p (High, 512 blocks); HDR pipeline with sun-shadow
@@ -221,7 +226,7 @@ The full 1.0 checklist, accepted limitations and audit results:
 
 - [docs/README.md](docs/README.md) — specification, research and project plan.
 - [docs/spec/01-technical-architecture.md](docs/spec/01-technical-architecture.md) — crate graph and architecture.
-- [docs/spec/18-networking-multiplayer.md](docs/spec/18-networking-multiplayer.md) — protocol v2 and multiplayer design.
+- [docs/spec/18-networking-multiplayer.md](docs/spec/18-networking-multiplayer.md) — protocol v3 and multiplayer design.
 - [docs/admin/](docs/admin/README.md) — server quickstart, configuration, admin, security, backup, upgrade, troubleshooting.
 - [docs/plan/1.0.1-audit.md](docs/plan/1.0.1-audit.md) — post-release docs/security/metadata audit findings and accepted risks.
 - [CONTRIBUTING.md](CONTRIBUTING.md) — build, test and review workflow.

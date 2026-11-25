@@ -556,12 +556,20 @@ The day phase is `tick_count % 24_000`: day is `0..12_000`, night is
 | Category | Cap | When | Distance | Floor |
 | --- | ---: | --- | --- | --- |
 | Passive | 10 | day | 12–40 m | grass top, two air cells |
-| Hostile | 8 | night, or any time while the player is below Y=40 | 16–48 m | solid surface (night) or a cave floor within ±16 Y of an underground player |
+| Hostile | 8 | night, or any time while the player is below Y=40 | 16–48 m | solid surface (night) or a cave floor within ±16 Y of an underground player, and `gameplay_light ≤ 7` |
 
 Every 20 ticks the host makes two deterministic attempts per eligible category.
 Each attempt hashes the world seed, tick and attempt to choose an angle and
 distance, requires a loaded chunk column, no candidate within 8 m of the
-player, two air cells above the floor and a collision-free species AABB.
+player, two air cells above the floor, a collision-free species AABB and, for
+hostiles, `World::gameplay_light(feet, day_factor, weather_factor) ≤ 7`
+(`HOSTILE_SPAWN_MAX_LIGHT`). `weather_factor` is 1.0 in 1.2 because the weather
+machine belongs to 1.3; the night ramp is the server-owned day factor. This
+keeps the old night/depth windows but makes a torch-lit room unspawnable:
+level 14 block light at the source falls below 8 after six lateral steps, so one
+torch suppresses roughly a 7-block radius. Breaking the torch (or its support)
+restores the dark rule. `Host::hostile_spawn_light_ok` is the testable
+predicate.
 Hostiles are always zombies; passive species are picked deterministically from
 the same hash. Natural spawning does not create a mob inside a solid block or
 in an unloaded column.
@@ -622,7 +630,25 @@ and `on_ground` are transient and restart at idle/full cooldown after a load.
 The state hash covers id, kind, quantised position, yaw, health and age, so a
 save/reload reproduces the hash exactly; spawn counters are not persisted.
 
-### A.6 Scope notes and post-1.0 work
+### A.6 1.2 light spawning and crop bookkeeping
+
+The 1.2 slice changes only the natural-spawn light check: hostiles now require
+`gameplay_light ≤ 7` in addition to the night/depth window, the 16–48 m ring,
+the 8 m minimum and the two-air-cell floor. The population still consists of the
+five Appendix A species; no new hostile kind, pathfinding, line-of-sight or
+per-player attribution was added. Existing caps, freeze-in-unloaded-columns,
+age/distance despawn and the zombie daylight burn are unchanged, and a zombie
+still burns when its column is sky-exposed during the day.
+
+Farming and sleep are **not** entity systems in this milestone: crops are host
+`CropState` records keyed by block position (persisted in `crops.txt`) and beds
+are ordinary world blocks. Neither is a replicated entity, neither consumes an
+entity id, and neither participates in `mobs.txt` or the entity interest sets.
+The client is told about crop stage/hydration and bed changes through
+`block_edit`; `light_update` carries the relit sections. Sleep state is
+per-player and travels in `sleep_state` (spec 18 §3.13.10).
+
+### A.7 Scope notes and post-1.0 work
 
 Deferred: pathfinding/navigation, sight and hearing, memory, goal graphs and
 priority interrupts, per-player caps and spawn attribution, persistent/named

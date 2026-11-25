@@ -55,7 +55,9 @@ use ob_sim::{
     EYE_HEIGHT, GRAVITY, MAX_HEALTH, MAX_HUNGER, Player, StepEvents, TICK_DT, advance_vitals, fall_damage, reset_vitals,
 };
 
-use crate::{ARMOR_SLOTS, ActionOutcome, AttackOutcome, GameMode, HOTBAR_SLOTS, Host, ItemStack, MAX_STACK_SIZE};
+use crate::{
+    ARMOR_SLOTS, ActionOutcome, AttackOutcome, GameMode, HOTBAR_SLOTS, Host, INVENTORY_SLOTS, ItemStack, MAX_STACK_SIZE,
+};
 
 /// World-directory filename for persisted network players.
 pub const NETWORK_PLAYERS_FILE: &str = "network_players.txt";
@@ -96,8 +98,8 @@ pub struct ServerPlayer {
     pub dead: bool,
     /// Whether a `Death` was sent and a `Respawn` is expected.
     pub respawn_pending: bool,
-    /// Nine hotbar slots.
-    pub inventory: [Option<ItemStack>; HOTBAR_SLOTS],
+    /// 36 player inventory slots: hotbar `0..9`, main `9..36`.
+    pub inventory: [Option<ItemStack>; INVENTORY_SLOTS],
     /// Selected hotbar slot, `0..9`.
     pub selected_slot: usize,
     /// Four armor slots (helmet, chestplate, leggings, boots).
@@ -118,6 +120,12 @@ pub struct ServerPlayer {
     pub vitals_dirty: bool,
     /// Last damage cause, for logs and reconnect hints.
     pub last_damage_cause: Option<String>,
+    /// Whether this player is currently asleep in a bed (runtime only).
+    pub sleeping: bool,
+    /// Occupied bed foot position while asleep (runtime only).
+    pub bed: Option<BlockPos>,
+    /// Personal bed respawn point, persisted with the player record.
+    pub respawn_point: Option<WorldVec>,
 }
 
 impl ServerPlayer {
@@ -134,7 +142,7 @@ impl ServerPlayer {
             hunger: MAX_HUNGER,
             dead: false,
             respawn_pending: false,
-            inventory: [None; HOTBAR_SLOTS],
+            inventory: [None; INVENTORY_SLOTS],
             selected_slot: 0,
             equipment: [None; ARMOR_SLOTS],
             game_mode,
@@ -145,6 +153,9 @@ impl ServerPlayer {
             inventory_dirty: true,
             vitals_dirty: true,
             last_damage_cause: None,
+            sleeping: false,
+            bed: None,
+            respawn_point: None,
         }
     }
 
@@ -227,6 +238,17 @@ pub struct NetworkDamageEvent {
     pub died: bool,
 }
 
+/// Read-only sleep state for the network layer's `SleepState` broadcast.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NetworkSleepSnapshot {
+    /// Connected sleepers, ascending.
+    pub sleepers: Vec<u64>,
+    /// Whether every eligible (connected, alive) player is asleep.
+    pub all_sleeping: bool,
+    /// Fast-forward ticks left in the 100-tick sunrise skip.
+    pub skip_remaining_ticks: u32,
+}
+
 /// Result of one accepted network move.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NetworkMoveResult {
@@ -293,6 +315,9 @@ impl Host {
         player.id = id;
         player.name = name.to_string();
         player.respawn_pending = player.dead;
+        // Sleep is transient; a reconnecting player wakes at the spawn/bed.
+        player.sleeping = false;
+        player.bed = None;
         player.inventory_dirty = true;
         player.vitals_dirty = true;
         player.fall_distance = 0.0;
@@ -409,13 +434,27 @@ impl Host {
             .get(&id)
             .map(|player| (player.dead, player.game_mode))?;
         if outcome.dealt > 0.0 && mode == GameMode::Survival {
+            let mut woke_sleeper = false;
             if let Some(player) = self.network_players.get_mut(&id) {
                 player.vitals_dirty = true;
                 player.last_damage_cause = Some(cause.to_string());
+                if player.sleeping {
+                    // Damage wakes a sleeper and cancels the shared sunrise
+                    // fast-forward for the whole session, matching the spec's
+                    // "damage wakes a sleeper" rule; the remaining sleepers must
+                    // not immediately restart the skip next tick.
+                    player.sleeping = false;
+                    player.bed = None;
+                    woke_sleeper = true;
+                }
                 if dead {
                     player.respawn_pending = true;
                 }
             }
+            if woke_sleeper {
+                self.wake_all_network_sleepers();
+            }
+            self.sleep_skip = None;
             self.network_damage_events.push(NetworkDamageEvent {
                 player: id,
                 amount: outcome.dealt,
@@ -447,11 +486,19 @@ impl Host {
         if !dead {
             return false;
         }
-        self.ensure_streaming_around(self.spawn, 2, 16);
+        let target = self
+            .network_players
+            .get(&id)
+            .and_then(|player| player.respawn_point)
+            .unwrap_or(self.spawn);
+        self.ensure_streaming_around(target, 2, 16);
         let mut respawned = false;
         self.with_network_player_action(id, |host| {
             let inventory = host.inventory;
-            host.respawn();
+            host.player.pos = target;
+            host.player.velocity = WorldVec::ZERO;
+            host.player.on_ground = false;
+            reset_vitals(&mut host.player);
             debug_assert_eq!(host.inventory, inventory, "respawn keeps the network inventory");
             respawned = true;
         });
@@ -463,6 +510,8 @@ impl Host {
         player.fall_distance = 0.0;
         player.pending_move_distance = 0.0;
         player.last_damage_cause = None;
+        player.sleeping = false;
+        player.bed = None;
         player.inventory_dirty = true;
         player.vitals_dirty = true;
         self.mark_player_dirty();
@@ -501,6 +550,215 @@ impl Host {
     ) -> Result<ActionOutcome, String> {
         self.with_network_player_action(id, |host| host.network_place_block_exact(pos, block))
             .unwrap_or_else(|| Err("not_connected".to_string()))
+    }
+
+    /// Uses the selected item on a block for a network player.
+    ///
+    /// Bed interaction is routed to the per-player sleep state; every other
+    /// block runs the same [`Host::interact_block_as_player`] rules as
+    /// single-player, with the sender's pose and inventory installed by
+    /// [`Host::with_network_player_action`]. The client cannot place, plant,
+    /// till or sleep without passing the server-side reach, support, light,
+    /// inventory and sleep-window checks.
+    pub(crate) fn network_use_block(&mut self, id: u64, pos: BlockPos) -> Result<ActionOutcome, String> {
+        let Some(player) = self.network_players.get(&id) else {
+            return Err("not_connected".to_string());
+        };
+        if player.dead {
+            return Err("dead".to_string());
+        }
+        if player.sleeping {
+            return Err("sleeping".to_string());
+        }
+        let block = self.world.get_block(pos);
+        let bed_foot = self.registry.id_or_air("openblock:bed_foot");
+        let bed_head = self.registry.id_or_air("openblock:bed_head");
+        if block == bed_foot || block == bed_head {
+            self.network_sleep_request(id, pos)?;
+            return Ok(ActionOutcome {
+                changed: true,
+                ..ActionOutcome::default()
+            });
+        }
+        self.with_network_player_action(id, |host| host.interact_block_as_player(pos))
+            .unwrap_or_else(|| Err("not_connected".to_string()))
+    }
+
+    /// Puts one network player to sleep in the bed at `pos`.
+    ///
+    /// Validates reach (3.5 m), the sleep window, the two-block bed shape and
+    /// obstruction, then records the personal respawn point. The sunrise skip
+    /// starts only when every eligible player is asleep; see
+    /// [`Host::tick_network_sleep`].
+    pub(crate) fn network_sleep_request(&mut self, id: u64, pos: BlockPos) -> Result<(), String> {
+        let Some(player) = self.network_players.get(&id) else {
+            return Err("not_connected".to_string());
+        };
+        if player.dead {
+            return Err("dead".to_string());
+        }
+        if player.sleeping {
+            return Err("already_sleeping".to_string());
+        }
+        let (foot, head) = self.bed_pair(pos)?;
+        let distance = player
+            .pos
+            .distance(foot.center())
+            .min(player.pos.distance(head.center()));
+        if distance > crate::BED_USE_DISTANCE {
+            return Err("out_of_reach".to_string());
+        }
+        // A valid bed use sets the personal respawn point even if it is not
+        // currently possible to sleep; the night window and obstruction checks
+        // below still refuse the sleep itself.
+        let respawn = WorldVec::new(foot.x as f64 + 0.5, foot.y as f64 + 1.0, foot.z as f64 + 0.5);
+        if let Some(player) = self.network_players.get_mut(&id) {
+            player.respawn_point = Some(respawn);
+            player.vitals_dirty = true;
+        }
+        self.mark_player_dirty();
+        if !self.is_sleep_window() {
+            return Err("not_night".to_string());
+        }
+        if !self.bed_is_clear(foot) || !self.bed_is_clear(head) {
+            return Err("obstructed".to_string());
+        }
+        let Some(player) = self.network_players.get_mut(&id) else {
+            return Err("not_connected".to_string());
+        };
+        player.sleeping = true;
+        player.bed = Some(foot);
+        player.vitals_dirty = true;
+        if self.sleep_wait_start.is_none() {
+            self.sleep_wait_start = Some(self.tick_count);
+        }
+        Ok(())
+    }
+
+    /// Wakes one network player and cancels a running shared skip.
+    ///
+    /// Returns whether the player was asleep.
+    pub fn network_wake(&mut self, id: u64) -> bool {
+        let Some(player) = self.network_players.get_mut(&id) else {
+            return false;
+        };
+        if !player.sleeping {
+            return false;
+        }
+        player.sleeping = false;
+        player.bed = None;
+        if self.sleep_skip.is_some() {
+            // Waking one sleeper ends the shared skip and wakes the others.
+            self.wake_all_network_sleepers();
+        } else if !self.network_players.values().any(|player| player.sleeping) {
+            self.sleep_wait_start = None;
+        }
+        self.mark_player_dirty();
+        true
+    }
+
+    /// Sleep state for the network layer's `SleepState` broadcast.
+    pub fn network_sleep_snapshot(&self) -> NetworkSleepSnapshot {
+        let mut sleepers: Vec<u64> = self
+            .network_players
+            .values()
+            .filter(|player| player.sleeping)
+            .map(|player| player.id)
+            .collect();
+        sleepers.sort_unstable();
+        let eligible = self.network_players.values().filter(|player| !player.dead).count();
+        NetworkSleepSnapshot {
+            all_sleeping: eligible > 0 && sleepers.len() == eligible,
+            sleepers,
+            skip_remaining_ticks: self
+                .sleep_skip
+                .map_or(0, |skip| crate::SLEEP_FAST_FORWARD_TICKS.saturating_sub(skip.elapsed)),
+        }
+    }
+
+    /// The receiving player's bed foot position, if they are asleep.
+    pub fn network_player_bed(&self, id: u64) -> Option<BlockPos> {
+        self.network_players.get(&id).and_then(|player| player.bed)
+    }
+
+    /// Whether a network player is asleep.
+    pub fn network_player_sleeping(&self, id: u64) -> bool {
+        self.network_players.get(&id).is_some_and(|player| player.sleeping)
+    }
+
+    /// Cancels every sleeper and the shared sunrise skip.
+    fn wake_all_network_sleepers(&mut self) {
+        let mut changed = false;
+        for player in self.network_players.values_mut() {
+            if player.sleeping {
+                player.sleeping = false;
+                player.bed = None;
+                changed = true;
+            }
+        }
+        self.sleep_skip = None;
+        self.sleep_wait_start = None;
+        if changed {
+            self.mark_player_dirty();
+        }
+    }
+
+    /// Advances the multiplayer sleep vote and the 100-tick sunrise skip.
+    ///
+    /// A skip runs only while every eligible (connected, alive) player is
+    /// asleep. Damage clears the damaged player's sleep and the skip in
+    /// [`Host::damage_network_player`]; the next tick wakes the remaining
+    /// sleepers. A partial sleep waiting for another player times out after
+    /// [`crate::SLEEP_REQUEST_TIMEOUT_TICKS`].
+    pub(crate) fn tick_network_sleep(&mut self) {
+        let eligible: Vec<u64> = self
+            .network_players
+            .values()
+            .filter(|player| !player.dead)
+            .map(|player| player.id)
+            .collect();
+        let sleepers: Vec<u64> = self
+            .network_players
+            .values()
+            .filter(|player| player.sleeping)
+            .map(|player| player.id)
+            .collect();
+        if eligible.is_empty() {
+            self.sleep_skip = None;
+            self.sleep_wait_start = None;
+            return;
+        }
+        if sleepers.len() == eligible.len() {
+            self.sleep_wait_start = None;
+            if self.sleep_skip.is_none() {
+                self.start_sleep_skip();
+            }
+            let Some(mut skip) = self.sleep_skip else {
+                return;
+            };
+            self.tick_count = self.tick_count.saturating_add(skip.step).min(skip.target_tick);
+            skip.elapsed = skip.elapsed.saturating_add(1);
+            if self.tick_count >= skip.target_tick || skip.elapsed >= crate::SLEEP_FAST_FORWARD_TICKS {
+                self.tick_count = skip.target_tick;
+                self.wake_all_network_sleepers();
+            } else {
+                self.sleep_skip = Some(skip);
+            }
+            return;
+        }
+        if self.sleep_skip.is_some() {
+            // An awake player cancels the skip and wakes everyone.
+            self.wake_all_network_sleepers();
+            return;
+        }
+        if sleepers.is_empty() {
+            self.sleep_wait_start = None;
+            return;
+        }
+        let started = *self.sleep_wait_start.get_or_insert(self.tick_count);
+        if self.tick_count.saturating_sub(started) >= crate::SLEEP_REQUEST_TIMEOUT_TICKS {
+            self.wake_all_network_sleepers();
+        }
     }
 
     /// Applies one melee attack for a network player.
@@ -547,7 +805,7 @@ impl Host {
             .unwrap_or(false)
     }
 
-    /// Gives items to a network player's hotbar; returns the overflow.
+    /// Gives items to a network player's inventory; returns the overflow.
     ///
     /// Admin/test entry point. Newly created items start at full tool/armor
     /// durability; use [`Host::give_network_stack`] to preserve an exact stack.
@@ -557,7 +815,7 @@ impl Host {
     }
 
     /// Gives an exact stack (count and durability included) to a network
-    /// player's hotbar and returns the leftover.
+    /// player's inventory and returns the leftover.
     ///
     /// Item-entity pickup uses this path so a damaged tool keeps its remaining
     /// durability instead of being repaired. Returns the whole stack when the
@@ -633,6 +891,9 @@ impl Host {
         self.tick_mobs();
         self.tick_furnaces();
         tick_network_items(self);
+        self.tick_crops();
+        // After mob damage has had a chance to wake a sleeper.
+        self.tick_network_sleep();
         self.mark_player_dirty();
     }
 
@@ -724,6 +985,39 @@ impl Host {
         if Aabb::block(pos).intersects(&self.player.aabb()) {
             return Err("player_overlap".to_string());
         }
+        let torch = self.registry.id_or_air("openblock:torch");
+        let bed_foot = self.registry.id_or_air("openblock:bed_foot");
+        let bed_head = self.registry.id_or_air("openblock:bed_head");
+        if block == torch {
+            // 1.2 torches are floor-only.
+            let floor = pos.offset(0, -1, 0);
+            if !floor.in_world() || !self.world.is_solid(floor) {
+                return Err("no_support".to_string());
+            }
+        }
+        if block == bed_foot || block == bed_head {
+            let (foot, head) = if block == bed_foot {
+                (pos, pos.offset(0, 0, 1))
+            } else {
+                (pos.offset(0, 0, -1), pos)
+            };
+            if !foot.in_world()
+                || !head.in_world()
+                || self.world.chunk(foot.chunk()).is_none()
+                || self.world.chunk(head.chunk()).is_none()
+            {
+                return Err("invalid_position".to_string());
+            }
+            if self.world.get_block(foot) != BlockId::AIR || self.world.get_block(head) != BlockId::AIR {
+                return Err("occupied".to_string());
+            }
+            if !self.world.is_solid(foot.offset(0, -1, 0)) || !self.world.is_solid(head.offset(0, -1, 0)) {
+                return Err("no_support".to_string());
+            }
+            if Aabb::block(head).intersects(&self.player.aabb()) {
+                return Err("player_overlap".to_string());
+            }
+        }
         let supported = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
             .into_iter()
             .any(|(dx, dy, dz)| self.world.is_solid(pos.offset(dx, dy, dz)));
@@ -744,13 +1038,30 @@ impl Host {
 fn tick_network_players(host: &mut Host) {
     let ids: Vec<u64> = host.network_players.keys().copied().collect();
     for id in ids {
-        let (moved, health_before, hunger_before, mode, dead_before) = match host.network_players.get_mut(&id) {
+        let (moved, health_before, hunger_before, mode, dead_before, sleeping) = match host.network_players.get_mut(&id)
+        {
             Some(player) => {
                 let moved = std::mem::take(&mut player.pending_move_distance);
-                (moved, player.health, player.hunger, player.game_mode, player.dead)
+                (
+                    moved,
+                    player.health,
+                    player.hunger,
+                    player.game_mode,
+                    player.dead,
+                    player.sleeping,
+                )
             }
             None => continue,
         };
+        if sleeping {
+            // Sleep freezes hunger/regen and clears fall tracking; damage is
+            // still applied by the mob tick and wakes the player.
+            if let Some(player) = host.network_players.get_mut(&id) {
+                player.pending_move_distance = 0.0;
+                player.fall_distance = 0.0;
+            }
+            continue;
+        }
 
         let mut starvation = 0.0f32;
         let mut starvation_died = false;
@@ -993,6 +1304,11 @@ pub(crate) fn network_players_state(
             player.selected_slot.min(HOTBAR_SLOTS - 1),
             player.game_mode.name(),
         ));
+        if let Some(point) = player.respawn_point
+            && point.is_finite()
+        {
+            text.push_str(&format!(" r{:?},{:?},{:?}", point.x, point.y, point.z));
+        }
         for (slot, stack) in player.inventory.iter().enumerate() {
             let Some(stack) = stack.filter(|stack| stack.count > 0) else {
                 continue;
@@ -1106,7 +1422,23 @@ pub(crate) fn load_network_players(world_dir: &Path, registry: &Registry) -> BTr
         player.selected_slot = selected.min(HOTBAR_SLOTS - 1);
 
         for token in &fields[11..] {
-            if let Some(rest) = token.strip_prefix('i') {
+            if let Some(rest) = token.strip_prefix('r') {
+                let parts: Vec<&str> = rest.split(',').collect();
+                if parts.len() != 3 {
+                    log::warn!("network_players.txt:{line_number}: malformed respawn token");
+                    continue;
+                }
+                let parse = |text: &str| text.parse::<f64>().ok().filter(|value| value.is_finite());
+                let (Some(x), Some(y), Some(z)) = (parse(parts[0]), parse(parts[1]), parse(parts[2])) else {
+                    log::warn!("network_players.txt:{line_number}: invalid respawn point");
+                    continue;
+                };
+                player.respawn_point = Some(WorldVec::new(
+                    x.clamp(-MAX_WORLD_XZ, MAX_WORLD_XZ),
+                    y.clamp(-64.0, 320.0),
+                    z.clamp(-MAX_WORLD_XZ, MAX_WORLD_XZ),
+                ));
+            } else if let Some(rest) = token.strip_prefix('i') {
                 let Some((slot_text, stack_text)) = rest.split_once(':') else {
                     log::warn!("network_players.txt:{line_number}: malformed inventory token");
                     continue;
@@ -1115,7 +1447,7 @@ pub(crate) fn load_network_players(world_dir: &Path, registry: &Registry) -> BTr
                     log::warn!("network_players.txt:{line_number}: invalid inventory slot");
                     continue;
                 };
-                if slot >= HOTBAR_SLOTS {
+                if slot >= INVENTORY_SLOTS {
                     log::warn!("network_players.txt:{line_number}: inventory slot {slot} out of range");
                     continue;
                 }
@@ -1222,7 +1554,7 @@ pub fn item_from_dto(registry: &Registry, dto: &ItemStackDto) -> Option<ItemId> 
     registry.item_id(&dto.item)
 }
 
-/// Resolves an armor slot address (`9..13` relative to the equipment base).
+/// Resolves an equipment-array index (`0..4`) to its armor slot.
 pub fn equipment_armor_slot(index: usize) -> Option<ArmorSlot> {
     match index {
         0 => Some(ArmorSlot::Helmet),
@@ -1343,6 +1675,8 @@ mod tests {
             player.health = 13.0;
             player.hunger = 8.5;
             player.selected_slot = 2;
+            player.inventory[9] = Some(ItemStack::new(stone, 9));
+            player.inventory[35] = Some(ItemStack::new(pickaxe, 1).with_durability(7));
             player.equipment[0] = Some(ItemStack {
                 item: helmet,
                 count: 1,
@@ -1371,7 +1705,50 @@ mod tests {
         assert_eq!(saved.selected_slot, 2);
         assert_eq!(saved.inventory[0].expect("stone").count, 32);
         assert_eq!(saved.inventory[1].expect("pickaxe").item, pickaxe);
+        assert_eq!(saved.inventory[9].expect("main stone").count, 9);
+        assert_eq!(saved.inventory[35].expect("main pickaxe").durability, Some(7));
         assert_eq!(saved.equipment[0].expect("helmet").durability, Some(99));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn old_network_players_sidecar_loads_nine_hotbar_rows_and_new_main_rows() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!("ob-net-players-sidecar-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let registry = Registry::base();
+        // A 1.1 record has only i0..i8 hotbar tokens (and e0..e3 equipment).
+        std::fs::write(
+            dir.join(NETWORK_PLAYERS_FILE),
+            "alice 0.5 70.0 0.5 0 0 20 20 0 3 survival i0:openblock:stone,12 i8:openblock:apple,2 e0:openblock:iron_helmet,99\n",
+        )
+        .expect("write old sidecar");
+        let players = load_network_players(&dir, &registry);
+        let alice = players.get("alice").expect("alice");
+        assert_eq!(alice.inventory[0].expect("stone").count, 12);
+        assert_eq!(alice.inventory[8].expect("apple").count, 2);
+        assert!(alice.inventory[HOTBAR_SLOTS..].iter().all(Option::is_none));
+        assert_eq!(alice.equipment[0].expect("helmet").durability, Some(99));
+
+        // A 1.2 record can address main slots 9..36; 36 is out of range and is
+        // dropped instead of being clamped onto slot 35.
+        std::fs::write(
+            dir.join(NETWORK_PLAYERS_FILE),
+            "alice 0.5 70.0 0.5 0 0 20 20 0 0 survival i9:openblock:dirt,4 i35:openblock:stick,3 i36:openblock:coal,1\n",
+        )
+        .expect("write new sidecar");
+        let players = load_network_players(&dir, &registry);
+        let alice = players.get("alice").expect("alice");
+        assert_eq!(alice.inventory[9].expect("dirt").count, 4);
+        assert_eq!(alice.inventory[35].expect("stick").count, 3);
+        let coal = registry.item_id("openblock:coal").unwrap();
+        assert!(
+            alice.inventory.iter().flatten().all(|stack| stack.item != coal),
+            "row 36 must be dropped, not clamped onto row 35"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1434,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn furnace_output_can_only_be_taken_to_the_hotbar() {
+    fn furnace_output_is_take_only_into_any_player_slot() {
         let (dir, mut host) = temp_host("furnace-output");
         host.join_network_player(1, "alice", GameMode::Survival).expect("join");
         let pos = BlockPos::new(3, 70, -2);
@@ -1478,10 +1855,16 @@ mod tests {
         let state = host.furnace_at(pos).expect("furnace");
         assert_eq!(state.input, Some(input));
         assert_eq!(state.output, Some(output));
-        // A hotbar destination is the legal take path.
+        // A hotbar destination is one legal take path.
         assert_eq!(host.network_inventory_move(1, 102, 0, 1, Some(window)), Ok(true));
         assert_eq!(host.furnace_at(pos).expect("furnace").output, None);
         assert_eq!(host.network_player(1).expect("online").inventory[0], Some(output));
+
+        // A main-inventory destination (9..36) works too; v3 output routing is
+        // not restricted to the hotbar.
+        host.furnace_at_mut(pos).expect("furnace").output = Some(output);
+        assert_eq!(host.network_inventory_move(1, 102, 9, 1, Some(window)), Ok(true));
+        assert_eq!(host.network_player(1).expect("online").inventory[9], Some(output));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1649,7 +2032,11 @@ mod tests {
             Err("invalid_count")
         );
         assert_eq!(
-            host.network_inventory_move(1, 13, 1, 1, Some(window)),
+            host.network_inventory_move(1, 40, 1, 1, Some(window)),
+            Err("invalid_slot")
+        );
+        assert_eq!(
+            host.network_inventory_move(1, 99, 1, 1, Some(window)),
             Err("invalid_slot")
         );
         assert_eq!(host.network_inventory_move(1, 100, 1, 1, None), Err("no_window"));
@@ -1665,12 +2052,12 @@ mod tests {
             let from = if next(4) == 0 {
                 100 + next(27) as u16
             } else {
-                next(13) as u16
+                next(40) as u16
             };
             let to = if next(4) == 0 {
                 100 + next(27) as u16
             } else {
-                next(13) as u16
+                next(40) as u16
             };
             let count = [0u8, 1, 2, 3, 5, 64, 255][next(7)];
             let _ = host.network_inventory_move(1, from, to, count, Some(window));
@@ -1722,9 +2109,9 @@ mod tests {
 /// Parsed inventory-move address.
 #[derive(Debug, Clone, Copy)]
 enum SlotAddress {
-    /// Hotbar slot `0..9`.
-    Hotbar(usize),
-    /// Armor slot `0..4` (wire addresses `9..13`).
+    /// Player inventory slot `0..36` (hotbar `0..9`, main `9..36`).
+    Player(usize),
+    /// Armor slot `0..4` (wire addresses `36..40`).
     Equipment(usize),
     /// Slot inside the open window (`100..`).
     Window(usize),
@@ -1733,8 +2120,8 @@ enum SlotAddress {
 /// Parses a wire slot address against the open-window descriptor.
 fn parse_slot_address(slot: u16, window: Option<NetworkWindowRef>) -> Result<SlotAddress, &'static str> {
     match slot {
-        0..=8 => Ok(SlotAddress::Hotbar(usize::from(slot))),
-        9..=12 => Ok(SlotAddress::Equipment(usize::from(slot - 9))),
+        0..=35 => Ok(SlotAddress::Player(usize::from(slot))),
+        36..=39 => Ok(SlotAddress::Equipment(usize::from(slot - 36))),
         value if value >= ob_protocol::SLOT_WINDOW_START => {
             let Some(window) = window else {
                 return Err("no_window");
@@ -1765,8 +2152,8 @@ impl Host {
     /// `net` is not sufficient on its own: a client can report a teleport and
     /// send a container move in the same tick before that check runs.
     ///
-    /// Non-window moves (hotbar/equipment only) do not require an open window or
-    /// a nearby container and behave exactly like
+    /// Non-window moves (player inventory/equipment only) do not require an
+    /// open window or a nearby container and behave exactly like
     /// [`Host::network_inventory_move`].
     pub(crate) fn network_inventory_move_checked(
         &mut self,
@@ -1812,8 +2199,9 @@ impl Host {
 
     /// Applies one validated slot move for a network player.
     ///
-    /// Slot addresses use the protocol layout: hotbar `0..9`, equipment `9..13`
-    /// and an open window from `100`. Window moves require the
+    /// Slot addresses use the protocol layout: player inventory `0..36`
+    /// (hotbar `0..9`, main `9..36`), equipment `36..40` and an open window from
+    /// `100`. Window moves require the
     /// [`NetworkWindowRef`] the net layer is tracking for that player. Counts
     /// are bounded by the source stack; merges respect content max stacks;
     /// incompatible destinations need a full-stack swap. All writes are
@@ -1892,7 +2280,7 @@ impl Host {
         let from_furnace_output = from_address.is_window()
             && window.is_some_and(|window| window.furnace)
             && matches!(from_address, SlotAddress::Window(2));
-        if from_furnace_output && !matches!(to_address, SlotAddress::Hotbar(_)) {
+        if from_furnace_output && !matches!(to_address, SlotAddress::Player(_)) {
             // The furnace output is take-only and the only legal destination is
             // the player's hotbar. A window destination could otherwise swap the
             // destination stack *into* the output slot, because the source write
@@ -1969,7 +2357,7 @@ impl Host {
         window: Option<NetworkWindowRef>,
     ) -> Result<Option<ItemStack>, &'static str> {
         match address {
-            SlotAddress::Hotbar(slot) => Ok(self
+            SlotAddress::Player(slot) => Ok(self
                 .network_players
                 .get(&id)
                 .and_then(|player| player.inventory.get(slot).copied().flatten())),
@@ -2002,7 +2390,7 @@ impl Host {
             _ => None,
         };
         match address {
-            SlotAddress::Hotbar(slot) => {
+            SlotAddress::Player(slot) => {
                 let Some(player) = self.network_players.get_mut(&id) else {
                     return Err("not_connected");
                 };

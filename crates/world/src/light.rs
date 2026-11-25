@@ -87,14 +87,19 @@ impl Light {
         }
     }
 
-    fn get(&self, pos: LocalPos) -> u16 {
+    /// The packed word at a local position.
+    pub fn get(&self, pos: LocalPos) -> u16 {
         match self {
             Self::Uniform(value) => *value,
             Self::Dense(data) => data[pos.index()],
         }
     }
 
-    fn set(&mut self, pos: LocalPos, value: u16) {
+    /// Writes a packed word at a local position.
+    ///
+    /// Writing the current uniform value is a no-op, so fully open and fully
+    /// dark sections stay allocation-free.
+    pub fn set(&mut self, pos: LocalPos, value: u16) {
         match self {
             Self::Uniform(current) if *current == value => {}
             Self::Uniform(_) => {
@@ -130,6 +135,22 @@ impl Light {
         self.set(pos, packed);
     }
 
+    /// Collapses a dense container whose words are all equal back to uniform.
+    ///
+    /// Seeding a section from its initial uniform sky value can promote it to
+    /// dense while every final cell ends up equal (fully open air, fully solid
+    /// rock, or a fully dark cave). Compacting after a bulk seed keeps those
+    /// sections allocation-free.
+    pub fn compact(&mut self) {
+        let Self::Dense(data) = self else {
+            return;
+        };
+        let first = data[0];
+        if data.iter().all(|&word| word == first) {
+            *self = Self::Uniform(first);
+        }
+    }
+
     /// Approximate heap bytes used by this container.
     pub fn heap_bytes(&self) -> usize {
         match self {
@@ -159,6 +180,77 @@ impl Light {
         match data {
             Some(data) => Self::Dense(data),
             None => Self::Uniform(0),
+        }
+    }
+}
+
+/// Packs one light cell word: `[sky:4][R:4][G:4][B:4]`.
+pub const fn pack(sky: u8, red: u8, green: u8, blue: u8) -> u16 {
+    (sky as u16) << 12 | (red as u16) << 8 | (green as u16) << 4 | blue as u16
+}
+
+/// Sky nibble of a packed light word.
+pub const fn unpack_sky(word: u16) -> u8 {
+    ((word >> 12) & 0xF) as u8
+}
+
+/// R channel nibble of a packed light word.
+pub const fn unpack_red(word: u16) -> u8 {
+    ((word >> 8) & 0xF) as u8
+}
+
+/// G channel nibble of a packed light word.
+pub const fn unpack_green(word: u16) -> u8 {
+    ((word >> 4) & 0xF) as u8
+}
+
+/// B channel nibble of a packed light word.
+pub const fn unpack_blue(word: u16) -> u8 {
+    (word & 0xF) as u8
+}
+
+/// Replaces the sky nibble of a packed word.
+pub const fn with_sky(word: u16, sky: u8) -> u16 {
+    (word & 0x0FFF) | ((sky as u16 & 0xF) << 12)
+}
+
+/// Replaces the RGB nibbles of a packed word.
+pub const fn with_block(word: u16, red: u8, green: u8, blue: u8) -> u16 {
+    (word & 0xF000) | ((red as u16 & 0xF) << 8) | ((green as u16 & 0xF) << 4) | (blue as u16 & 0xF)
+}
+
+/// A decoded light sample at one block: sky plus independent RGB block light.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LightSample {
+    /// Sky light `0..=15`.
+    pub sky: u8,
+    /// Red block-light channel `0..=15`.
+    pub red: u8,
+    /// Green block-light channel `0..=15`.
+    pub green: u8,
+    /// Blue block-light channel `0..=15`.
+    pub blue: u8,
+}
+
+impl LightSample {
+    /// Decodes a packed word.
+    pub const fn from_word(word: u16) -> Self {
+        Self {
+            sky: unpack_sky(word),
+            red: unpack_red(word),
+            green: unpack_green(word),
+            blue: unpack_blue(word),
+        }
+    }
+
+    /// Brightest block-light channel, the value gameplay compares against.
+    pub const fn block_level(self) -> u8 {
+        if self.red >= self.green && self.red >= self.blue {
+            self.red
+        } else if self.green >= self.blue {
+            self.green
+        } else {
+            self.blue
         }
     }
 }

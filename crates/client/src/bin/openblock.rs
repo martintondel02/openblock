@@ -1,6 +1,6 @@
 //! The `openblock` game client binary.
 
-const USAGE: &str = "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--mesh-workers N] [--survival|--creative] [--fly] [--x11] [--no-audio] [--mute] [--connect HOST:PORT] [--name NAME] [--screenshot PATH] [--screenshot-inventory PATH] [--screenshot-dead] [--screenshot-settings[=TAB]] [--screenshot-settings-tab TAB] [--screenshot-crafting] [--screenshot-title] [--screenshot-new-world] [--screenshot-worlds] [--screenshot-connect] [--screenshot-debug] [--screenshot-mobs] [--screenshot-furnace] [--screenshot-chest] [--screenshot-items] [--screenshot-network] [--screenshot-name-tags] [--screenshot-net-ui=KIND] [--screenshot-size WxH] [--ui-scale PERCENT|auto] [--seconds N] [--texture-style NAME] [--texture-pack PATH] [--no-texture-pack] [--ui-font PATH] [--default-ui-font] [--time-of-day F] [--title|--menu] [--version]";
+const USAGE: &str = "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--mesh-workers N] [--survival|--creative] [--fly] [--x11] [--no-audio] [--mute] [--connect HOST:PORT] [--name NAME] [--screenshot PATH] [--screenshot-inventory PATH] [--screenshot-dead] [--screenshot-settings[=TAB]] [--screenshot-settings-tab TAB] [--screenshot-crafting] [--screenshot-title] [--screenshot-new-world] [--screenshot-worlds] [--screenshot-connect] [--screenshot-debug] [--screenshot-mobs] [--screenshot-furnace] [--screenshot-chest] [--screenshot-torch] [--screenshot-farm] [--screenshot-sleep] [--screenshot-items] [--screenshot-network] [--screenshot-name-tags] [--screenshot-net-ui=KIND] [--screenshot-size WxH] [--ui-scale PERCENT|auto] [--seconds N] [--texture-style NAME] [--texture-pack PATH] [--no-texture-pack] [--ui-font PATH] [--default-ui-font] [--time-of-day F] [--title|--menu] [--version]";
 
 fn main() {
     ob_core::init_logging();
@@ -31,6 +31,9 @@ fn main() {
         println!("          --screenshot-mobs[=plain] spawns avatars; plain omits the F3 overlay");
         println!("          --screenshot-furnace[=empty|active|full] opens a seeded furnace screen");
         println!("          --screenshot-chest[=empty|active|full] opens a seeded 27-slot chest screen");
+        println!("          --screenshot-torch renders a sealed room lit only by a 1.2 torch");
+        println!("          --screenshot-farm renders a watered wheat farm at four growth stages");
+        println!("          --screenshot-sleep enters a bed at night and renders the sleep overlay");
         println!("          --screenshot-network renders a network survival frame from an in-process loopback server");
         println!("          --screenshot-name-tags renders synthetic remote-player name tags over a world");
         println!("          --screenshot-net-ui=loading|failed|disconnected|roster  multiplayer overlay audit frame");
@@ -70,6 +73,9 @@ fn main() {
         println!("  --screenshot-mobs  spawn a few mobs and show the HUD plus F3 mob/day counts");
         println!("  --screenshot-furnace  place and open a seeded furnace screen");
         println!("  --screenshot-chest  place and open a seeded chest screen");
+        println!("  --screenshot-torch  render a sealed room lit only by a torch (1.2 light proof)");
+        println!("  --screenshot-farm   render watered farmland with wheat at four growth stages");
+        println!("  --screenshot-sleep  enter a bed at night and render the sleep overlay");
         println!("  --screenshot-items  seed ores, ingots, iron tools/armor, food, planks and 14 HP / 12 hunger");
         println!("  --screenshot-network  render network survival from an in-process loopback server");
         println!("  --screenshot-name-tags  render synthetic remote-player name tags over a world");

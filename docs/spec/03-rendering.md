@@ -569,6 +569,71 @@ layout, so no pipeline branches on it. The six-bit origins address a 64³ cluste
 five-bit extents cap one merged quad at 32 blocks; that is why OPEN-009 blocks the 64³ Metal
 escalation without a wider record.
 
+### 4.1.1 Shipping vertex format (1.0–1.2) and split light
+
+The 16 B quad record above is the target GPU-driven cluster format; the
+shipping 1.1/1.2 renderer still emits per-section triangle lists from the CPU
+greedy mesher. Its vertex grew from 28 to **32 B** in 1.2:
+
+| Offset | Bytes | Field | Meaning |
+| ---: | ---: | --- | --- |
+| 0 | 12 | `position` | three `f32` world-space coordinates |
+| 12 | 8 | `uv` | two `f32`, tile units covering the merged rectangle |
+| 20 | 4 | `layer` | `u32` block texture-array layer |
+| 24 | 4 | `light` | packed `sky:u8` (bits 0–7), `block:u8` (bits 8–15) |
+| 28 | 4 | `reserved` | zero; keeps the stride 4-byte aligned at 32 B |
+
+`sky` and `block` are already byte-scaled; face brightness, per-corner
+ambient occlusion and the deterministic per-quad tint are folded into both
+values. The vertex shader unpacks them into two smooth `f32` varyings, never
+interpolating the packed word, and the fragment shader evaluates
+
+```wgsl
+warm        = mix(vec3(1.0), vec3(1.0, 0.82, 0.58), block * 0.85);
+sky_light   = sky * camera.world_light.rgb * sun_light_factor(...);
+block_light = block * warm;
+lit         = albedo * (sky_light + block_light);
+```
+
+Sky light follows the celestial palette and the sun-shadow term; block light
+does not, so a torch reads the same at noon and midnight. The shadow pass
+applies only the direct-sun attenuation through `sun_light_factor`, avoiding
+double-darkening of torches in shadow. Water, shadow and far-LOD passes share
+the same 32 B layout; the shadow shader reads the packed word but does not use
+it. Far 2×2-chunk batches reuse the section mesher, so they carry both sky and
+block light rather than the optional sky-only variant.
+
+**Smooth light and AO.** For a cube face, each corner averages the four cells
+in the layer in front of the face (the base cell and its U/V/diagonal
+neighbours), skipping opaque samples and falling back to the owning cell's
+light if all four are opaque. The existing three-occluder AO factor is applied
+on top. `SectionSnapshot` now caches each 18³ cell's block id, packed light word
+and opacity; both light and AO read one 3×3 layer per face instead of resolving
+registry block types and section positions per corner. This is why a sky shaft
+and a torch gradient interpolate across a face instead of banding per block,
+and it keeps the mesher near the pre-light build time (see the 1.2 measurements
+section).
+
+**Cross content.** `BlockShape::Cross` emits two diagonal, alpha-tested quads
+inset 0.15 blocks from the cell edges, with the full tile UV. Each plane is
+emitted in both windings so the backface-culled shadow pass still gets a caster;
+the main chunk pipeline has culling disabled and simply overdraws the rare
+cross blocks. `torch`, `wheat_0..3` and the pre-existing leaves are alpha
+cut-outs: the procedural catalogue, the resource-pack loader and mip generation
+all threshold alpha at 0.5 (`is_cut_out_layer`), and the fragment shader
+discards texels below 0.5 before writing colour. A cross block is non-opaque
+and never culls a neighbouring cube face; two crosses do not cull each other.
+`face_visible` continues to hide identical non-opaque blocks.
+
+**Resource packs.** The catalogue grew from 27 to 38 layers and remains
+append-only. The new names and vanilla-style file candidates are `torch`,
+`farmland_dry` (`farmland.png`), `farmland_wet` (`farmland_moist.png`),
+`wheat_0..3` (`wheat_stage0..3.png`), `bed_foot_{top,side}` and
+`bed_head_{top,side}`. Missing files fall back to the procedural layer in every
+one of the four styles; farmland and bed layers are opaque, torch and wheat are
+cut-outs. Texture-array tests assert binary alpha at mip 0 and a complete mip
+chain for every layer.
+
 ### 4.2 Draw records
 
 ```rust

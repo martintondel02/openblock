@@ -39,7 +39,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use ob_content::textures::{COUNT, GRASS_SIDE, GRASS_TOP, LEAVES, NAMES};
+use ob_content::textures::{COUNT, GRASS_SIDE, GRASS_TOP, LEAVES, NAMES, TORCH, WHEAT_0, WHEAT_3};
 
 use crate::textures::{TexturePack, TexturePackStyle};
 
@@ -297,7 +297,7 @@ pub(crate) fn load_resource_pack_with_fallback(
     let layer_bytes = (size * size * 4) as usize;
     let mut base = Vec::with_capacity(COUNT * layer_bytes);
     for (index, texture) in decoded.iter().enumerate() {
-        let cut_out = index == LEAVES.0 as usize;
+        let cut_out = is_cut_out_layer(index);
         let mut layer = match texture {
             Some(texture) => scale_square(&texture.rgba, texture.side, size),
             None => {
@@ -435,6 +435,20 @@ fn candidate_files(name: &str) -> &'static [&'static str] {
         "chest_top" => &["chest_top.png"],
         "chest_side" => &["chest_side.png"],
         "chest_front" => &["chest_front.png"],
+        // 1.2 Light & Home layers. Farmland and wheat use the vanilla names;
+        // beds usually live under `entity/bed` in a pack, so their block layers
+        // commonly fall back to the procedural catalogue.
+        "torch" => &["torch.png"],
+        "farmland_dry" => &["farmland.png", "farmland_dry.png"],
+        "farmland_wet" => &["farmland_moist.png", "farmland_wet.png"],
+        "wheat_0" => &["wheat_stage0.png", "wheat_0.png"],
+        "wheat_1" => &["wheat_stage1.png", "wheat_1.png"],
+        "wheat_2" => &["wheat_stage2.png", "wheat_2.png"],
+        "wheat_3" => &["wheat_stage3.png", "wheat_3.png"],
+        "bed_foot_top" => &["bed_foot_top.png"],
+        "bed_foot_side" => &["bed_foot_side.png"],
+        "bed_head_top" => &["bed_head_top.png"],
+        "bed_head_side" => &["bed_head_side.png"],
         // `debug` has no Minecraft equivalent and is procedural by design.
         _ => &[],
     }
@@ -590,6 +604,16 @@ fn decode_texture(path: &Path) -> Result<DecodedTexture, TextureLoadError> {
     }
 
     Ok(DecodedTexture { side, rgba })
+}
+
+/// Whether a catalogue layer is alpha-tested.
+///
+/// Leaves were the only 1.1 cut-out; 1.2 adds the torch and the four wheat
+/// stages, whose cross quads must punch through the transparent background.
+fn is_cut_out_layer(layer: usize) -> bool {
+    layer == LEAVES.0 as usize
+        || layer == TORCH.0 as usize
+        || (WHEAT_0.0 as usize..=WHEAT_3.0 as usize).contains(&layer)
 }
 
 /// Applies the cut-out/opaque rule to one RGBA layer.
@@ -766,7 +790,7 @@ fn downsample(source: &[u8], edge: u32, next_edge: u32) -> Vec<u8> {
     let next_layer = (next_edge * next_edge * 4) as usize;
     let mut output = vec![0u8; COUNT * next_layer];
     for layer in 0..COUNT {
-        let cut_out = layer == LEAVES.0 as usize;
+        let cut_out = is_cut_out_layer(layer);
         for y in 0..next_edge {
             for x in 0..next_edge {
                 let mut sums = [0u32; 4];
@@ -814,7 +838,7 @@ mod tests {
     use super::*;
 
     /// Non-debug catalogue files and the NAMES index they feed, in pack order.
-    const PACK_FILES: [(&str, &str); 26] = [
+    const PACK_FILES: [(&str, &str); 37] = [
         ("grass_top", "grass_block_top.png"),
         ("grass_side", "grass_block_side.png"),
         ("dirt", "dirt.png"),
@@ -841,6 +865,17 @@ mod tests {
         ("chest_top", "chest_top.png"),
         ("chest_side", "chest_side.png"),
         ("chest_front", "chest_front.png"),
+        ("torch", "torch.png"),
+        ("farmland_dry", "farmland.png"),
+        ("farmland_wet", "farmland_moist.png"),
+        ("wheat_0", "wheat_stage0.png"),
+        ("wheat_1", "wheat_stage1.png"),
+        ("wheat_2", "wheat_stage2.png"),
+        ("wheat_3", "wheat_stage3.png"),
+        ("bed_foot_top", "bed_foot_top.png"),
+        ("bed_foot_side", "bed_foot_side.png"),
+        ("bed_head_top", "bed_head_top.png"),
+        ("bed_head_side", "bed_head_side.png"),
     ];
 
     /// Scratch directory that is removed when the test finishes.
@@ -1416,6 +1451,47 @@ mod tests {
                 "chest_front.png",
                 layer_colour(ob_content::textures::CHEST_FRONT.0 as usize),
             ),
+            ("torch.png", layer_colour(ob_content::textures::TORCH.0 as usize)),
+            (
+                "farmland.png",
+                layer_colour(ob_content::textures::FARMLAND_DRY.0 as usize),
+            ),
+            (
+                "farmland_moist.png",
+                layer_colour(ob_content::textures::FARMLAND_WET.0 as usize),
+            ),
+            (
+                "wheat_stage0.png",
+                layer_colour(ob_content::textures::WHEAT_0.0 as usize),
+            ),
+            (
+                "wheat_stage1.png",
+                layer_colour(ob_content::textures::WHEAT_1.0 as usize),
+            ),
+            (
+                "wheat_stage2.png",
+                layer_colour(ob_content::textures::WHEAT_2.0 as usize),
+            ),
+            (
+                "wheat_stage3.png",
+                layer_colour(ob_content::textures::WHEAT_3.0 as usize),
+            ),
+            (
+                "bed_foot_top.png",
+                layer_colour(ob_content::textures::BED_FOOT_TOP.0 as usize),
+            ),
+            (
+                "bed_foot_side.png",
+                layer_colour(ob_content::textures::BED_FOOT_SIDE.0 as usize),
+            ),
+            (
+                "bed_head_top.png",
+                layer_colour(ob_content::textures::BED_HEAD_TOP.0 as usize),
+            ),
+            (
+                "bed_head_side.png",
+                layer_colour(ob_content::textures::BED_HEAD_SIDE.0 as usize),
+            ),
         ];
         for (file, colour) in files {
             write_solid(&block_dir.join(file), 16, colour);
@@ -1826,5 +1902,59 @@ mod tests {
         assert_eq!(pixel(grass_top, 16, 4, 4), green);
         let leaves = layer_bytes(&loaded.mips[0], 16, LEAVES.0 as usize);
         assert_eq!(pixel(leaves, 16, 4, 4), [60, 130, 40, 255]);
+    }
+
+    #[test]
+    fn new_cutout_layers_can_be_overridden_by_a_resource_pack() {
+        let pack = TempDir::new();
+        let block_dir = pack.block_dir();
+        write_standard_pack(&block_dir, 16, true);
+        let mut torch = vec![0u8; (16 * 16 * 4) as usize];
+        for y in 0..16u32 {
+            for x in 0..16u32 {
+                let offset = ((y * 16 + x) * 4) as usize;
+                if x < 8 {
+                    torch[offset..offset + 4].copy_from_slice(&[240, 180, 60, 200]);
+                }
+            }
+        }
+        write_png(&block_dir.join("torch.png"), 16, 16, &torch);
+        let mut wheat = vec![0u8; (16 * 16 * 4) as usize];
+        for y in 0..16u32 {
+            for x in 0..16u32 {
+                let offset = ((y * 16 + x) * 4) as usize;
+                if x % 3 == 0 {
+                    wheat[offset..offset + 4].copy_from_slice(&[80, 180, 60, 255]);
+                }
+            }
+        }
+        write_png(&block_dir.join("wheat_stage3.png"), 16, 16, &wheat);
+
+        let layers = load_resource_pack(&pack.path).expect("new cut-out layers load");
+        let torch_layer = layer_bytes(&layers.mips[0], 16, ob_content::textures::TORCH.0 as usize);
+        let mut transparent = 0;
+        let mut opaque = 0;
+        for pixel in torch_layer.as_chunks::<4>().0 {
+            assert!(pixel[3] == 0 || pixel[3] == 255, "torch alpha must be binary");
+            if pixel[3] == 0 {
+                transparent += 1;
+            } else {
+                opaque += 1;
+                assert_eq!(&pixel[..3], &[240, 180, 60]);
+            }
+        }
+        assert!(
+            transparent > 0 && opaque > 0,
+            "torch cut-out needs both holes and texels"
+        );
+        let wheat_layer = layer_bytes(&layers.mips[0], 16, ob_content::textures::WHEAT_3.0 as usize);
+        assert!(wheat_layer.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 0));
+        assert!(wheat_layer.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 255));
+
+        // Farmland is opaque even when the pack supplies an alpha channel.
+        let farmland = layer_bytes(&layers.mips[0], 16, ob_content::textures::FARMLAND_DRY.0 as usize);
+        assert!(farmland.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255));
+        let bed = layer_bytes(&layers.mips[0], 16, ob_content::textures::BED_HEAD_TOP.0 as usize);
+        assert!(bed.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255));
     }
 }

@@ -1702,3 +1702,255 @@ rasterised casters, so the visual result is not a cleared map.
   documented threshold/downsample structure and future wide-glow use.
 - The offscreen numbers include a GPU→CPU readback and no present; a windowed run will
   differ, especially in the tail percentiles.
+
+---
+
+## 2026-11-25 — 1.2 lighting vertical slice (Light & Home engine)
+
+### Environment and methodology
+
+| | |
+| --- | --- |
+| OS | Fedora Linux 45, kernel 7.3.4-300 |
+| CPU/GPU | AMD Ryzen 7 9800X3D, integrated RADV "RAPHAEL_MENDOCINO" (Vulkan) |
+| Renderer | wgpu 30.0.2, offscreen `Rgba8UnormSrgb` + `Depth32Float`, 1280×720 |
+| Build | dev profile is `opt-level = 1` (workspace); 512 runs use `--release` |
+| World | seed 42, 32-chunk radius (4,225 columns, 101,400 sections); migration probe uses a 17×17-column seed-42 sample |
+| Tools | ignored `ob_world` probe `light_performance_probe`, ignored `ob_server` probe `streaming_unload_plateau_at_512_blocks`, `render_distance_bench`, and a temporary external migration probe |
+
+The lighting work adds no per-frame GPU pass. It changes the section snapshot
+(block + light + opacity), the vertex layout (28 → 32 B with split sky/block)
+and the content catalogue. Streaming and meshing were measured separately so
+world generation, the CPU mesher and the upload are not hidden inside a frame
+number. The 512 render number includes GPU→CPU readback and excludes window
+presentation, as in the 1.1 runs.
+
+### What ships
+
+**Content.** Nine append-only block ids: `torch` (20), `farmland_dry` (21),
+`farmland_wet` (22), `wheat_0..3` (23–26) and `bed_foot`/`bed_head` (27–28).
+`BlockType` now carries `emission: [u8;3]`, `attenuation: [u8;3]`,
+`sky_attenuation: u8` and `shape: Cube | Cross`. Six items append after every
+existing block item: seeds (61), wheat (62), bread (63), wood/stone/iron hoe
+(64–66); ids 0–60 are unchanged. The pack schema accepts the same fields plus
+`shape`, validates every channel in 0–15 (`PackError::InvalidLight`) and derives
+material-class defaults for old packs (opaque 15, fluid 1, otherwise 0). The
+base pack's `leaves` gets explicit 1/1 attenuation. Recipes append at 25–29
+(torch, bread, three hoes). Texture catalogue grows 27 → 38 layers, all four
+built-in styles generate the eleven new layers, and torch/wheat are alpha
+cut-outs.
+
+**World engine.** `ChunkColumn::finalise` seeds sky top-down per XZ column with a
+running subtraction, then runs a local 16-bucket sky BFS and a per-channel RGB
+block-light BFS. Fully opaque sections are collapsed to uniform zero and air
+sections already holding the running level are skipped; a transparent section
+is never reset from one column, because that erased a shaft written by an
+earlier column in the same section. `World::insert_chunk` reconciles all four
+chunk borders; equal uniform section pairs are skipped, differing pairs seed
+the whole 16×16 face, and a bounded BFS removes the seam.
+
+**Edits.** `World::set_block` relights a 31³ box. Sky-opacity edits that change
+the box's bottom plane additionally rebuild the 31×31 column volume below it;
+this is what makes a sealed shaft darken a cave farther below than 15 blocks.
+Block-light edits clear and re-seed the box, seed from all in-box emitters and
+the six outside faces, and skip both expensive passes when the relevant stored
+light is zero. Light writes mark every touched section dirty, so the client
+remesh path sees the neighbour section whose snapshot border light changed.
+`World::relight_around`/`relight_all` expose the same paths to tools/migration.
+
+**Query.** `World::light_sample`, `sky_light`, `block_light` and
+`gameplay_light(pos, day_factor, weather_factor)` implement
+`max(floor(sky × day × weather), max(R,G,B))` without mutating stored light.
+`World::light_hash` is a cached FNV-1a checksum over the canonical per-cell
+words, independent of the uniform/dense representation.
+
+**Persistence/migration.** `world.obs` stays v4. `world_meta.txt` is additive,
+preserves unknown lines, and contains `light_version=2`.
+`load_world_dir_with_report` relights a world with no marker or an older
+marker, rewrites `world.obs` as v4 and writes the marker atomically; a second
+load trusts it and does not relight. `save_world_dir` writes the marker on every
+save. Raw `from_bytes` callers get `World::light_version() == 1` because they
+cannot see the sidecar.
+
+### Measured results
+
+**Worldgen lighting overhead.** The ignored probe compares the 1.1 per-section
+seed with the new column `finalise` on a hand-built 16×16 column with a 65-block
+solid/air split and a carved room:
+
+| Seeder | ms/chunk |
+| --- | ---: |
+| 1.1 per-section `seed_sky_light` | 0.406–0.408 |
+| 1.2 `ChunkColumn::finalise` | 0.549–0.565 |
+| **Delta** | **+0.14–0.16** (target ≤ 0.30) |
+
+The full 512 streaming path is not slower than 1.1. `render_distance_bench`
+streamed 4,225 columns in **470.5–471.8 ms** (66 calls, 4,220 generated) versus
+the 1.1 478–501 ms row. The ignored server probe streamed 4,220 columns in
+**439.0 ms** (9 calls) versus 467.7 ms for the 1.1 probe. Border reconciliation
+is inside the noise: the flat-world probe measured 0.558 ms/chunk with it and
+0.562 ms/chunk without.
+
+**Edit relight (dev profile, 100 alternating edits, sorted).**
+
+| Edit | p50 | p99 | max |
+| --- | ---: | ---: | ---: |
+| Torch place/remove | 0.137 ms | 0.145 ms | 0.145 ms |
+| Dark-room stone edit (sky skipped) | 0.088 ms | 0.092 ms | 0.092 ms |
+| Open-sky roof place/remove | 0.820 ms | 0.831 ms | 0.831 ms |
+| Deep-shaft seal/open (volume tail) | 1.832 ms | 1.902 ms | 1.902 ms |
+
+Ordinary edits meet the ≤ 1 ms target. The deep-shaft case is deliberately a
+worst case: an 8×8×4 room below the 31³ box whose only source is a one-block
+shaft. It exceeds 1 ms and is documented as a known exception; a removal-BFS
+or lazy-tail design is the follow-up.
+
+**512-block meshing and memory.** The scene is 2,620 near sections + 1,010 far
+batches, 24,418,752 cached vertices, 716 last-frame draws. The final run measured
+**mesh + upload 399.1 ms** on 16 threads versus the 1.1 LOD row's 326 ms
+(+22%). The vertex count grew 7.2% because per-corner smooth light splits some
+greedy runs, and the stride grew 28 → 32 B. This is a load-time cost only; it is
+not a frame cost. The first lighting pass measured 530.2 ms; caching opacity in
+the section snapshot and reading block+light with one section lookup brought it
+to 399 ms.
+
+| Metric | 1.1 LOD reference | 1.2 lighting |
+| --- | ---: | ---: |
+| World heap (seed 42, 4,225 columns) | 322.5 MiB | **132.2 MiB** |
+| Dense light sections (seed 42, 289-column sample) | 2,068 fake-light sections | **437** |
+| Mesh estimate (CPU+GPU double count) | 1,216 MiB | 1,490.4 MiB |
+| RSS after build / peak | 454 / 457 MiB | 269 / 272 MiB |
+| Frame p50, 720p High | 11.04 ms (90.6 FPS) | 10.7–11.3 ms (≈92 FPS in the 10-frame run) |
+
+The world heap *fell* by ~190 MiB. The 1.1 fake per-section sky light kept
+cave/ore sections dense (mixed air and solid) and those words are now uniform
+dark; the 289-column migration probe measured 21.59 → 8.85 MiB and 2,068 → 437
+dense light sections. The mesh estimate rises by 274 MiB because 32 B × 24.4 M
+vertices are counted once on the CPU and once on the GPU. RSS is lower because
+the smaller world heap dominates.
+
+**Migration hash.** A seed-42 17×17-column world was generated with the 1.2
+generator, then its sky words were replaced with the 1.1 rule (opaque 0, fluid
+12, otherwise 15) and written as a v4 `world.obs` with no `world_meta.txt`:
+
+| | |
+| --- | --- |
+| 1.1-style fake-light hash | `86af880296846a9f` |
+| 1.2 relit hash | `d6211f26a80f374f` |
+| Second load hash | `d6211f26a80f374f` (stable) |
+| Migration report | `relit: true, save_rewritten: true, meta_written: true` |
+| Second-load report | `relit: false, save_rewritten: false, meta_written: false` |
+| `world.obs` version | 4 (unchanged) |
+| `world.obs` bytes | 670,999 → 473,991 |
+| World heap | 21.59 → 8.85 MiB |
+
+The seed-42 host smoke hash is **unchanged** at `eba0c42219691190` in two fresh
+data directories. That is expected: `Host::state_hash` does not yet hash light.
+It also confirms that the v4 save/reload path still round-trips block data with
+the new light words; the light was not relit because the host does not call the
+migration loader yet (see follow-ups).
+
+**GPU/visual proof.** The offscreen sealed-room test measured mean luma
+**0.00** dark vs **85.57** with a torch, and the border test measured a smooth
+torch gradient across x=15/16. The 512 High-preset frame rendered all terrain,
+cloud, shadow and water passes without validation errors.
+
+| Capture | Path | Notes |
+| --- | --- | --- |
+| Sealed room, no torch | `/tmp/openblock-light-cave-dark.png` | black frame, luma 0.00 |
+| Same room, torch on the floor | `/tmp/openblock-light-torch.png` | warm source, luma 85.57 |
+| Torch + wheat crosses | `/tmp/openblock-light-cross.png` | cut-out alpha and torch emission |
+| 512 blocks, High, 720p | `/tmp/openblock-light-512.png` | 4,225 columns, 716 draws, LOD + clouds |
+
+### Tests and static checks
+
+* `./dev-cargo test -p ob_content -p ob_world -p ob_render --all-targets`:
+  **42 + 62 + 174** tests pass; 6 ignored performance probes remain.
+* New world tests cover deep-shaft sealing/brightening below the relight box,
+  whole-face uniform-border propagation, dirty-section marking, sealed-room
+  torch propagation, border seams, gameplay light, migration and hash stability.
+* New render tests cover the 512 layout, cross cut-outs, torch light in cross and
+  cube vertices, border light in the snapshot, and edit → relight → remesh.
+* `clippy -p ob_content -p ob_world -p ob_render --all-targets -- -D warnings`,
+  `fmt --check` and `cargo doc --no-deps` are clean.
+* The full workspace suite (`test --workspace --all-targets`) also passes after
+  the concurrent 36-slot inventory slice landed; it was run on top of that
+  commit, not used as a pre-commit gate while client/server were mid-edit.
+
+### Deviations, limitations and exact follow-ups
+
+1. **The shipping host does not run the migration yet.** `Host::open` still calls
+   `ob_world::read_save_file` + `ob_world::from_bytes`
+   (`crates/server/src/lib.rs:390-391`) and the save path calls
+   `to_bytes_checked`/`save_worker::commit` directly. Replace the load with
+   `load_world_dir_with_report` (log `LightMigration`), and after the world
+   commit write `WorldMeta { light_version: LIGHT_VERSION, .. }` (or use
+   `save_world_dir` on the synchronous path). Until then a 1.0/1.1 world keeps
+   fake light in live play and no `world_meta.txt` is created, even though the
+   world crate's migration tests pass.
+2. **State hash.** Add `self.world.light_hash()` to `Host::state_hash`
+   (`crates/server/src/lib.rs:2428`) and regenerate fixtures. The current
+   seed-42 hash intentionally remains `eba0c42219691190`.
+3. **Gameplay call sites in the server slice.** Use
+   `World::gameplay_light(pos, day_factor, weather_factor)` for hostile spawn
+   (≤ 7) and crop growth (≥ 9); pass weather 1.0 clear, 0.8 rain, 0.6 thunder.
+   `World::set_block` already relights synchronously, so the server must not
+   call a second relight per edit. For tooling/multi-block effects,
+   `World::relight_around` and `relight_all` are public.
+4. **Client remesh.** `World::set_block`/`insert_chunk` now mark light-touched
+   sections in `World::take_dirty_sections`. The client mesh scheduler must keep
+   consuming that set; no protocol/LightUpdate message is added by this slice.
+   The server still needs to replicate the block edit as before.
+5. **Chunk unload.** No removal BFS runs in surviving neighbours. A torch in an
+   unloaded column can leave light in a still-resident neighbour until the
+   column reloads and reconciles. Resident streaming, edits and save/load are
+   seam-free.
+6. **Deep sky tail.** 1.83/1.90 ms p50/p99 vs the 1 ms ordinary-edit target. The
+   volume pass is only taken when the 31³ box bottom plane changes; a
+   removal-BFS or lazy-tail design can remove the exception.
+7. **Colour and dimensions.** The renderer still collapses RGB block light to
+   the brightest channel in its 8-bit vertex byte; gameplay keeps all channels.
+   `has_sky == false` is specified but unexercised because 1.2 content has no
+   such dimension.
+8. **Content/server semantics.** Torch support/break, farmland hydration, wheat
+   growth, bed pairing/sleep and the mob/crop thresholds live in the server
+   content slice, not in this world/render slice. Beds are solid full cubes in
+   1.2 (no partial shapes yet).
+
+### Files changed (this slice)
+
+`crates/content/src/{lib.rs,pack.rs}`, `packs/base/blocks.json`,
+`crates/world/src/{chunk.rs,lib.rs,light.rs,lighting.rs,save.rs,section.rs,world.rs}`,
+`crates/render/src/{lib.rs,mesh.rs,offscreen.rs,pipeline.rs,resource_pack.rs,shader.wgsl,shadow.wgsl,texture_packs.rs,textures.rs}`,
+`docs/spec/03-rendering.md`, `docs/spec/07-light-and-weather.md` and this file.
+`CHANGELOG.md`, `README.md`, packaging, client/protocol/server/core and
+`docs/plan/1.2-inventory.md` were left untouched.
+
+## 2026-11-25 — 1.2.0 release verification (Light & Home)
+
+Final verification of the shipped 1.2.0 tree (lighting 24b50ac, inventory
+a5ad3cb, server gameplay b18b551, client integration 3e28ef0):
+
+- `cargo test --workspace --all-targets`: **967 passed, 0 failed, 18 ignored**
+  (protocol 35, core 44, content 42, world 62, sim 30, render 174, server 118 +
+  66 integration, client 289 + 18 loopback, tools/acceptance/misc).
+- `cargo clippy --workspace --all-targets -- -D warnings`, `fmt --check`,
+  `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps`,
+  `check-arch.sh` and `check-docs.py` all clean.
+- Seed-42 headless smoke twice on fresh dirs: `smoke OK hash=ed80bbaf244bc31d`
+  (hash covers blocks/entities/crops/personal respawn; derived light is covered
+  by world save/load + relight tests rather than the host hash because border
+  propagation may settle differently across streaming reloads).
+- Quick multiplayer load gate PASS (676 chunks, 20 TPS, RSS 14.1 MiB for the
+  server); backup/restore PASS.
+- Lighting/migration measurements remain in the 1.2 lighting section above;
+  protocol is v3 (36-slot inventory + LightUpdate/TimeSync/SleepState);
+  save format stays v4 with additive `world_meta.txt`, `crops.txt`, personal
+  respawn in `spawn.txt` and 36-slot inventory rows.
+- v1.2.0 screenshots: `docs/img/v1.2.0-{torch,farm,sleep,inventory,inventory-960x540-125}.png`
+
+Known limits at release: no weather, crops pause in unloaded columns, no bone
+meal/tool tiers beyond iron/offhand, bed pillow fixed +Z, wall torches/coloured
+light absent, predicted multiplayer placement relights locally before the
+authoritative LightUpdate, server chunk memory still grows with exploration, and
+the 1.1 far-shadow/LOD limits apply.

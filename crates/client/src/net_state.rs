@@ -1,4 +1,4 @@
-//! Pure server-authoritative state for the protocol v2 client.
+//! Pure server-authoritative state for the protocol v3 client.
 //!
 //! This module is deliberately free of sockets, threads, winit and the
 //! renderer. It turns protocol `ServerMessage` payloads into the state the
@@ -9,8 +9,8 @@
 //!
 //! Ownership split:
 //!
-//! * [`SurvivalState`] mirrors vitals, the nine hotbar slots, the four armor
-//!   slots and the death/respawn handshake for the local player.
+//! * [`SurvivalState`] mirrors vitals, the 36 player inventory slots, the four
+//!   armor slots and the death/respawn handshake for the local player.
 //! * [`ReplicatedEntities`] mirrors mobs and dropped items with opaque ids and
 //!   short position interpolation.
 //! * [`RemoteContainers`] mirrors the one open furnace/chest window and turns
@@ -25,7 +25,7 @@ use ob_content::{ItemId, MobKind, Registry};
 use ob_math::WorldVec;
 use ob_protocol::{
     ContainerKind as WireContainerKind, DespawnReason, EQUIPMENT_SLOTS, EntityKind, EntitySnapshot, EntityStateEntry,
-    FurnaceProgress, HOTBAR_SLOTS, ItemStackDto, SLOT_WINDOW_START,
+    FurnaceProgress, HOTBAR_SLOTS, INVENTORY_SLOTS, ItemStackDto, MAIN_SLOTS, SLOT_WINDOW_START,
 };
 use ob_render::EntityInstance;
 use ob_server::{CHEST_SLOTS, ContainerState, FurnaceState, ItemStack, MAX_STACK_SIZE};
@@ -76,8 +76,8 @@ pub struct SurvivalState {
     pub hunger: f32,
     /// Effective armor defense points.
     pub armor_defense: u8,
-    /// Nine hotbar stacks.
-    pub inventory: [Option<ItemStack>; HOTBAR_SLOTS],
+    /// 36 player inventory stacks: hotbar `0..9`, main `9..36`.
+    pub inventory: [Option<ItemStack>; INVENTORY_SLOTS],
     /// Four equipment (armor) stacks.
     pub equipment: [Option<ItemStack>; EQUIPMENT_SLOTS],
     /// Selected hotbar slot.
@@ -102,7 +102,7 @@ impl Default for SurvivalState {
             health: 20.0,
             hunger: 20.0,
             armor_defense: 0,
-            inventory: [None; HOTBAR_SLOTS],
+            inventory: [None; INVENTORY_SLOTS],
             equipment: [None; EQUIPMENT_SLOTS],
             selected: 0,
             dead: false,
@@ -138,10 +138,14 @@ impl SurvivalState {
         &mut self,
         registry: &Registry,
         hotbar: &[Option<ItemStackDto>; HOTBAR_SLOTS],
+        main: &[Option<ItemStackDto>; MAIN_SLOTS],
         selected: u8,
         equipment: &[Option<ItemStackDto>; EQUIPMENT_SLOTS],
     ) {
         for (slot, dto) in self.inventory.iter_mut().zip(hotbar) {
+            *slot = dto.as_ref().and_then(|dto| stack_from_dto(registry, dto));
+        }
+        for (slot, dto) in self.inventory[HOTBAR_SLOTS..].iter_mut().zip(main) {
             *slot = dto.as_ref().and_then(|dto| stack_from_dto(registry, dto));
         }
         for (slot, dto) in self.equipment.iter_mut().zip(equipment) {
@@ -209,6 +213,11 @@ impl SurvivalState {
     /// Selected hotbar stack.
     pub fn selected_stack(&self) -> Option<ItemStack> {
         self.inventory.get(self.selected).copied().flatten()
+    }
+
+    /// The first nine inventory slots (the hotbar).
+    pub fn hotbar(&self) -> &[Option<ItemStack>] {
+        &self.inventory[..HOTBAR_SLOTS]
     }
 }
 
@@ -859,7 +868,7 @@ impl RemoteContainers {
     ///
     /// Window-sourced cursors are left alone: the container update that follows
     /// a window transaction owns their validation.
-    pub fn apply_hotbar(&mut self, hotbar: &[Option<ItemStack>; HOTBAR_SLOTS]) -> bool {
+    pub fn apply_hotbar(&mut self, hotbar: &[Option<ItemStack>]) -> bool {
         if self.cursor.is_some() && !self.cursor_hotbar_valid(hotbar) {
             self.cursor = None;
             return true;
@@ -884,7 +893,7 @@ impl RemoteContainers {
             .is_some_and(|stack| stack.item == cursor.stack.item && stack.count >= cursor.stack.count)
     }
 
-    fn cursor_hotbar_valid(&self, hotbar: &[Option<ItemStack>; HOTBAR_SLOTS]) -> bool {
+    fn cursor_hotbar_valid(&self, hotbar: &[Option<ItemStack>]) -> bool {
         let Some(cursor) = self.cursor else {
             return true;
         };
@@ -897,14 +906,14 @@ impl RemoteContainers {
     }
 
     /// The authoritative snapshot without cursor shadowing.
-    pub fn authoritative(&self, hotbar: &[Option<ItemStack>; HOTBAR_SLOTS]) -> Option<ContainerSnapshot> {
+    pub fn authoritative(&self, hotbar: &[Option<ItemStack>]) -> Option<ContainerSnapshot> {
         self.window
             .as_ref()
             .map(|window| authoritative_snapshot(window, hotbar))
     }
 
     /// The snapshot the UI draws, with the cursor preview subtracted.
-    pub fn snapshot(&self, hotbar: &[Option<ItemStack>; HOTBAR_SLOTS]) -> Option<ContainerSnapshot> {
+    pub fn snapshot(&self, hotbar: &[Option<ItemStack>]) -> Option<ContainerSnapshot> {
         let window = self.window.as_ref()?;
         let mut snapshot = authoritative_snapshot(window, hotbar);
         if let Some(cursor) = self.cursor {
@@ -920,7 +929,7 @@ impl RemoteContainers {
     pub fn click(
         &mut self,
         registry: &Registry,
-        hotbar: &[Option<ItemStack>; HOTBAR_SLOTS],
+        hotbar: &[Option<ItemStack>],
         slot: SlotId,
         button: crate::containers::ClickButton,
     ) -> RemoteClickOutcome {
@@ -1064,11 +1073,15 @@ impl Default for RemoteUpdate {
     }
 }
 
-fn authoritative_snapshot(window: &RemoteWindow, hotbar: &[Option<ItemStack>; HOTBAR_SLOTS]) -> ContainerSnapshot {
+fn authoritative_snapshot(window: &RemoteWindow, hotbar: &[Option<ItemStack>]) -> ContainerSnapshot {
+    let mut inventory = [None; HOTBAR_SLOTS];
+    for (destination, source) in inventory.iter_mut().zip(hotbar.iter()) {
+        *destination = *source;
+    }
     ContainerSnapshot {
         furnace: window.furnace_state(),
         chest: window.chest_state().unwrap_or_default().slots,
-        inventory: *hotbar,
+        inventory,
     }
 }
 
@@ -1167,7 +1180,7 @@ pub fn address_to_slot(window: &RemoteWindow, address: u16) -> Option<SlotId> {
 
 /// Equipment wire address for one armor slot index (helmet first).
 pub fn equipment_address(index: usize) -> Option<u16> {
-    (index < EQUIPMENT_SLOTS).then(|| 9 + index as u16)
+    (index < EQUIPMENT_SLOTS).then(|| ob_protocol::EQUIPMENT_SLOT_START + index as u16)
 }
 
 fn revision_for(window: &RemoteWindow, from: u16, to: u16) -> Option<u64> {
@@ -1233,7 +1246,16 @@ pub fn friendly_action_rejection(action: &str, reason: &str) -> String {
         "inventory_full" => "Your inventory is full",
         "not_edible_or_full" => "Not edible or hunger is full",
         "not_equippable" => "That item cannot be equipped",
-        "not_dead" => "You are not dead",
+        "needs_hoe" => "Hold a hoe to till grass or dirt",
+        "needs_seeds" => "Hold seeds to plant on farmland",
+        "seeds_missing" | "missing_seeds" => "Seeds are not available in this content pack",
+        "too_dark" => "Too dark to plant here - crops need light 9",
+        "not_night" => "You can only sleep at night",
+        "obstructed" => "The bed is obstructed",
+        "bed_malformed" => "That bed is broken",
+        "not_interactable" => "That block cannot be used",
+        "sleeping" | "already_sleeping" => "You are already sleeping",
+        "not_bed" => "That is not a bed",
         "no_target" => "Nothing is in reach",
         "cooldown" => "Slow down",
         "rate_limited" => "Slow down",
@@ -1243,7 +1265,12 @@ pub fn friendly_action_rejection(action: &str, reason: &str) -> String {
         other => other,
     };
     let action = action.trim();
-    if action.is_empty() || matches!(text, "You are dead" | "Not connected") {
+    // Gameplay-use hints are shown verbatim: the action tag is useful for
+    // debugging edit/inventory rejections but reads as noise in a toast.
+    if action.is_empty()
+        || matches!(action, "use_block" | "sleep_request" | "sleep")
+        || matches!(text, "You are dead" | "Not connected")
+    {
         text.to_string()
     } else {
         format!("{text} ({action})")
@@ -1322,10 +1349,17 @@ mod tests {
             std::array::from_fn(|index| (index == 2).then(|| dto(&registry, "openblock:stone", 12, None)));
         let equipment: [Option<ItemStackDto>; EQUIPMENT_SLOTS] =
             std::array::from_fn(|index| (index == 0).then(|| dto(&registry, "openblock:iron_helmet", 1, Some(55))));
-        state.apply_inventory(&registry, &hotbar, 9, &equipment);
+        let main: [Option<ItemStackDto>; MAIN_SLOTS] =
+            std::array::from_fn(|index| (index == 0).then(|| dto(&registry, "openblock:dirt", 5, None)));
+        state.apply_inventory(&registry, &hotbar, &main, 9, &equipment);
         assert!(state.inventory_received);
         assert_eq!(state.selected, 8, "out-of-range selected slots clamp");
         assert_eq!(state.inventory[2].map(|stack| stack.count), Some(12));
+        assert_eq!(
+            state.inventory[9].map(|stack| stack.count),
+            Some(5),
+            "main slots map to addresses 9..36"
+        );
         assert!(state.equipment[0].is_some());
         state.apply_selected(2);
         assert_eq!(state.selected_stack().map(|stack| stack.count), Some(12));
@@ -1337,6 +1371,18 @@ mod tests {
         assert_eq!(events[0].amount, 3.5);
         assert_eq!(events[0].cause, "fall");
         assert!(state.drain_damage_events().is_empty());
+    }
+
+    #[test]
+    fn equipment_wire_addresses_match_protocol_v3() {
+        assert_eq!(equipment_address(0), Some(36));
+        assert_eq!(equipment_address(1), Some(37));
+        assert_eq!(equipment_address(2), Some(38));
+        assert_eq!(equipment_address(3), Some(39));
+        assert_eq!(equipment_address(4), None);
+        assert_eq!(slot_to_address(SlotId::Hotbar(8)), Some(8));
+        assert_eq!(slot_to_address(SlotId::Hotbar(9)), None);
+        assert_eq!(slot_to_address(SlotId::FurnaceInput), Some(SLOT_WINDOW_START));
     }
 
     #[test]
@@ -1403,7 +1449,13 @@ mod tests {
             }),
             _ => None,
         });
-        state.apply_inventory(&registry, &hotbar, 0, &std::array::from_fn(|_| None));
+        state.apply_inventory(
+            &registry,
+            &hotbar,
+            &std::array::from_fn(|_| None),
+            0,
+            &std::array::from_fn(|_| None),
+        );
         assert!(state.inventory.iter().all(Option::is_none));
         assert!(stack_from_dto(&registry, &dto(&registry, "openblock:stone", 1, None)).is_some());
     }
@@ -1900,6 +1952,14 @@ mod tests {
             "not_equippable",
             "not_dead",
             "no_target",
+            "needs_hoe",
+            "needs_seeds",
+            "too_dark",
+            "not_night",
+            "obstructed",
+            "bed_malformed",
+            "not_interactable",
+            "sleeping",
             "unknown_reason",
         ];
         for reason in reasons {
@@ -1913,6 +1973,14 @@ mod tests {
         assert_eq!(
             friendly_action_rejection("inventory_move", "stale_revision"),
             "The container changed; try again (inventory_move)"
+        );
+        assert_eq!(
+            friendly_action_rejection("use_block", "needs_hoe"),
+            "Hold a hoe to till grass or dirt"
+        );
+        assert_eq!(
+            friendly_action_rejection("use_block", "not_night"),
+            "You can only sleep at night"
         );
     }
 }

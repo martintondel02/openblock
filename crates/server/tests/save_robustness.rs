@@ -268,8 +268,14 @@ fn hostile_sidecars_are_sanitized_or_skipped() {
         Some(1),
         "a zero count clamps to one rather than vanishing"
     );
-    assert!(inventory[8].is_some(), "out-of-range slot must clamp into the hotbar");
-    assert_eq!(inventory[8].expect("clamped").count, 2);
+    assert!(
+        inventory[8].is_none(),
+        "out-of-range slot 999 is dropped, never clamped onto the last hotbar slot"
+    );
+    assert!(
+        !inventory.iter().flatten().any(|stack| stack.count == 2),
+        "the dropped out-of-range dirt must not appear anywhere else"
+    );
 
     let helmet = host.equipment()[0].expect("helmet");
     assert_eq!(helmet.count, 1);

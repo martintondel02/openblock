@@ -23,10 +23,10 @@ cargo build --release --locked -p ob_server --bin openblock-server
 ```
 
 Expected (version and protocol numbers advance between releases; save format 4
-and protocol 2 are the interim 1.0 values):
+and protocol 3 are the current values):
 
 ```text
-openblock-server <version> (save format 4, protocol 2, linux/x86_64)
+openblock-server <version> (save format 4, protocol 3, linux/x86_64)
 save format: 4
 protocol: 2 (interim JSON over TCP)
 max frame: 2097152 bytes
@@ -34,7 +34,7 @@ networking: enabled with --listen ADDR; disabled by default
 ```
 
 > The shared version banner and the dedicated `protocol:` line agree at
-> protocol 2: the banner uses the engine-core constant and the `protocol:` line
+> protocol 3: the banner uses the engine-core constant and the `protocol:` line
 > the wire-protocol constant, and a server integration test asserts the two
 > values match. See
 > [troubleshooting](troubleshooting.md#client-side-errors).
@@ -82,8 +82,8 @@ Expected tail (the hash depends on the exact build and seed):
 
 ```text
 [INFO ] openblock_server: smoke test: generating, ticking, saving, reloading
-[INFO ] openblock_server: smoke OK: state hash eba0c42219691190
-smoke OK hash=eba0c42219691190
+[INFO ] openblock_server: smoke OK: state hash ed80bbaf244bc31d
+smoke OK hash=ed80bbaf244bc31d
 ```
 
 That hash is the 1.0.0 reference (seed 42, save format 4); the value changes
@@ -108,8 +108,8 @@ For a local-only test, bind loopback:
 Expected:
 
 ```text
-[INFO ] openblock_server: openblock-server <version> (save format 4, protocol 2, linux/x86_64)
-[INFO ] openblock_server: networking: interim JSON/TCP protocol v2 (max frame 2097152 bytes)
+[INFO ] openblock_server: openblock-server <version> (save format 4, protocol 3, linux/x86_64)
+[INFO ] openblock_server: networking: JSON/TCP protocol v3 (max frame 2097152 bytes)
 [INFO ] ob_server::net: starting TCP server on 127.0.0.1:25565: world 'world' seed ..., max 8 players, interest 6 chunks, default mode survival
 [INFO ] openblock_server: dedicated server listening on 127.0.0.1:25565 (max 8 players, 6 chunk interest, autosave 60 s)
 [INFO ] openblock_server: commands: help | list | say <msg> | kick <id|name> [reason] | save | tps | stop

@@ -1,4 +1,4 @@
-//! Loopback integration tests for protocol v2 server-authoritative survival.
+//! Loopback integration tests for protocol v3 server-authoritative survival.
 //!
 //! Each test starts a real dedicated server on `127.0.0.1:0` with a temporary
 //! world, connects raw `std::net::TcpStream` clients and exchanges the public
@@ -12,10 +12,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ob_content::{BlockId, ItemId, MobKind, Registry};
-use ob_math::{Aabb, BlockPos, WorldVec};
+use ob_math::{Aabb, BlockPos, LocalPos, WorldVec};
 use ob_protocol::{
-    ClientMessage, ContainerKind, DespawnReason, EntityKind, ItemStackDto, MAX_FRAME_LEN, PROTOCOL_VERSION,
-    ServerMessage, read_message, write_message,
+    ClientMessage, ContainerKind, DespawnReason, EntityKind, ItemStackDto, LIGHT_ENCODING_RAW, LIGHT_ENCODING_ZSTD,
+    LIGHT_SECTION_FORMAT, MAX_FRAME_LEN, MAX_LIGHT_SECTIONS_PER_UPDATE, PROTOCOL_VERSION, ServerMessage,
+    decode_light_words, read_message, write_message,
 };
 use ob_server::{DedicatedServer, GameMode, Host, HostConfig, NetConfig};
 
@@ -70,6 +71,11 @@ impl TestServer {
     }
 
     fn start_with_interval(label: &str, game_mode: GameMode, save_interval_seconds: u64) -> Self {
+        Self::start_with_interval_at(label, game_mode, save_interval_seconds, 0)
+    }
+
+    /// Starts at a fixed world tick (used by the sleep tests to begin at night).
+    fn start_with_interval_at(label: &str, game_mode: GameMode, save_interval_seconds: u64, start_tick: u64) -> Self {
         let dir = TempDir::new(label);
         let registry = Arc::new(Registry::base());
         let host_config = HostConfig {
@@ -79,7 +85,10 @@ impl TestServer {
             render_distance_chunks: 2,
             generate_budget: 8,
         };
-        let host = Host::open(Arc::clone(&registry), host_config.clone()).expect("open test world");
+        let mut host = Host::open(Arc::clone(&registry), host_config.clone()).expect("open test world");
+        if start_tick != 0 {
+            host.set_tick_count(start_tick);
+        }
         let spawn = host.spawn();
         let net_config = NetConfig {
             listen: "127.0.0.1:0".parse::<SocketAddr>().expect("ephemeral loopback"),
@@ -180,6 +189,101 @@ impl TestClient {
         }
     }
 
+    /// Sends a creative block edit and reports whether it was accepted.
+    fn try_place_block(&mut self, pos: [i32; 3], block: u16) -> bool {
+        self.send(ClientMessage::BlockEdit { pos, block });
+        let deadline = Instant::now() + WAIT;
+        loop {
+            match self.recv() {
+                ServerMessage::BlockEdit {
+                    pos: edited,
+                    block: placed,
+                    ..
+                } if edited == pos && placed == block => {
+                    return true;
+                }
+                ServerMessage::ActionRejected { action, reason } if action == "block_edit" => {
+                    let _ = reason;
+                    return false;
+                }
+                _ => {}
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for block edit at {pos:?}");
+        }
+    }
+
+    /// Sends a creative block edit and panics if the server rejects it.
+    fn place_block(&mut self, pos: [i32; 3], block: u16) {
+        assert!(self.try_place_block(pos, block), "block edit at {pos:?} was rejected");
+    }
+
+    /// Walks a network player from `start` to `target` with server-legal steps.
+    fn move_to(&mut self, start: WorldVec, target: WorldVec) {
+        let deadline = Instant::now() + WAIT;
+        let mut current = start;
+        while current.distance(target) > 0.25 {
+            assert!(
+                Instant::now() < deadline,
+                "could not move the test player to {target:?}"
+            );
+            let dx = (target.x - current.x).clamp(-1.9, 1.9);
+            let dy = (target.y - current.y).clamp(-4.5, 4.5);
+            let dz = (target.z - current.z).clamp(-1.9, 1.9);
+            current = WorldVec::new(current.x + dx, current.y + dy, current.z + dz);
+            self.send(ClientMessage::Move {
+                pos: [current.x, current.y, current.z],
+                yaw: 0.0,
+                pitch: 0.0,
+            });
+            std::thread::sleep(Duration::from_millis(60));
+        }
+    }
+
+    /// Waits for an `InventorySync` that contains `item` in the hotbar.
+    fn wait_hotbar_slot(&mut self, item: &str) -> u8 {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let ServerMessage::InventorySync { hotbar, .. } = self.recv()
+                && let Some(slot) = slot_of(&hotbar, item)
+            {
+                return slot;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {item} in the hotbar");
+        }
+    }
+
+    /// Waits for the next `BlockEdit` at `pos` and returns its block id.
+    fn wait_block_edit(&mut self, pos: [i32; 3]) -> u16 {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let ServerMessage::BlockEdit { pos: edited, block, .. } = self.recv()
+                && edited == pos
+            {
+                return block;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for a block edit at {pos:?}"
+            );
+        }
+    }
+
+    /// Waits for a `LightUpdate` and returns its sections.
+    fn next_light_update(&mut self) -> Vec<ob_protocol::LightSectionDto> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let ServerMessage::LightUpdate { sections, .. } = self.recv() {
+                return sections;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for LightUpdate");
+        }
+    }
+
+    /// Waits for a `SleepState` matching `predicate`.
+    fn sleep_state_until(&mut self, what: &str, predicate: impl FnMut(&ServerMessage) -> bool) -> ServerMessage {
+        self.recv_until_in(what, WAIT, predicate)
+    }
+
     fn expect_disconnect(&mut self, contains: &str) -> String {
         match self.recv_until("disconnect", |message| {
             matches!(message, ServerMessage::Disconnect { .. })
@@ -250,6 +354,7 @@ fn inventory_of(message: &ServerMessage) -> ([Option<ItemStackDto>; 9], u8, [Opt
     match message {
         ServerMessage::InventorySync {
             hotbar,
+            main: _,
             selected,
             equipment,
         } => (hotbar.clone(), *selected, equipment.clone()),
@@ -666,7 +771,7 @@ fn eat_and_equip_armor_mitigate_damage() {
         .position(Option::is_none)
         .expect("free slot") as u16;
     alice.send(ClientMessage::InventoryMove {
-        from: 9,
+        from: 36,
         to: free,
         count: 1,
         revision: None,
@@ -1266,16 +1371,151 @@ fn reconnect_and_restart_restore_network_player_state() {
 }
 
 #[test]
-fn protocol_v1_client_is_rejected_with_reason() {
+fn thirty_six_slot_inventory_moves_equips_and_survives_reconnect() {
+    let mut server = TestServer::start("inventory36");
+    let mut alice = TestClient::connect(server.addr());
+    let joined = join(&server, &mut alice, "alice");
+    assert!(server.server().give_network_item(joined.id, "openblock:stone", 40));
+    assert!(server.server().give_network_item(joined.id, "openblock:iron_helmet", 1));
+
+    // Initial sync: all items start in the nine hotbar slots and the 27 main
+    // slots are explicitly present and empty.
+    let sync = alice.recv_until("initial hotbar items", |message| match message {
+        ServerMessage::InventorySync { hotbar, main, .. } => {
+            main.iter().all(Option::is_none)
+                && hotbar.iter().flatten().any(|stack| stack.item == "openblock:stone")
+                && hotbar
+                    .iter()
+                    .flatten()
+                    .any(|stack| stack.item == "openblock:iron_helmet")
+        }
+        _ => false,
+    });
+    let ServerMessage::InventorySync { hotbar, main, .. } = sync else {
+        unreachable!()
+    };
+    assert_eq!(main.len(), 27);
+    assert_eq!(
+        hotbar
+            .iter()
+            .flatten()
+            .filter(|stack| stack.item == "openblock:stone")
+            .map(|stack| u32::from(stack.count))
+            .sum::<u32>(),
+        40
+    );
+    let helmet_slot = hotbar
+        .iter()
+        .position(|slot| slot.as_ref().is_some_and(|stack| stack.item == "openblock:iron_helmet"))
+        .expect("helmet in the hotbar");
+
+    // Hotbar slot 0 -> main slot 9 (wire address 0 -> 9).
+    alice.send(ClientMessage::InventoryMove {
+        from: 0,
+        to: 9,
+        count: 40,
+        revision: None,
+    });
+    alice.recv_until("stone moved to main", |message| match message {
+        ServerMessage::InventorySync { hotbar, main, .. } => {
+            hotbar
+                .iter()
+                .all(|slot| slot.as_ref().is_none_or(|stack| stack.item != "openblock:stone"))
+                && main[0]
+                    .as_ref()
+                    .is_some_and(|stack| stack.item == "openblock:stone" && stack.count == 40)
+        }
+        _ => false,
+    });
+
+    // Main slot 9 -> hotbar slot 0 for a partial stack.
+    alice.send(ClientMessage::InventoryMove {
+        from: 9,
+        to: 0,
+        count: 20,
+        revision: None,
+    });
+    alice.recv_until("half stone moved back", |message| match message {
+        ServerMessage::InventorySync { hotbar, main, .. } => {
+            hotbar[0]
+                .as_ref()
+                .is_some_and(|stack| stack.item == "openblock:stone" && stack.count == 20)
+                && main[0]
+                    .as_ref()
+                    .is_some_and(|stack| stack.item == "openblock:stone" && stack.count == 20)
+        }
+        _ => false,
+    });
+
+    // Equip the helmet from its hotbar slot using the new equipment address 36.
+    alice.send(ClientMessage::InventoryMove {
+        from: helmet_slot as u16,
+        to: 36,
+        count: 1,
+        revision: None,
+    });
+    alice.recv_until("helmet equipped at address 36", |message| match message {
+        ServerMessage::InventorySync { hotbar, equipment, .. } => {
+            equipment[0]
+                .as_ref()
+                .is_some_and(|stack| stack.item == "openblock:iron_helmet")
+                && hotbar[helmet_slot].is_none()
+        }
+        _ => false,
+    });
+
+    // Reconnect with the same name: the inventory and equipment are restored.
+    alice.send(ClientMessage::Disconnect);
+    drop(alice);
+    let deadline = Instant::now() + WAIT;
+    while server.server().player_count() != 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut again = TestClient::connect(server.addr());
+    let rejoined = join(&server, &mut again, "alice");
+    let ServerMessage::InventorySync {
+        hotbar,
+        main,
+        selected,
+        equipment,
+    } = rejoined.inventory
+    else {
+        unreachable!()
+    };
+    assert_eq!(selected, 0);
+    assert_eq!(main.len(), 27);
+    assert!(
+        main[0]
+            .as_ref()
+            .is_some_and(|stack| stack.item == "openblock:stone" && stack.count == 20)
+    );
+    assert!(
+        hotbar[0]
+            .as_ref()
+            .is_some_and(|stack| stack.item == "openblock:stone" && stack.count == 20)
+    );
+    assert!(
+        equipment[0]
+            .as_ref()
+            .is_some_and(|stack| stack.item == "openblock:iron_helmet")
+    );
+    again.send(ClientMessage::Disconnect);
+    drop(again);
+    server.stop();
+}
+
+#[test]
+fn protocol_v2_client_is_rejected_with_reason() {
     let mut server = TestServer::start("protocol");
     let mut old = TestClient::connect(server.addr());
     old.send(ClientMessage::Hello {
-        protocol: 1,
+        protocol: 2,
         name: "legacy".to_string(),
     });
     let reason = old.expect_disconnect("protocol_mismatch");
-    assert!(reason.contains("server protocol 2"), "{reason}");
-    assert_eq!(ob_protocol::PROTOCOL_VERSION, 2);
+    assert!(reason.contains("server protocol 3"), "{reason}");
+    assert!(reason.contains("upgrade"), "{reason}");
+    assert_eq!(ob_protocol::PROTOCOL_VERSION, 3);
     server.stop();
 }
 
@@ -1300,4 +1540,184 @@ fn creative_network_mode_keeps_instant_edits_and_immunity() {
     assert!(!player.dead);
     assert_eq!(player.health, 20.0);
     server.stop();
+}
+/// Decodes a `LightUpdate` section and returns the packed word at `pos`.
+fn light_word_in_sections(sections: &[ob_protocol::LightSectionDto], pos: BlockPos) -> Option<u16> {
+    let section = pos.section();
+    let dto = sections
+        .iter()
+        .find(|dto| dto.cx == section.x && dto.cy == section.y && dto.cz == section.z)?;
+    assert_eq!(dto.format, LIGHT_SECTION_FORMAT);
+    let words = decode_light_words(dto.encoding, &dto.data).expect("valid light words");
+    assert_eq!(words.len(), ob_protocol::LIGHT_CELLS);
+    let local = LocalPos {
+        x: (pos.x - section.x * 16) as u8,
+        y: (pos.y - section.y * 16) as u8,
+        z: (pos.z - section.z * 16) as u8,
+    };
+    Some(words[local.index()])
+}
+
+#[test]
+fn light_update_round_trips_dense_sections_over_loopback() {
+    let server = TestServer::start_with_mode("light-update", GameMode::Creative);
+    let mut alice = TestClient::connect(server.addr());
+    let joined = join(&server, &mut alice, "alice");
+    let spawn = server.spawn;
+    let sx = spawn.x.floor() as i32;
+    let sz = spawn.z.floor() as i32;
+    let stone = server.registry.id("openblock:stone").expect("stone").0;
+    let torch = server.registry.id("openblock:torch").expect("torch").0;
+    let build = WorldVec::new(sx as f64 + 0.5, 100.0, sz as f64 + 0.5);
+    alice.move_to(spawn, build);
+    wait_player_position(&server, joined.id, build);
+    let base = [sx, 100, sz];
+    alice.place_block(base, stone);
+    alice.place_block([sx, 101, sz], torch);
+    let sections = alice.next_light_update();
+    assert!(!sections.is_empty());
+    assert!(sections.len() <= MAX_LIGHT_SECTIONS_PER_UPDATE);
+    for dto in &sections {
+        assert_eq!(dto.format, LIGHT_SECTION_FORMAT);
+        assert!(dto.encoding == LIGHT_ENCODING_RAW || dto.encoding == LIGHT_ENCODING_ZSTD);
+    }
+    let pos = BlockPos::new(sx, 101, sz);
+    let word = light_word_in_sections(&sections, pos).expect("torch section is in the batch");
+    assert_eq!((word >> 8) & 0xF, 14, "red block light at the torch");
+    assert_eq!((word >> 4) & 0xF, 14, "green block light at the torch");
+    assert_eq!(word & 0xF, 14, "blue block light at the torch");
+}
+
+#[test]
+fn multiplayer_sleep_requires_every_player_and_fast_forwards_to_sunrise() {
+    let mut server = TestServer::start_with_interval_at("sleep-loopback", GameMode::Creative, 3_600, 15_000);
+    let mut alice = TestClient::connect(server.addr());
+    let alice_joined = join(&server, &mut alice, "alice");
+    let mut bob = TestClient::connect(server.addr());
+    let bob_joined = join(&server, &mut bob, "bob");
+
+    let spawn = server.spawn;
+    let sx = spawn.x.floor() as i32;
+    let sz = spawn.z.floor() as i32;
+    let stone = server.registry.id("openblock:stone").expect("stone").0;
+    let bed_foot = server.registry.id("openblock:bed_foot").expect("bed_foot").0;
+    // Both players move next to the future bed (client-authoritative movement),
+    // then a floating platform high above the terrain keeps the bed cells clear
+    // of trees and slopes.
+    let near_foot = WorldVec::new(sx as f64 + 0.5, 102.0, sz as f64 + 0.5);
+    let near_head = WorldVec::new(sx as f64 + 0.5, 102.0, sz as f64 + 1.5);
+    alice.move_to(spawn, near_foot);
+    bob.move_to(spawn, near_head);
+    wait_player_position(&server, alice_joined.id, near_foot);
+    wait_player_position(&server, bob_joined.id, near_head);
+    alice.place_block([sx, 100, sz], stone);
+    alice.place_block([sx, 100, sz + 1], stone);
+    alice.place_block([sx, 101, sz], bed_foot);
+
+    alice.send(ClientMessage::SleepRequest { pos: [sx, 101, sz] });
+    let state = alice.sleep_state_until("alice asleep", |message| {
+        matches!(
+            message,
+            ServerMessage::SleepState {
+                sleeping: true,
+                all_sleeping: false,
+                ..
+            }
+        )
+    });
+    let ServerMessage::SleepState { sleepers, bed, .. } = state else {
+        unreachable!()
+    };
+    assert_eq!(sleepers, vec![alice_joined.id]);
+    assert_eq!(bed, Some([sx, 101, sz]));
+
+    bob.send(ClientMessage::SleepRequest { pos: [sx, 101, sz] });
+    bob.sleep_state_until("everyone asleep", |message| {
+        matches!(
+            message,
+            ServerMessage::SleepState {
+                sleeping: true,
+                all_sleeping: true,
+                ..
+            }
+        )
+    });
+    let sunrise = bob.recv_until("sunrise TimeSync", |message| {
+        matches!(message, ServerMessage::TimeSync { day_phase: 0, .. })
+    });
+    let ServerMessage::TimeSync { tick, .. } = sunrise else {
+        unreachable!()
+    };
+    assert!(tick >= 24_000, "fast-forward reaches sunrise, got {tick}");
+    bob.sleep_state_until("woken at sunrise", |message| {
+        matches!(
+            message,
+            ServerMessage::SleepState {
+                sleeping: false,
+                all_sleeping: false,
+                ..
+            }
+        )
+    });
+
+    // The bed respawn point persists in the network-player sidecar.
+    server.stop();
+    let text = std::fs::read_to_string(server.world_dir().join("network_players.txt")).expect("network players");
+    assert!(text.contains(" r"), "respawn token written: {text}");
+    let host = server.reopen();
+    let alice_record = host.saved_network_player("alice").expect("alice record");
+    assert_eq!(
+        alice_record.respawn_point,
+        Some(WorldVec::new(sx as f64 + 0.5, 102.0, sz as f64 + 0.5))
+    );
+    let bob_record = host.saved_network_player("bob").expect("bob record");
+    assert!(bob_record.respawn_point.is_some());
+}
+#[test]
+fn farming_use_block_updates_replicate_to_clients() {
+    let server = TestServer::start_with_mode("farming-sync", GameMode::Creative);
+    let mut alice = TestClient::connect(server.addr());
+    let joined = join(&server, &mut alice, "alice");
+    let spawn = server.spawn;
+    let sx = spawn.x.floor() as i32;
+    let sz = spawn.z.floor() as i32;
+    let near = WorldVec::new(sx as f64 + 0.5, 200.0, sz as f64 + 0.5);
+    alice.move_to(spawn, near);
+    wait_player_position(&server, joined.id, near);
+
+    let dirt = server.registry.id("openblock:dirt").expect("dirt").0;
+    let stone = server.registry.id("openblock:stone").expect("stone").0;
+    let torch = server.registry.id("openblock:torch").expect("torch").0;
+    let farmland_dry = server.registry.id("openblock:farmland_dry").expect("farmland").0;
+    let wheat_0 = server.registry.id("openblock:wheat_0").expect("wheat_0").0;
+
+    let soil = [sx, 198, sz];
+    alice.place_block(soil, dirt);
+    // A lit torch beside the crop keeps the planting light rule satisfied.
+    alice.place_block([sx + 1, 197, sz], stone);
+    alice.place_block([sx + 1, 198, sz], torch);
+
+    assert!(server.server().give_network_item(joined.id, "openblock:wood_hoe", 1));
+    let hoe_slot = alice.wait_hotbar_slot("openblock:wood_hoe");
+    alice.send(ClientMessage::SelectSlot { slot: hoe_slot });
+    alice.recv_until(
+        "hoe selected",
+        |message| matches!(message, ServerMessage::SelectedSlot { slot } if *slot == hoe_slot),
+    );
+    alice.send(ClientMessage::UseBlock { pos: soil });
+    assert_eq!(alice.wait_block_edit(soil), farmland_dry);
+
+    assert!(server.server().give_network_item(joined.id, "openblock:seeds", 4));
+    let seeds_slot = alice.wait_hotbar_slot("openblock:seeds");
+    alice.send(ClientMessage::SelectSlot { slot: seeds_slot });
+    alice.recv_until(
+        "seeds selected",
+        |message| matches!(message, ServerMessage::SelectedSlot { slot } if *slot == seeds_slot),
+    );
+    alice.send(ClientMessage::UseBlock { pos: soil });
+    assert_eq!(alice.wait_block_edit([sx, 199, sz]), wheat_0);
+
+    // Harvesting the immature crop removes the block and replicates the edit.
+    alice.send(ClientMessage::UseBlock { pos: [sx, 199, sz] });
+    assert_eq!(alice.wait_block_edit([sx, 199, sz]), 0);
 }

@@ -1729,6 +1729,9 @@ mod tests {
 
     /// Writes one RGBA8 image to disk.
     fn write_test_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
         let file = std::fs::File::create(path).expect("create screenshot png");
         let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
         encoder.set_color(png::ColorType::Rgba);
@@ -1966,7 +1969,7 @@ mod tests {
             .render_cached_scene(&camera, &scene)
             .expect("render water with shadows again");
         write_test_png(
-            std::path::Path::new("/tmp/openblock-shaders-water.png"),
+            &std::env::temp_dir().join("openblock-shaders-water.png"),
             1280,
             720,
             &rgba,
@@ -2204,7 +2207,7 @@ mod tests {
             .expect("render UI font sample");
         let pixels = renderer.read_rgba();
         assert_eq!(pixels.len(), (640 * 360 * 4) as usize);
-        write_test_png(std::path::Path::new("/tmp/ui-font-sample.png"), 640, 360, &pixels);
+        write_test_png(&std::env::temp_dir().join("ui-font-sample.png"), 640, 360, &pixels);
         eprintln!("wrote /tmp/ui-font-sample.png");
     }
 
@@ -2534,7 +2537,8 @@ mod tests {
                 position: corners[index],
                 uv: uvs[index],
                 layer: u32::from(ob_content::textures::WATER.0),
-                light: 1.0,
+                light: crate::Vertex::pack_light(255, 0),
+                reserved: 0,
             });
         }
         renderer.upload_mesh(
@@ -2717,5 +2721,306 @@ mod tests {
         renderer.render_cached_scene(&camera, &scene).expect("second frame");
         let error = OffscreenRenderer::pop_validation_scope(scope);
         assert!(error.is_none(), "wgpu validation error: {error:?}");
+    }
+
+    // ------------------------------------------------------------------
+    // 1.2 lighting and cross-content GPU tests.
+    // ------------------------------------------------------------------
+
+    /// A sealed 7×7×3 room inside a 16×16 stone block from y=60..=80.
+    ///
+    /// The room is carved from (4,64,4)..=(10,66,10); the camera looks at the
+    /// far wall, so the frame is black until a torch is placed on the floor.
+    fn sealed_light_room(registry: &Arc<Registry>) -> World {
+        let stone = registry.id_or_air("openblock:stone");
+        let mut column = ChunkColumn::new(ChunkPos::new(0, 0));
+        for y in 60..=80 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    column.set_block(BlockPos::new(x, y, z), stone);
+                }
+            }
+        }
+        for y in 64..=66 {
+            for z in 4..=10 {
+                for x in 4..=10 {
+                    column.set_block(BlockPos::new(x, y, z), BlockId::AIR);
+                }
+            }
+        }
+        column.recompute_heightmap();
+        let mut world = World::new(Arc::clone(registry), 11);
+        world.insert_chunk(column);
+        world
+    }
+
+    /// Mean luma of a small square around a framebuffer point.
+    fn luma_near(pixels: &[u8], width: u32, height: u32, point: [f32; 2], radius: i32) -> f32 {
+        let cx = point[0].round() as i32;
+        let cy = point[1].round() as i32;
+        let mut sum = 0f64;
+        let mut count = 0usize;
+        for y in (cy - radius).max(0)..=(cy + radius).min(height as i32 - 1) {
+            for x in (cx - radius).max(0)..=(cx + radius).min(width as i32 - 1) {
+                let offset = ((y as u32 * width + x as u32) * 4) as usize;
+                sum += 0.2126 * f64::from(pixels[offset])
+                    + 0.7152 * f64::from(pixels[offset + 1])
+                    + 0.0722 * f64::from(pixels[offset + 2]);
+                count += 1;
+            }
+        }
+        if count == 0 { 0.0 } else { (sum / count as f64) as f32 }
+    }
+
+    #[test]
+    fn dark_cave_becomes_readable_with_a_torch() {
+        const WIDTH: u32 = 640;
+        const HEIGHT: u32 = 360;
+        let Some(mut renderer) = open_renderer(WIDTH, HEIGHT, "dark_cave_becomes_readable_with_a_torch") else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let mut world = sealed_light_room(&registry);
+        let torch = registry.id_or_air("openblock:torch");
+        assert_ne!(torch, BlockId::AIR);
+        let camera = look_at(WorldVec::new(7.5, 66.4, 10.5), [7.5, 65.8, 4.5]);
+        let scene = SceneParams::new(Environment::new(0.75));
+
+        let scope = renderer.push_validation_scope();
+        renderer
+            .render_world_scene(&world, &camera, &scene)
+            .expect("render the dark room");
+        assert!(OffscreenRenderer::pop_validation_scope(scope).is_none());
+        let dark = renderer.read_rgba();
+        let dark_luma = mean_luma(&dark);
+        write_test_png(
+            &std::env::temp_dir().join("openblock-light-cave-dark.png"),
+            WIDTH,
+            HEIGHT,
+            &dark,
+        );
+
+        assert!(world.set_block(BlockPos::new(7, 65, 6), torch));
+        let scope = renderer.push_validation_scope();
+        renderer
+            .render_world_scene(&world, &camera, &scene)
+            .expect("render the torch-lit room");
+        assert!(OffscreenRenderer::pop_validation_scope(scope).is_none());
+        let lit = renderer.read_rgba();
+        let lit_luma = mean_luma(&lit);
+        write_test_png(
+            &std::env::temp_dir().join("openblock-light-torch.png"),
+            WIDTH,
+            HEIGHT,
+            &lit,
+        );
+
+        eprintln!("sealed room mean luma: dark={dark_luma:.2}, torch={lit_luma:.2}");
+        assert!(
+            dark_luma < 3.0,
+            "a sealed cave at night must be nearly black, got {dark_luma}"
+        );
+        assert!(
+            lit_luma > dark_luma + 12.0,
+            "a torch must visibly light the room ({dark_luma} -> {lit_luma})"
+        );
+        // The warm torch tint must reach the visible wall, not just the source.
+        let warm = lit
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| {
+                i32::from(pixel[0]) > i32::from(pixel[1]) + 18 && i32::from(pixel[1]) > i32::from(pixel[2]) + 8
+            })
+            .count();
+        assert!(warm > 50, "the torch-lit frame has only {warm} warm pixels");
+    }
+
+    #[test]
+    fn torch_light_crosses_a_chunk_border_in_the_shaded_image() {
+        const WIDTH: u32 = 640;
+        const HEIGHT: u32 = 360;
+        let Some(mut renderer) = open_renderer(WIDTH, HEIGHT, "torch_light_crosses_a_chunk_border_in_the_shaded_image")
+        else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let stone = registry.id_or_air("openblock:stone");
+        let torch = registry.id_or_air("openblock:torch");
+        let mut world = World::new(Arc::clone(&registry), 12);
+        for cx in 0..2 {
+            let mut column = ChunkColumn::new(ChunkPos::new(cx, 0));
+            for z in 0..16 {
+                for x in 0..16 {
+                    column.set_block(BlockPos::new(cx * 16 + x, 64, z), stone);
+                }
+            }
+            world.insert_chunk(column);
+        }
+        assert!(world.set_block(BlockPos::new(15, 65, 8), torch));
+
+        let camera = look_at(WorldVec::new(15.5, 74.0, 12.0), [15.5, 65.0, 7.0]);
+        let scene = SceneParams::new(Environment::new(0.75));
+        let scope = renderer.push_validation_scope();
+        renderer
+            .render_world_scene(&world, &camera, &scene)
+            .expect("render torch across the border");
+        assert!(OffscreenRenderer::pop_validation_scope(scope).is_none());
+        let pixels = renderer.read_rgba();
+
+        // Sample the floor on the torch side, on the neighbouring-chunk side of
+        // x=16, and far away where the torch does not reach.
+        let near = project(&camera, WIDTH, HEIGHT, [15.5, 65.02, 10.5]).expect("near point on screen");
+        let across = project(&camera, WIDTH, HEIGHT, [16.5, 65.02, 10.5]).expect("across point on screen");
+        let far = project(&camera, WIDTH, HEIGHT, [27.5, 65.02, 10.5]).expect("far point on screen");
+        let near_luma = luma_near(&pixels, WIDTH, HEIGHT, near, 2);
+        let across_luma = luma_near(&pixels, WIDTH, HEIGHT, across, 2);
+        let far_luma = luma_near(&pixels, WIDTH, HEIGHT, far, 2);
+        eprintln!("torch across border luma: near={near_luma:.2}, across={across_luma:.2}, far={far_luma:.2}");
+        assert!(
+            near_luma > far_luma + 8.0,
+            "the torch must brighten its side ({near_luma} vs {far_luma})"
+        );
+        assert!(
+            across_luma > far_luma + 4.0,
+            "light must cross the chunk border ({across_luma} vs {far_luma})"
+        );
+        assert!(
+            (near_luma - across_luma).abs() < 18.0,
+            "the border must not show a hard light discontinuity ({near_luma} vs {across_luma})"
+        );
+    }
+
+    #[test]
+    fn cross_cutout_torch_and_wheat_render_on_the_gpu() {
+        const WIDTH: u32 = 640;
+        const HEIGHT: u32 = 360;
+        let Some(mut renderer) = open_renderer(WIDTH, HEIGHT, "cross_cutout_torch_and_wheat_render_on_the_gpu") else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let mut world = test_world(&registry);
+        let torch = registry.id_or_air("openblock:torch");
+        let wheat = registry.id_or_air("openblock:wheat_3");
+        let camera = look_at(WorldVec::new(8.5, 66.8, 13.0), [8.5, 66.5, 8.0]);
+        let scene = SceneParams::new(Environment::default());
+
+        renderer
+            .render_world_scene(&world, &camera, &scene)
+            .expect("render the baseline");
+        let baseline = renderer.read_rgba();
+
+        assert!(world.set_block(BlockPos::new(8, 66, 8), torch));
+        assert!(world.set_block(BlockPos::new(9, 66, 8), wheat));
+        let scope = renderer.push_validation_scope();
+        renderer
+            .render_world_scene(&world, &camera, &scene)
+            .expect("render cross content");
+        assert!(OffscreenRenderer::pop_validation_scope(scope).is_none());
+        let lit = renderer.read_rgba();
+        write_test_png(
+            &std::env::temp_dir().join("openblock-light-cross.png"),
+            WIDTH,
+            HEIGHT,
+            &lit,
+        );
+
+        // Restrict the comparison to the projected cross area.
+        let center = project(&camera, WIDTH, HEIGHT, [8.5, 66.5, 8.5]).expect("cross center on screen");
+        let radius = 55i32;
+        let mut changed = 0usize;
+        let mut warm = 0usize;
+        let mut green = 0usize;
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        let cx = center[0] as i32;
+        let cy = center[1] as i32;
+        for y in (cy - radius).max(0)..=(cy + radius).min(HEIGHT as i32 - 1) {
+            for x in (cx - radius).max(0)..=(cx + radius).min(WIDTH as i32 - 1) {
+                let offset = ((y as u32 * WIDTH + x as u32) * 4) as usize;
+                let before = &baseline[offset..offset + 4];
+                let after = &lit[offset..offset + 4];
+                if before[..3]
+                    .iter()
+                    .zip(after[..3].iter())
+                    .any(|(a, b)| a.abs_diff(*b) > 3)
+                {
+                    changed += 1;
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                    if i32::from(after[0]) > i32::from(after[1]) + 18 && i32::from(after[1]) > i32::from(after[2]) + 8 {
+                        warm += 1;
+                    }
+                    if i32::from(after[1]) > i32::from(after[0]) + 10 && i32::from(after[1]) > i32::from(after[2]) + 5 {
+                        green += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("cross pixels: changed={changed}, warm={warm}, green={green}");
+        assert!(
+            changed > 80,
+            "the crosses must be visible (only {changed} changed pixels)"
+        );
+        assert!(warm > 20, "the torch cross has only {warm} warm pixels");
+        assert!(green > 5, "the wheat cross has only {green} green pixels");
+        let bbox = ((max_x - min_x + 1) * (max_y - min_y + 1)) as usize;
+        assert!(
+            changed * 10 < bbox * 9,
+            "cut-out crosses filled {changed} of {bbox} bounding-box pixels; alpha test may be broken"
+        );
+    }
+
+    #[test]
+    fn far_512_scene_still_renders_with_the_new_vertex_layout() {
+        const WIDTH: u32 = 640;
+        const HEIGHT: u32 = 360;
+        let Some(mut renderer) = open_renderer(WIDTH, HEIGHT, "far_512_scene_still_renders_with_the_new_vertex_layout")
+        else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let world = test_world(&registry);
+        // A synthetic far batch at x≈500 exercises the 512-block far plane, LOD
+        // buffer format and fog with the 32-byte vertex. Lighting adds no extra
+        // draw pass, so a rendered far quad is the streaming smoke test here.
+        let layer = u32::from(ob_content::textures::STONE.0);
+        let mut mesh = crate::MeshData::default();
+        for index in [0usize, 1, 2, 0, 2, 3] {
+            let corner = [
+                [500.0f32, 70.0, 0.0],
+                [500.0, 70.0, 16.0],
+                [516.0, 70.0, 16.0],
+                [516.0, 70.0, 0.0],
+            ][index];
+            mesh.vertices.push(crate::Vertex {
+                position: corner,
+                uv: [[0.0f32, 16.0], [0.0, 0.0], [16.0, 0.0], [16.0, 16.0]][index],
+                layer,
+                light: crate::Vertex::pack_light(255, 0),
+                reserved: 0,
+            });
+        }
+        renderer.upload_lod_batch(
+            crate::LodBatchKey::containing(ChunkPos::new(31, 0), 2),
+            [500.0, 70.0, 0.0],
+            [516.0, 70.0, 16.0],
+            mesh,
+        );
+
+        let mut camera = Camera::new(WorldVec::new(0.0, 90.0, 8.0), std::f32::consts::FRAC_PI_2, -0.05);
+        camera.far = 512.0;
+        let scene = SceneParams::new(Environment::default());
+        let scope = renderer.push_validation_scope();
+        renderer
+            .render_world_scene(&world, &camera, &scene)
+            .expect("render the 512-block scene");
+        assert!(OffscreenRenderer::pop_validation_scope(scope).is_none());
+        let pixels = renderer.read_rgba();
+        assert!(mean_luma(&pixels) > 5.0, "the far scene must not be fully black");
     }
 }

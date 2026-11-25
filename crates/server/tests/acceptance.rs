@@ -1004,7 +1004,7 @@ fn find_chest_empty(host: &Host, pos: BlockPos) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------------
-// Multiplayer survival variant (raw protocol v2 client)
+// Multiplayer survival variant (raw protocol v3 client)
 // ---------------------------------------------------------------------------
 
 use ob_math::Aabb;
@@ -1176,6 +1176,7 @@ fn net_inventory(message: &ServerMessage) -> ([Option<ItemStackDto>; 9], u8, [Op
     match message {
         ServerMessage::InventorySync {
             hotbar,
+            main: _,
             selected,
             equipment,
         } => (hotbar.clone(), *selected, equipment.clone()),
@@ -1620,19 +1621,20 @@ fn full_inventory_crafting_armor_and_tool_break_edges() {
     let planks = item_id(&host, "openblock:planks");
     let log = item_id(&host, "openblock:log");
 
-    // Eight full stone stacks plus one log = a completely full inventory. The
-    // planks recipe consumes the log and therefore frees a slot, so it must
-    // succeed rather than reporting "inventory full".
-    assert_eq!(host.give_item(stone, 255), 0);
-    assert_eq!(host.give_item(stone, 255), 0);
-    assert_eq!(host.give_item(stone, 2), 0);
+    // Thirty-five full stone stacks plus one log fill all 36 slots. The planks
+    // recipe consumes the log and therefore frees a slot, so it must succeed
+    // rather than reporting "inventory full".
+    for _ in 0..8 {
+        assert_eq!(host.give_item(stone, 255), 0);
+    }
+    assert_eq!(host.give_item(stone, 200), 0);
     assert_eq!(host.give_item(log, 1), 0);
     assert!(host.inventory().iter().all(Option::is_some));
     let outcome = craft(&mut host, "openblock:planks");
     assert!(outcome.crafted, "{}", outcome.message);
     assert_eq!(item_count(&host, planks), 4);
     assert_eq!(item_count(&host, log), 0);
-    assert_eq!(item_count(&host, stone), 512);
+    assert_eq!(item_count(&host, stone), 2240);
     assert!(
         host.inventory().iter().all(Option::is_some),
         "the freed slot holds planks"
@@ -1788,12 +1790,15 @@ fn full_chest_break_drops_every_slot() {
         "broken chest record must be removed"
     );
     assert_eq!(host.world().get_block(chest_pos), BlockId::AIR);
-    // The player's nine-slot inventory can only accept part of the 27 stacks,
-    // but at least one chest-content stack must have been collected; the rest
-    // remain as item entities.
+    // The 36-slot inventory accepts all 27 stacks plus the chest item; anything
+    // beyond 36 stacks would stay as an item entity.
     let stone_count = item_count(&host, stone);
-    assert!(stone_count > 0, "at least some chest contents were collected");
-    assert!(host.item_entities().iter().any(|entity| entity.stack.item == stone));
+    assert_eq!(
+        stone_count,
+        (CHEST_SLOTS as u32) * 64,
+        "every chest stack was collected"
+    );
+    assert!(host.item_entities().is_empty(), "no overflow with 36 slots");
 }
 
 #[test]

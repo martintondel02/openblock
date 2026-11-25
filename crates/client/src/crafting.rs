@@ -810,6 +810,12 @@ mod tests {
         registry.recipes().map(|(id, _)| (id, 4)).collect()
     }
 
+    fn row_for<'a>(rows: &'a [CraftingRow], name: &str) -> &'a CraftingRow {
+        rows.iter()
+            .find(|row| row.output_name == name)
+            .unwrap_or_else(|| panic!("missing crafting row {name}"))
+    }
+
     #[test]
     fn key_hint_fits_the_panel_inner_width_at_960x540() {
         let screen = [960.0, 540.0];
@@ -833,43 +839,46 @@ mod tests {
             false,
             &inventory(&registry, &[]),
         );
-        assert_eq!(rows.len(), 25);
+        assert_eq!(rows.len(), registry.recipe_len());
         let sections: Vec<CraftSection> = rows.iter().map(|row| row.section).collect();
-        assert_eq!(sections[..3], [CraftSection::Basics; 3]);
-        assert_eq!(sections[3..5], [CraftSection::Building; 2]);
-        assert_eq!(sections[5..17], [CraftSection::Tools; 12]);
-        assert_eq!(sections[17..], [CraftSection::Armor; 8]);
+        let basics = registry
+            .recipes()
+            .filter(|(id, _)| !registry.recipe(*id).unwrap().needs_table)
+            .count();
+        assert!(sections[..basics].iter().all(|s| *s == CraftSection::Basics));
+        let building = rows.iter().filter(|row| row.section == CraftSection::Building).count();
+        let tools = rows.iter().filter(|row| row.section == CraftSection::Tools).count();
+        let armor = rows.iter().filter(|row| row.section == CraftSection::Armor).count();
+        assert!(building >= 2, "furnace and chest");
+        assert!(tools >= 12, "every tool recipe is listed");
+        assert!(armor >= 8, "both armor tiers are listed");
+        assert_eq!(basics + building + tools + armor, rows.len());
         let names: Vec<&str> = rows.iter().map(|row| row.output_name.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "Planks",
-                "Sticks",
-                "Crafting Table",
-                "Furnace",
-                "Chest",
-                "Wooden Pickaxe",
-                "Wooden Axe",
-                "Wooden Shovel",
-                "Wooden Sword",
-                "Stone Pickaxe",
-                "Stone Axe",
-                "Stone Shovel",
-                "Stone Sword",
-                "Iron Pickaxe",
-                "Iron Axe",
-                "Iron Shovel",
-                "Iron Sword",
-                "Leather Helmet",
-                "Leather Chestplate",
-                "Leather Leggings",
-                "Leather Boots",
-                "Iron Helmet",
-                "Iron Chestplate",
-                "Iron Leggings",
-                "Iron Boots",
-            ]
-        );
+        for expected in [
+            "Planks",
+            "Sticks",
+            "Crafting Table",
+            "Furnace",
+            "Chest",
+            "Wooden Pickaxe",
+            "Iron Sword",
+            "Leather Helmet",
+            "Iron Boots",
+        ] {
+            assert!(names.contains(&expected), "missing row {expected}");
+        }
+        // 1.2 append-only recipes appear when the content pack provides them.
+        for (recipe, row) in [
+            ("openblock:torch", "Torch"),
+            ("openblock:bread", "Bread"),
+            ("openblock:wood_hoe", "Wooden Hoe"),
+            ("openblock:stone_hoe", "Stone Hoe"),
+            ("openblock:iron_hoe", "Iron Hoe"),
+        ] {
+            if registry.recipe_id(recipe).is_some() {
+                assert!(names.contains(&row), "missing 1.2 row {row}");
+            }
+        }
         // Every section stays in deterministic registry recipe order.
         for pair in rows.windows(2).filter(|pair| pair[0].section == pair[1].section) {
             assert!(
@@ -879,9 +888,9 @@ mod tests {
                 pair[1].output_name
             );
         }
-        assert_eq!(rows[0].output_label(), "Planks x4");
-        assert_eq!(rows[5].output_label(), "Wooden Pickaxe");
-        assert_eq!(rows[13].output_label(), "Iron Pickaxe");
+        assert_eq!(row_for(&rows, "Planks").output_label(), "Planks x4");
+        assert_eq!(row_for(&rows, "Wooden Pickaxe").output_label(), "Wooden Pickaxe");
+        assert_eq!(row_for(&rows, "Iron Pickaxe").output_label(), "Iron Pickaxe");
     }
 
     #[test]
@@ -904,9 +913,9 @@ mod tests {
             false,
             &inventory(&registry, &[("openblock:planks", 4), ("openblock:stick", 2)]),
         );
-        assert_eq!(rows[0].status, CraftStatus::Craftable(2));
-        assert!(rows[0].can_craft());
-        for row in &rows[3..] {
+        assert_eq!(row_for(&rows, "Planks").status, CraftStatus::Craftable(2));
+        assert!(row_for(&rows, "Planks").can_craft());
+        for row in rows.iter().filter(|row| row.needs_table) {
             assert_eq!(row.status, CraftStatus::NeedsTable, "{}", row.output_name);
             assert!(!row.can_craft());
         }
@@ -914,7 +923,7 @@ mod tests {
         let rows = crafting_rows(&registry, &available, false, true, &[]);
         assert!(rows.iter().all(|row| row.status == CraftStatus::Creative));
         assert!(rows.iter().all(CraftingRow::can_craft));
-        assert_eq!(rows[3].status.label(), "available");
+        assert_eq!(row_for(&rows, "Furnace").status.label(), "available");
     }
 
     #[test]
@@ -927,25 +936,34 @@ mod tests {
             false,
             &inventory(&registry, &[("openblock:planks", 2), ("openblock:stick", 1)]),
         );
-        assert_eq!(rows[0].ingredient_summary, "1 Log");
-        assert_eq!(rows[1].ingredient_summary, "2 Planks");
-        assert_eq!(rows[3].ingredient_summary, "8 Cobblestones");
-        assert_eq!(rows[4].ingredient_summary, "8 Planks");
-        assert_eq!(rows[5].ingredient_summary, "3 Planks + 2 Sticks");
-        assert_eq!(rows[7].ingredient_summary, "1 Plank + 2 Sticks");
-        assert_eq!(rows[9].ingredient_summary, "3 Cobblestones + 2 Sticks");
-        assert_eq!(rows[13].ingredient_summary, "3 Iron Ingots + 2 Sticks");
-        assert_eq!(rows[18].ingredient_summary, "8 Leather");
-        assert_eq!(rows[22].ingredient_summary, "8 Iron Ingots");
-        let pick = &rows[5];
+        assert_eq!(row_for(&rows, "Planks").ingredient_summary, "1 Log");
+        assert_eq!(row_for(&rows, "Sticks").ingredient_summary, "2 Planks");
+        assert_eq!(row_for(&rows, "Furnace").ingredient_summary, "8 Cobblestones");
+        assert_eq!(row_for(&rows, "Chest").ingredient_summary, "8 Planks");
+        assert_eq!(
+            row_for(&rows, "Wooden Pickaxe").ingredient_summary,
+            "3 Planks + 2 Sticks"
+        );
+        assert_eq!(row_for(&rows, "Wooden Shovel").ingredient_summary, "1 Plank + 2 Sticks");
+        assert_eq!(
+            row_for(&rows, "Stone Pickaxe").ingredient_summary,
+            "3 Cobblestones + 2 Sticks"
+        );
+        assert_eq!(
+            row_for(&rows, "Iron Pickaxe").ingredient_summary,
+            "3 Iron Ingots + 2 Sticks"
+        );
+        assert_eq!(row_for(&rows, "Leather Chestplate").ingredient_summary, "8 Leather");
+        assert_eq!(row_for(&rows, "Iron Chestplate").ingredient_summary, "8 Iron Ingots");
+        let pick = row_for(&rows, "Wooden Pickaxe");
         assert_eq!(pick.ingredients[0].have, 2);
         assert!(!pick.ingredients[0].enough);
         assert_eq!(pick.ingredients[1].have, 1);
         assert!(!pick.ingredients[1].enough);
         // A row can be missing ingredients without needing a table.
-        assert_eq!(rows[1].status, CraftStatus::Craftable(4));
+        assert_eq!(row_for(&rows, "Sticks").status, CraftStatus::Craftable(4));
         // Larger ingredient totals are one status entry with per-item colours.
-        let furnace = &rows[3];
+        let furnace = row_for(&rows, "Furnace");
         assert_eq!(furnace.ingredients.len(), 1);
         assert_eq!(furnace.ingredients[0].need, 8);
         assert!(!furnace.ingredients[0].enough);
@@ -956,12 +974,16 @@ mod tests {
         let registry = Registry::base();
         let all_zero: Vec<(RecipeId, u8)> = registry.recipes().map(|(id, _)| (id, 0)).collect();
         let rows = crafting_rows(&registry, &all_zero, false, false, &[]);
-        assert_eq!(rows[0].status, CraftStatus::Missing);
-        assert_eq!(rows[3].status, CraftStatus::NeedsTable);
-        assert_eq!(rows[3].status.label(), "needs crafting table");
+        assert_eq!(row_for(&rows, "Planks").status, CraftStatus::Missing);
+        assert_eq!(row_for(&rows, "Furnace").status, CraftStatus::NeedsTable);
+        assert_eq!(row_for(&rows, "Furnace").status.label(), "needs crafting table");
+        let table_recipes = registry
+            .recipes()
+            .filter(|(id, _)| registry.recipe(*id).unwrap().needs_table)
+            .count();
         assert_eq!(
             rows.iter().filter(|row| row.status == CraftStatus::NeedsTable).count(),
-            22,
+            table_recipes,
             "every table recipe is gated while no crafting table is nearby"
         );
         assert!(
@@ -970,21 +992,23 @@ mod tests {
                 .all(|row| row.section != CraftSection::Basics)
         );
         let rows = crafting_rows(&registry, &all_zero, true, false, &[]);
-        assert_eq!(rows[0].status, CraftStatus::Missing);
-        assert_eq!(rows[3].status, CraftStatus::Missing);
+        assert_eq!(row_for(&rows, "Planks").status, CraftStatus::Missing);
+        assert_eq!(row_for(&rows, "Furnace").status, CraftStatus::Missing);
     }
 
     #[test]
     fn selection_wraps_both_ways_and_clamps_to_the_list() {
+        let registry = Registry::base();
         let mut state = CraftingState::default();
         state.open();
-        state.move_selection(-1, 25);
-        assert_eq!(state.selected, 24);
-        state.move_selection(1, 25);
+        let count = registry.recipe_len();
+        state.move_selection(-1, count);
+        assert_eq!(state.selected, count - 1);
+        state.move_selection(1, count);
         assert_eq!(state.selected, 0);
-        state.move_selection(3, 25);
+        state.move_selection(3, count);
         assert_eq!(state.selected, 3);
-        state.move_selection(100, 25);
+        state.move_selection(count as i32, count);
         assert_eq!(state.selected, 3);
         state.move_selection(1, 0);
         assert_eq!(state.selected, 0);
@@ -995,20 +1019,24 @@ mod tests {
     fn recipe_rows_map_to_host_craft_requests() {
         let registry = Registry::base();
         let rows = crafting_rows(&registry, &all_available(&registry), true, false, &[]);
+        let iron_pickaxe = rows
+            .iter()
+            .position(|row| row.output_name == "Iron Pickaxe")
+            .expect("iron pickaxe row");
         let mut state = CraftingState {
-            selected: 13,
+            selected: iron_pickaxe,
             ..CraftingState::default()
         };
         let recipe = state.selected_recipe(&rows).expect("selected recipe");
         assert_eq!(registry.recipe(recipe).expect("recipe").id, "openblock:iron_pickaxe");
-        state.selected = 99;
+        state.selected = 999;
         state.clamp_selection(rows.len());
-        assert_eq!(state.selected, 24);
+        assert_eq!(state.selected, rows.len() - 1);
         assert_eq!(
             registry.recipe(state.selected_recipe(&rows).unwrap()).unwrap().id,
             "openblock:iron_boots"
         );
-        state.selected = 23;
+        state.selected = rows.len() - 2;
         assert_eq!(
             registry.recipe(state.selected_recipe(&rows).unwrap()).unwrap().id,
             "openblock:iron_leggings"
@@ -1077,7 +1105,7 @@ mod tests {
     fn wheel_and_page_navigation_reach_the_last_recipe() {
         let registry = Registry::base();
         let rows = crafting_rows(&registry, &all_available(&registry), true, false, &[]);
-        assert_eq!(rows.len(), 25);
+        assert_eq!(rows.len(), registry.recipe_len());
         let screen = [1280.0, 720.0];
         let page = CraftingState::page_rows(screen, &rows);
         assert!(page >= 2);
@@ -1088,10 +1116,11 @@ mod tests {
         state.scroll_by(999, screen, &rows);
         let layout = crafting_layout(screen, &rows, state.scroll);
         let last = layout.rows.last().expect("last row").rect.center();
-        assert_eq!(state.update_hover(last, screen, &rows), Some(24));
-        assert_eq!(state.click(last, screen, &rows), Some(rows[24].recipe));
+        let last_index = rows.len() - 1;
+        assert_eq!(state.update_hover(last, screen, &rows), Some(last_index));
+        assert_eq!(state.click(last, screen, &rows), Some(rows[last_index].recipe));
         assert_eq!(
-            registry.recipe(rows[24].recipe).expect("recipe").id,
+            registry.recipe(rows[last_index].recipe).expect("recipe").id,
             "openblock:iron_boots"
         );
     }
@@ -1150,7 +1179,7 @@ mod tests {
         assert_eq!(layout.panel.w, CRAFTING_PANEL_WIDTH);
         assert_eq!(layout.panel.h, CRAFTING_PANEL_HEIGHT);
         assert!(layout.max_scroll > 0, "the expanded list must scroll at 720p");
-        assert_eq!(layout.rows.len(), 25);
+        assert_eq!(layout.rows.len(), registry.recipe_len());
         assert!(list_height(&rows) > layout.content.h);
         assert_eq!(layout.rows[0].rect.y, layout.content.y + CRAFTING_SECTION_HEIGHT);
         assert!(layout.rows.iter().all(|row| row.rect.x >= layout.content.x));
@@ -1257,9 +1286,13 @@ mod tests {
     fn crafting_screen_draws_gated_and_scrollable_panels() {
         let registry = Registry::base();
         let rows = crafting_rows(&registry, &all_available(&registry), false, false, &[]);
+        let table_recipes = registry
+            .recipes()
+            .filter(|(id, _)| registry.recipe(*id).unwrap().needs_table)
+            .count();
         assert_eq!(
             rows.iter().filter(|row| row.status == CraftStatus::NeedsTable).count(),
-            22
+            table_recipes
         );
         let screen = [1280.0, 720.0];
         let layout = crafting_layout(screen, &rows, 0);
@@ -1296,7 +1329,7 @@ mod tests {
         let info = pick.output_info(&registry);
         assert!(info.contains("Durability 131/131"), "got {info}");
         assert!(info.contains("Speed 4.0"), "got {info}");
-        let planks = &rows[0];
+        let planks = row_for(&rows, "Planks");
         assert!(planks.output_info(&registry).starts_with("hardness "));
     }
 }

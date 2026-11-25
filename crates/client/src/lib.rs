@@ -42,6 +42,7 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 pub mod containers;
 pub mod crafting;
 pub mod frontend;
+pub mod interaction;
 pub mod inventory;
 pub mod lod_state;
 mod menu_app;
@@ -168,6 +169,12 @@ pub struct ClientOptions {
     pub screenshot_chest: bool,
     /// Chest contents for the offscreen screenshot.
     pub screenshot_chest_demo: ContainerDemo,
+    /// Render a torch-lit dark room (1.2 light sync visual proof).
+    pub screenshot_torch: bool,
+    /// Render a wheat farm at several growth stages.
+    pub screenshot_farm: bool,
+    /// Render a bed with the sleep overlay active at night.
+    pub screenshot_sleep: bool,
     /// Select the settings tab used by an offscreen settings screenshot.
     pub screenshot_settings_tab: Option<SettingsTab>,
     /// Do not open an audio device at all (headless/streaming setups).
@@ -245,6 +252,9 @@ impl Default for ClientOptions {
             screenshot_furnace_demo: ContainerDemo::Active,
             screenshot_chest: false,
             screenshot_chest_demo: ContainerDemo::Full,
+            screenshot_torch: false,
+            screenshot_farm: false,
+            screenshot_sleep: false,
             screenshot_settings_tab: None,
             no_audio: false,
             mute: false,
@@ -366,6 +376,12 @@ pub fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
             ScreenshotMode::Furnace
         } else if options.screenshot_chest {
             ScreenshotMode::Chest
+        } else if options.screenshot_torch {
+            ScreenshotMode::Torch
+        } else if options.screenshot_farm {
+            ScreenshotMode::Farm
+        } else if options.screenshot_sleep {
+            ScreenshotMode::Sleep
         } else {
             ScreenshotMode::Hud
         };
@@ -528,6 +544,12 @@ enum ScreenshotMode {
     Furnace,
     /// Open, seeded chest screen.
     Chest,
+    /// 1.2 visual proof: a sealed room lit only by a torch.
+    Torch,
+    /// 1.2 visual proof: farmland with water and wheat at several stages.
+    Farm,
+    /// 1.2 visual proof: night bed with the sleep overlay.
+    Sleep,
     /// Multiplayer loading/failure/roster overlay over a world.
     NetUi(NetUiKind),
 }
@@ -540,7 +562,7 @@ pub fn screenshot(options: &ClientOptions, path: &std::path::Path) -> Result<(),
     screenshot_with_mode(options, path, ScreenshotMode::Hud)
 }
 
-/// Renders one offscreen protocol v2 survival frame from an in-process server.
+/// Renders one offscreen protocol v3 survival frame from an in-process server.
 ///
 /// This is the documentation/demo probe for the network runtime. It opens a
 /// temporary world, installs a small survival scene (mobs, dropped items and a
@@ -984,7 +1006,7 @@ fn screenshot_network_demo_inner(
     let eye = client.player().eye();
     let mut camera = Camera::new(eye, client.player().yaw, client.player().pitch);
     camera.far = far_plane_for_render_distance(client.render_radius());
-    let environment = Environment::from_ticks(client.server_tick() + DAY_LENGTH_TICKS / 4, DAY_LENGTH_TICKS);
+    let environment = Environment::from_ticks(client.server_tick() + client.day_ticks() / 4, client.day_ticks());
     let now = Instant::now();
     let entities = client.entity_instances(now);
     let (mobs, items) = client.entity_counts();
@@ -1067,7 +1089,7 @@ fn screenshot_network_demo_inner(
         mobs_total: mobs,
         mobs_passive: client.entities().passive_mob_count(registry),
         mobs_hostile: client.entities().hostile_mob_count(registry),
-        day_phase: client.server_tick() % 24_000,
+        day_phase: client.day_phase(),
         day: time_of_day > 0.25 && time_of_day < 0.75,
         defense: client.armor_defense(),
         graphics_summary: renderer.graphics().summary(),
@@ -1215,6 +1237,7 @@ fn screenshot_with_mode(
     // Demo-only world seeding needs loaded chunks for mob collision checks and
     // block placement raycasts, so it runs after the first full stream.
     let mut screenshot_container: Option<(ContainerKind, BlockPos)> = None;
+    let mut screenshot_sleep_remaining: Option<u32> = None;
     match mode {
         ScreenshotMode::Mobs => {
             let count = seed_screenshot_mobs(&mut host, &registry);
@@ -1249,6 +1272,22 @@ fn screenshot_with_mode(
                 screenshot_container = Some((ContainerKind::Chest, pos));
             } else {
                 log::warn!("chest screenshot: could not place a chest");
+            }
+        }
+        ScreenshotMode::Torch => {
+            if seed_screenshot_torch_room(&mut host, &registry).is_none() {
+                log::warn!("torch screenshot: could not build the dark room");
+            }
+        }
+        ScreenshotMode::Farm => {
+            if !seed_screenshot_farm(&mut host, &registry) {
+                log::warn!("farm screenshot: could not build the wheat plot");
+            }
+        }
+        ScreenshotMode::Sleep => {
+            screenshot_sleep_remaining = seed_screenshot_sleep(&mut host, &registry);
+            if screenshot_sleep_remaining.is_none() {
+                log::warn!("sleep screenshot: could not enter the bed");
             }
         }
         _ => {}
@@ -1292,7 +1331,16 @@ fn screenshot_with_mode(
         ui.toasts.push_warning("Inventory full - dropped Log x2");
         ui.block_name_seconds = ui_state::BLOCK_NAME_SECONDS;
     }
-    let environment = options.time_of_day.map(Environment::new).unwrap_or_default();
+    let environment = match (options.time_of_day, mode) {
+        (Some(time_of_day), _) => Environment::new(time_of_day),
+        // The bed capture must show the night the player is sleeping through.
+        (None, ScreenshotMode::Sleep) => {
+            Environment::from_ticks(host.tick_count() + DAY_LENGTH_TICKS / 4, DAY_LENGTH_TICKS)
+        }
+        // A torch-lit room is dark by construction; keeping the default noon
+        // light shows that the glow comes from block light alone.
+        (None, _) => Environment::default(),
+    };
     // The debug screenshot reports real world counters. Render the world once
     // without the overlay to fill `RenderStats` deterministically, then compose
     // the final frame with the HUD and F3 overlay on top.
@@ -1336,10 +1384,20 @@ fn screenshot_with_mode(
                 // slot/defence/durability line; the hotbar keeps the held iron
                 // tool selected. With `--screenshot-items` a full iron set is
                 // equipped, so the armor row shows four pieces and 15 defence.
-                let focus = host.hotbar_selection();
+                // Focus the iron hoe so the 1.2 capture proves the new tool
+                // hint (tier, durability and speed) without hiding the full
+                // four-row inventory behind an armor tooltip.
+                let iron_hoe = registry.item_id("openblock:iron_hoe");
+                let focus = iron_hoe
+                    .and_then(|item| {
+                        host.inventory()
+                            .iter()
+                            .position(|stack| stack.is_some_and(|stack| stack.item == item))
+                    })
+                    .unwrap_or_else(|| host.hotbar_selection());
                 ui.inventory.selected = focus;
                 ui.inventory.hovered = Some(focus);
-                ui.inventory.armor_hovered = Some(ArmorSlot::Chestplate);
+                ui.inventory.armor_hovered = None;
                 inventory::draw_survival(
                     &mut frame,
                     &ui,
@@ -1569,8 +1627,7 @@ fn screenshot_with_mode(
                 BlockPos::new(0, 0, 0),
             ));
             let mut session = ContainerSession::new(kind, pos);
-            let mut view = container_snapshot(&host, kind, pos);
-            view.inventory = *host.inventory();
+            let view = container_snapshot(&host, kind, pos);
             let demo_slot = match kind {
                 ContainerKind::Furnace => containers::SlotId::FurnaceOutput,
                 ContainerKind::Chest => containers::SlotId::Chest(0),
@@ -1627,6 +1684,45 @@ fn screenshot_with_mode(
             }
             // Containers are modal; keep the panel clear.
             let _ = survival;
+        }
+        ScreenshotMode::Torch | ScreenshotMode::Farm => {
+            ui.block_name_seconds = ui_state::BLOCK_NAME_SECONDS;
+            let cross = [0.95, 0.97, 1.0, 0.85];
+            frame.rect(centre_x - 1.0, centre_y - 9.0, 2.0, 18.0, cross);
+            frame.rect(centre_x - 9.0, centre_y - 1.0, 18.0, 2.0, cross);
+            draw_vitals_for_mode(&mut frame, &ui, &host, screen);
+            draw_hotbar_for_mode(&mut frame, &ui, &registry, &host, screen);
+            draw_selected_name(&mut frame, &ui, &registry, &host, screen);
+            if survival {
+                ui_state::draw_toasts(&mut frame, &ui.toasts, screen);
+            }
+            log::info!(
+                "{} screenshot: player {:?}, light under torch {}, crops {}",
+                if mode == ScreenshotMode::Torch { "torch" } else { "farm" },
+                host.player().pos,
+                host.world().light_word(BlockPos::new(
+                    host.player().pos.x.floor() as i32,
+                    host.player().pos.y.floor() as i32,
+                    host.player().pos.z.floor() as i32
+                )),
+                host.crop_count(),
+            );
+        }
+        ScreenshotMode::Sleep => {
+            let overlay = ui_state::SleepOverlay {
+                sleepers: 1,
+                total: 1,
+                all_sleeping: true,
+                skip_remaining_ticks: screenshot_sleep_remaining.unwrap_or(0),
+                hint: "Move or press Esc to wake".to_string(),
+            };
+            ui_state::draw_sleep_overlay(&mut frame, &overlay, screen);
+            log::info!(
+                "sleep screenshot: overlay '{}' / '{}', phase {}",
+                overlay.count_text(),
+                overlay.status_text(),
+                host.day_phase(),
+            );
         }
         ScreenshotMode::NetUi(kind) => {
             if kind == NetUiKind::Roster {
@@ -1864,7 +1960,7 @@ fn screenshot_debug_stats(
 /// Gives the screenshot host a deterministic, representative inventory and
 /// wounded vitals.
 ///
-/// The nine hotbar slots are chosen to exercise the expanded catalogue: an iron
+/// The 36 inventory slots are chosen to exercise the expanded catalogue: an iron
 /// tool (held, so the F3 line reports `251/251 speed 6.0`), iron armor, cooked
 /// food, coal, an ingot, raw ore and enough planks/sticks/cobblestone for the
 /// crafting availability colours. This uses only the public host API.
@@ -1921,6 +2017,37 @@ fn seed_screenshot_items(host: &mut Host, registry: &Registry) {
             if leftover > 0 {
                 log::warn!("screenshot items: {name} x{leftover} did not fit");
             }
+        }
+    }
+    // Populate the 27 main slots too, so the 1.2 inventory screenshot shows
+    // all four rows rather than an empty backpack.
+    for (slot, name, count) in [
+        (9usize, "openblock:cobblestone", 64_u8),
+        (10, "openblock:dirt", 64),
+        (11, "openblock:planks", 32),
+        (13, "openblock:stick", 16),
+        (18, "openblock:apple", 5),
+        (19, "openblock:coal", 8),
+        (22, "openblock:iron_ingot", 8),
+        (27, "openblock:raw_iron", 4),
+        (31, "openblock:glass", 12),
+        // 1.2 items: the inventory capture shows every new icon, a hoe
+        // durability tooltip and the new block items in the backpack rows.
+        (12, "openblock:torch", 16),
+        (14, "openblock:seeds", 12),
+        (15, "openblock:wheat", 9),
+        (16, "openblock:bread", 5),
+        (20, "openblock:wood_hoe", 1),
+        (21, "openblock:stone_hoe", 1),
+        (23, "openblock:iron_hoe", 1),
+        (24, "openblock:bed_foot", 1),
+        (25, "openblock:bed_head", 1),
+        (26, "openblock:wheat_1", 4),
+        (28, "openblock:farmland_dry", 16),
+    ] {
+        if let Some(item) = registry.item_id(name) {
+            let stack = host.make_stack(item, count);
+            let _ = host.set_inventory_slot(slot, stack);
         }
     }
     let iron_slot = slot_of(host, "openblock:iron_pickaxe");
@@ -2109,6 +2236,231 @@ fn seed_screenshot_container(host: &mut Host, registry: &Registry, block_name: &
     None
 }
 
+/// Finds a flat build origin and floor height near the spawn.
+///
+/// The highest surface in the requested radius is flattened to one floor level
+/// so screenshot structures always sit on solid ground even on sloped terrain.
+fn screenshot_build_origin(host: &Host, radius: i32) -> (i32, i32, i32) {
+    let player = host.player();
+    let cx = player.pos.x.floor() as i32;
+    let cz = player.pos.z.floor() as i32;
+    let mut highest = i32::MIN;
+    for dz in -radius..=radius {
+        for dx in -radius..=radius {
+            if let Some(height) = host.world().height_at(cx + dx, cz + dz) {
+                highest = highest.max(height);
+            }
+        }
+    }
+    let floor = if highest == i32::MIN {
+        player.pos.y.floor() as i32
+    } else {
+        highest + 1
+    };
+    (cx, floor, cz)
+}
+
+/// Teleports the screenshot camera to a feet position and look direction.
+fn place_screenshot_player(host: &mut Host, feet: WorldVec, yaw: f32, pitch: f32) {
+    let player = host.player_mut();
+    player.pos = feet;
+    player.velocity = WorldVec::ZERO;
+    player.yaw = yaw;
+    player.pitch = pitch;
+    player.flying = false;
+}
+
+/// Builds a sealed stone room with one torch: a dark-room light visual proof.
+fn seed_screenshot_torch_room(host: &mut Host, registry: &Registry) -> Option<BlockPos> {
+    let stone = registry.id("openblock:stone")?;
+    let torch = registry.id("openblock:torch")?;
+    let (cx, floor, cz) = screenshot_build_origin(host, 9);
+    let world = host.world_mut();
+    // A long, narrow room: the torch sits near the far end so the camera end
+    // stays genuinely dark and the falloff is visible in one frame.
+    for x in -3_i32..=3 {
+        for z in -8_i32..=8 {
+            for y in floor..=floor + 4 {
+                world.set_block(BlockPos::new(cx + x, y, cz + z), BlockId::AIR);
+            }
+            world.set_block(BlockPos::new(cx + x, floor - 1, cz + z), stone);
+        }
+    }
+    for x in -3_i32..=3 {
+        for z in -8_i32..=8 {
+            let wall = x.abs() == 3 || z.abs() == 8;
+            for y in floor..=floor + 3 {
+                if wall {
+                    world.set_block(BlockPos::new(cx + x, y, cz + z), stone);
+                }
+            }
+        }
+    }
+    for x in -3_i32..=3 {
+        for z in -8_i32..=8 {
+            world.set_block(BlockPos::new(cx + x, floor + 4, cz + z), stone);
+        }
+    }
+    let torch_pos = BlockPos::new(cx, floor, cz - 2);
+    world.set_block(torch_pos, torch);
+    place_screenshot_player(
+        host,
+        WorldVec::new(f64::from(cx) + 0.5, f64::from(floor), f64::from(cz) + 6.5),
+        0.0,
+        -0.13,
+    );
+    let snapshot = ob_render::SectionSnapshot::capture(host.world(), torch_pos.section());
+    let mesh = snapshot.mesh(registry);
+    let torch_vertices = mesh
+        .vertices
+        .iter()
+        .filter(|vertex| vertex.layer == u32::from(ob_content::textures::TORCH.0))
+        .count();
+    log::info!(
+        "torch screenshot: {} torch-layer vertices in section {:?}, block {:?}",
+        torch_vertices,
+        torch_pos.section(),
+        host.world().get_block(torch_pos)
+    );
+    if let Some(item) = registry.item_for_block(torch) {
+        let _ = host.give_item(item, 8);
+        if let Some(slot) = host
+            .inventory()
+            .iter()
+            .position(|stack| stack.is_some_and(|stack| stack.item == item))
+        {
+            host.set_hotbar_selection(slot);
+        }
+    }
+    log::info!(
+        "torch screenshot: sealed room at ({cx}, {floor}, {cz}), torch at {:?}, light {}",
+        torch_pos,
+        host.world().light_word(torch_pos)
+    );
+    Some(torch_pos)
+}
+
+/// Builds a 7x7 farmland plot with water and wheat at four growth stages.
+fn seed_screenshot_farm(host: &mut Host, registry: &Registry) -> bool {
+    let (Some(dirt), Some(dry), Some(wet), Some(water)) = (
+        registry.id("openblock:dirt"),
+        registry.id("openblock:farmland_dry"),
+        registry.id("openblock:farmland_wet"),
+        registry.id("openblock:water"),
+    ) else {
+        return false;
+    };
+    let wheat: [Option<BlockId>; 4] = [
+        registry.id("openblock:wheat_0"),
+        registry.id("openblock:wheat_1"),
+        registry.id("openblock:wheat_2"),
+        registry.id("openblock:wheat_3"),
+    ];
+    let (cx, floor, cz) = screenshot_build_origin(host, 5);
+    let world = host.world_mut();
+    for x in -3_i32..=3 {
+        for z in -3_i32..=3 {
+            for y in floor + 1..=floor + 3 {
+                world.set_block(BlockPos::new(cx + x, y, cz + z), BlockId::AIR);
+            }
+            world.set_block(BlockPos::new(cx + x, floor - 1, cz + z), dirt);
+            if x == 0 && z == 0 {
+                world.set_block(BlockPos::new(cx, floor, cz), water);
+                continue;
+            }
+            let near_water = x.abs() <= 2 && z.abs() <= 2;
+            world.set_block(BlockPos::new(cx + x, floor, cz + z), if near_water { wet } else { dry });
+            let stage = (x + z).rem_euclid(4) as usize;
+            if let Some(wheat) = wheat[stage] {
+                world.set_block(BlockPos::new(cx + x, floor + 1, cz + z), wheat);
+            }
+        }
+    }
+    place_screenshot_player(
+        host,
+        WorldVec::new(f64::from(cx) + 0.5, f64::from(floor) + 3.2, f64::from(cz) + 5.5),
+        0.0,
+        -0.62,
+    );
+    if let Some(hoe) = registry
+        .item_id("openblock:iron_hoe")
+        .and_then(|item| host.make_stack(item, 1))
+    {
+        let _ = host.give_item(hoe.item, 1);
+    }
+    if let Some(seeds) = registry.item_id("openblock:seeds") {
+        let _ = host.give_item(seeds, 16);
+    }
+    if let Some(slot) = host.inventory().iter().position(|stack| {
+        stack.is_some_and(|stack| {
+            host.registry()
+                .item(stack.item)
+                .tool
+                .is_some_and(|tool| tool.kind == ob_content::ToolKind::Hoe)
+        })
+    }) {
+        host.set_hotbar_selection(slot);
+    }
+    log::info!(
+        "farm screenshot: 7x7 plot at ({cx}, {floor}, {cz}), {} crops",
+        host.crop_count()
+    );
+    true
+}
+
+/// Installs a bed, enters it at night and advances the skip partway.
+///
+/// Returns the authoritative fast-forward ticks remaining for the overlay.
+fn seed_screenshot_sleep(host: &mut Host, registry: &Registry) -> Option<u32> {
+    let (Some(stone), Some(foot), Some(head)) = (
+        registry.id("openblock:stone"),
+        registry.id("openblock:bed_foot"),
+        registry.id("openblock:bed_head"),
+    ) else {
+        return None;
+    };
+    let (cx, floor, cz) = screenshot_build_origin(host, 5);
+    let world = host.world_mut();
+    for x in -3_i32..=3 {
+        for z in -3_i32..=3 {
+            for y in floor..=floor + 3 {
+                world.set_block(BlockPos::new(cx + x, y, cz + z), BlockId::AIR);
+            }
+            world.set_block(BlockPos::new(cx + x, floor - 1, cz + z), stone);
+        }
+    }
+    let foot_pos = BlockPos::new(cx, floor, cz - 1);
+    let head_pos = BlockPos::new(cx, floor, cz);
+    world.set_block(foot_pos, foot);
+    world.set_block(head_pos, head);
+    host.set_tick_count(15_000);
+    place_screenshot_player(
+        host,
+        WorldVec::new(f64::from(cx) + 0.5, f64::from(floor), f64::from(cz) + 2.3),
+        0.0,
+        -0.20,
+    );
+    if host.use_block_at(foot_pos).is_err() {
+        log::warn!("sleep screenshot: could not enter the bed");
+        return None;
+    }
+    // Advance the 100-tick sunrise fast-forward to a visible countdown.
+    for _ in 0..30 {
+        host.tick(&PlayerInput::default());
+    }
+    if host.sleeping() {
+        log::info!(
+            "sleep screenshot: sleeping at {:?}, phase {}, countdown {}",
+            foot_pos,
+            host.day_phase(),
+            ob_server::SLEEP_FAST_FORWARD_TICKS.saturating_sub(30)
+        );
+        Some(ob_server::SLEEP_FAST_FORWARD_TICKS.saturating_sub(30))
+    } else {
+        None
+    }
+}
+
 /// Fills a screenshot furnace with a representative in-progress smelt.
 fn seed_screenshot_furnace(host: &mut Host, registry: &Registry, pos: BlockPos, full: bool) {
     let (input_count, fuel_count) = if full { (64, 64) } else { (3, 8) };
@@ -2201,7 +2553,9 @@ fn seed_screenshot_chest(host: &mut Host, registry: &Registry, pos: BlockPos) {
 /// Snapshot used by container drawing and click decisions.
 fn container_snapshot(host: &Host, kind: ContainerKind, pos: BlockPos) -> ContainerSnapshot {
     let mut snapshot = ContainerSnapshot {
-        inventory: *host.inventory(),
+        // Container screens keep their nine-slot hotbar strip; the main
+        // inventory is addressed from the full inventory screen.
+        inventory: std::array::from_fn(|index| host.inventory()[index]),
         ..ContainerSnapshot::default()
     };
     match kind {
@@ -2614,6 +2968,10 @@ struct GameState {
     attack_ready: Option<Instant>,
     /// Decaying camera pitch offset after taking damage.
     camera_shake: f32,
+    /// Simulated ticks spent asleep (single-player countdown estimate).
+    sleep_ticks: u32,
+    /// Previous frame's sleep state, for start/wake toasts.
+    was_sleeping: bool,
 }
 
 impl GameState {
@@ -2765,6 +3123,10 @@ impl GameState {
             self.ui.focus_death_buttons();
             return;
         }
+        if self.ui.screen == Screen::Playing && self.host.sleeping() {
+            self.wake_from_sleep();
+            return;
+        }
         match self.ui.screen {
             Screen::Playing => {
                 self.cancel_mining();
@@ -2798,6 +3160,15 @@ impl GameState {
             }
         }
         self.persist_settings();
+    }
+
+    /// Leaves a single-player bed on player input (Esc, movement).
+    fn wake_from_sleep(&mut self) {
+        if self.host.wake() {
+            self.cancel_mining();
+            self.keys = [false; 8];
+        }
+        self.sleep_ticks = 0;
     }
 
     /// Enters the modal death screen exactly once, releasing gameplay input.
@@ -2885,6 +3256,9 @@ impl GameState {
 
     /// Selects a hotbar slot in both the host and the UI model.
     fn select_hotbar_slot(&mut self, slot: usize) {
+        if self.host.sleeping() {
+            return;
+        }
         if self.host.game_mode() == HostGameMode::Survival {
             self.host.set_hotbar_selection(slot);
         }
@@ -2897,6 +3271,9 @@ impl GameState {
 
     /// Cycles the hotbar by `steps` slots, using the host selection in survival.
     fn cycle_hotbar_slots(&mut self, steps: i32) {
+        if self.host.sleeping() {
+            return;
+        }
         let current = if self.host.game_mode() == HostGameMode::Survival {
             self.host.hotbar_selection()
         } else {
@@ -2908,6 +3285,9 @@ impl GameState {
 
     /// Opens the survival inventory or creative palette and releases the pointer.
     fn open_inventory(&mut self) {
+        if self.host.sleeping() {
+            return;
+        }
         self.cancel_mining();
         self.ui.open_inventory();
         if self.host.game_mode() == HostGameMode::Survival {
@@ -2928,7 +3308,7 @@ impl GameState {
 
     /// Opens the crafting screen from gameplay and releases the pointer.
     fn open_crafting(&mut self) {
-        if self.ui.screen != Screen::Playing || self.host.is_dead() {
+        if self.ui.screen != Screen::Playing || self.host.is_dead() || self.host.sleeping() {
             return;
         }
         self.cancel_mining();
@@ -2954,7 +3334,7 @@ impl GameState {
     /// Opens a furnace or chest modal screen for the authoritative block
     /// entity at `pos`.
     fn open_container(&mut self, kind: ContainerKind, pos: BlockPos) {
-        if self.ui.screen != Screen::Playing || self.host.is_dead() {
+        if self.ui.screen != Screen::Playing || self.host.is_dead() || self.host.sleeping() {
             return;
         }
         let exists = match kind {
@@ -4085,6 +4465,12 @@ impl GameState {
         // Shift crouches/sneaks; Ctrl sprints (Minecraft-style bindings).
         input.sneak = self.keys[5];
         input.sprint = self.keys[6];
+        // Movement wakes a sleeping player before the host freezes their input
+        // for this tick. The host owns the actual wake/cancel-skip transition.
+        if self.host.sleeping() && (input.forward != 0.0 || input.strafe != 0.0 || input.jump) {
+            self.host.wake();
+            self.sleep_ticks = 0;
+        }
         self.prev_eye = self.host.player().eye();
         let before = self.host.player().pos;
         self.host.tick(&input);
@@ -4093,6 +4479,11 @@ impl GameState {
         let dx = after.x - before.x;
         let dz = after.z - before.z;
         self.footstep_distance += (dx * dx + dz * dz).sqrt();
+        if self.host.sleeping() {
+            self.sleep_ticks = self.sleep_ticks.saturating_add(1);
+        } else {
+            self.sleep_ticks = 0;
+        }
         if self.host.tick_count().is_multiple_of(20) {
             self.stream_and_mesh();
         }
@@ -4136,6 +4527,16 @@ impl GameState {
             self.accumulator = Duration::ZERO;
         }
         self.drain_pickup_events();
+        let sleeping = self.host.sleeping();
+        if sleeping != self.was_sleeping {
+            if sleeping {
+                self.ui.toasts.push("Sleeping - press Esc or move to wake");
+            } else {
+                self.sleep_ticks = 0;
+                self.ui.toasts.push_success("You woke up");
+            }
+            self.was_sleeping = sleeping;
+        }
         self.validate_container();
         let damaged = if self.host.game_mode() == HostGameMode::Survival {
             self.damage_flash.observe(self.host.player().health)
@@ -4287,7 +4688,8 @@ impl GameState {
     fn build_ui_frame_at(&self, physical: [f32; 2]) -> Option<UiFrame> {
         let screen = ui_screen(physical, self.ui.settings.ui_scale_percent);
         let [width, height] = screen;
-        let playing = self.ui.screen == Screen::Playing;
+        let sleeping = self.ui.screen == Screen::Playing && self.host.sleeping();
+        let playing = self.ui.screen == Screen::Playing && !sleeping;
         let inventory_open = self.ui.screen == Screen::Inventory;
         let crafting_open = self.ui.screen == Screen::Crafting;
         let container_open = self.ui.container_open();
@@ -4308,6 +4710,7 @@ impl GameState {
             && !crafting_open
             && !container_open
             && !death_open
+            && !sleeping
             && !self.initial_load
         {
             return None;
@@ -4379,7 +4782,7 @@ impl GameState {
 
             if playing {
                 let mode = if survival {
-                    "survival - Shift crouch, Ctrl sprint, RMB eat/place"
+                    "survival - Shift crouch, Ctrl sprint, RMB use/eat/place"
                 } else if self.host.player().flying {
                     "fly (F)"
                 } else {
@@ -4434,9 +4837,35 @@ impl GameState {
             ui_state::draw_settings_screen(&mut frame, &self.ui, &info, screen);
         }
 
+        // --- Sleep overlay: replaces the gameplay HUD while in a bed ---
+        if sleeping && self.host.sleeping() {
+            let skip_remaining = ob_server::SLEEP_FAST_FORWARD_TICKS.saturating_sub(self.sleep_ticks);
+            let overlay = ui_state::SleepOverlay {
+                sleepers: 1,
+                total: 1,
+                all_sleeping: true,
+                skip_remaining_ticks: skip_remaining,
+                hint: "Move or press Esc to wake".to_string(),
+            };
+            ui_state::draw_sleep_overlay(&mut frame, &overlay, screen);
+        }
+
         // --- Death screen: drawn over the HUD, below the F3 overlay ---
         if death_open {
-            ui_state::draw_death_screen(&mut frame, &self.ui, screen);
+            let note = if self.host.respawn_point().is_some() {
+                "Respawn at your bed"
+            } else {
+                ui_state::DEATH_NOTE
+            };
+            ui_state::draw_death_screen_custom(
+                &mut frame,
+                &self.ui,
+                self.ui.death_cause.as_deref(),
+                ["Respawn", "Save & quit"],
+                note,
+                "Enter/Click select   Up/Down choose   Esc focus buttons   F3 debug",
+                screen,
+            );
         }
 
         // --- Initial streaming overlay: covers the HUD until the near ring is
@@ -4493,7 +4922,12 @@ impl GameState {
     /// mouse button is held, resets when the target changes or the button is
     /// released, and applies exactly one break action on completion.
     fn update_mining(&mut self, dt: Duration) {
-        if self.ui.screen != Screen::Playing || !self.captured || !self.mouse_left || self.host.is_dead() {
+        if self.ui.screen != Screen::Playing
+            || !self.captured
+            || !self.mouse_left
+            || self.host.is_dead()
+            || self.host.sleeping()
+        {
             self.mining.stop();
             return;
         }
@@ -4597,7 +5031,7 @@ impl GameState {
 
     /// Starts hold-to-mine for the block currently under the crosshair.
     fn start_mining(&mut self) {
-        if !self.captured || self.ui.screen != Screen::Playing || self.host.is_dead() {
+        if !self.captured || self.ui.screen != Screen::Playing || self.host.is_dead() || self.host.sleeping() {
             return;
         }
         self.mouse_left = true;
@@ -4624,35 +5058,40 @@ impl GameState {
         }
     }
 
-    /// Handles right-click: eat food or place a block, throttled per cooldown.
+    /// Handles right-click: server-authoritative use, eat, or place.
     ///
-    /// Survival eats a selected edible item when hunger is missing, then falls
-    /// through to placement rules. Placement must match the selected stack's
-    /// block item; creative keeps the fixed palette pick.
+    /// The targeted block is classified by [`interaction::route_use`]. Beds,
+    /// wheat and the matching hoe/seeds route to [`Host::use_block_at`]; the
+    /// host decides whether the action succeeds, consumes the item or rejects
+    /// it. Containers keep their existing client-side screen dispatch and every
+    /// other target keeps the normal eat/place rules below.
     fn place_block(&mut self) {
-        if !self.captured || self.ui.screen != Screen::Playing || self.host.is_dead() {
+        if !self.captured || self.ui.screen != Screen::Playing || self.host.is_dead() || self.host.sleeping() {
             return;
         }
-        // Right-click always tries a block interaction first. A targeted
-        // crafting table opens the crafting screen; every other block keeps
-        // the normal eat/place rules below.
         let player = self.host.player();
         if let Some(hit) = self.host.world().raycast(player.eye(), player.forward(), REACH) {
-            let block = self.host.world().get_block(hit.block);
-            match self.registry.block(block).id {
-                "openblock:crafting_table" => {
+            let target = self.host.world().get_block(hit.block);
+            let selected = self.host.selected_stack();
+            let creative = self.host.game_mode() == HostGameMode::Creative;
+            match interaction::route_use(&self.registry, target, selected, creative) {
+                interaction::UseRoute::CraftingTable => {
                     self.open_crafting();
                     return;
                 }
-                "openblock:furnace" => {
-                    self.open_container(ContainerKind::Furnace, hit.block);
+                interaction::UseRoute::Container => {
+                    match self.registry.block(target).id {
+                        "openblock:furnace" => self.open_container(ContainerKind::Furnace, hit.block),
+                        "openblock:chest" => self.open_container(ContainerKind::Chest, hit.block),
+                        _ => {}
+                    }
                     return;
                 }
-                "openblock:chest" => {
-                    self.open_container(ContainerKind::Chest, hit.block);
+                interaction::UseRoute::UseBlock => {
+                    self.use_block_at(hit.block);
                     return;
                 }
-                _ => {}
+                interaction::UseRoute::Place => {}
             }
         }
         if self.host.game_mode() == HostGameMode::Survival {
@@ -4725,6 +5164,77 @@ impl GameState {
         }
     }
 
+    /// Uses the selected item on `pos` through the authoritative host.
+    ///
+    /// Rejections are short server reasons; they are mapped to a helpful toast
+    /// without consuming or placing anything client-side. Successful outcomes
+    /// report tilling/planting/harvest drops and tool breakage exactly like the
+    /// normal break path.
+    fn use_block_at(&mut self, pos: BlockPos) {
+        match self.host.use_block_at(pos) {
+            Ok(outcome) => {
+                if !outcome.changed {
+                    return;
+                }
+                if let Some(placed) = outcome.placed {
+                    let block = self.registry.block(placed);
+                    let label = match block.id {
+                        "openblock:farmland_dry" | "openblock:farmland_wet" => "Tilled farmland".to_string(),
+                        id if id.starts_with("openblock:wheat_") => "Planted wheat".to_string(),
+                        id => format!("Used {}", inventory::display_name(id)),
+                    };
+                    self.ui.toasts.push(label);
+                    if let Some(material) = audio_material_for(&self.registry, placed)
+                        && let Some(engine) = &mut self.audio
+                    {
+                        engine.play_sfx(AudioSfx::BlockPlace(material));
+                    }
+                }
+                if let Some(broke) = outcome.broke {
+                    self.ui
+                        .flash_broken_block(inventory::display_name(self.registry.block(broke).id));
+                }
+                if !outcome.drops.is_empty() {
+                    let summary = outcome
+                        .drops
+                        .iter()
+                        .map(|drop| {
+                            format!(
+                                "{} x{}",
+                                inventory::item_display_name(&self.registry, drop.item),
+                                drop.count
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.ui.toasts.push(format!("Harvested {summary}"));
+                    if let Some(engine) = &mut self.audio {
+                        engine.play_sfx(AudioSfx::BlockBreak(AudioMaterial::Grass));
+                    }
+                }
+                if let Some(item) = outcome.tool_broke {
+                    let name = inventory::item_display_name(&self.registry, item);
+                    self.ui.toasts.push_warning(format!("Your {name} broke!"));
+                    if let Some(engine) = &mut self.audio {
+                        engine.play_sfx(AudioSfx::ToolBreak);
+                    }
+                }
+            }
+            Err(reason) => {
+                let hint = net_state::friendly_action_rejection("use_block", &reason);
+                self.ui.toasts.push_warning(hint);
+                // A valid bed sets the personal respawn point before the sleep
+                // window/obstruction check rejects the actual sleep.
+                if matches!(reason.as_str(), "not_night" | "obstructed")
+                    && self.host.respawn_point().is_some()
+                    && !self.host.sleeping()
+                {
+                    self.ui.toasts.push("Respawn point set at this bed");
+                }
+            }
+        }
+    }
+
     /// Number of registry-backed inventory entries (every block except air).
     fn inventory_item_count(&self) -> usize {
         inventory_blocks(&self.registry).len()
@@ -4787,7 +5297,7 @@ impl GameState {
     fn move_inventory_selection(&mut self, dx: i32, dy: i32) {
         if self.host.game_mode() == HostGameMode::Survival {
             self.ui.inventory.selected =
-                inventory::move_survival_selection(self.ui.inventory.selected, dx, dy, ui_state::HOTBAR_SLOTS);
+                inventory::move_survival_selection(self.ui.inventory.selected, dx, dy, ui_state::INVENTORY_SLOTS);
         } else {
             let item_count = self.inventory_item_count();
             self.ui
@@ -4799,7 +5309,7 @@ impl GameState {
     fn scroll_inventory(&mut self, rows: i32) {
         if self.host.game_mode() == HostGameMode::Survival {
             self.ui.inventory.selected =
-                inventory::cycle_survival_selection(self.ui.inventory.selected, rows, ui_state::HOTBAR_SLOTS);
+                inventory::cycle_survival_selection(self.ui.inventory.selected, rows, ui_state::INVENTORY_SLOTS);
             return;
         }
         let item_count = self.inventory_item_count();
@@ -4820,8 +5330,18 @@ impl GameState {
     /// Assigns the current inventory selection and returns to gameplay.
     fn assign_inventory_selection(&mut self) -> bool {
         if self.host.game_mode() == HostGameMode::Survival {
-            let slot = self.ui.inventory.selected.min(ui_state::HOTBAR_SLOTS - 1);
+            let slot = self.ui.inventory.selected.min(ui_state::INVENTORY_SLOTS - 1);
             self.ui.inventory.selected = slot;
+            if let Some(cursor) = self.ui.inventory.cursor {
+                // Enter places a picked-up stack on the keyboard-selected slot,
+                // or cancels when the same slot is selected again.
+                if cursor.from == slot {
+                    self.ui.inventory.clear_cursor();
+                } else {
+                    self.place_inventory_cursor(cursor, slot);
+                }
+                return true;
+            }
             if self
                 .host
                 .inventory()
@@ -4831,6 +5351,15 @@ impl GameState {
                 .is_some_and(|stack| self.registry.item(stack.item).armor.is_some())
             {
                 self.equip_armor_slot(slot);
+                return true;
+            }
+            if slot >= ui_state::HOTBAR_SLOTS {
+                // Main-inventory slots are not hotbar selections: a second
+                // Enter picks the stack up so arrows can move it.
+                if let Some(stack) = self.host.inventory().get(slot).copied().flatten() {
+                    self.ui.inventory.cursor = Some(inventory::InventoryCursor { from: slot, stack });
+                    self.play_ui_sound(true);
+                }
                 return true;
             }
             self.select_hotbar_slot(slot);
@@ -4848,33 +5377,135 @@ impl GameState {
         }
     }
 
-    /// Handles a left click on the inventory: hovering a slot selects and
-    /// activates it. Clicks outside keep the inventory open.
+    /// Handles a left click on the inventory.
+    ///
+    /// In survival the screen uses click-to-pick/click-to-place: the first
+    /// click on a main-inventory stack raises it to the pointer, the second
+    /// click on a hotbar/main slot performs the authoritative move. Shift-click
+    /// quick-moves a stack between the hotbar and main inventory. Clicking a
+    /// hotbar slot without a held stack still selects it and closes the screen;
+    /// armor is equipped by clicking it and unequipped by clicking its slot.
     fn inventory_click(&mut self) {
         self.update_inventory_hover();
-        if self.host.game_mode() == HostGameMode::Survival
-            && let Some(slot) = self.ui.inventory.armor_hovered
-        {
-            self.unequip_armor_slot(slot);
-            return;
-        }
-        let Some(index) = self.ui.inventory.hovered else {
-            return;
-        };
-        self.ui.inventory.selected = index;
-        if self.host.game_mode() == HostGameMode::Survival
-            && self
+        let shift = self.keys[5];
+        if self.host.game_mode() == HostGameMode::Survival {
+            if let Some(slot) = self.ui.inventory.armor_hovered {
+                if let Some(cursor) = self.ui.inventory.cursor {
+                    let armor_index = inventory::armor_index(slot);
+                    let matching = self
+                        .registry
+                        .item(cursor.stack.item)
+                        .armor
+                        .is_some_and(|armor| armor_index == inventory::armor_index(armor.slot));
+                    if matching && self.host.equip_armor(cursor.from) {
+                        self.play_ui_sound(true);
+                        self.ui.inventory.clear_cursor();
+                    } else {
+                        self.ui.toasts.push_warning("That armor does not fit this slot");
+                        self.ui.inventory.clear_cursor();
+                    }
+                    self.update_inventory_hover();
+                    return;
+                }
+                self.unequip_armor_slot(slot);
+                return;
+            }
+            let Some(index) = self.ui.inventory.hovered else {
+                self.ui.inventory.clear_cursor();
+                return;
+            };
+            self.ui.inventory.selected = index;
+            if shift {
+                self.quick_transfer_inventory(index);
+                return;
+            }
+            if self.ui.inventory.cursor.is_some() {
+                match inventory::click_cursor_slot(&mut self.ui.inventory, self.host.inventory(), index) {
+                    inventory::CursorClick::Move { from, to, stack } => {
+                        self.place_inventory_cursor(inventory::InventoryCursor { from, stack }, to);
+                    }
+                    inventory::CursorClick::Cancelled => self.play_ui_sound(false),
+                    inventory::CursorClick::Picked | inventory::CursorClick::Ignored => {}
+                }
+                return;
+            }
+            if self
                 .host
                 .inventory()
                 .get(index)
                 .copied()
                 .flatten()
                 .is_some_and(|stack| self.registry.item(stack.item).armor.is_some())
-        {
-            self.equip_armor_slot(index);
+            {
+                self.equip_armor_slot(index);
+                return;
+            }
+            if index < ui_state::HOTBAR_SLOTS {
+                self.select_hotbar_slot(index);
+                self.ui.close_inventory();
+                self.capture_pointer();
+                self.update_title();
+                return;
+            }
+            if inventory::click_cursor_slot(&mut self.ui.inventory, self.host.inventory(), index)
+                == inventory::CursorClick::Picked
+            {
+                self.play_ui_sound(true);
+            }
             return;
         }
+        let Some(index) = self.ui.inventory.hovered else {
+            return;
+        };
+        self.ui.inventory.selected = index;
         self.assign_inventory_selection();
+    }
+
+    /// Applies a click-to-place preview to `to` in the authoritative host.
+    fn place_inventory_cursor(&mut self, cursor: inventory::InventoryCursor, to: usize) {
+        let name = inventory::item_display_name(&self.registry, cursor.stack.item);
+        match self.host.move_inventory_items(cursor.from, to, cursor.stack.count) {
+            Ok(_) => {
+                self.play_ui_sound(true);
+                self.ui.inventory.clear_cursor();
+                if to < ui_state::HOTBAR_SLOTS {
+                    self.ui.toasts.push(format!("Moved {name}"));
+                }
+            }
+            Err(reason) => {
+                self.ui.inventory.clear_cursor();
+                let message = if reason == "empty_source" {
+                    "That stack moved already".to_string()
+                } else {
+                    format!("Cannot move {name}: {reason}")
+                };
+                self.ui.toasts.push_warning(message);
+            }
+        }
+        self.update_inventory_hover();
+    }
+
+    /// Shift-click quick transfer between the hotbar and main inventory.
+    fn quick_transfer_inventory(&mut self, slot: usize) {
+        let stack = self.host.inventory().get(slot).copied().flatten();
+        let Some(stack) = stack else {
+            return;
+        };
+        if self.registry.item(stack.item).armor.is_some() {
+            self.equip_armor_slot(slot);
+            return;
+        }
+        let name = inventory::item_display_name(&self.registry, stack.item);
+        match self.host.quick_transfer_inventory_slot(slot) {
+            Ok(_) => {
+                self.play_ui_sound(true);
+                self.ui.inventory.clear_cursor();
+                self.ui.toasts.push(format!("Moved {name}"));
+            }
+            Err("no_room") => self.ui.toasts.push_warning("No room in the other row"),
+            Err(_) => {}
+        }
+        self.update_inventory_hover();
     }
 
     /// Moves the crafting selection by `steps` rows and keeps it on screen.
@@ -5155,6 +5786,8 @@ impl ApplicationHandler for App {
             mob_render: MobRenderCache::new(),
             attack_ready: None,
             camera_shake: 0.0,
+            sleep_ticks: 0,
+            was_sleeping: false,
         };
         if state.fly_toggle {
             let player = state.host.player_mut();
@@ -5281,7 +5914,8 @@ impl ApplicationHandler for App {
                     } else if pressed {
                         match action {
                             Action::Fly => {
-                                if state.ui.screen == Screen::Playing && !state.host.is_dead() {
+                                if state.ui.screen == Screen::Playing && !state.host.is_dead() && !state.host.sleeping()
+                                {
                                     state.fly_toggle = true;
                                 }
                             }
@@ -6376,6 +7010,9 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
                     })?;
                 }
             }
+            "screenshot-torch" => options.screenshot_torch = true,
+            "screenshot-farm" => options.screenshot_farm = true,
+            "screenshot-sleep" => options.screenshot_sleep = true,
             "screenshot-items" => options.screenshot_items = true,
             "no-audio" => options.no_audio = true,
             "mute" => options.mute = true,
@@ -6444,6 +7081,9 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
         + usize::from(options.screenshot_mobs)
         + usize::from(options.screenshot_furnace)
         + usize::from(options.screenshot_chest)
+        + usize::from(options.screenshot_torch)
+        + usize::from(options.screenshot_farm)
+        + usize::from(options.screenshot_sleep)
         + usize::from(options.screenshot_network)
         + usize::from(options.screenshot_name_tags)
         + usize::from(options.screenshot_net_ui.is_some())
@@ -6503,6 +7143,15 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
     if options.screenshot_chest && options.screenshot.is_none() {
         return Err("--screenshot-chest requires --screenshot PATH".into());
     }
+    if options.screenshot_torch && options.screenshot.is_none() {
+        return Err("--screenshot-torch requires --screenshot PATH".into());
+    }
+    if options.screenshot_farm && options.screenshot.is_none() {
+        return Err("--screenshot-farm requires --screenshot PATH".into());
+    }
+    if options.screenshot_sleep && options.screenshot.is_none() {
+        return Err("--screenshot-sleep requires --screenshot PATH".into());
+    }
     if options.screenshot_network && options.screenshot.is_none() {
         return Err("--screenshot-network requires --screenshot PATH".into());
     }
@@ -6521,6 +7170,9 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
         || options.screenshot_mobs
         || options.screenshot_furnace
         || options.screenshot_chest
+        || options.screenshot_torch
+        || options.screenshot_farm
+        || options.screenshot_sleep
         || options.screenshot_items)
         && options.game_mode == Some(SettingsGameMode::Creative)
     {
@@ -6544,6 +7196,9 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
             || options.screenshot_mobs
             || options.screenshot_furnace
             || options.screenshot_chest
+            || options.screenshot_torch
+            || options.screenshot_farm
+            || options.screenshot_sleep
             || options.screenshot_network
             || options.screenshot_name_tags
             || options.screenshot_net_ui.is_some()
@@ -6799,6 +7454,44 @@ mod tests {
         let error = options_from_args(&[("screenshot-inventory".to_string(), String::new())])
             .expect_err("empty path must fail");
         assert!(error.contains("--screenshot-inventory"));
+    }
+
+    #[test]
+    fn one_two_screenshot_flags_parse_and_need_a_target_path() {
+        let path = std::path::PathBuf::from("/tmp/gameplay.png");
+        for flag in ["screenshot-torch", "screenshot-farm", "screenshot-sleep"] {
+            let options = options_from_args(&[
+                ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+                (flag.to_string(), String::new()),
+            ])
+            .expect("valid 1.2 screenshot flag");
+            assert_eq!(options.screenshot.as_deref(), Some(path.as_path()));
+            match flag {
+                "screenshot-torch" => assert!(options.screenshot_torch),
+                "screenshot-farm" => assert!(options.screenshot_farm),
+                "screenshot-sleep" => assert!(options.screenshot_sleep),
+                _ => unreachable!(),
+            }
+            let error =
+                options_from_args(&[(flag.to_string(), String::new())]).expect_err("a screenshot path is required");
+            assert!(error.contains(flag), "got {error}");
+        }
+
+        let error = options_from_args(&[
+            ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+            ("screenshot-torch".to_string(), String::new()),
+            ("screenshot-farm".to_string(), String::new()),
+        ])
+        .expect_err("screen modes are mutually exclusive");
+        assert!(error.contains("cannot be combined"), "got {error}");
+
+        let error = options_from_args(&[
+            ("screenshot".to_string(), path.to_string_lossy().into_owned()),
+            ("screenshot-sleep".to_string(), String::new()),
+            ("creative".to_string(), String::new()),
+        ])
+        .expect_err("1.2 gameplay captures require survival");
+        assert!(error.contains("require survival mode"), "got {error}");
     }
 
     #[test]

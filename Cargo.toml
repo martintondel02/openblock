@@ -4,7 +4,7 @@ members = ["crates/*", "xtask"]
 default-members = ["crates/*"]
 
 [workspace.package]
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.100"
 license = "MIT OR Apache-2.0"
@@ -31,16 +31,16 @@ serde_json = "1"
 # sources through cc-rs, which the Zig-based sandbox wrapper cannot target.
 zstd = { package = "zstd-pure-rs", version = "0.2" }
 
-ob_core = { path = "crates/core", version = "1.1.0" }
-ob_math = { path = "crates/math", version = "1.1.0" }
-ob_content = { path = "crates/content", version = "1.1.0" }
-ob_world = { path = "crates/world", version = "1.1.0" }
-ob_worldgen = { path = "crates/worldgen", version = "1.1.0" }
-ob_sim = { path = "crates/sim", version = "1.1.0" }
-ob_protocol = { path = "crates/protocol", version = "1.1.0" }
-ob_render = { path = "crates/render", version = "1.1.0" }
-ob_audio = { path = "crates/audio", version = "1.1.0" }
-ob_server = { path = "crates/server", version = "1.1.0" }
+ob_core = { path = "crates/core", version = "1.2.0" }
+ob_math = { path = "crates/math", version = "1.2.0" }
+ob_content = { path = "crates/content", version = "1.2.0" }
+ob_world = { path = "crates/world", version = "1.2.0" }
+ob_worldgen = { path = "crates/worldgen", version = "1.2.0" }
+ob_sim = { path = "crates/sim", version = "1.2.0" }
+ob_protocol = { path = "crates/protocol", version = "1.2.0" }
+ob_render = { path = "crates/render", version = "1.2.0" }
+ob_audio = { path = "crates/audio", version = "1.2.0" }
+ob_server = { path = "crates/server", version = "1.2.0" }
 
 [profile.dev]
 opt-level = 1

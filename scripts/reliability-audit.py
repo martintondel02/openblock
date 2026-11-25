@@ -8,7 +8,7 @@ thread sampling, corrupted/truncated sidecars, SIGTERM under autosave, a
 save+stop race and an out-of-space/file-size-limit proxy.
 
 It reuses the protocol bots and server wrapper from `scripts/load-gate.py` so
-the reliability lane speaks the same protocol-v2 framing as the load gate.
+the reliability lane speaks the same protocol-v3 framing as the load gate.
 Stdlib only, loopback only, no window and no GPU.
 
 Examples:

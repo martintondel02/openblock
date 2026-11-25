@@ -3,7 +3,7 @@
 //! This module is deliberately independent of winit and the renderer so it can
 //! be exercised by loopback integration tests on CI hosts without a GPU. It
 //! owns the TCP connection, the replicated [`World`], the local [`Player`], the
-//! remote-player table, chat, chunk request bookkeeping and the protocol v2
+//! remote-player table, chat, chunk request bookkeeping and the protocol v3
 //! survival state ([`SurvivalState`]), replicated mobs/items
 //! ([`ReplicatedEntities`]) and container windows ([`RemoteContainers`]). The
 //! windowed client (`net_app`) and the headless tests share exactly this API.
@@ -62,11 +62,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use ob_content::{BlockId, Registry};
-use ob_math::{Aabb, BlockPos, ChunkPos, N_SECTIONS, SectionPos, WORLD_MAX_Y, WORLD_MIN_Y, WorldVec};
+use ob_math::{Aabb, BlockPos, ChunkPos, LocalPos, N_SECTIONS, SectionPos, WORLD_MAX_Y, WORLD_MIN_Y, WorldVec};
 use ob_protocol::{
-    ClientMessage, MAX_CHAT_LEN, MAX_FRAME_LEN, PROTOCOL_VERSION, PlayerSnapshot, ProtocolError, RateLimit,
-    ServerMessage, content_fingerprint, decode_chunk, decode_payload, encode_client_frame, manifest_matches,
-    validate_chat_text, validate_player_name, write_message,
+    ClientMessage, LIGHT_CELLS, LIGHT_SECTION_FORMAT, MAX_CHAT_LEN, MAX_FRAME_LEN, MAX_LIGHT_SECTIONS_PER_UPDATE,
+    PROTOCOL_VERSION, PlayerSnapshot, ProtocolError, RateLimit, ServerMessage, content_fingerprint, decode_chunk,
+    decode_light_words, decode_payload, encode_client_frame, manifest_matches, validate_chat_text,
+    validate_player_name, write_message,
 };
 use ob_render::EntityInstance;
 use ob_server::{ItemStack, MOB_ATTACK_REACH};
@@ -207,7 +208,7 @@ impl fmt::Display for NetError {
             NetError::Refused(reason) => write!(formatter, "server refused the connection: {reason}"),
             NetError::ProtocolMismatch { server, client } => write!(
                 formatter,
-                "protocol mismatch: server speaks v{server}, this client speaks v{client}"
+                "protocol mismatch: server speaks v{server}, this client speaks v{client}; both sides must be a 1.2+ build (protocol v3)"
             ),
             NetError::ContentMismatch {
                 server,
@@ -313,6 +314,57 @@ pub struct ServerInfo {
     pub max_players: u16,
     /// Server message of the day.
     pub motd: String,
+}
+
+/// Authoritative sleep state from the latest [`ServerMessage::SleepState`].
+///
+/// `sleepers` is sorted ascending and capped to the client's player-list bound;
+/// `skip_remaining_ticks` is the server's authoritative 100-tick fast-forward
+/// countdown. The view is `None` until the first personalised message arrives.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SleepView {
+    /// Whether this client's player is in a bed.
+    pub sleeping: bool,
+    /// Foot position of the occupied bed, when asleep.
+    pub bed: Option<[i32; 3]>,
+    /// Connected players currently asleep, ascending.
+    pub sleepers: Vec<u64>,
+    /// Whether every eligible player is asleep (the sunrise skip runs then).
+    pub all_sleeping: bool,
+    /// Fast-forward ticks left in the 100-tick sunrise skip.
+    pub skip_remaining_ticks: u32,
+}
+
+impl SleepView {
+    /// Number of players currently asleep.
+    pub fn sleeper_count(&self) -> usize {
+        self.sleepers.len()
+    }
+}
+
+/// Counters for the `LightUpdate` path (diagnostics and loopback tests).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LightSyncStats {
+    /// Decoded batches applied to the replicated world.
+    pub batches: u64,
+    /// Sections whose light words were replaced.
+    pub sections: u64,
+    /// Sections dropped because they were unloaded, malformed or stale.
+    pub sections_dropped: u64,
+    /// Neighbouring sections marked dirty because their snapshot border light
+    /// changed.
+    pub neighbour_remeshes: u64,
+    /// Highest `LightUpdate::tick` applied.
+    pub last_tick: u64,
+}
+
+/// Last authoritative clock sample.
+#[derive(Debug, Clone, Copy)]
+struct ServerClock {
+    tick: u64,
+    day_phase: u64,
+    day_ticks: u64,
+    received: Instant,
 }
 
 /// One line in the chat log.
@@ -1041,10 +1093,26 @@ pub enum NetEvent {
     ContainerCursorDropped,
 }
 
+/// One dense light section decoded on the reader thread.
+///
+/// Decoding zstd/base64 on the reader keeps a large `LightUpdate` batch off the
+/// render thread; the main thread only copies the 4,096 words into the
+/// replicated section and marks the affected meshes dirty.
+#[derive(Debug)]
+struct LightSectionUpdate {
+    pos: SectionPos,
+    words: Vec<u16>,
+}
+
 /// One item produced by the reader thread.
 enum Inbound {
     Message(Box<ServerMessage>),
     Chunk(Box<ChunkColumn>),
+    /// Dense per-section light patches, already decoded and bounded.
+    Light {
+        tick: u64,
+        sections: Vec<LightSectionUpdate>,
+    },
     Closed(String),
 }
 
@@ -1243,6 +1311,12 @@ pub struct NetworkClient {
     /// it (`None` means no rollback is pending).
     container_cursor_rollback: Option<Option<CursorStack>>,
     last_server_state: Option<PlayerSnapshot>,
+    /// Latest authoritative clock (`None` until the first `TimeSync`).
+    clock: Option<ServerClock>,
+    /// Latest personalised sleep state (`None` until the first `SleepState`).
+    sleep: Option<SleepView>,
+    /// Counters for the dense-light replication path.
+    light_stats: LightSyncStats,
     ping_ms: Option<u32>,
     pending_ping: Option<(u32, Instant)>,
     next_ping_id: u32,
@@ -1261,6 +1335,7 @@ pub struct NetworkClient {
     attack_limit: RateLimit,
     inventory_limit: RateLimit,
     eat_limit: RateLimit,
+    sleep_limit: RateLimit,
     equip_limit: RateLimit,
     respawn_limit: RateLimit,
     close_limit: RateLimit,
@@ -1485,6 +1560,9 @@ impl NetworkClient {
             container_awaiting_sync: false,
             container_cursor_rollback: None,
             last_server_state: None,
+            clock: None,
+            sleep: None,
+            light_stats: LightSyncStats::default(),
             ping_ms: None,
             pending_ping: None,
             next_ping_id: 1,
@@ -1503,6 +1581,7 @@ impl NetworkClient {
             attack_limit: RateLimit::new(10.0, 10),
             inventory_limit: RateLimit::new(20.0, 30),
             eat_limit: RateLimit::new(4.0, 4),
+            sleep_limit: RateLimit::new(2.0, 4),
             equip_limit: RateLimit::new(5.0, 5),
             respawn_limit: RateLimit::new(1.0, 2),
             close_limit: RateLimit::new(10.0, 10),
@@ -1593,16 +1672,58 @@ impl NetworkClient {
         &mut self.player
     }
 
-    /// Estimated server tick.
+    /// Estimated authoritative server tick.
     ///
-    /// The interim protocol only sends the server tick once, in `Hello`, so the
-    /// client advances it from wall-clock time since joining. This is used for
-    /// day/night presentation only; it is not authoritative and does not stop
-    /// while menus are open.
+    /// The protocol sends `TimeSync` in the handshake, at 1 Hz and every tick
+    /// during a sleep skip. Between samples the client advances one tick per
+    /// 50 ms; before the first sample it falls back to the handshake tick.
     pub fn server_tick(&self) -> u64 {
-        self.info
-            .tick
-            .saturating_add((self.joined_at.elapsed().as_secs_f64() * 20.0) as u64)
+        self.clock.map_or_else(
+            || {
+                self.info
+                    .tick
+                    .saturating_add((self.joined_at.elapsed().as_secs_f64() * 20.0) as u64)
+            },
+            |clock| {
+                clock
+                    .tick
+                    .saturating_add((clock.received.elapsed().as_secs_f64() * 20.0) as u64)
+            },
+        )
+    }
+
+    /// Authoritative day phase (`tick % day_ticks`).
+    ///
+    /// Use this rather than `server_tick() % 24_000` for clock UI: it follows
+    /// the server's sleep fast-forward exactly and never relies on a local
+    /// day-length constant.
+    pub fn day_phase(&self) -> u64 {
+        let day_ticks = self.day_ticks().max(1);
+        self.clock.map_or(self.server_tick() % day_ticks, |clock| {
+            let elapsed = (clock.received.elapsed().as_secs_f64() * 20.0) as u64;
+            clock.day_phase.wrapping_add(elapsed) % clock.day_ticks.max(1)
+        })
+    }
+
+    /// Authoritative ticks in one full day.
+    pub fn day_ticks(&self) -> u64 {
+        self.clock
+            .map_or(self.info.day_ticks.max(1), |clock| clock.day_ticks.max(1))
+    }
+
+    /// Latest personalised sleep state, if the server has sent one.
+    pub fn sleep_view(&self) -> Option<&SleepView> {
+        self.sleep.as_ref()
+    }
+
+    /// Whether this client's player is currently asleep.
+    pub fn sleeping(&self) -> bool {
+        self.sleep.as_ref().is_some_and(|sleep| sleep.sleeping)
+    }
+
+    /// Counters for the dense-light replication path.
+    pub fn light_sync_stats(&self) -> LightSyncStats {
+        self.light_stats
     }
 
     /// Local simulation ticks since connecting.
@@ -1625,8 +1746,9 @@ impl NetworkClient {
         &self.survival
     }
 
-    /// The authoritative hotbar.
-    pub fn inventory(&self) -> &[Option<ItemStack>; ob_protocol::HOTBAR_SLOTS] {
+    /// The authoritative 36-slot player inventory (hotbar `0..9`, main
+    /// `9..36`).
+    pub fn inventory(&self) -> &[Option<ItemStack>; ob_protocol::INVENTORY_SLOTS] {
         &self.survival.inventory
     }
 
@@ -1760,6 +1882,27 @@ impl NetworkClient {
         })
     }
 
+    /// Sends `sleep_request` for the bed at `pos` (foot or head half).
+    ///
+    /// The server validates reach, the sleep window, obstruction and the other
+    /// players' state; the client does not mark itself asleep locally.
+    pub fn send_sleep_request(&mut self, pos: BlockPos) -> bool {
+        if !self.state.is_connected() || self.survival.dead || !pos.in_world() || !self.sleep_limit.allow_now() {
+            return false;
+        }
+        self.queue(ClientMessage::SleepRequest {
+            pos: [pos.x, pos.y, pos.z],
+        })
+    }
+
+    /// Sends `wake` to leave a bed or cancel the sunrise skip.
+    pub fn send_wake(&mut self) -> bool {
+        if !self.state.is_connected() || !self.sleep_limit.allow_now() {
+            return false;
+        }
+        self.queue(ClientMessage::Wake)
+    }
+
     /// Sends `attack` for an explicit replicated mob id.
     pub fn send_attack(&mut self, target: Option<u64>) -> bool {
         if !self.state.is_connected() || self.survival.dead || !self.attack_limit.allow_now() {
@@ -1859,9 +2002,9 @@ impl NetworkClient {
                 message: Some("Waiting for the server to confirm the last item move".to_string()),
             };
         }
-        let hotbar = self.survival.inventory;
+        let inventory = self.survival.inventory;
         let previous_cursor = self.containers.cursor();
-        let mut outcome = self.containers.click(&self.registry, &hotbar, slot, button);
+        let mut outcome = self.containers.click(&self.registry, &inventory, slot, button);
         if let Some(transfer) = outcome.transfer {
             if self.send_inventory_move(transfer.from, transfer.to, transfer.count, transfer.revision) {
                 self.container_awaiting_sync = true;
@@ -1875,10 +2018,51 @@ impl NetworkClient {
         outcome
     }
 
-    /// Equips the armor in `hotbar_slot` or unequips the matching armor slot.
+    /// Equips the armor in any player inventory slot (`0..36`).
+    ///
+    /// Hotbar pieces use the compact `Equip` intent; a piece in the main
+    /// inventory is moved to its equipment address with `InventoryMove`.
+    pub fn equip_inventory_slot(&mut self, slot: usize) -> bool {
+        if !self.state.is_connected() || self.survival.dead || slot >= ob_protocol::INVENTORY_SLOTS {
+            return false;
+        }
+        let Some(stack) = self.survival.inventory[slot].filter(|stack| stack.count > 0) else {
+            return false;
+        };
+        let Some(armor) = self.registry.item(stack.item).armor else {
+            return false;
+        };
+        let Some(address) = crate::net_state::equipment_address(crate::inventory::armor_index(armor.slot)) else {
+            return false;
+        };
+        if slot < ob_protocol::HOTBAR_SLOTS {
+            self.send_equip(slot)
+        } else {
+            self.send_inventory_move(slot as u16, address, 1, None)
+        }
+    }
+
+    /// Shift-click quick transfer between the hotbar and main inventory.
+    ///
+    /// Computes the first compatible/empty destination with the same helper the
+    /// single-player path uses, then sends exactly one `InventoryMove`.
+    pub fn quick_transfer_inventory(&mut self, slot: usize) -> bool {
+        if !self.state.is_connected() || self.survival.dead {
+            return false;
+        }
+        let Some((target, count)) =
+            crate::inventory::quick_transfer_target(&self.registry, &self.survival.inventory, slot)
+        else {
+            return false;
+        };
+        self.send_inventory_move(slot as u16, target as u16, count, None)
+    }
+
+    /// Equips the armor in a player inventory slot or unequips a matching armor
+    /// slot.
     ///
     /// Unequipping uses an `inventory_move` from the equipment address into the
-    /// first empty hotbar slot.
+    /// first empty player inventory slot.
     pub fn toggle_equipment(&mut self, armor_index: usize) -> bool {
         if !self.state.is_connected() || self.survival.dead || armor_index >= ob_protocol::EQUIPMENT_SLOTS {
             return false;
@@ -1988,6 +2172,12 @@ impl NetworkClient {
                 Ok(Inbound::Chunk(column)) => {
                     self.last_inbound = Instant::now();
                     self.handle_chunk(*column);
+                }
+                Ok(Inbound::Light { tick, sections }) => {
+                    self.last_inbound = Instant::now();
+                    if self.state.is_connected() {
+                        self.apply_light_batch(tick, sections);
+                    }
                 }
                 Ok(Inbound::Closed(reason)) => self.handle_disconnect(reason, &mut events),
                 Err(TryRecvError::Empty) => break,
@@ -2422,6 +2612,47 @@ impl NetworkClient {
                     });
                 }
             }
+            ServerMessage::TimeSync {
+                tick,
+                day_phase,
+                day_ticks,
+            } => {
+                // Keep the clock sample monotonic during a reconnect/handshake
+                // race; a server restart resets its own clock, but the protocol
+                // session still starts from a fresh `Hello`.
+                self.clock = Some(ServerClock {
+                    tick,
+                    day_phase: if day_ticks == 0 { 0 } else { day_phase % day_ticks },
+                    day_ticks: day_ticks.max(1),
+                    received: Instant::now(),
+                });
+            }
+            ServerMessage::SleepState {
+                sleeping,
+                bed,
+                sleepers,
+                all_sleeping,
+                skip_remaining_ticks,
+            } => {
+                let mut sleepers: Vec<u64> = sleepers.into_iter().take(MAX_PLAYER_LIST).collect();
+                sleepers.sort_unstable();
+                sleepers.dedup();
+                let bed = bed.filter(|pos| {
+                    let pos = BlockPos::new(pos[0], pos[1], pos[2]);
+                    pos.in_world()
+                });
+                self.sleep = Some(SleepView {
+                    sleeping,
+                    bed,
+                    sleepers,
+                    all_sleeping,
+                    skip_remaining_ticks: skip_remaining_ticks.min(u32::from(u16::MAX)),
+                });
+            }
+            ServerMessage::LightUpdate { .. } => {
+                // Decoded on the reader thread; a direct/stray frame is ignored
+                // rather than relighting or predicting on the render thread.
+            }
             ServerMessage::Pong { id } => {
                 if let Some((pending, sent)) = self.pending_ping
                     && pending == id
@@ -2452,13 +2683,14 @@ impl NetworkClient {
             }
             ServerMessage::InventorySync {
                 hotbar,
+                main,
                 selected,
                 equipment,
             } => {
                 self.container_awaiting_sync = false;
                 self.container_cursor_rollback = None;
                 self.survival
-                    .apply_inventory(&self.registry, &hotbar, selected, &equipment);
+                    .apply_inventory(&self.registry, &hotbar, &main, selected, &equipment);
                 self.player.health = self.survival.health;
                 self.player.hunger = self.survival.hunger;
                 if self.containers.apply_hotbar(&self.survival.inventory) {
@@ -2614,6 +2846,33 @@ impl NetworkClient {
         }
     }
 
+    /// Replaces the light words of every decoded section in one batch.
+    ///
+    /// This is deliberately a pure replacement: no server light is predicted or
+    /// recomputed locally. Sections that are not resident are dropped, and a
+    /// stale batch (older than an already-applied tick) cannot move light
+    /// backwards.
+    fn apply_light_batch(&mut self, tick: u64, sections: Vec<LightSectionUpdate>) {
+        if tick < self.light_stats.last_tick {
+            self.light_stats.sections_dropped = self.light_stats.sections_dropped.saturating_add(sections.len() as u64);
+            return;
+        }
+        self.light_stats.last_tick = tick;
+        for update in sections {
+            if self.world.section(update.pos).is_none() {
+                self.light_stats.sections_dropped = self.light_stats.sections_dropped.saturating_add(1);
+                continue;
+            }
+            let neighbours = apply_light_section(&mut self.world, update.pos, &update.words);
+            self.light_stats.sections = self.light_stats.sections.saturating_add(1);
+            self.light_stats.neighbour_remeshes = self
+                .light_stats
+                .neighbour_remeshes
+                .saturating_add(u64::from(neighbours));
+        }
+        self.light_stats.batches = self.light_stats.batches.saturating_add(1);
+    }
+
     /// Inserts a decoded column and replays edits that raced ahead of it.
     fn handle_chunk(&mut self, column: ChunkColumn) {
         if !self.state.is_connected() {
@@ -2694,6 +2953,8 @@ impl NetworkClient {
         self.pending_edit_count = 0;
         self.remote.clear();
         self.last_server_state = None;
+        self.clock = None;
+        self.sleep = None;
         self.player.dead = false;
         self.player.health = 20.0;
         self.player.hunger = 20.0;
@@ -2708,6 +2969,73 @@ impl NetworkClient {
             events.push(NetEvent::Disconnected { reason });
         }
     }
+}
+
+/// Replaces one section's dense light words and schedules the affected meshes.
+///
+/// Returns how many **loaded** neighbouring sections must be remeshed because
+/// their one-block [`ob_render::SectionSnapshot`] border light changed. The
+/// section itself is always marked dirty. A missing section or a payload with
+/// the wrong length is ignored, so a stale/racing update cannot panic or create
+/// a partially written section.
+fn apply_light_section(world: &mut World, pos: SectionPos, words: &[u16]) -> u8 {
+    if words.len() != LIGHT_CELLS {
+        return 0;
+    }
+    let Some(chunk) = world.chunk_mut(pos.chunk()) else {
+        return 0;
+    };
+    let Some(section) = chunk.section_mut(pos) else {
+        return 0;
+    };
+    // A worker snapshot captures a one-block border on *every* side, so a
+    // changed cell on an edge or corner can affect up to seven other sections
+    // (the 26 section neighbours minus the unchanged axis directions). Track
+    // the 3x3x3 offset set exactly instead of only the six face neighbours.
+    let mut changed_neighbours = [false; 27];
+    {
+        let light = section.light_mut();
+        for (index, &new) in words.iter().enumerate() {
+            let local = LocalPos::from_index(index);
+            let old = light.get(local);
+            if old == new {
+                continue;
+            }
+            let x_offsets: [i32; 2] = [0, i32::from(local.x == 15) - i32::from(local.x == 0)];
+            let y_offsets: [i32; 2] = [0, i32::from(local.y == 15) - i32::from(local.y == 0)];
+            let z_offsets: [i32; 2] = [0, i32::from(local.z == 15) - i32::from(local.z == 0)];
+            for dx in x_offsets {
+                for dy in y_offsets {
+                    for dz in z_offsets {
+                        let slot = (((dx + 1) * 3 + (dy + 1)) * 3 + (dz + 1)) as usize;
+                        changed_neighbours[slot] = true;
+                    }
+                }
+            }
+            light.set(local, new);
+        }
+        light.compact();
+    }
+
+    world.mark_section_dirty(pos);
+    let mut remeshed = 0u8;
+    for (index, changed) in changed_neighbours.into_iter().enumerate() {
+        if !changed {
+            continue;
+        }
+        let dx = (index / 9) as i32 - 1;
+        let dy = ((index / 3) % 3) as i32 - 1;
+        let dz = (index % 3) as i32 - 1;
+        if dx == 0 && dy == 0 && dz == 0 {
+            continue;
+        }
+        let neighbour = SectionPos::new(pos.x + dx, pos.y + dy, pos.z + dz);
+        if world.section(neighbour).is_some() {
+            world.mark_section_dirty(neighbour);
+            remeshed += 1;
+        }
+    }
+    remeshed
 }
 
 impl Drop for NetworkClient {
@@ -2860,6 +3188,50 @@ fn reader_loop(
                     return;
                 }
             },
+            Ok(ServerMessage::LightUpdate { tick, sections }) => {
+                // Bound a hostile batch before decoding, validate the per-section
+                // format and drop only the malformed entries: one bad section
+                // must not kill an otherwise good light batch.
+                let mut decoded = Vec::with_capacity(sections.len().min(MAX_LIGHT_SECTIONS_PER_UPDATE));
+                for section in sections.into_iter().take(MAX_LIGHT_SECTIONS_PER_UPDATE) {
+                    if section.format != LIGHT_SECTION_FORMAT {
+                        log::debug!(
+                            "dropping light section at ({}, {}, {}) with format {}",
+                            section.cx,
+                            section.cy,
+                            section.cz,
+                            section.format
+                        );
+                        continue;
+                    }
+                    match decode_light_words(section.encoding, &section.data) {
+                        Ok(words) => decoded.push(LightSectionUpdate {
+                            pos: SectionPos::new(section.cx, section.cy, section.cz),
+                            words,
+                        }),
+                        Err(error) => {
+                            log::debug!(
+                                "dropping malformed light section at ({}, {}, {}): {error}",
+                                section.cx,
+                                section.cy,
+                                section.cz
+                            );
+                        }
+                    }
+                }
+                if !decoded.is_empty()
+                    && !push_inbound(
+                        &inbound,
+                        Inbound::Light {
+                            tick,
+                            sections: decoded,
+                        },
+                        &shutdown,
+                    )
+                {
+                    return;
+                }
+            }
             Ok(message) => {
                 if !push_inbound(&inbound, Inbound::Message(Box::new(message)), &shutdown) {
                     return;
@@ -3455,5 +3827,149 @@ mod tests {
         assert!(resolve_endpoint("127.0.0.1:not-a-port").is_err());
         let loopback = resolve_endpoint("127.0.0.1:25565").expect("valid loopback endpoint");
         assert_eq!(loopback[0].port(), 25565);
+    }
+
+    /// Three resident chunk columns for the pure dense-light tests.
+    fn light_test_world() -> (Arc<Registry>, World) {
+        let registry = Arc::new(Registry::base());
+        let generator = ob_worldgen::Generator::new(42);
+        let mut world = World::new(Arc::clone(&registry), 42);
+        for z in -1..=1 {
+            for x in -1..=1 {
+                world.insert_chunk(generator.generate_chunk(ChunkPos::new(x, z), &registry));
+            }
+        }
+        (registry, world)
+    }
+
+    fn dense_words(changes: &[(LocalPos, u16)]) -> Vec<u16> {
+        let mut words = vec![0u16; LIGHT_CELLS];
+        for &(pos, word) in changes {
+            words[pos.index()] = word;
+        }
+        words
+    }
+
+    #[test]
+    fn dense_light_replacement_marks_the_section_and_changed_border_neighbours() {
+        let (_registry, mut world) = light_test_world();
+        let section = SectionPos::new(0, 4, 0);
+        // Start from an all-dark section so a later border write is observable.
+        // (This first write changes the generated sky light and may remesh
+        // neighbours; the dirty set is cleared before the assertions.)
+        let _ = apply_light_section(&mut world, section, &dense_words(&[]));
+        let _ = world.take_dirty_sections();
+
+        // Change one cell on each of the -X, +X and +Z borders. The +Y border
+        // stays dark, so only three loaded neighbours may be remeshed.
+        let changes = [
+            (LocalPos { x: 0, y: 8, z: 8 }, 0x0E1A),
+            (LocalPos { x: 15, y: 8, z: 8 }, 0x0E2B),
+            (LocalPos { x: 8, y: 8, z: 15 }, 0x0E3C),
+        ];
+        let words = dense_words(&changes);
+        assert_eq!(apply_light_section(&mut world, section, &words), 3);
+        let dirty = world.take_dirty_sections();
+        for pos in [
+            section,
+            SectionPos::new(-1, 4, 0),
+            SectionPos::new(1, 4, 0),
+            SectionPos::new(0, 4, 1),
+        ] {
+            assert!(dirty.contains(&pos), "missing dirty section {pos:?} in {dirty:?}");
+        }
+        assert!(
+            !dirty.contains(&SectionPos::new(0, 5, 0)),
+            "an unchanged +Y border must not remesh the upper neighbour"
+        );
+        let origin = section.origin();
+        for (local, word) in changes {
+            assert_eq!(
+                world.light_word(origin.offset(local.x as i32, local.y as i32, local.z as i32)),
+                word
+            );
+        }
+    }
+
+    #[test]
+    fn corner_light_changes_remesh_all_snapshot_border_neighbours() {
+        let (_registry, mut world) = light_test_world();
+        let section = SectionPos::new(0, 4, 0);
+        let _ = apply_light_section(&mut world, section, &dense_words(&[]));
+        let _ = world.take_dirty_sections();
+
+        // A changed corner cell is captured by the snapshots of all seven
+        // loaded sections that touch that corner, not only by the face
+        // neighbours.
+        let corner = LocalPos { x: 0, y: 0, z: 0 };
+        assert_eq!(
+            apply_light_section(&mut world, section, &dense_words(&[(corner, 0x0EAA)])),
+            7,
+            "eight corner-touching sections minus the edited section"
+        );
+        let dirty = world.take_dirty_sections();
+        for dx in -1..=0 {
+            for dy in -1..=0 {
+                for dz in -1..=0 {
+                    let neighbour = SectionPos::new(section.x + dx, section.y + dy, section.z + dz);
+                    assert!(
+                        dirty.contains(&neighbour),
+                        "corner snapshot border must remesh {neighbour:?}: {dirty:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            !dirty.contains(&SectionPos::new(1, 4, 0)),
+            "the opposite +X face is not part of this corner"
+        );
+    }
+
+    #[test]
+    fn interior_only_light_changes_do_not_remesh_neighbours_and_unloaded_sections_are_dropped() {
+        let (_registry, mut world) = light_test_world();
+        let section = SectionPos::new(0, 4, 0);
+        let _ = apply_light_section(&mut world, section, &dense_words(&[]));
+        let _ = world.take_dirty_sections();
+
+        let interior = LocalPos { x: 7, y: 7, z: 7 };
+        assert_eq!(
+            apply_light_section(&mut world, section, &dense_words(&[(interior, 0x0FAA)])),
+            0
+        );
+        let dirty = world.take_dirty_sections();
+        assert_eq!(dirty, vec![section], "only the edited section is remeshed");
+
+        // Out-of-range payloads and sections in a non-resident column are
+        // ignored without touching the world's dirty set.
+        assert_eq!(apply_light_section(&mut world, section, &[0u16; 3]), 0);
+        assert_eq!(
+            apply_light_section(&mut world, SectionPos::new(2, 4, 0), &dense_words(&[])),
+            0
+        );
+        assert!(world.take_dirty_sections().is_empty());
+        assert_eq!(
+            world.light_word(
+                section
+                    .origin()
+                    .offset(interior.x as i32, interior.y as i32, interior.z as i32)
+            ),
+            0x0FAA
+        );
+    }
+
+    #[test]
+    fn dense_light_words_match_the_chunk_codec_order() {
+        // Sanity check for the dense index order used by the protocol: the
+        // first word is local (0,0,0), the 16th is (15,0,0), and index 256 is
+        // the start of the next Y layer.
+        let mut words = vec![0u16; LIGHT_CELLS];
+        words[0] = 0x0001;
+        words[15] = 0x0002;
+        words[256] = 0x0003;
+        assert_eq!(LocalPos::from_index(0), LocalPos { x: 0, y: 0, z: 0 });
+        assert_eq!(LocalPos::from_index(15), LocalPos { x: 15, y: 0, z: 0 });
+        assert_eq!(LocalPos::from_index(256), LocalPos { x: 0, y: 1, z: 0 });
+        assert_eq!(words[LocalPos { x: 15, y: 0, z: 0 }.index()], 0x0002);
     }
 }

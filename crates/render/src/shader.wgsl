@@ -444,15 +444,21 @@ struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) layer: u32,
-    @location(3) light: f32,
+    // Packed light from `Vertex`: sky in the low byte, block light in the next
+    // byte. Both already include face brightness, per-corner AO and quad tint.
+    @location(3) light: u32,
 };
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) @interpolate(flat) layer: u32,
-    @location(2) light: f32,
-    @location(3) world_position: vec3<f32>,
+    // Split varyings interpolate smoothly across the triangle; the packed u32
+    // input must never be interpolated itself (sky/block would carry into each
+    // other's byte).
+    @location(2) sky: f32,
+    @location(3) block: f32,
+    @location(4) world_position: vec3<f32>,
 };
 
 @vertex
@@ -461,7 +467,8 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.clip_position = camera.view_proj * vec4<f32>(input.position, 1.0);
     output.uv = input.uv;
     output.layer = input.layer;
-    output.light = input.light;
+    output.sky = f32(input.light & 0xFFu) / 255.0;
+    output.block = f32((input.light >> 8u) & 0xFFu) / 255.0;
     output.world_position = input.position;
     return output;
 }
@@ -482,7 +489,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // `world_light.rgb` is exactly (1,1,1), preserving the daylight look. The
     // shadow term removes only the direct-sun part on sun-facing geometry.
     let shadow = sun_light_factor(input.world_position, normal, view_distance);
-    let lit = albedo * input.light * camera.world_light.rgb * shadow;
+    // Sky light follows the time of day and the tinted sun/moon palette; block
+    // light is independent of the clock so a torch reads the same in a cave at
+    // noon and at midnight. Torch light is slightly warm; the tint is scaled by
+    // strength so a 1-level glow stays nearly white instead of orange.
+    let warm = mix(vec3<f32>(1.0), vec3<f32>(1.0, 0.82, 0.58), input.block * 0.85);
+    let sky_light = input.sky * camera.world_light.rgb * shadow;
+    let block_light = input.block * warm;
+    let lit = albedo * (sky_light + block_light);
     return vec4<f32>(apply_fog(lit, input.world_position), 1.0);
 }
 
@@ -520,7 +534,7 @@ fn fs_water(input: VertexOutput) -> @location(0) vec4<f32> {
         * sun_up * shadow * clamp(camera.sun.w, 0.0, 2.0);
 
     // Deep water tinted by the albedo; shallower/facing views reflect more sky.
-    let deep = texel.rgb * vec3<f32>(0.30, 0.62, 0.82) * camera.world_light.rgb;
+    let deep = texel.rgb * vec3<f32>(0.30, 0.62, 0.82) * (camera.world_light.rgb + input.sky * 0.15);
     let reflected = mix(camera.horizon.rgb, camera.zenith.rgb, 0.45);
     var colour = mix(deep, reflected, fresnel * 0.55);
     // Water receives the same cascade shadows as opaque terrain. The shadowed
@@ -544,7 +558,8 @@ fn vs_shadow(input: VertexInput) -> VertexOutput {
     output.clip_position = camera.view_proj * vec4<f32>(input.position, 1.0);
     output.uv = input.uv;
     output.layer = input.layer;
-    output.light = input.light;
+    output.sky = f32(input.light & 0xFFu) / 255.0;
+    output.block = f32((input.light >> 8u) & 0xFFu) / 255.0;
     output.world_position = input.position;
     return output;
 }

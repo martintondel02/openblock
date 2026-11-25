@@ -248,6 +248,93 @@ Sleep requires a bed, an unobstructed bed, and time in the sleep window (12,600.
 
 World spawn is selected once by the worldgen spawn search ([06 §3.3](06-worldgen.md#33-the-staged-pipeline)): a deterministic scan of chunk rings from `(0,0)` with at most 4,096 candidate columns, accepting the first column whose surface is solid, dry, above sea level, inside the `openblock:spawnable` biome tag, has slope ≤ 2 over 5×5, four air blocks above, lies outside every structure bounding box and has sky light ≥ 7 at noon; the result is stored in `level.json`. Player spawn and respawn spiral around that point up to 16 blocks and 128 candidates, requiring two air blocks, a solid non-damaging floor, no fluid, no cactus or fire, and non-damaging light. If none exists the host places a 3×3 platform of the dimension's surface block and logs the event.
 
+### 3.10.1 1.2 farming, torches, beds and sleep (server slice)
+
+> Status: implemented in `ob_server` (single-player and network). This records
+> the shipped 1.2 behaviour and its deliberate divergence from the fuller rules
+> above; §3.10 remains the target model.
+
+**Torches.** `openblock:torch` is placed only into an air cell whose block
+underneath is solid (`BlockType::solid`) and within reach; wall torches are not
+in 1.2. A rejected placement consumes no item. The torch emits level 14 through
+the content `emission` field and the world's 31³ edit relight. Breaking the
+supporting block (or a bed/remote edit that removes it) removes the torch above
+and relights; the torch item drops through the normal `block_drop` path. The
+single-player path is `Host::apply_action_with_outcome`/`place_selected_at`;
+the network path is the same helper after the client's reach/position checks.
+
+**Farming.** `UseBlock`/`Host::use_block_at` on grass or dirt with a
+`ToolKind::Hoe` turns the block into `farmland_dry`, wears the hoe by one point
+(removed at zero) and records the block update. Seeds on farmland require an
+air cell above and gameplay light ≥ 9 (`CROP_MIN_LIGHT`), consume one seed and
+create `wheat_0` plus a `CropState` (`id`, `pos`, `stage`, `age`, `hydrated`).
+Growth is host-owned, not random-tick:
+
+| Rule | Value |
+| --- | --- |
+| Growth per stage, dry | 2,400 ticks (2 min) |
+| Growth per stage, hydrated | 1,200 ticks (1 min) |
+| Stages | 0 → 3 (`wheat_0..wheat_3`) |
+| Hydration | water within 4 blocks horizontally and ±1 Y, checked every 20 ticks |
+| Farmland visual | `farmland_dry`/`farmland_wet` swapped on hydration change |
+| Light pause | growth pauses while `gameplay_light < 9` |
+| Harvest stage 3 | 1 wheat + 1–3 seeds (deterministic `mix64` of seed+position) |
+| Harvest immature | 1 seed |
+| Grass break | dirt plus a 12.5% deterministic seed drop |
+
+Stages swap the world block id and are broadcast as a `BlockEdit` per stage in
+multiplayer; the client meshes the dirty section from the normal edit path.
+Crops in unloaded columns are frozen until their column streams back. A missing
+`crops.txt` (1.0/1.1 world) loads as no crops; the block at a saved position is
+authoritative for the stage, so a hand-edited world cannot grow a phantom crop.
+The 1.2 server uses content-driven `openblock:bread` food 5; seeds and wheat are
+not edible, and the existing eat/equip logic is unchanged.
+
+**Beds and sleep.** A bed is two blocks, foot and head, with the pillow fixed at
++Z (no facing state in 1.2). Placing either half validates both cells, solid
+support under both, no player overlap and consumes exactly one bed item;
+breaking either half removes both and drops one bed item. `UseBlock` on either
+half resolves the pair and, within 3.5 m, in the sleep window
+`12,600..=23,400` and with two air cells above both halves, starts sleep. The
+first use of a valid bed stores the personal respawn point at the foot block's
+top cell even if it is too early to sleep; the sleep itself still returns
+`not_night` or `obstructed` for a daytime or blocked bed.
+
+Single-player `Host::tick` freezes the sleeping player (no input/gravity) and
+fast-forwards the clock to the next sunrise over `SLEEP_FAST_FORWARD_TICKS =
+100` ticks, adding `ceil(remaining/100)` extra ticks per tick and clamping to
+phase 0. Damage wakes the player and cancels the skip; removing either bed block
+also wakes. The skip advances the world clock only; crops, mobs,
+furnaces and items tick once per simulated tick rather than once per skipped
+tick. Multiplayer uses the same 100-tick skip only when every connected
+alive player is asleep (creative included; there are no spectators or
+dimensions in this milestone). A partial sleep waits up to 600 ticks for the
+others, then wakes everyone; waking one player cancels the skip and wakes all.
+Damage clears the damaged sleeper and the skip. The world clock is exposed to
+clients through `time_sync`, sleep votes through `sleep_state`, and all state
+transitions are server-authoritative.
+
+Persistence is additive and backwards-readable: the existing first line of
+`spawn.txt` stays the world spawn and a `respawn <x> <y> <z>` line carries the
+personal bed point; `network_players.txt` carries an optional `r<x>,<y>,<z>`
+token per player; `crops.txt` is the crop sidecar described above. Sleep itself
+is transient. A reconnecting player starts awake at the saved position with the
+saved bed respawn point intact.
+
+**Light-based hostile spawning.** The 1.2 rule is
+`World::gameplay_light(pos, day_factor, weather_factor) <= 7`, with the existing
+depth/night windows and caps retained. `Host::day_factor` is 1.0 through
+11,000, ramps to 0 over 11,000–13,000, stays 0 through 13,000–21,000 and ramps
+back to 1 over 21,000–24,000; `weather_factor` is 1.0 because 1.3 owns weather.
+A torch-lit room therefore suppresses hostile spawns at night while a dark cave
+remains spawnable. `Host::hostile_spawn_light_ok` exposes the predicate for
+tests.
+
+**State hash.** `Host::state_hash` now covers `World::light_hash`, the personal
+respawn point and every crop record (sorted by id), in addition to the existing
+persisted fields. The seed-42 smoke hash changes accordingly (see
+`docs/plan/1.2-gameplay.md`).
+
 ### 3.11 Difficulty, game rules and death
 
 | Difficulty | Damage taken | Starvation floor | Regen | Hostile mobs |

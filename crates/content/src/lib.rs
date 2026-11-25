@@ -62,6 +62,8 @@ pub enum ToolKind {
     Shovel,
     /// No block has a sword preference; swords exist for combat later.
     Sword,
+    /// Farmland and future tilling targets.
+    Hoe,
 }
 
 impl ToolKind {
@@ -72,6 +74,7 @@ impl ToolKind {
             Self::Axe => "axe",
             Self::Shovel => "shovel",
             Self::Sword => "sword",
+            Self::Hoe => "hoe",
         }
     }
 }
@@ -346,9 +349,31 @@ pub mod textures {
     pub const CHEST_SIDE: TextureId = TextureId(25);
     /// Chest front (interim: always the +Z face; see [`crate::BlockTextures`]).
     pub const CHEST_FRONT: TextureId = TextureId(26);
+    /// Torch cut-out (cross model, transparent background).
+    pub const TORCH: TextureId = TextureId(27);
+    /// Dry farmland top.
+    pub const FARMLAND_DRY: TextureId = TextureId(28);
+    /// Hydrated farmland top.
+    pub const FARMLAND_WET: TextureId = TextureId(29);
+    /// Wheat growth stage 0 (sprout).
+    pub const WHEAT_0: TextureId = TextureId(30);
+    /// Wheat growth stage 1.
+    pub const WHEAT_1: TextureId = TextureId(31);
+    /// Wheat growth stage 2.
+    pub const WHEAT_2: TextureId = TextureId(32);
+    /// Wheat growth stage 3 (harvestable).
+    pub const WHEAT_3: TextureId = TextureId(33);
+    /// Bed foot top (blanket and pillow).
+    pub const BED_FOOT_TOP: TextureId = TextureId(34);
+    /// Bed foot side.
+    pub const BED_FOOT_SIDE: TextureId = TextureId(35);
+    /// Bed head top (blanket).
+    pub const BED_HEAD_TOP: TextureId = TextureId(36);
+    /// Bed head side.
+    pub const BED_HEAD_SIDE: TextureId = TextureId(37);
 
     /// Number of texture layers the renderer must generate.
-    pub const COUNT: usize = 27;
+    pub const COUNT: usize = 38;
 
     /// Names of the procedural textures, indexed by layer.
     pub const NAMES: [&str; COUNT] = [
@@ -379,6 +404,17 @@ pub mod textures {
         "chest_top",
         "chest_side",
         "chest_front",
+        "torch",
+        "farmland_dry",
+        "farmland_wet",
+        "wheat_0",
+        "wheat_1",
+        "wheat_2",
+        "wheat_3",
+        "bed_foot_top",
+        "bed_foot_side",
+        "bed_head_top",
+        "bed_head_side",
     ];
 
     // Compile-time guard: the layer table and the catalogue must stay in sync.
@@ -456,6 +492,30 @@ impl BlockTextures {
     }
 }
 
+/// The rendered geometry of a block type.
+///
+/// 1.2 adds only the two shapes the first content delta needs; partial cube
+/// shapes (slabs, stairs) are deferred to the block-state wave.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockShape {
+    /// A full cube: six axis-aligned faces.
+    #[default]
+    Cube,
+    /// Two diagonal, alpha-cut-out quads (torches, crops, flowers).
+    Cross,
+}
+
+impl BlockShape {
+    /// Stable lower-case name used by content packs.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Cube => "cube",
+            Self::Cross => "cross",
+        }
+    }
+}
+
 /// A block type definition. Block states (properties) arrive with MS-01's
 /// full palette work; v0.0.x has one state per type.
 #[derive(Debug, Clone)]
@@ -488,6 +548,25 @@ pub struct BlockType {
     /// tier. Hand or an under-tier tool still breaks the block, but slowly and
     /// without a drop.
     pub required_tier: u8,
+    /// Emitted block-light levels per RGB channel (`0..=15`).
+    ///
+    /// The base pack uses white emitters (`[14, 14, 14]` for a torch); the
+    /// per-channel form exists for 1.3+ coloured lamps and stained glass.
+    pub emission: [u8; 3],
+    /// Block-light attenuation per RGB channel (`0..=15`).
+    ///
+    /// Lateral propagation costs `max(1, attenuation[c])` per step, so a
+    /// transparent material still loses one level per block. Opaque blocks
+    /// declare 15 to stop block light.
+    pub attenuation: [u8; 3],
+    /// Sky-light attenuation (`0..=15`).
+    ///
+    /// A column's running sky level is reduced by this value at every cell;
+    /// 15 zeroes the column below. Air is 0, water and leaves are 1, opaque
+    /// blocks are 15. Wheat and torches are 0; beds are 1.
+    pub sky_attenuation: u8,
+    /// Rendered geometry.
+    pub shape: BlockShape,
 }
 
 impl BlockType {
@@ -903,6 +982,54 @@ const NEW_ITEMS: [NewItemDef; 23] = [
     },
 ];
 
+/// 1.2 "Light & Home" items, appended after every existing item and after the
+/// block items of the new blocks. Ids are stable: seeds/wheat/bread then the
+/// three hoes.
+const LIGHT_ITEMS: [NewItemDef; 6] = [
+    NewItemDef {
+        id: "openblock:seeds",
+        max_stack: 64,
+        food: None,
+        tool: None,
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:wheat",
+        max_stack: 64,
+        food: None,
+        tool: None,
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:bread",
+        max_stack: 64,
+        food: Some(5),
+        tool: None,
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:wood_hoe",
+        max_stack: 1,
+        food: None,
+        tool: tool_spec(ToolKind::Hoe, 1, 2.0, 1.0, 59),
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:stone_hoe",
+        max_stack: 1,
+        food: None,
+        tool: tool_spec(ToolKind::Hoe, 2, 4.0, 1.0, 131),
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:iron_hoe",
+        max_stack: 1,
+        food: None,
+        tool: tool_spec(ToolKind::Hoe, 3, 6.0, 1.0, 250),
+        armor: None,
+    },
+];
+
 /// One name-resolved mob definition used to build [`Registry::base`].
 ///
 /// Stats are copied verbatim into [`MobSpec`]; drop item names are resolved
@@ -1042,7 +1169,7 @@ struct RecipeDef {
     needs_table: bool,
 }
 
-const BASE_RECIPES: [RecipeDef; 25] = [
+const BASE_RECIPES: [RecipeDef; 30] = [
     RecipeDef {
         id: "openblock:planks",
         name: "Planks",
@@ -1216,6 +1343,42 @@ const BASE_RECIPES: [RecipeDef; 25] = [
         name: "Iron Boots",
         output: ("openblock:iron_boots", 1),
         ingredients: &[("openblock:iron_ingot", 4)],
+        needs_table: true,
+    },
+    // 1.2 "Light & Home" recipes, append-only after the 1.0 table.
+    RecipeDef {
+        id: "openblock:torch",
+        name: "Torch",
+        output: ("openblock:torch", 4),
+        ingredients: &[("openblock:coal", 1), ("openblock:stick", 1)],
+        needs_table: false,
+    },
+    RecipeDef {
+        id: "openblock:bread",
+        name: "Bread",
+        output: ("openblock:bread", 1),
+        ingredients: &[("openblock:wheat", 3)],
+        needs_table: false,
+    },
+    RecipeDef {
+        id: "openblock:wood_hoe",
+        name: "Wooden Hoe",
+        output: ("openblock:wood_hoe", 1),
+        ingredients: &[("openblock:planks", 2), ("openblock:stick", 2)],
+        needs_table: true,
+    },
+    RecipeDef {
+        id: "openblock:stone_hoe",
+        name: "Stone Hoe",
+        output: ("openblock:stone_hoe", 1),
+        ingredients: &[("openblock:cobblestone", 2), ("openblock:stick", 2)],
+        needs_table: true,
+    },
+    RecipeDef {
+        id: "openblock:iron_hoe",
+        name: "Iron Hoe",
+        output: ("openblock:iron_hoe", 1),
+        ingredients: &[("openblock:iron_ingot", 2), ("openblock:stick", 2)],
         needs_table: true,
     },
 ];
@@ -1451,7 +1614,12 @@ impl Registry {
                 0,
             ),
         ];
-        let blocks = defs
+        // Existing 1.1 blocks keep their ids and appearance. Light defaults
+        // follow the documented material classes: opaque blocks stop sky and
+        // block light, water attenuates both by one, air and non-solid plants
+        // are transparent. Leaves are the one existing exception (solid but not
+        // opaque) and get the explicit 1/1 attenuation below.
+        let mut blocks: Vec<BlockType> = defs
             .into_iter()
             .map(
                 |(id, color, solid, opaque, fluid, textures, hardness, preferred_tool, required_tier)| BlockType {
@@ -1464,9 +1632,175 @@ impl Registry {
                     hardness,
                     preferred_tool,
                     required_tier,
+                    emission: [0; 3],
+                    attenuation: if opaque {
+                        [15; 3]
+                    } else if fluid {
+                        [1; 3]
+                    } else {
+                        [0; 3]
+                    },
+                    sky_attenuation: if opaque {
+                        15
+                    } else if fluid {
+                        1
+                    } else {
+                        0
+                    },
+                    shape: BlockShape::Cube,
                 },
             )
             .collect();
+        for block in &mut blocks {
+            if block.id == "openblock:leaves" {
+                block.attenuation = [1; 3];
+                block.sky_attenuation = 1;
+            }
+        }
+        // 1.2 "Light & Home" content delta. Ids are append-only: torch 20,
+        // farmland 21-22, wheat stages 23-26, bed 27-28. None of these blocks
+        // carry block states yet; the server owns support, tilling, growth and
+        // bed-pair semantics in a later slice.
+        blocks.extend([
+            BlockType {
+                id: "openblock:torch",
+                color: [1.0, 0.78, 0.32],
+                solid: false,
+                opaque: false,
+                fluid: false,
+                textures: BlockTextures::all(tex::TORCH),
+                hardness: 0.0,
+                preferred_tool: None,
+                required_tier: 0,
+                emission: [14, 14, 14],
+                attenuation: [0; 3],
+                sky_attenuation: 0,
+                shape: BlockShape::Cross,
+            },
+            BlockType {
+                id: "openblock:farmland_dry",
+                color: [0.36, 0.24, 0.14],
+                solid: true,
+                opaque: true,
+                fluid: false,
+                textures: BlockTextures::all(tex::FARMLAND_DRY),
+                hardness: 0.6,
+                preferred_tool: Some(ToolKind::Shovel),
+                required_tier: 0,
+                emission: [0; 3],
+                attenuation: [15; 3],
+                sky_attenuation: 15,
+                shape: BlockShape::Cube,
+            },
+            BlockType {
+                id: "openblock:farmland_wet",
+                color: [0.23, 0.16, 0.10],
+                solid: true,
+                opaque: true,
+                fluid: false,
+                textures: BlockTextures::all(tex::FARMLAND_WET),
+                hardness: 0.6,
+                preferred_tool: Some(ToolKind::Shovel),
+                required_tier: 0,
+                emission: [0; 3],
+                attenuation: [15; 3],
+                sky_attenuation: 15,
+                shape: BlockShape::Cube,
+            },
+            BlockType {
+                id: "openblock:wheat_0",
+                color: [0.42, 0.62, 0.22],
+                solid: false,
+                opaque: false,
+                fluid: false,
+                textures: BlockTextures::all(tex::WHEAT_0),
+                hardness: 0.0,
+                preferred_tool: None,
+                required_tier: 0,
+                emission: [0; 3],
+                attenuation: [0; 3],
+                sky_attenuation: 0,
+                shape: BlockShape::Cross,
+            },
+            BlockType {
+                id: "openblock:wheat_1",
+                color: [0.52, 0.66, 0.24],
+                solid: false,
+                opaque: false,
+                fluid: false,
+                textures: BlockTextures::all(tex::WHEAT_1),
+                hardness: 0.0,
+                preferred_tool: None,
+                required_tier: 0,
+                emission: [0; 3],
+                attenuation: [0; 3],
+                sky_attenuation: 0,
+                shape: BlockShape::Cross,
+            },
+            BlockType {
+                id: "openblock:wheat_2",
+                color: [0.64, 0.68, 0.26],
+                solid: false,
+                opaque: false,
+                fluid: false,
+                textures: BlockTextures::all(tex::WHEAT_2),
+                hardness: 0.0,
+                preferred_tool: None,
+                required_tier: 0,
+                emission: [0; 3],
+                attenuation: [0; 3],
+                sky_attenuation: 0,
+                shape: BlockShape::Cross,
+            },
+            BlockType {
+                id: "openblock:wheat_3",
+                color: [0.76, 0.66, 0.28],
+                solid: false,
+                opaque: false,
+                fluid: false,
+                textures: BlockTextures::all(tex::WHEAT_3),
+                hardness: 0.0,
+                preferred_tool: None,
+                required_tier: 0,
+                emission: [0; 3],
+                attenuation: [0; 3],
+                sky_attenuation: 0,
+                shape: BlockShape::Cross,
+            },
+            // Beds collide as a full cube in 1.2 (no partial shapes yet) but
+            // stay non-opaque so their blanket, sides and pillow render as a
+            // distinct block instead of hiding against the floor.
+            BlockType {
+                id: "openblock:bed_foot",
+                color: [0.55, 0.12, 0.12],
+                solid: true,
+                opaque: false,
+                fluid: false,
+                textures: BlockTextures::column(tex::BED_FOOT_TOP, tex::BED_FOOT_SIDE, tex::PLANKS),
+                hardness: 0.2,
+                preferred_tool: None,
+                required_tier: 0,
+                emission: [0; 3],
+                attenuation: [1; 3],
+                sky_attenuation: 1,
+                shape: BlockShape::Cube,
+            },
+            BlockType {
+                id: "openblock:bed_head",
+                color: [0.66, 0.22, 0.21],
+                solid: true,
+                opaque: false,
+                fluid: false,
+                textures: BlockTextures::column(tex::BED_HEAD_TOP, tex::BED_HEAD_SIDE, tex::PLANKS),
+                hardness: 0.2,
+                preferred_tool: None,
+                required_tier: 0,
+                emission: [0; 3],
+                attenuation: [1; 3],
+                sky_attenuation: 1,
+                shape: BlockShape::Cube,
+            },
+        ]);
         Self::from_blocks(blocks).expect("the built-in base block set is valid")
     }
 
@@ -1558,7 +1892,7 @@ impl Registry {
             });
         }
 
-        let capacity = blocks.len() + NON_BLOCK_ITEMS.len() + NEW_ITEMS.len();
+        let capacity = blocks.len() + NON_BLOCK_ITEMS.len() + NEW_ITEMS.len() + LIGHT_ITEMS.len();
         let mut items: Vec<ItemType> = Vec::with_capacity(capacity);
         let mut item_by_id = FxHashMap::default();
         let mut item_for_block = vec![None; blocks.len()];
@@ -1621,11 +1955,26 @@ impl Registry {
             );
         }
 
-        // Item ids 47..=51: block items for blocks appended after the frozen
-        // catalogue (the five new blocks in the base pack), plus any extra
-        // custom-pack blocks in deterministic block-index order.
+        // Item ids 47..=51: block items for the 1.0 blocks appended after the
+        // frozen catalogue; 1.2's nine new blocks take the next free ids
+        // (52..=60). Any extra custom-pack blocks follow in deterministic
+        // block-index order.
         for block_index in 0..blocks.len() {
             add_block_item(&blocks, block_index, &mut items, &mut item_by_id, &mut item_for_block);
+        }
+
+        // 1.2 non-block items append after every block item, so the existing
+        // item ids 0..=60 cannot move when blocks are appended later.
+        for def in LIGHT_ITEMS {
+            add_item(
+                &mut items,
+                &mut item_by_id,
+                def.id,
+                def.food,
+                def.tool,
+                def.armor,
+                def.max_stack,
+            );
         }
 
         // Resolve the base recipe table against this registry. A custom pack
@@ -1994,7 +2343,7 @@ mod tests {
         assert_eq!(reg.id("openblock:grass"), Some(BlockId(3)));
         assert!(reg.block(BlockId(3)).opaque);
         assert!(reg.block(reg.id("openblock:water").unwrap()).fluid);
-        assert_eq!(reg.len(), 20);
+        assert_eq!(reg.len(), 29);
         assert_eq!(reg.block(reg.id("openblock:bedrock").unwrap()).hardness, f32::INFINITY);
         assert!(!reg.block(reg.id("openblock:bedrock").unwrap()).breakable());
         assert_eq!(reg.block(reg.id("openblock:stone").unwrap()).hardness, 1.5);
@@ -2006,6 +2355,14 @@ mod tests {
         assert_eq!(reg.id("openblock:copper_ore"), Some(BlockId(17)));
         assert_eq!(reg.id("openblock:furnace"), Some(BlockId(18)));
         assert_eq!(reg.id("openblock:chest"), Some(BlockId(19)));
+        // 1.2 content delta: append-only ids after the 1.0 catalogue.
+        assert_eq!(reg.id("openblock:torch"), Some(BlockId(20)));
+        assert_eq!(reg.id("openblock:farmland_dry"), Some(BlockId(21)));
+        assert_eq!(reg.id("openblock:farmland_wet"), Some(BlockId(22)));
+        assert_eq!(reg.id("openblock:wheat_0"), Some(BlockId(23)));
+        assert_eq!(reg.id("openblock:wheat_3"), Some(BlockId(26)));
+        assert_eq!(reg.id("openblock:bed_foot"), Some(BlockId(27)));
+        assert_eq!(reg.id("openblock:bed_head"), Some(BlockId(28)));
     }
 
     #[test]
@@ -2171,7 +2528,7 @@ mod tests {
             }
         }
         assert_eq!(textures::NAMES.len(), textures::COUNT);
-        assert_eq!(textures::COUNT, 27);
+        assert_eq!(textures::COUNT, 38);
         assert_eq!(textures::NAMES[14], "planks");
         assert_eq!(textures::NAMES[15], "cobblestone");
         assert_eq!(textures::NAMES[16], "crafting_table_top");
@@ -2185,6 +2542,17 @@ mod tests {
         assert_eq!(textures::NAMES[24], "chest_top");
         assert_eq!(textures::NAMES[25], "chest_side");
         assert_eq!(textures::NAMES[26], "chest_front");
+        assert_eq!(textures::NAMES[27], "torch");
+        assert_eq!(textures::NAMES[28], "farmland_dry");
+        assert_eq!(textures::NAMES[29], "farmland_wet");
+        assert_eq!(textures::NAMES[30], "wheat_0");
+        assert_eq!(textures::NAMES[31], "wheat_1");
+        assert_eq!(textures::NAMES[32], "wheat_2");
+        assert_eq!(textures::NAMES[33], "wheat_3");
+        assert_eq!(textures::NAMES[34], "bed_foot_top");
+        assert_eq!(textures::NAMES[35], "bed_foot_side");
+        assert_eq!(textures::NAMES[36], "bed_head_top");
+        assert_eq!(textures::NAMES[37], "bed_head_side");
         assert_eq!(textures::COAL_ORE, TextureId(18));
         assert_eq!(textures::IRON_ORE, TextureId(19));
         assert_eq!(textures::COPPER_ORE, TextureId(20));
@@ -2194,6 +2562,13 @@ mod tests {
         assert_eq!(textures::CHEST_TOP, TextureId(24));
         assert_eq!(textures::CHEST_SIDE, TextureId(25));
         assert_eq!(textures::CHEST_FRONT, TextureId(26));
+        assert_eq!(textures::TORCH, TextureId(27));
+        assert_eq!(textures::FARMLAND_DRY, TextureId(28));
+        assert_eq!(textures::FARMLAND_WET, TextureId(29));
+        assert_eq!(textures::WHEAT_0, TextureId(30));
+        assert_eq!(textures::WHEAT_3, TextureId(33));
+        assert_eq!(textures::BED_FOOT_TOP, TextureId(34));
+        assert_eq!(textures::BED_HEAD_SIDE, TextureId(37));
         let mut names: Vec<&str> = textures::NAMES.to_vec();
         names.sort_unstable();
         names.dedup();
@@ -2215,7 +2590,7 @@ mod tests {
         // v0.0.7/v0.0.8 item ids are frozen: eleven block items, the apple,
         // three block items, then the stick and eight tools. v0.0.9 appends 23
         // non-block items at 24..=46 and five block items at 47..=51.
-        assert_eq!(reg.item_len(), 52);
+        assert_eq!(reg.item_len(), 67);
         assert_eq!(reg.item_id("openblock:stone"), Some(ItemId(0)));
         assert_eq!(reg.item_id("openblock:dirt"), Some(ItemId(1)));
         assert_eq!(reg.item_id("openblock:grass"), Some(ItemId(2)));
@@ -2247,6 +2622,20 @@ mod tests {
         assert_eq!(reg.item_id("openblock:copper_ore"), Some(ItemId(49)));
         assert_eq!(reg.item_id("openblock:furnace"), Some(ItemId(50)));
         assert_eq!(reg.item_id("openblock:chest"), Some(ItemId(51)));
+        // 1.2: nine block items (52..=60) then six non-block items (61..=66).
+        assert_eq!(reg.item_id("openblock:torch"), Some(ItemId(52)));
+        assert_eq!(reg.item_id("openblock:farmland_dry"), Some(ItemId(53)));
+        assert_eq!(reg.item_id("openblock:farmland_wet"), Some(ItemId(54)));
+        assert_eq!(reg.item_id("openblock:wheat_0"), Some(ItemId(55)));
+        assert_eq!(reg.item_id("openblock:wheat_3"), Some(ItemId(58)));
+        assert_eq!(reg.item_id("openblock:bed_foot"), Some(ItemId(59)));
+        assert_eq!(reg.item_id("openblock:bed_head"), Some(ItemId(60)));
+        assert_eq!(reg.item_id("openblock:seeds"), Some(ItemId(61)));
+        assert_eq!(reg.item_id("openblock:wheat"), Some(ItemId(62)));
+        assert_eq!(reg.item_id("openblock:bread"), Some(ItemId(63)));
+        assert_eq!(reg.item_id("openblock:wood_hoe"), Some(ItemId(64)));
+        assert_eq!(reg.item_id("openblock:stone_hoe"), Some(ItemId(65)));
+        assert_eq!(reg.item_id("openblock:iron_hoe"), Some(ItemId(66)));
 
         // The v0.0.9 non-block item ids 24..=46 are frozen in this exact order.
         let appended = [
@@ -2365,6 +2754,7 @@ mod tests {
         assert_eq!(ToolKind::Axe.name(), "axe");
         assert_eq!(ToolKind::Shovel.name(), "shovel");
         assert_eq!(ToolKind::Sword.name(), "sword");
+        assert_eq!(ToolKind::Hoe.name(), "hoe");
     }
 
     #[test]
@@ -2555,7 +2945,7 @@ mod tests {
     #[test]
     fn recipe_table_is_stable_and_complete() {
         let reg = Registry::base();
-        assert_eq!(reg.recipe_len(), 25);
+        assert_eq!(reg.recipe_len(), 30);
         let expected = [
             "openblock:planks",
             "openblock:sticks",
@@ -2582,6 +2972,11 @@ mod tests {
             "openblock:iron_chestplate",
             "openblock:iron_leggings",
             "openblock:iron_boots",
+            "openblock:torch",
+            "openblock:bread",
+            "openblock:wood_hoe",
+            "openblock:stone_hoe",
+            "openblock:iron_hoe",
         ];
         for (index, id) in expected.iter().enumerate() {
             let recipe_id = reg.recipe_id(id).expect("base recipe exists");
@@ -2897,5 +3292,138 @@ mod tests {
                 "{sword} must out-damage {pickaxe}"
             );
         }
+    }
+
+    #[test]
+    fn light_content_blocks_declare_light_and_shape() {
+        let reg = Registry::base();
+        let block = |name: &str| reg.block(reg.id(name).unwrap());
+
+        // Existing blocks: opaque stops both light kinds, water/leaves attenuate
+        // by one, air passes sky through with no loss.
+        assert_eq!(block("openblock:air").sky_attenuation, 0);
+        assert_eq!(block("openblock:air").attenuation, [0; 3]);
+        assert_eq!(block("openblock:stone").sky_attenuation, 15);
+        assert_eq!(block("openblock:stone").attenuation, [15; 3]);
+        assert_eq!(block("openblock:water").sky_attenuation, 1);
+        assert_eq!(block("openblock:water").attenuation, [1; 3]);
+        assert_eq!(block("openblock:leaves").sky_attenuation, 1);
+        assert_eq!(block("openblock:leaves").attenuation, [1; 3]);
+        for (_, existing) in reg.iter() {
+            if existing.opaque {
+                assert_eq!(existing.sky_attenuation, 15, "{}", existing.id);
+            }
+        }
+
+        let torch = block("openblock:torch");
+        assert_eq!(torch.shape, BlockShape::Cross);
+        assert!(!torch.solid && !torch.opaque && !torch.fluid);
+        assert_eq!(torch.emission, [14, 14, 14]);
+        assert_eq!(torch.attenuation, [0; 3]);
+        assert_eq!(torch.sky_attenuation, 0);
+        assert_eq!(torch.textures, BlockTextures::all(textures::TORCH));
+
+        for (name, texture) in [
+            ("openblock:farmland_dry", textures::FARMLAND_DRY),
+            ("openblock:farmland_wet", textures::FARMLAND_WET),
+        ] {
+            let farmland = block(name);
+            assert!(farmland.solid && farmland.opaque && !farmland.fluid, "{name}");
+            assert_eq!(farmland.shape, BlockShape::Cube, "{name}");
+            assert_eq!(farmland.textures, BlockTextures::all(texture), "{name}");
+            assert_eq!(farmland.emission, [0; 3], "{name}");
+            assert_eq!(farmland.sky_attenuation, 15, "{name}");
+        }
+
+        for (name, texture) in [
+            ("openblock:wheat_0", textures::WHEAT_0),
+            ("openblock:wheat_1", textures::WHEAT_1),
+            ("openblock:wheat_2", textures::WHEAT_2),
+            ("openblock:wheat_3", textures::WHEAT_3),
+        ] {
+            let wheat = block(name);
+            assert!(!wheat.solid && !wheat.opaque && !wheat.fluid, "{name}");
+            assert_eq!(wheat.shape, BlockShape::Cross, "{name}");
+            assert_eq!(wheat.textures, BlockTextures::all(texture), "{name}");
+            assert_eq!(wheat.sky_attenuation, 0, "{name}");
+        }
+
+        for (name, top, side) in [
+            ("openblock:bed_foot", textures::BED_FOOT_TOP, textures::BED_FOOT_SIDE),
+            ("openblock:bed_head", textures::BED_HEAD_TOP, textures::BED_HEAD_SIDE),
+        ] {
+            let bed = block(name);
+            assert!(bed.solid && !bed.opaque && !bed.fluid, "{name}");
+            assert_eq!(bed.shape, BlockShape::Cube, "{name}");
+            assert_eq!(
+                bed.textures,
+                BlockTextures::column(top, side, textures::PLANKS),
+                "{name}"
+            );
+            assert_eq!(bed.sky_attenuation, 1, "{name}");
+            assert_eq!(bed.attenuation, [1; 3], "{name}");
+        }
+    }
+
+    #[test]
+    fn light_content_items_recipes_and_food_are_append_only() {
+        let reg = Registry::base();
+        let item = |name: &str| reg.item(name_id(&reg, name));
+        let block = |name: &str| reg.id(name).unwrap();
+
+        assert_eq!(item("openblock:seeds").max_stack, 64);
+        assert_eq!(item("openblock:seeds").food, None);
+        assert_eq!(item("openblock:wheat").max_stack, 64);
+        assert_eq!(item("openblock:wheat").food, None);
+        assert!(item("openblock:bread").edible());
+        assert_eq!(item("openblock:bread").food, Some(5));
+
+        for (name, tier, durability) in [
+            ("openblock:wood_hoe", 1, 59),
+            ("openblock:stone_hoe", 2, 131),
+            ("openblock:iron_hoe", 3, 250),
+        ] {
+            let hoe = item(name).tool.expect("hoe is a tool");
+            assert_eq!(hoe.kind, ToolKind::Hoe, "{name}");
+            assert_eq!(hoe.tier, tier, "{name}");
+            assert_eq!(hoe.durability, durability, "{name}");
+            assert!(hoe.attack_damage <= 1.0, "{name}");
+            assert_eq!(item(name).max_stack, 1, "{name}");
+        }
+
+        let recipe = |name: &str| *reg.recipe(reg.recipe_id(name).unwrap()).unwrap();
+        let torch = recipe("openblock:torch");
+        assert_eq!(torch.output, (name_id(&reg, "openblock:torch"), 4));
+        assert_eq!(
+            torch.ingredients,
+            &[
+                (name_id(&reg, "openblock:coal"), 1),
+                (name_id(&reg, "openblock:stick"), 1)
+            ]
+        );
+        assert!(!torch.needs_table);
+
+        let bread = recipe("openblock:bread");
+        assert_eq!(bread.output, (name_id(&reg, "openblock:bread"), 1));
+        assert_eq!(bread.ingredients, &[(name_id(&reg, "openblock:wheat"), 3)]);
+
+        for (hoe, material, output) in [
+            ("openblock:wood_hoe", "openblock:planks", "openblock:wood_hoe"),
+            ("openblock:stone_hoe", "openblock:cobblestone", "openblock:stone_hoe"),
+            ("openblock:iron_hoe", "openblock:iron_ingot", "openblock:iron_hoe"),
+        ] {
+            let recipe = recipe(hoe);
+            assert_eq!(recipe.output, (name_id(&reg, output), 1), "{hoe}");
+            assert_eq!(
+                recipe.ingredients,
+                &[(name_id(&reg, material), 2), (name_id(&reg, "openblock:stick"), 2)],
+                "{hoe}"
+            );
+            assert!(recipe.needs_table, "{hoe}");
+        }
+
+        // Torch and bed block items exist so a placed torch is recoverable.
+        assert!(reg.item_for_block(block("openblock:torch")).is_some());
+        assert!(reg.item_for_block(block("openblock:bed_foot")).is_some());
     }
 }

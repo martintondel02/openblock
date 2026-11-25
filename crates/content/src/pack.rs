@@ -16,7 +16,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{BlockTextures, BlockType, Registry, TextureId, ToolKind, textures};
+use crate::{BlockShape, BlockTextures, BlockType, Registry, TextureId, ToolKind, textures};
 
 /// The only supported `format` version of the JSON schema.
 pub const FORMAT_VERSION: u32 = 1;
@@ -160,6 +160,17 @@ pub enum PackError {
         /// Why the rule is invalid.
         reason: &'static str,
     },
+    /// A light emission, attenuation or shape value is invalid.
+    InvalidLight {
+        /// File being loaded, when the error came from a pack.
+        path: Option<PathBuf>,
+        /// Index of the offending block.
+        index: usize,
+        /// Resource id of the offending block.
+        id: String,
+        /// Why the light data is invalid.
+        reason: String,
+    },
 }
 
 impl PackError {
@@ -209,6 +220,12 @@ impl PackError {
                 texture,
             },
             Self::InvalidToolRule { index, id, reason, .. } => Self::InvalidToolRule {
+                path,
+                index,
+                id,
+                reason,
+            },
+            Self::InvalidLight { index, id, reason, .. } => Self::InvalidLight {
                 path,
                 index,
                 id,
@@ -322,6 +339,15 @@ impl fmt::Display for PackError {
             } => {
                 write_path(f, path.as_deref())?;
                 write!(f, "invalid tool rule for block {id:?} at block {index}: {reason}")
+            }
+            Self::InvalidLight {
+                path,
+                index,
+                id,
+                reason,
+            } => {
+                write_path(f, path.as_deref())?;
+                write!(f, "invalid light data for block {id:?} at block {index}: {reason}")
             }
         }
     }
@@ -450,6 +476,19 @@ struct RawBlock {
     /// Minimum tool tier for drops and preferred-tool speed; omitted means 0.
     #[serde(default)]
     required_tier: u8,
+    /// Emitted RGB block light, each 0..=15; omitted means no emission.
+    #[serde(default)]
+    emission: Option<[u8; 3]>,
+    /// RGB block-light attenuation, each 0..=15; omitted means no attenuation.
+    #[serde(default)]
+    attenuation: Option<[u8; 3]>,
+    /// Sky-light attenuation 0..=15; omitted derives 15 for opaque blocks and
+    /// 0 otherwise.
+    #[serde(default)]
+    sky_attenuation: Option<u8>,
+    /// Rendered shape; omitted means a full cube.
+    #[serde(default)]
+    shape: Option<BlockShape>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -531,6 +570,25 @@ fn build_blocks(path: &Path, raw_blocks: &[RawBlock]) -> Result<Vec<BlockType>, 
         let textures = resolve_textures(path, index, &raw.id, raw.textures.as_ref())?;
         let hardness = validate_hardness(path, index, &raw.id, raw.hardness)?;
         validate_tool_rule(path, index, &raw.id, raw.preferred_tool, raw.required_tier)?;
+        let emission = raw.emission.unwrap_or([0; 3]);
+        // Material-class defaults mirror the base registry: opaque blocks stop
+        // both light kinds, fluids attenuate by one, air/plants pass sky
+        // unchanged. Packs override these for leaves, beds, stained glass, etc.
+        let attenuation = raw.attenuation.unwrap_or(if raw.opaque {
+            [15; 3]
+        } else if raw.fluid {
+            [1; 3]
+        } else {
+            [0; 3]
+        });
+        let sky_attenuation = raw.sky_attenuation.unwrap_or(if raw.opaque {
+            15
+        } else if raw.fluid {
+            1
+        } else {
+            0
+        });
+        validate_light(path, index, &raw.id, emission, attenuation, sky_attenuation)?;
         blocks.push(BlockType {
             id: intern(&raw.id),
             color,
@@ -541,6 +599,10 @@ fn build_blocks(path: &Path, raw_blocks: &[RawBlock]) -> Result<Vec<BlockType>, 
             hardness,
             preferred_tool: raw.preferred_tool,
             required_tier: raw.required_tier,
+            emission,
+            attenuation,
+            sky_attenuation,
+            shape: raw.shape.unwrap_or_default(),
         });
     }
     Ok(blocks)
@@ -588,6 +650,41 @@ fn validate_tool_rule(
             id: id.to_owned(),
             reason: "required_tier > 0 needs a preferred_tool",
         });
+    }
+    Ok(())
+}
+
+/// Validates emission and attenuation channels and sky attenuation.
+fn validate_light(
+    path: &Path,
+    index: usize,
+    id: &str,
+    emission: [u8; 3],
+    attenuation: [u8; 3],
+    sky_attenuation: u8,
+) -> Result<(), PackError> {
+    let invalid = |reason: String| PackError::InvalidLight {
+        path: Some(path.to_path_buf()),
+        index,
+        id: id.to_owned(),
+        reason,
+    };
+    if let Some((channel, value)) = emission.iter().enumerate().find(|(_, value)| **value > 15) {
+        return Err(invalid(format!(
+            "emission {} channel is {value}, expected 0..=15",
+            ["red", "green", "blue"][channel]
+        )));
+    }
+    if let Some((channel, value)) = attenuation.iter().enumerate().find(|(_, value)| **value > 15) {
+        return Err(invalid(format!(
+            "attenuation {} channel is {value}, expected 0..=15",
+            ["red", "green", "blue"][channel]
+        )));
+    }
+    if sky_attenuation > 15 {
+        return Err(invalid(format!(
+            "sky_attenuation is {sky_attenuation}, expected 0..=15"
+        )));
     }
     Ok(())
 }
@@ -778,6 +875,10 @@ mod tests {
         assert_eq!(expected.hardness, actual.hardness);
         assert_eq!(expected.preferred_tool, actual.preferred_tool);
         assert_eq!(expected.required_tier, actual.required_tier);
+        assert_eq!(expected.emission, actual.emission);
+        assert_eq!(expected.attenuation, actual.attenuation);
+        assert_eq!(expected.sky_attenuation, actual.sky_attenuation);
+        assert_eq!(expected.shape, actual.shape);
     }
 
     #[test]
@@ -792,7 +893,10 @@ mod tests {
             assert_block_eq(base_block, loaded_block);
         }
         assert_eq!(loaded.id("openblock:air"), Some(BlockId(0)));
-        assert_eq!(loaded.len(), 20);
+        assert_eq!(loaded.len(), 29);
+        let loaded_torch = loaded.block(loaded.id("openblock:torch").unwrap());
+        assert_eq!(loaded_torch.emission, [14, 14, 14]);
+        assert_eq!(loaded_torch.shape, BlockShape::Cross);
         assert_eq!(
             loaded.block(loaded.id("openblock:cobblestone").unwrap()).preferred_tool,
             Some(ToolKind::Pickaxe)
@@ -1069,6 +1173,10 @@ mod tests {
         assert_eq!(block.textures, BlockTextures::all(textures::DEBUG));
         assert_eq!(block.preferred_tool, None);
         assert_eq!(block.required_tier, 0);
+        assert_eq!(block.emission, [0; 3]);
+        assert_eq!(block.attenuation, [0; 3]);
+        assert_eq!(block.sky_attenuation, 0);
+        assert_eq!(block.shape, BlockShape::Cube);
     }
 
     #[test]
@@ -1265,5 +1373,65 @@ mod tests {
             Registry::from_blocks(reordered),
             Err(PackError::InvalidOrder { .. })
         ));
+    }
+
+    #[test]
+    fn light_fields_parse_and_invalid_values_are_rejected() {
+        let temp = TempPack::new("light_fields");
+        let path = temp.write(
+            "blocks.json",
+            r#"{
+                "format": 1,
+                "blocks": [
+                    { "id": "openblock:air" },
+                    {
+                        "id": "openblock:test_lamp",
+                        "solid": true,
+                        "opaque": false,
+                        "emission": [14, 10, 6],
+                        "attenuation": [1, 2, 3],
+                        "sky_attenuation": 4,
+                        "shape": "cross"
+                    },
+                    {
+                        "id": "openblock:test_opaque",
+                        "solid": true,
+                        "opaque": true
+                    }
+                ]
+            }"#,
+        );
+        let registry = registry_from_pack(&path).expect("light fields load");
+        let lamp = registry.block(registry.id("openblock:test_lamp").unwrap());
+        assert_eq!(lamp.emission, [14, 10, 6]);
+        assert_eq!(lamp.attenuation, [1, 2, 3]);
+        assert_eq!(lamp.sky_attenuation, 4);
+        assert_eq!(lamp.shape, BlockShape::Cross);
+        // Omitted light fields derive from the material class.
+        let opaque = registry.block(registry.id("openblock:test_opaque").unwrap());
+        assert_eq!(opaque.attenuation, [15; 3]);
+        assert_eq!(opaque.sky_attenuation, 15);
+        assert_eq!(opaque.shape, BlockShape::Cube);
+
+        for (field, value) in [
+            ("emission", "[16, 0, 0]"),
+            ("emission", "[0, 0, 16]"),
+            ("attenuation", "[0, 16, 0]"),
+        ] {
+            let bad = temp.write(
+                "bad_light.json",
+                format!(
+                    r#"{{"format":1,"blocks":[{{"id":"openblock:air"}},{{"id":"openblock:test_bad","{field}":{value}}}]}}"#
+                ),
+            );
+            let error = load_blocks_json(&bad).expect_err("out-of-range light values must fail");
+            assert!(matches!(error, PackError::InvalidLight { .. }), "{field}: {error}");
+        }
+        let bad_sky = temp.write(
+            "bad_sky.json",
+            r#"{"format":1,"blocks":[{"id":"openblock:air"},{"id":"openblock:test_bad","sky_attenuation":16}]}"#,
+        );
+        let error = load_blocks_json(&bad_sky).expect_err("sky attenuation above 15 must fail");
+        assert!(matches!(error, PackError::InvalidLight { .. }), "{error}");
     }
 }

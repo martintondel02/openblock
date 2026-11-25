@@ -3,7 +3,7 @@
 //! Starts a real [`DedicatedServer`] on `127.0.0.1:0` and drives
 //! [`ob_client::net::NetworkClient`] headlessly. The v1 cases cover the creative
 //! handshake, spawn chunks, movement, block edits, chat, ping and clean
-//! disconnect. The protocol v2 cases exercise survival sync, authoritative
+//! disconnect. The protocol v3 cases exercise survival sync, authoritative
 //! place/break/pickup, mob replication and attacks, furnace and chest windows
 //! with revisions, damage/death/respawn, out-of-reach prediction reverts and
 //! reconnect restore. No window, GPU, external network or wall-clock luck is
@@ -20,12 +20,14 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ob_client::containers::{ClickButton, SlotId};
+use ob_client::mesh_scheduler::MeshScheduler;
 use ob_client::net::{
     ConnectOptions, MAX_CHAT_SENDER_CHARS, MAX_CHAT_TEXT_CHARS, MAX_PLAYER_LIST, NetEvent, NetState, NetworkClient,
 };
 use ob_client::net_state::{MAX_ENTITY_BATCH, ReplicatedKind};
-use ob_content::{BlockId, MobKind, Registry, SMELT_TICKS_PER_ITEM};
+use ob_content::{BlockId, MobKind, Registry, SMELT_TICKS_PER_ITEM, textures};
 use ob_math::{BlockPos, ChunkPos, WorldVec};
+use ob_render::SectionSnapshot;
 use ob_server::{DedicatedServer, FurnaceSlot, GameMode, Host, HostConfig, ItemStack, NetConfig};
 use ob_sim::BlockAction;
 
@@ -570,6 +572,7 @@ fn survival_handshake_syncs_vitals_inventory_and_selection() {
     assert_eq!(client.armor_defense(), 0);
     assert_eq!(client.selected_slot(), 0);
     assert!(!client.is_dead());
+    assert_eq!(client.inventory().len(), 36, "hotbar 9 + main 27");
     assert!(client.inventory().iter().all(Option::is_none));
     assert!(client.equipment().iter().all(Option::is_none));
     assert_eq!(client.server_info().world_name, "client-loopback");
@@ -583,6 +586,87 @@ fn survival_handshake_syncs_vitals_inventory_and_selection() {
     assert!(client.select_slot(0));
     wait_for(&mut client, "selected slot echo 0", |client| {
         client.selected_slot() == 0
+    });
+
+    client.shutdown();
+    loopback.stop();
+}
+
+#[test]
+fn survival_thirty_six_slots_move_quick_transfer_and_equip() {
+    let registry = Arc::new(Registry::base());
+    let (mut loopback, ()) = Loopback::start_survival(&registry, |_, _| ());
+    let addr = loopback.addr();
+    let mut client = NetworkClient::connect(ConnectOptions::new(
+        addr.to_string(),
+        "inventory36",
+        2,
+        Arc::clone(&registry),
+    ))
+    .expect("connect survival server");
+    wait_ready(&mut client);
+    wait_survival_sync(&mut client);
+    assert_eq!(client.inventory().len(), 36);
+
+    let stone = registry.item_id("openblock:stone").expect("stone item");
+    let helmet = registry.item_id("openblock:iron_helmet").expect("helmet item");
+    assert!(
+        loopback
+            .server()
+            .give_network_item(client.local_id(), "openblock:stone", 20)
+    );
+    wait_for(&mut client, "stone in hotbar", |client| {
+        client.inventory()[0].is_some_and(|stack| stack.item == stone && stack.count == 20)
+    });
+    assert_eq!(
+        client.inventory()[..9].iter().flatten().count(),
+        1,
+        "items start in the hotbar"
+    );
+    assert!(client.inventory()[9..].iter().all(Option::is_none));
+
+    // Click-to-place move: hotbar 0 -> main 9.
+    assert!(client.send_inventory_move(0, 9, 20, None));
+    wait_for(&mut client, "stone in main slot 9", |client| {
+        client.inventory()[9].is_some_and(|stack| stack.item == stone && stack.count == 20)
+            && client.inventory()[0].is_none()
+    });
+
+    // Quick transfer from main back to the first empty hotbar slot.
+    assert!(client.quick_transfer_inventory(9));
+    wait_for(&mut client, "quick transfer back", |client| {
+        client.inventory()[0].is_some_and(|stack| stack.item == stone && stack.count == 20)
+            && client.inventory()[9].is_none()
+    });
+
+    // Equip from a main slot using the wire equipment address 36.
+    assert!(
+        loopback
+            .server()
+            .give_network_item(client.local_id(), "openblock:iron_helmet", 1)
+    );
+    wait_for(&mut client, "helmet sync", |client| {
+        client.inventory().iter().flatten().any(|stack| stack.item == helmet)
+    });
+    let helmet_slot = client
+        .inventory()
+        .iter()
+        .position(|stack| stack.is_some_and(|stack| stack.item == helmet))
+        .expect("helmet slot");
+    assert!(helmet_slot < 9, "new items still fill the hotbar first");
+    assert!(client.send_inventory_move(helmet_slot as u16, 9, 1, None));
+    wait_for(&mut client, "helmet in main", |client| {
+        client.inventory()[9].is_some_and(|stack| stack.item == helmet)
+    });
+    assert!(client.equip_inventory_slot(9));
+    wait_for(&mut client, "helmet equipped from main", |client| {
+        client
+            .survival()
+            .equipment
+            .iter()
+            .flatten()
+            .any(|stack| stack.item == helmet)
+            && client.inventory()[9].is_none()
     });
 
     client.shutdown();
@@ -995,6 +1079,17 @@ fn survival_damage_death_respawn_keeps_inventory() {
             .flatten()
             .any(|stack| stack.item == apple && stack.count == 2)
     });
+    // Put the food in the main inventory so death/respawn proves the 36-slot
+    // range survives, not only the hotbar.
+    let apple_slot = client
+        .inventory()
+        .iter()
+        .position(|stack| stack.is_some_and(|stack| stack.item == apple))
+        .expect("apple slot");
+    assert!(client.send_inventory_move(apple_slot as u16, 9, 2, None));
+    wait_for(&mut client, "apple in main", |client| {
+        client.inventory()[9].is_some_and(|stack| stack.item == apple && stack.count == 2)
+    });
 
     // The admin damage path routes through armor and relays damage + death.
     assert!(loopback.server().damage_network_player(client.local_id(), 20.0));
@@ -1027,6 +1122,10 @@ fn survival_damage_death_respawn_keeps_inventory() {
     assert!((client.health() - 20.0).abs() < 0.01, "health {}", client.health());
     assert!((client.hunger() - 20.0).abs() < 0.01, "hunger {}", client.hunger());
     assert_eq!(client.player().pos, client.server_info().spawn);
+    assert!(
+        client.inventory()[9].is_some_and(|stack| stack.item == apple && stack.count == 2),
+        "main-inventory stacks survive death/respawn"
+    );
     assert!(
         client
             .inventory()
@@ -1440,6 +1539,397 @@ fn hostile_server_payloads_are_bounded() {
     client.shutdown();
     drop(control);
     let _ = server.join();
+}
+
+/// Finds the first inventory slot holding `name`.
+fn inventory_slot(client: &NetworkClient, registry: &Registry, name: &str) -> Option<usize> {
+    let item = registry.item_id(name)?;
+    client
+        .inventory()
+        .iter()
+        .position(|stack| stack.is_some_and(|stack| stack.item == item))
+}
+
+/// Waits for one inventory snapshot that contains `name` with at least `count`.
+fn wait_for_item(client: &mut NetworkClient, registry: &Registry, name: &str, count: u8) {
+    let item = registry.item_id(name).expect("known item");
+    wait_for(client, name, |client| {
+        client
+            .inventory()
+            .iter()
+            .flatten()
+            .any(|stack| stack.item == item && stack.count >= count)
+    });
+}
+
+/// Polls the mesh scheduler until one section result arrives.
+fn wait_for_mesh(scheduler: &mut MeshScheduler, timeout: Duration) -> Option<ob_client::mesh_scheduler::MeshResult> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(result) = scheduler.try_recv() {
+            return Some(result);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn survival_use_block_tills_plants_harvests_and_reports_rejections() {
+    let registry = Arc::new(Registry::base());
+    let (mut loopback, (dirt_base, grass_base)) = Loopback::start_survival(&registry, |host, registry| {
+        let spawn = host.player().pos;
+        let base = BlockPos::new(
+            spawn.x.floor() as i32 + 1,
+            spawn.y.floor() as i32,
+            spawn.z.floor() as i32,
+        );
+        clear_platform(host, registry, base);
+        let dirt = registry.id("openblock:dirt").expect("dirt");
+        assert!(host.world_mut().set_block(base, dirt));
+
+        let grass_base = BlockPos::new(base.x, base.y, base.z - 2);
+        clear_platform(host, registry, grass_base);
+        let grass = registry.id("openblock:grass").expect("grass");
+        assert!(host.world_mut().set_block(grass_base, grass));
+        // Daylight so gameplay light allows planting on the surface.
+        host.set_tick_count(6_000);
+        (base, grass_base)
+    });
+    let addr = loopback.addr();
+    let mut client = NetworkClient::connect(ConnectOptions::new(
+        addr.to_string(),
+        "farmer",
+        2,
+        Arc::clone(&registry),
+    ))
+    .expect("connect survival server");
+    wait_ready(&mut client);
+    wait_survival_sync(&mut client);
+    assert!(
+        (5_900..7_000).contains(&client.day_phase()),
+        "handshake time sync should place the clock in daylight, got {}",
+        client.day_phase()
+    );
+
+    let id = client.local_id();
+    // Hoe a dirt block: the server consumes durability and broadcasts the
+    // farmland block change.
+    assert!(loopback.server().give_network_item(id, "openblock:iron_hoe", 1));
+    wait_for_item(&mut client, &registry, "openblock:iron_hoe", 1);
+    let hoe_slot = inventory_slot(&client, &registry, "openblock:iron_hoe").expect("hoe slot");
+    assert!(client.select_slot(hoe_slot));
+    wait_for(&mut client, "hoe selected", |client| client.selected_slot() == hoe_slot);
+    assert!(client.use_block(dirt_base));
+    wait_for(&mut client, "tilled farmland", |client| {
+        let block = client.world().get_block(dirt_base);
+        matches!(
+            registry.block(block).id,
+            "openblock:farmland_dry" | "openblock:farmland_wet"
+        )
+    });
+    wait_for(&mut client, "hoe durability sync", |client| {
+        client.inventory().iter().flatten().any(|stack| {
+            stack.item == registry.item_id("openblock:iron_hoe").expect("hoe") && stack.durability == Some(249)
+        })
+    });
+
+    // Plant seeds: one is consumed and the wheat block appears through the
+    // authoritative block update.
+    assert!(loopback.server().give_network_item(id, "openblock:seeds", 3));
+    wait_for_item(&mut client, &registry, "openblock:seeds", 3);
+    let seed_slot = inventory_slot(&client, &registry, "openblock:seeds").expect("seed slot");
+    assert!(client.select_slot(seed_slot));
+    wait_for(&mut client, "seeds selected", |client| {
+        client.selected_slot() == seed_slot
+    });
+    assert!(client.use_block(dirt_base));
+    let crop = dirt_base.offset(0, 1, 0);
+    wait_for(&mut client, "planted wheat", |client| {
+        registry
+            .block(client.world().get_block(crop))
+            .id
+            .starts_with("openblock:wheat_")
+    });
+    wait_for(&mut client, "seed consumed", |client| {
+        client
+            .inventory()
+            .iter()
+            .flatten()
+            .filter(|stack| stack.item == registry.item_id("openblock:seeds").expect("seeds"))
+            .map(|stack| stack.count)
+            .sum::<u8>()
+            == 2
+    });
+
+    // Harvest the immature crop by using it. It leaves farmland behind.
+    assert!(client.use_block(crop));
+    wait_for(&mut client, "harvested wheat", |client| {
+        client.world().get_block(crop) == BlockId::AIR
+    });
+
+    // Holding the hoe on farmland is rejected with `needs_seeds`; the toast
+    // mapping is pinned in `net_state` unit tests.
+    assert!(client.select_slot(hoe_slot));
+    wait_for(&mut client, "hoe reselected", |client| {
+        client.selected_slot() == hoe_slot
+    });
+    assert!(client.use_block(dirt_base));
+    assert!(
+        wait_for_rejection(&mut client, "use_block", "needs_seeds"),
+        "farmland without seeds must be rejected with needs_seeds"
+    );
+
+    // Seeds on grass are rejected with `needs_hoe` and consume nothing.
+    assert!(client.select_slot(seed_slot));
+    wait_for(&mut client, "seeds reselected", |client| {
+        client.selected_slot() == seed_slot
+    });
+    assert!(client.use_block(grass_base));
+    assert!(
+        wait_for_rejection(&mut client, "use_block", "needs_hoe"),
+        "grass without a hoe must be rejected with needs_hoe"
+    );
+    assert_eq!(
+        client.world().get_block(grass_base),
+        registry.id("openblock:grass").expect("grass")
+    );
+
+    client.shutdown();
+    loopback.stop();
+}
+
+#[test]
+fn night_bed_sleeps_votes_wakes_and_reaches_sunrise() {
+    let registry = Arc::new(Registry::base());
+    let (mut loopback, (bed_foot, bed_head)) = Loopback::start_survival(&registry, |host, registry| {
+        let spawn = host.player().pos;
+        let bed_foot = BlockPos::new(
+            spawn.x.floor() as i32 + 1,
+            spawn.y.floor() as i32,
+            spawn.z.floor() as i32,
+        );
+        clear_platform(host, registry, bed_foot);
+        let stone = registry.id("openblock:stone").expect("stone");
+        assert!(host.world_mut().set_block(bed_foot.offset(0, -1, 0), stone));
+        assert!(host.world_mut().set_block(bed_foot.offset(0, -1, 1), stone));
+        assert!(
+            host.world_mut()
+                .set_block(bed_foot, registry.id("openblock:bed_foot").expect("bed foot"))
+        );
+        let bed_head = bed_foot.offset(0, 0, 1);
+        assert!(
+            host.world_mut()
+                .set_block(bed_head, registry.id("openblock:bed_head").expect("bed head"))
+        );
+        host.set_tick_count(15_000);
+        (bed_foot, bed_head)
+    });
+    let addr = loopback.addr();
+    let mut client = NetworkClient::connect(ConnectOptions::new(
+        addr.to_string(),
+        "sleeper",
+        2,
+        Arc::clone(&registry),
+    ))
+    .expect("connect survival server");
+    wait_ready(&mut client);
+    wait_survival_sync(&mut client);
+    assert!(client.day_phase() >= 14_900, "clock should start at night");
+
+    // The explicit SleepRequest enters the bed; one player means the 100%
+    // vote passes immediately and the sunrise skip runs.
+    assert!(client.send_sleep_request(bed_foot));
+    wait_for(&mut client, "sleeping", |client| {
+        client
+            .sleep_view()
+            .is_some_and(|sleep| sleep.sleeping && sleep.all_sleeping && sleep.skip_remaining_ticks > 0)
+    });
+    assert_eq!(
+        client.sleep_view().and_then(|sleep| sleep.bed),
+        Some([bed_foot.x, bed_foot.y, bed_foot.z])
+    );
+    assert_eq!(client.sleep_view().map(|sleep| sleep.sleeper_count()), Some(1));
+
+    // Wake cancels the skip and keeps the night clock.
+    assert!(client.send_wake());
+    wait_for(&mut client, "wake", |client| {
+        !client.sleep_view().is_some_and(|sleep| sleep.sleeping)
+    });
+    assert!(client.day_phase() >= 13_000, "waking early keeps the night clock");
+
+    // Re-enter on the head half; the second request runs the skip to sunrise.
+    assert!(client.send_sleep_request(bed_head));
+    wait_for(&mut client, "sleeping again", |client| client.sleeping());
+    wait_for(&mut client, "sunrise", |client| {
+        !client.sleeping() && (client.day_phase() < 200 || client.day_phase() > 23_800)
+    });
+
+    client.shutdown();
+    loopback.stop();
+}
+
+#[test]
+fn day_bed_use_is_rejected_with_not_night_but_sets_the_respawn_hint() {
+    let registry = Arc::new(Registry::base());
+    let (mut loopback, bed_foot) = Loopback::start_survival(&registry, |host, registry| {
+        let spawn = host.player().pos;
+        let bed_foot = BlockPos::new(
+            spawn.x.floor() as i32 + 1,
+            spawn.y.floor() as i32,
+            spawn.z.floor() as i32,
+        );
+        clear_platform(host, registry, bed_foot);
+        let stone = registry.id("openblock:stone").expect("stone");
+        assert!(host.world_mut().set_block(bed_foot.offset(0, -1, 0), stone));
+        assert!(host.world_mut().set_block(bed_foot.offset(0, -1, 1), stone));
+        assert!(
+            host.world_mut()
+                .set_block(bed_foot, registry.id("openblock:bed_foot").expect("bed foot"))
+        );
+        assert!(host.world_mut().set_block(
+            bed_foot.offset(0, 0, 1),
+            registry.id("openblock:bed_head").expect("bed head")
+        ));
+        host.set_tick_count(6_000);
+        bed_foot
+    });
+    let addr = loopback.addr();
+    let mut client = NetworkClient::connect(ConnectOptions::new(
+        addr.to_string(),
+        "day_sleeper",
+        2,
+        Arc::clone(&registry),
+    ))
+    .expect("connect");
+    wait_ready(&mut client);
+    let _ = client.poll();
+    assert!(client.send_sleep_request(bed_foot));
+    assert!(
+        wait_for_rejection(&mut client, "sleep", "not_night"),
+        "daytime bed use must report not_night"
+    );
+    assert!(!client.sleeping());
+    assert!(client.day_phase() >= 5_900 && client.day_phase() < 7_000);
+    client.shutdown();
+    loopback.stop();
+}
+
+#[test]
+fn loopback_light_update_brightens_a_remote_torch_and_remeshes() {
+    let registry = Arc::new(Registry::base());
+    let (mut loopback, torch_pos) = Loopback::start_survival(&registry, |host, registry| {
+        let spawn = host.player().pos;
+        let base = BlockPos::new(
+            spawn.x.floor() as i32 + 1,
+            spawn.y.floor() as i32,
+            spawn.z.floor() as i32,
+        );
+        clear_platform(host, registry, base);
+        let stone = registry.id("openblock:stone").expect("stone");
+        assert!(host.world_mut().set_block(base.offset(0, -1, 0), stone));
+        base
+    });
+    let addr = loopback.addr();
+    let mut placing = NetworkClient::connect(ConnectOptions::new(
+        addr.to_string(),
+        "torch_placer",
+        2,
+        Arc::clone(&registry),
+    ))
+    .expect("connect placer");
+    let mut observer = NetworkClient::connect(ConnectOptions::new(
+        addr.to_string(),
+        "torch_observer",
+        2,
+        Arc::clone(&registry),
+    ))
+    .expect("connect observer");
+    wait_ready(&mut placing);
+    wait_ready(&mut observer);
+    wait_survival_sync(&mut placing);
+    wait_survival_sync(&mut observer);
+
+    // The observer must not locally compute the torch light. It only receives
+    // the authoritative BlockEdit plus a dense LightUpdate batch.
+    let before = observer.world().light_sample(torch_pos).block_level();
+    assert!(before < 14);
+
+    assert!(
+        loopback
+            .server()
+            .give_network_item(placing.local_id(), "openblock:torch", 4)
+    );
+    wait_for_item(&mut placing, &registry, "openblock:torch", 4);
+    let torch_slot = inventory_slot(&placing, &registry, "openblock:torch").expect("torch slot");
+    assert!(placing.select_slot(torch_slot));
+    wait_for(&mut placing, "torch selected", |client| {
+        client.selected_slot() == torch_slot
+    });
+    let torch = registry.id("openblock:torch").expect("torch");
+    assert!(placing.edit_block(torch_pos, torch));
+
+    wait_for(&mut observer, "authoritative torch block", |client| {
+        client.world().get_block(torch_pos) == torch
+    });
+    wait_for(&mut observer, "torch LightUpdate", |client| {
+        client.light_sync_stats().sections >= 1 && client.world().light_sample(torch_pos).block_level() == 14
+    });
+    let stats = observer.light_sync_stats();
+    assert!(stats.batches >= 1, "light batch applied: {stats:?}");
+    assert!(stats.last_tick > 0, "batch carries the server tick: {stats:?}");
+    assert_eq!(stats.sections_dropped, 0, "the torch section is resident: {stats:?}");
+    assert!(
+        observer.world().light_sample(torch_pos.offset(1, 0, 0)).block_level() >= 13,
+        "torch light propagates into the neighbour cell"
+    );
+
+    // The LightUpdate must invalidate the section mesh. Build the snapshot
+    // through the same scheduler the network runtime uses and assert the
+    // emitted vertices carry block light.
+    let section = torch_pos.section();
+    let dirty = observer.world_mut().take_dirty_sections();
+    assert!(
+        dirty.contains(&section),
+        "torch section {section:?} must be queued for remesh: {dirty:?}"
+    );
+    let mut scheduler = MeshScheduler::new(2, Arc::clone(&registry));
+    assert!(scheduler.submit(observer.world(), section));
+    let result = wait_for_mesh(&mut scheduler, WAIT).expect("torch section mesh");
+    assert!(!result.mesh.is_empty(), "the surface section must produce geometry");
+    assert!(
+        result
+            .mesh
+            .vertices
+            .iter()
+            .filter(|vertex| vertex.layer == u32::from(textures::TORCH.0))
+            .any(|vertex| vertex.block_byte() > 0),
+        "torch cross vertices must carry server-propagated block light"
+    );
+    // A direct snapshot round-trip matches the live section (proves the
+    // scheduler did not need a client relight).
+    let snapshot = SectionSnapshot::capture(observer.world(), section);
+    assert_eq!(
+        snapshot.light_word(
+            torch_pos.local().x as i32,
+            torch_pos.local().y as i32,
+            torch_pos.local().z as i32
+        ),
+        observer.world().light_word(torch_pos)
+    );
+
+    // Break the torch: the observer must see the section go dark again through
+    // another authoritative light patch.
+    assert!(placing.edit_block(torch_pos, BlockId::AIR));
+    wait_for(&mut observer, "torch removed", |client| {
+        client.world().light_sample(torch_pos).block_level() < 14
+    });
+
+    placing.shutdown();
+    observer.shutdown();
+    loopback.stop();
 }
 
 /// One-off documentation probe: renders a survival frame from an in-process

@@ -26,7 +26,9 @@ struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) layer: u32,
-    @location(3) light: f32,
+    // Packed sky/block light; the depth pass does not consume it, but the
+    // vertex buffer layout must match the shared 32-byte `Vertex`.
+    @location(3) light: u32,
 };
 
 struct VertexOutput {

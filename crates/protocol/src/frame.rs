@@ -46,6 +46,8 @@ pub enum ProtocolError {
     InvalidChat(&'static str),
     /// A chunk payload is malformed or exceeds a protocol bound.
     InvalidChunk(&'static str),
+    /// A light-section patch is malformed or exceeds a protocol bound.
+    InvalidLight(&'static str),
     /// An encoded chunk would not fit in the protocol's chunk budget.
     ChunkTooLarge {
         /// Encoded payload length in bytes.
@@ -68,6 +70,7 @@ impl std::fmt::Display for ProtocolError {
             ProtocolError::InvalidName(reason) => write!(formatter, "invalid player name: {reason}"),
             ProtocolError::InvalidChat(reason) => write!(formatter, "invalid chat text: {reason}"),
             ProtocolError::InvalidChunk(reason) => write!(formatter, "invalid chunk payload: {reason}"),
+            ProtocolError::InvalidLight(reason) => write!(formatter, "invalid light patch: {reason}"),
             ProtocolError::ChunkTooLarge { len, max } => {
                 write!(formatter, "encoded chunk of {len} bytes exceeds the {max}-byte limit")
             }

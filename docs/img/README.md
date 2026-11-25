@@ -192,3 +192,24 @@ openblock --no-audio --no-texture-pack --screenshot docs/img/v1.1.0-f3.png --scr
 Note: `render-distance-bench` must be built from `ob_tools`; the screenshots
 here were captured with the release `openblock` 1.1.0 binary. The water and F3
 captures are documentation-only.
+
+## v1.2.0 screenshots (Light & Home)
+
+Offscreen captures with classic textures and fresh data dirs. The torch/farm/
+sleep modes are offscreen-only flags in the client (`--screenshot-torch`,
+`--screenshot-farm`, `--screenshot-sleep`).
+
+| Capture | Path |
+| --- | --- |
+| Torch-lit sealed room (block light 14 falloff) | `docs/img/v1.2.0-torch.png` |
+| 7×7 watered wheat farm with growth stages and iron hoe | `docs/img/v1.2.0-farm.png` |
+| Night bed and sleep overlay ("1/1 players sleeping") | `docs/img/v1.2.0-sleep.png` |
+| 36-slot inventory (hotbar/main/armor) with 1.2 items | `docs/img/v1.2.0-inventory.png` |
+| Compact 960×540@125 inventory check | `docs/img/v1.2.0-inventory-960x540-125.png` |
+
+```sh
+openblock --no-audio --no-texture-pack --screenshot docs/img/v1.2.0-torch.png --screenshot-torch
+openblock --no-audio --no-texture-pack --screenshot docs/img/v1.2.0-farm.png --screenshot-farm
+openblock --no-audio --no-texture-pack --screenshot docs/img/v1.2.0-sleep.png --screenshot-sleep
+openblock --no-audio --no-texture-pack --screenshot docs/img/v1.2.0-inventory.png --screenshot-items --data-dir /tmp/ob-shots/v1.2.0-inventory
+```
