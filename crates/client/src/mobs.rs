@@ -55,6 +55,10 @@ pub struct MobVisual {
     pub walk_phase: f32,
     /// Whether the avatar should bob/swing.
     pub moving: bool,
+    /// Inherited colour variant (`0..=3`).
+    pub variant: u8,
+    /// Whether the baby half-scale applies.
+    pub baby: bool,
 }
 
 /// Fixed palette per species.
@@ -90,7 +94,45 @@ pub fn palette(kind: MobKind) -> MobPalette {
             accent: [0.80, 0.18, 0.16],
             limb: [0.18, 0.22, 0.34],
         },
+        MobKind::Spider => MobPalette {
+            body: [0.16, 0.14, 0.13],
+            head: [0.22, 0.19, 0.17],
+            accent: [0.72, 0.12, 0.10],
+            limb: [0.10, 0.09, 0.09],
+        },
+        MobKind::Skeleton => MobPalette {
+            body: [0.80, 0.80, 0.74],
+            head: [0.88, 0.88, 0.82],
+            accent: [0.55, 0.54, 0.50],
+            limb: [0.72, 0.72, 0.66],
+        },
+        MobKind::Creeper => MobPalette {
+            body: [0.27, 0.63, 0.24],
+            head: [0.31, 0.70, 0.27],
+            accent: [0.08, 0.09, 0.07],
+            limb: [0.20, 0.47, 0.18],
+        },
     }
+}
+
+/// Applies a small deterministic colour-variant shift to a palette.
+///
+/// Variant 0 is the base colour; 1–3 tint the body/head/limb slightly warmer,
+/// cooler or darker so bred offspring are visibly different without new icon
+/// or render assets.
+fn vary_palette(mut palette: MobPalette, variant: u8) -> MobPalette {
+    let shift = match variant % 4 {
+        0 => [1.0, 1.0, 1.0],
+        1 => [1.08, 0.96, 0.90],
+        2 => [0.92, 0.97, 1.08],
+        _ => [0.92, 0.92, 0.88],
+    };
+    for channel in 0..3 {
+        palette.body[channel] = (palette.body[channel] * shift[channel]).clamp(0.0, 1.0);
+        palette.head[channel] = (palette.head[channel] * shift[channel]).clamp(0.0, 1.0);
+        palette.limb[channel] = (palette.limb[channel] * shift[channel]).clamp(0.0, 1.0);
+    }
+    palette
 }
 
 /// Turns every live mob into cubes, using the authoritative positions.
@@ -110,6 +152,8 @@ pub fn mob_instances(registry: &Registry, mobs: &[MobEntity], elapsed: f32) -> V
                 hurt: entity.mob.hurt_timer > 0.0,
                 walk_phase: elapsed * 8.0 + entity.id as f32 * 0.9,
                 moving: speed > WALK_SPEED_THRESHOLD,
+                variant: entity.mob.variant.min(3),
+                baby: entity.mob.is_baby(),
             }
         })
         .collect();
@@ -125,7 +169,7 @@ pub fn mob_instances(registry: &Registry, mobs: &[MobEntity], elapsed: f32) -> V
 pub fn mob_instances_from_visuals(registry: &Registry, visuals: &[MobVisual]) -> Vec<EntityInstance> {
     let mut instances = Vec::with_capacity(visuals.len() * 8);
     for visual in visuals {
-        // Skip unknown kinds defensively; the base registry always has all five.
+        // Skip unknown kinds defensively; the base registry always has all eight.
         if visual.kind.index() >= registry.mob_len() {
             continue;
         }
@@ -195,7 +239,8 @@ fn reference_dimensions(kind: MobKind) -> (f32, f32) {
         MobKind::Pig => (0.9, 0.9),
         MobKind::Sheep => (0.9, 1.3),
         MobKind::Chicken => (0.4, 0.7),
-        MobKind::Zombie => (0.6, 1.8),
+        MobKind::Zombie | MobKind::Skeleton | MobKind::Creeper => (0.6, 1.8),
+        MobKind::Spider => (1.0, 0.9),
     }
 }
 
@@ -213,21 +258,31 @@ fn compose_mob(registry: &Registry, visual: &MobVisual, out: &mut Vec<EntityInst
     let (reference_width, reference_height) = reference_dimensions(visual.kind);
     let sx = (spec.width / reference_width).clamp(0.25, 4.0);
     let sy = (spec.height / reference_height).clamp(0.25, 4.0);
-    if (sx - 1.0).abs() < 1e-6 && (sy - 1.0).abs() < 1e-6 {
-        return;
-    }
     let uniform = (sx + sy) * 0.5;
-    for cube in &mut out[start..] {
-        cube.position[0] = visual.pos.x as f32 + (cube.position[0] - visual.pos.x as f32) * sx;
-        cube.position[1] = visual.pos.y as f32 + (cube.position[1] - visual.pos.y as f32) * sy;
-        cube.position[2] = visual.pos.z as f32 + (cube.position[2] - visual.pos.z as f32) * sx;
-        cube.scale *= uniform;
+    let needs_spec_scale = (sx - 1.0).abs() >= 1e-6 || (sy - 1.0).abs() >= 1e-6;
+    if needs_spec_scale {
+        for cube in &mut out[start..] {
+            cube.position[0] = visual.pos.x as f32 + (cube.position[0] - visual.pos.x as f32) * sx;
+            cube.position[1] = visual.pos.y as f32 + (cube.position[1] - visual.pos.y as f32) * sy;
+            cube.position[2] = visual.pos.z as f32 + (cube.position[2] - visual.pos.z as f32) * sx;
+            cube.scale *= uniform;
+        }
+    }
+    if visual.baby {
+        // Babies are half-scale around the same feet anchor. Drops are empty
+        // and growth is server-authoritative; this is visual only.
+        for cube in &mut out[start..] {
+            cube.position[0] = visual.pos.x as f32 + (cube.position[0] - visual.pos.x as f32) * 0.5;
+            cube.position[1] = visual.pos.y as f32 + (cube.position[1] - visual.pos.y as f32) * 0.5;
+            cube.position[2] = visual.pos.z as f32 + (cube.position[2] - visual.pos.z as f32) * 0.5;
+            cube.scale *= 0.5;
+        }
     }
 }
 
 /// Hard-coded per-species cube layout before MobSpec scaling.
 fn compose_mob_parts(visual: &MobVisual, out: &mut Vec<EntityInstance>) {
-    let palette = palette(visual.kind);
+    let palette = vary_palette(palette(visual.kind), visual.variant);
     match visual.kind {
         MobKind::Cow => {
             push_quadruped_legs(out, visual, palette.limb, 0.19, 0.23, 0.24);
@@ -280,7 +335,78 @@ fn compose_mob_parts(visual: &MobVisual, out: &mut Vec<EntityInstance>) {
             push_cube(out, visual, [0.33, 0.88, 0.0], 0.18, palette.head);
             push_cube(out, visual, [0.0, 1.29, -0.03], 0.35, palette.head);
         }
+        MobKind::Skeleton => {
+            let swing = if visual.moving {
+                visual.walk_phase.sin() * LEG_SWING
+            } else {
+                0.0
+            };
+            push_cube(out, visual, [-0.13, 0.0, swing], 0.40, palette.limb);
+            push_cube(out, visual, [0.13, 0.0, -swing], 0.40, palette.limb);
+            push_cube(out, visual, [0.0, 0.40, 0.0], 0.44, palette.body);
+            push_cube(out, visual, [0.0, 0.84, 0.0], 0.34, palette.accent);
+            push_cube(out, visual, [0.0, 1.18, -0.02], 0.34, palette.head);
+            push_cube(out, visual, [-0.31, 0.52, -0.20], 0.12, palette.limb);
+            push_cube(out, visual, [0.31, 0.52, -0.20], 0.12, palette.limb);
+        }
+        MobKind::Creeper => {
+            let swing = if visual.moving {
+                visual.walk_phase.sin() * LEG_SWING * 0.6
+            } else {
+                0.0
+            };
+            push_quadruped_legs(out, visual, palette.limb, 0.16, 0.18, 0.20);
+            push_cube(out, visual, [0.0, 0.18, 0.0], 0.52, palette.body);
+            push_cube(out, visual, [0.0, 0.70, -0.02], 0.38, palette.head);
+            push_cube(out, visual, [-0.13, 1.04, -0.21], 0.04, palette.accent);
+            push_cube(out, visual, [0.13, 1.04, -0.21], 0.04, palette.accent);
+            let _ = swing;
+        }
+        MobKind::Spider => {
+            let swing = if visual.moving {
+                visual.walk_phase.sin() * LEG_SWING
+            } else {
+                0.0
+            };
+            for (index, side) in [-1.0f32, 1.0].into_iter().enumerate() {
+                let phase = if index == 0 { swing } else { -swing };
+                push_cube(out, visual, [side * 0.34, 0.0, -0.18 + phase], 0.10, palette.limb);
+                push_cube(out, visual, [side * 0.34, 0.0, 0.18 - phase], 0.10, palette.limb);
+            }
+            push_cube(out, visual, [0.0, 0.14, 0.0], 0.40, palette.body);
+            push_cube(out, visual, [0.0, 0.46, -0.28], 0.28, palette.head);
+            push_cube(out, visual, [-0.12, 0.54, -0.38], 0.05, palette.accent);
+            push_cube(out, visual, [0.12, 0.54, -0.38], 0.05, palette.accent);
+        }
     }
+}
+
+/// Builds small cubes for host-simulated arrows in single-player mode.
+///
+/// Mirrors the network client's arrow rendering so skeleton combat looks the
+/// same in both client paths without touching the render crate.
+pub fn projectile_instances(projectiles: &[ob_server::ProjectileEntity]) -> Vec<EntityInstance> {
+    let mut instances = Vec::with_capacity(projectiles.len() * 2);
+    for entity in projectiles {
+        let pos = entity.projectile.pos;
+        instances.push(EntityInstance {
+            position: [pos.x as f32, pos.y as f32, pos.z as f32],
+            scale: 0.14,
+            yaw: 0.0,
+            layer: 0,
+            tint: [0.82, 0.78, 0.66],
+            textured: false,
+        });
+        instances.push(EntityInstance {
+            position: [pos.x as f32, pos.y as f32 + 0.12, pos.z as f32],
+            scale: 0.09,
+            yaw: 0.0,
+            layer: 0,
+            tint: [0.42, 0.39, 0.33],
+            textured: false,
+        });
+    }
+    instances
 }
 
 /// Per-mob interpolation state keyed by stable session id.
@@ -293,6 +419,8 @@ struct CachedMob {
     hurt: bool,
     walk_phase: f32,
     moving: bool,
+    variant: u8,
+    baby: bool,
 }
 
 /// Smooths authoritative mob positions between fixed ticks.
@@ -343,6 +471,8 @@ impl MobRenderCache {
                     cached.yaw = entity.mob.yaw;
                     cached.hurt = entity.mob.hurt_timer > 0.0;
                     cached.moving = moving;
+                    cached.variant = entity.mob.variant.min(3);
+                    cached.baby = entity.mob.is_baby();
                     if moving {
                         cached.walk_phase = (cached.walk_phase + dt * speed as f32 * 5.0) % std::f32::consts::TAU;
                     } else {
@@ -360,6 +490,8 @@ impl MobRenderCache {
                             hurt: entity.mob.hurt_timer > 0.0,
                             walk_phase: 0.0,
                             moving,
+                            variant: entity.mob.variant.min(3),
+                            baby: entity.mob.is_baby(),
                         },
                     );
                 }
@@ -383,6 +515,8 @@ impl MobRenderCache {
                     hurt: cached.hurt,
                     walk_phase: cached.walk_phase,
                     moving: cached.moving,
+                    variant: cached.variant,
+                    baby: cached.baby,
                 })
             })
             .collect()
@@ -509,6 +643,48 @@ mod tests {
             let [r, g, b] = cube.tint;
             g > r && g > b && r < 0.5
         }));
+    }
+
+    #[test]
+    fn babies_are_half_scale_and_variants_tint_differently() {
+        let registry = registry();
+        let pos = WorldVec::new(4.0, 64.0, 4.0);
+        let mut mobs = [entity(&registry, 21, MobKind::Cow, pos)];
+        let adult = mob_instances(&registry, &mobs, 0.0);
+        mobs[0].mob.growth_timer = 100.0;
+        let baby = mob_instances(&registry, &mobs, 0.0);
+        assert_eq!(adult.len(), baby.len());
+        for (adult_cube, baby_cube) in adult.iter().zip(&baby) {
+            assert!(baby_cube.scale < adult_cube.scale);
+            assert!(baby_cube.position[1] >= pos.y as f32 - 1e-4);
+            assert!(
+                baby_cube.position[1] <= adult_cube.position[1] + 1e-4,
+                "a baby must not be taller than its adult"
+            );
+        }
+        let plain = instances_for(&registry, MobKind::Sheep, pos, 0.0);
+        let mut variant_mobs = [entity(&registry, 22, MobKind::Sheep, pos)];
+        variant_mobs[0].mob.variant = 2;
+        let varied = mob_instances(&registry, &variant_mobs, 0.0);
+        assert_ne!(plain[0].tint, varied[0].tint, "variant must change the palette");
+    }
+
+    #[test]
+    fn projectile_instances_render_as_small_arrow_cubes() {
+        let projectiles = [ob_server::ProjectileEntity {
+            id: 1,
+            projectile: ob_sim::Projectile::new(
+                ob_content::ProjectileKind::Arrow,
+                WorldVec::new(1.0, 2.0, 3.0),
+                WorldVec::new(0.0, 0.0, 1.0),
+                3.0,
+            ),
+            target_player: None,
+        }];
+        let cubes = projectile_instances(&projectiles);
+        assert_eq!(cubes.len(), 2);
+        assert!(cubes.iter().all(|cube| cube.scale < 0.2 && !cube.textured));
+        assert!(projectile_instances(&[]).is_empty());
     }
 
     #[test]

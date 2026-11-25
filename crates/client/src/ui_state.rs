@@ -3888,6 +3888,90 @@ pub fn vitals_layout(screen: [f32; 2]) -> (Vec<UiRect>, Vec<UiRect>) {
     (row(hearts_y), row(hunger_y))
 }
 
+/// Width of the XP bar under the crosshair HUD, in pixels.
+pub const XP_BAR_WIDTH: f32 = 220.0;
+/// Height of the XP bar, in pixels.
+pub const XP_BAR_HEIGHT: f32 = 4.0;
+
+/// Draws the 1.3 XP bar and level label just above the hotbar.
+///
+/// `progress` and `required` are authoritative server values; the bar is purely
+/// a view and never predicts XP. A non-finite or zero requirement renders an
+/// empty bar rather than dividing by zero.
+pub fn draw_xp_bar(frame: &mut UiFrame, screen: [f32; 2], level: u32, progress: u32, required: u32) {
+    let hotbar_top = screen[1] - HOTBAR_SLOT_SIZE - 18.0;
+    let y = hotbar_top - XP_BAR_HEIGHT - 2.0;
+    let x = ((screen[0] - XP_BAR_WIDTH) * 0.5).max(2.0);
+    let fraction = if required == 0 {
+        0.0
+    } else {
+        (f64::from(progress) / f64::from(required)).clamp(0.0, 1.0) as f32
+    };
+    frame.rect(
+        x - 1.0,
+        y - 1.0,
+        XP_BAR_WIDTH + 2.0,
+        XP_BAR_HEIGHT + 2.0,
+        [0.03, 0.04, 0.06, 0.75],
+    );
+    frame.rect(x - 1.0, y, XP_BAR_WIDTH, XP_BAR_HEIGHT, [0.14, 0.16, 0.20, 0.95]);
+    frame.rect(
+        x - 1.0,
+        y,
+        XP_BAR_WIDTH * fraction,
+        XP_BAR_HEIGHT,
+        [0.42, 0.82, 0.28, 1.0],
+    );
+    let label = format!("Lv {level}");
+    let width = frame.text_width(1.0, &label);
+    frame.text(x - 1.0 - width - 6.0, y - 3.0, 1.0, [0.55, 0.95, 0.42, 1.0], &label);
+}
+
+/// Draws charged-attack cooldown feedback under the crosshair.
+///
+/// The bar is hidden when `remaining_ms == 0`. `cooldown_ms` is the full swing
+/// cooldown for the selected item (625 ms sword, 1,000 ms otherwise).
+pub fn draw_attack_cooldown(frame: &mut UiFrame, screen: [f32; 2], remaining_ms: u32, cooldown_ms: u32) {
+    if remaining_ms == 0 || cooldown_ms == 0 {
+        return;
+    }
+    let width = 30.0;
+    let height = 3.0;
+    let x = (screen[0] - width) * 0.5;
+    let y = screen[1] * 0.5 + 14.0;
+    let fraction = 1.0 - (remaining_ms as f32 / cooldown_ms as f32).clamp(0.0, 1.0);
+    frame.rect(x - 1.0, y - 1.0, width + 2.0, height + 2.0, [0.02, 0.02, 0.03, 0.6]);
+    frame.rect(x, y, width, height, [0.24, 0.25, 0.28, 0.85]);
+    frame.rect(x, y, width * fraction, height, [0.95, 0.82, 0.35, 0.95]);
+}
+
+/// Draws a mob name and health bar just below the crosshair.
+///
+/// `health` and `max_health` are authoritative; the bar is clamped and hidden
+/// when the mob is unknown or already dead.
+pub fn draw_mob_health(frame: &mut UiFrame, screen: [f32; 2], name: &str, health: f32, max_health: f32) {
+    if !health.is_finite() || health <= 0.0 || !max_health.is_finite() || max_health <= 0.0 {
+        return;
+    }
+    let width = 132.0;
+    let height = 4.0;
+    let x = (screen[0] - width) * 0.5;
+    let y = screen[1] * 0.5 + 22.0;
+    frame.rect(x - 1.0, y - 1.0, width + 2.0, height + 2.0, [0.02, 0.02, 0.03, 0.65]);
+    frame.rect(x, y, width, height, [0.24, 0.05, 0.05, 0.9]);
+    let fraction = (health / max_health).clamp(0.0, 1.0);
+    frame.rect(x, y, width * fraction, height, [0.82, 0.16, 0.14, 0.95]);
+    let label = format!("{name}  {health:.0}/{max_health:.0}");
+    let text_width = frame.text_width(1.0, &label);
+    frame.text(
+        screen[0] * 0.5 - text_width * 0.5,
+        y + height + 2.0,
+        1.0,
+        [0.95, 0.93, 0.90, 0.95],
+        &label,
+    );
+}
+
 /// Draws the survival health and hunger rows from primitive rectangles.
 pub fn draw_vitals(frame: &mut UiFrame, screen: [f32; 2], health: f32, hunger: f32) {
     let (hearts, hunger_icons) = vitals_layout(screen);
@@ -5802,6 +5886,25 @@ mod tests {
             assert!(rect.x >= 0.0 && rect.x + rect.w <= screen[0]);
             assert!(rect.y >= 0.0 && rect.y + rect.h <= screen[1]);
         }
+    }
+
+    #[test]
+    fn xp_bar_and_attack_cooldown_fit_the_survival_hud() {
+        for screen in [[1280.0_f32, 720.0], [960.0, 540.0]] {
+            let mut frame = UiFrame::new(screen[0], screen[1]);
+            draw_xp_bar(&mut frame, screen, 30, 80, 107);
+            draw_attack_cooldown(&mut frame, screen, 500, 1_000);
+            let (_, quads) = frame.measure();
+            assert!(quads >= 5, "XP bar and cooldown need fills and outlines: {quads}");
+            let hotbar = UiState::default().hotbar_rects(screen);
+            let xp_y = screen[1] - HOTBAR_SLOT_SIZE - 18.0 - XP_BAR_HEIGHT - 2.0;
+            assert!(xp_y + XP_BAR_HEIGHT <= hotbar[0].y);
+            assert!(xp_y >= 0.0);
+        }
+        // A ready swing draws no cooldown bar.
+        let mut ready = UiFrame::new(1280.0, 720.0);
+        draw_attack_cooldown(&mut ready, [1280.0, 720.0], 0, 1_000);
+        assert_eq!(ready.measure().1, 0);
     }
 
     #[test]

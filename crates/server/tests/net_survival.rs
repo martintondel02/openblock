@@ -1,4 +1,4 @@
-//! Loopback integration tests for protocol v3 server-authoritative survival.
+//! Loopback integration tests for protocol v4 server-authoritative survival.
 //!
 //! Each test starts a real dedicated server on `127.0.0.1:0` with a temporary
 //! world, connects raw `std::net::TcpStream` clients and exchanges the public
@@ -68,6 +68,12 @@ impl TestServer {
 
     fn start_with_mode(label: &str, game_mode: GameMode) -> Self {
         Self::start_with_interval(label, game_mode, 3_600)
+    }
+
+    /// Starts at the beginning of the night so daylight burn cannot interfere
+    /// with slow, charged-attack combat tests.
+    fn start_at_night(label: &str) -> Self {
+        Self::start_with_interval_at(label, GameMode::Survival, 3_600, 13_000)
     }
 
     fn start_with_interval(label: &str, game_mode: GameMode, save_interval_seconds: u64) -> Self {
@@ -787,7 +793,7 @@ fn eat_and_equip_armor_mitigate_damage() {
 
 #[test]
 fn attack_mob_with_tool_damage_durability_and_drops() {
-    let mut server = TestServer::start("attack");
+    let mut server = TestServer::start_at_night("attack");
     let mut alice = TestClient::connect(server.addr());
     let id = join(&server, &mut alice, "alice").id;
     assert!(server.server().give_network_item(id, "openblock:wooden_sword", 1));
@@ -811,11 +817,14 @@ fn attack_mob_with_tool_damage_durability_and_drops() {
     let mut killed = false;
     let deadline = Instant::now() + Duration::from_secs(8);
     while !killed && Instant::now() < deadline {
+        // The server rejects a swing below 0.9 charge. Wait one full second so
+        // the wall-clock attack cooldown (625 ms for a sword) is satisfied.
+        std::thread::sleep(Duration::from_millis(950));
         alice.send(ClientMessage::Attack { target: Some(mob) });
-        let result = alice.recv_until(
-            "attack result",
-            |message| matches!(message, ServerMessage::AttackResult { target, .. } if *target == mob),
-        );
+        let result = alice.recv_until("attack result", |message| {
+            matches!(message, ServerMessage::AttackResult { target, .. } if *target == mob)
+                || matches!(message, ServerMessage::ActionRejected { action, .. } if action == "attack")
+        });
         let ServerMessage::AttackResult {
             hit,
             damage,
@@ -823,7 +832,7 @@ fn attack_mob_with_tool_damage_durability_and_drops() {
             ..
         } = result
         else {
-            unreachable!()
+            panic!("attack rejected: {result:?}");
         };
         assert!(hit, "the zombie must be in reach");
         assert!(damage > 0.0);
@@ -1104,8 +1113,82 @@ fn chest_window_transactions_persist_after_restart() {
 }
 
 #[test]
+fn network_breeding_emits_interact_results_xp_and_a_baby_entity() {
+    let mut server = TestServer::start_at_night("net-breed");
+    let mut alice = TestClient::connect(server.addr());
+    let id = join(&server, &mut alice, "alice").id;
+    assert!(server.server().give_network_item(id, "openblock:wheat", 8));
+    let slot = wait_slot(&server, id, server.registry.item_id("openblock:wheat").expect("wheat"));
+    alice.send(ClientMessage::SelectSlot { slot });
+    let player = server.server().server_player(id).expect("online");
+    let first = server
+        .server()
+        .spawn_mob(MobKind::Cow, [player.pos.x + 1.2, player.pos.y, player.pos.z])
+        .expect("cow one");
+    let second = server
+        .server()
+        .spawn_mob(MobKind::Cow, [player.pos.x + 2.0, player.pos.y, player.pos.z])
+        .expect("cow two");
+    alice.send(ClientMessage::InteractEntity { id: first });
+    alice.recv_until("first feed result", |message| {
+        matches!(message, ServerMessage::InteractResult { id: target, accepted: true, .. } if *target == first)
+    });
+    alice.send(ClientMessage::InteractEntity { id: second });
+    alice.recv_until("pair feed result", |message| {
+        matches!(message, ServerMessage::InteractResult { id: target, accepted: true, .. } if *target == second)
+    });
+    alice.recv_until(
+        "xp sync after breeding",
+        |message| matches!(message, ServerMessage::XpSync { points, .. } if *points > 0),
+    );
+    // The 60-tick gestation is visible as a baby mob spawn carrying `baby`.
+    alice.recv_until_in("baby entity spawn", Duration::from_secs(6), |message| {
+        matches!(
+            message,
+            ServerMessage::EntitySpawn {
+                kind: EntityKind::Mob { mob },
+                baby: true,
+                ..
+            } if mob == "openblock:cow"
+        )
+    });
+    server.stop();
+}
+
+#[test]
+fn network_skeleton_arrow_is_replicated_as_a_projectile_entity() {
+    let mut server = TestServer::start_at_night("net-arrow");
+    let mut alice = TestClient::connect(server.addr());
+    let _ = join(&server, &mut alice, "alice");
+    let player = server
+        .server()
+        .server_players()
+        .into_iter()
+        .find(|p| p.name == "alice")
+        .expect("alice");
+    let skeleton = server
+        .server()
+        .spawn_mob(MobKind::Skeleton, [player.pos.x + 10.0, player.pos.y, player.pos.z])
+        .expect("skeleton");
+    alice.recv_until(
+        "skeleton spawn",
+        |message| matches!(message, ServerMessage::EntitySpawn { id, .. } if *id == skeleton),
+    );
+    alice.recv_until_in("arrow spawn", Duration::from_secs(4), |message| {
+        matches!(
+            message,
+            ServerMessage::EntitySpawn {
+                kind: EntityKind::Projectile { projectile },
+                ..
+            } if projectile == "openblock:arrow"
+        )
+    });
+    server.stop();
+}
+
+#[test]
 fn mob_drops_spawn_as_items_and_are_picked_up() {
-    let mut server = TestServer::start("mob-drops");
+    let mut server = TestServer::start_at_night("mob-drops");
     let mut alice = TestClient::connect(server.addr());
     let id = join(&server, &mut alice, "alice").id;
     assert!(server.server().give_network_item(id, "openblock:wooden_sword", 1));
@@ -1126,6 +1209,7 @@ fn mob_drops_spawn_as_items_and_are_picked_up() {
     );
     let mut killed = false;
     for _ in 0..8 {
+        std::thread::sleep(Duration::from_millis(950));
         alice.send(ClientMessage::Attack { target: Some(cow) });
         let result = alice.recv_until(
             "cow attack",
@@ -1147,9 +1231,16 @@ fn mob_drops_spawn_as_items_and_are_picked_up() {
         } => stack.item == "openblock:raw_beef" || stack.item == "openblock:leather",
         _ => false,
     });
-    let ServerMessage::EntitySpawn { id: entity_id, .. } = drop else {
+    let ServerMessage::EntitySpawn { id: entity_id, pos, .. } = drop else {
         unreachable!()
     };
+    // Charged combat takes long enough for the fleeing cow to die a few metres
+    // away; walk the test client onto the drop so pickup can run.
+    alice.send(ClientMessage::Move {
+        pos,
+        yaw: 0.0,
+        pitch: 0.0,
+    });
     alice.recv_until("mob drop pickup", |message| {
         matches!(message, ServerMessage::EntityDespawn { ids, reason: DespawnReason::PickedUp } if ids.contains(&entity_id))
     });
@@ -1513,9 +1604,9 @@ fn protocol_v2_client_is_rejected_with_reason() {
         name: "legacy".to_string(),
     });
     let reason = old.expect_disconnect("protocol_mismatch");
-    assert!(reason.contains("server protocol 3"), "{reason}");
+    assert!(reason.contains("server protocol 4"), "{reason}");
     assert!(reason.contains("upgrade"), "{reason}");
-    assert_eq!(ob_protocol::PROTOCOL_VERSION, 3);
+    assert_eq!(ob_protocol::PROTOCOL_VERSION, 4);
     server.stop();
 }
 

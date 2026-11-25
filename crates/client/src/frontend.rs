@@ -947,7 +947,7 @@ pub fn draw_multiplayer_screen(
         if compact { 1.05 } else { 1.2 },
         [0.86, 0.91, 0.99, 1.0],
         if compact {
-            "Recent servers (protocol v3 required)"
+            "Recent servers (protocol v4 required)"
         } else {
             "Recent servers"
         },

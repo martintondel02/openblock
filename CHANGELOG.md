@@ -6,12 +6,88 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [1.4.0] — 2026-11-25 (Danger & Detail)
+
+The danger release: three new hostile mobs with arrows and explosions, charged
+and critical combat, animal breeding, XP and levels, and deterministic loot in
+worldgen structure chests. At the same time the renderer gets a softer near/far
+seam, depth-aware water, height fog, SSAO and cloud shadows. Protocol **v4**;
+save format 4 remains and older saves/players migrate additively.
+
+### Added — danger, combat and breeding
+- **Spider** (fast, leaps, climbs, neutral in bright light), **skeleton**
+  (arrow projectiles with gravity/impact, keeps distance, burns in daylight) and
+  **creeper** (approach, fuse, explosion with falloff, protects bedrock/water/
+  containers/beds). Zombies gain attack wind-up and daylight burning.
+- **Combat depth**: server-authoritative attack charge (sword 625 ms vs 1000 ms
+  unarmed, full-damage threshold 0.9), falling critical hits in single-player,
+  knockback/armor mitigation, mob wind-ups/cooldowns, reach + line-of-sight
+  checks, deterministic drops and XP. Network crits stay disabled until movement
+  validation.
+- **Breeding**: wheat/seeds feeding for cows/sheep/pigs/chickens, love/parent
+  cooldowns, babies with inherited variant colour and 300 s growth, local/global
+  caps, XP for breeding, persistence and multiplayer birth announcements.
+- **XP/levels**: server-authoritative XP curve (7+2L to 30, then 37+5(L-15),
+  107+9(L-30)), mob/breeding XP, persisted in `player.txt`, synced owner-only,
+  XP bar + level in both client paths, kept on death/respawn.
+- New items **bone/string/gunpowder/arrow** (stack 64, procedural icons) and an
+  arrow recipe; mob drops wired to them.
+- **Structure loot**: every worldgen structure now places a chest with a
+  deterministic 4–6-roll loot table (bread/wheat/seeds/iron/coal/torch/string/
+  bone/apple/arrow), salted by seed+region+position; the server registers chests
+  when structure chunks stream or open, empty records persist (no refill), and
+  player-placed chests are never auto-filled.
+- Spawning: hostile cap 12, light ≤7, night surface or cave-depth rules, weights
+  zombie/spider/skeleton/creeper, deterministic; creative players untargetable.
+
+### Added — graphics polish
+- **Soft near/far seam**: 64-block shared-haze blend around the simulation
+  radius, matched palettes/lighting and larger-scale far colour variation; the
+  hard pale ring from 1.3 is gone.
+- **Water**: High/Ultra scene-depth copy for thickness-based tint/opacity,
+  shoreline foam, travelling waves, Fresnel sky reflection, two-lobe glints,
+  cascade shadows, and an underwater red-absorption/blue-veil grade.
+- **Atmosphere**: per-vertex height fog for far terrain, sun-aligned ground haze,
+  baked 128² cloud-density texture enabling Ultra cloud shadows, cheaper far
+  shading.
+- **SSAO**: depth-reconstructed normals, 6 rotated hemisphere taps, depth-aware
+  blur, sky-neutral, distance fade; quarter-res on High / half on Ultra.
+- Front-to-back sorted opaque list saves ~1.0–1.2 ms; Low/Medium are also faster.
+- Measured at 512-chunk view (native, High): 1080p 16.63 ms p50 / 59.7 FPS, 720p
+  11.79 ms / 84.7 FPS; Ultra 1080p 17.74 ms; Medium 13.88 ms, Low 9.60 ms. The
+  FSR path still works but remains slower on this iGPU.
+
+### Networking/protocol v4
+- `PROTOCOL_VERSION=4` in `ob_protocol` and `ob_core`; v1–v3 clients are rejected
+  with a clear upgrade message. New messages: C→S `interact_entity`; S→C
+  `xp_sync`, `interact_result`, `explosion`; attack results carry charge/
+  critical/cooldown; entity DTOs add projectile/variant/baby. Framing and
+  chunk/light/inventory messages are unchanged.
+- Client HUD: cooldown bar, aimed-mob name/health, feeding/birth toasts, XP bar
+  and level, new item icons, arrow entities, and avatars for new mobs/variants.
+
+### Verification
+- Full workspace tests, clippy `-D warnings`, fmt, rustdoc, architecture/docs
+  checks, twice-run smoke (`a1089b9a54af1eb1`), load gate and backup/restore are
+  green; CI covers Fedora 44/45, Ubuntu, Windows and macOS.
+- New v1.4.0 screenshots: day/dusk/fog/high-angle/water/underwater/SSAO views and
+  before/after seam comparisons; docs `docs/plan/1.4-mobs.md` and graphics
+  measurements in `docs/plan/08-measurements.md`.
+
+### Known limitations
+Creeper/explosion/XP particles and sounds plus real arrow/bow meshes are visual
+follow-ups; explosions delete blocks without drops; network critical hits are
+disabled pending server movement validation; mobs have line-of-sight chase but no
+pathfinding; no weather yet; crops pause in unloaded columns; server chunk memory
+still grows with exploration; far terrain is visual-only with a coarse horizon,
+and FSR1 remains spatial-only/slower on the reference iGPU.
+
 ## [1.3.0] — 2026-11-25 (Far Horizons: 512-chunk view + FSR)
 
 The reach release: the world is now visible **512 chunks (8,192 blocks)** away
 through visual-only far-terrain LOD, with optional FSR 1.0 upscaling. Simulation
 and full-detail streaming stay at the configured 2–32 chunk radius; save format
-4 and protocol 3 are unchanged.
+4 and protocol 4 are unchanged.
 
 ### Added — 512-chunk visual render distance
 - New `view_distance_chunks` setting (32..=512, default 128, up to **8,192
@@ -124,7 +200,7 @@ Protocol **v3** (36-slot inventory, light/sleep sync); save format 4 remains and
 - Server-authoritative `UseBlock` routing with rejection reasons for missing
   hoe/seeds, darkness, wrong time, obstruction, reach, support, sleep state.
 
-### Added — 36-slot inventory and protocol v3
+### Added — 36-slot inventory and protocol v4
 - 9 hotbar + 27 main + 4 armor slots (equipment now 36..40, windows 100+);
   inventory UI is four rows with Armor/Main/Hotbar labels in both single-player
   and network clients; click pick/place, Shift-click quick transfer, armor
@@ -138,7 +214,7 @@ Protocol **v3** (36-slot inventory, light/sleep sync); save format 4 remains and
 
 ### Verification
 - Workspace tests pass (client 289 lib + loopback, server 118 lib + 66
-  integration, content 42, world 62, render 174, protocol 35+, core 44, tools);
+  integration, content 42, world 62, render 174, protocol 45+, core 44, tools);
   clippy `-D warnings`, fmt, rustdoc, architecture/docs checks, smoke twice,
   load gate and backup/restore pass; CI covers Fedora 44/45, Ubuntu, Windows and
   macOS.
@@ -147,7 +223,7 @@ Protocol **v3** (36-slot inventory, light/sleep sync); save format 4 remains and
 - Seed-42 smoke hash (covers blocks/entities/crops/personal respawn; derived
   light is verified by world save/load and relight tests instead, since border
   propagation can legitimately settle differently across streaming reloads)
-  `ed80bbaf244bc31d`.
+  `a1089b9a54af1eb1`.
 
 ### Known limitations
 - No weather yet; sleep has no thunder window; crops freeze in unloaded
@@ -491,7 +567,7 @@ audio, a real front-end and measured performance/operations tooling.
 
 ### Measured
 - Test suite: 683 passed, 0 failed, 10 ignored across the workspace (client 186
-  lib + 13 loopback, server lib 89 + protocol 30 + world 35 + content 39 +
+  lib + 13 loopback, server lib 89 + protocol 40 + world 35 + content 39 +
   audio 36 + render/sim/tools suites; adversarial/robustness tests included).
   Ignored entries are intentional GPU screenshot probes, real-pack/measurement
   reports and the network-throughput probe.

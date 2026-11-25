@@ -21,7 +21,7 @@
 //! components, block loot tables and the data-driven item pipeline arrive in
 //! `docs/spec/11-inventory-crafting-items.md`.
 //!
-//! The 1.0 interim catalogue also carries a five-species mob table
+//! The interim catalogue also carries an eight-species mob table
 //! ([`MobKind`], [`MobSpec`]) and a melee `attack_damage` value on every tool;
 //! see [`Registry::mob`] and [`Registry::attack_damage`].
 
@@ -156,16 +156,25 @@ pub enum MobKind {
     Chicken,
     /// A hostile zombie.
     Zombie,
+    /// A fast hostile spider (1.3).
+    Spider,
+    /// A hostile skeleton archer (1.3).
+    Skeleton,
+    /// A hostile creeper that explodes (1.3).
+    Creeper,
 }
 
 impl MobKind {
     /// Every mob kind, in stable catalogue order.
-    pub const ALL: [MobKind; 5] = [
+    pub const ALL: [MobKind; 8] = [
         MobKind::Cow,
         MobKind::Pig,
         MobKind::Sheep,
         MobKind::Chicken,
         MobKind::Zombie,
+        MobKind::Spider,
+        MobKind::Skeleton,
+        MobKind::Creeper,
     ];
 
     /// Stable namespaced resource id, e.g. `openblock:cow`.
@@ -179,6 +188,9 @@ impl MobKind {
             Self::Sheep => "openblock:sheep",
             Self::Chicken => "openblock:chicken",
             Self::Zombie => "openblock:zombie",
+            Self::Spider => "openblock:spider",
+            Self::Skeleton => "openblock:skeleton",
+            Self::Creeper => "openblock:creeper",
         }
     }
 
@@ -190,7 +202,7 @@ impl MobKind {
         Self::ALL.into_iter().find(|kind| kind.name() == name)
     }
 
-    /// Stable catalogue index (`Cow == 0` .. `Zombie == 4`).
+    /// Stable catalogue index (`Cow == 0` .. `Creeper == 7`).
     ///
     /// [`Registry::mob`] indexes its spec table by this value.
     pub const fn index(self) -> usize {
@@ -200,8 +212,78 @@ impl MobKind {
             Self::Sheep => 2,
             Self::Chicken => 3,
             Self::Zombie => 4,
+            Self::Spider => 5,
+            Self::Skeleton => 6,
+            Self::Creeper => 7,
         }
     }
+}
+
+/// A projectile species carried on the wire and simulated by the host.
+///
+/// The 1.3 slice ships one `Arrow` kind. Namespaced names are stable save and
+/// protocol keys, exactly like mob names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProjectileKind {
+    /// A skeleton arrow with gravity and a block/player impact.
+    Arrow,
+}
+
+impl ProjectileKind {
+    /// Every projectile kind, in stable catalogue order.
+    pub const ALL: [ProjectileKind; 1] = [ProjectileKind::Arrow];
+
+    /// Stable namespaced resource id.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Arrow => "openblock:arrow",
+        }
+    }
+
+    /// Parses a namespaced projectile id.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+}
+
+/// How a hostile mob attacks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MobAttack {
+    /// No attack (every passive species).
+    None,
+    /// A melee attack with a server-side wind-up and cooldown.
+    Melee {
+        /// Damage before armor, in health points.
+        damage: f32,
+        /// Maximum centre-to-centre reach in metres.
+        range: f32,
+        /// Seconds between completed attacks.
+        cooldown: f64,
+        /// Seconds between entering range and the hit landing.
+        windup: f64,
+    },
+    /// A ranged attack that keeps a distance band and fires a projectile.
+    Ranged {
+        /// Damage before armor per projectile, in health points.
+        damage: f32,
+        /// Closer than this, the mob backs away, in metres.
+        min_range: f32,
+        /// Farther than this, the mob closes in, in metres.
+        max_range: f32,
+        /// Seconds between shots.
+        cooldown: f64,
+    },
+    /// A creeper-style fuse followed by a block/entity explosion.
+    Explosive {
+        /// Distance at which the fuse starts, in metres.
+        trigger_range: f32,
+        /// Fuse length in seconds.
+        fuse: f64,
+        /// Block/entity damage radius in metres.
+        radius: f32,
+        /// Damage at the centre before armor and falloff.
+        max_damage: f32,
+    },
 }
 
 /// Definition and deterministic drop table for one mob kind.
@@ -227,6 +309,18 @@ pub struct MobSpec {
     pub height: f32,
     /// Deterministic death drops as `(item, count)` pairs.
     pub drops: &'static [(ItemId, u8)],
+    /// Attack pattern and tuning.
+    pub attack: MobAttack,
+    /// Direct player XP awarded for a kill.
+    pub xp_reward: u32,
+    /// Whether the mob stays neutral in gameplay light `>= 9` (spider).
+    pub neutral_in_light: bool,
+    /// Whether the mob can step up one-block ledges (spider).
+    pub climbs: bool,
+    /// Whether direct daylight burns the mob (zombie/skeleton).
+    pub burns_in_daylight: bool,
+    /// Projectile fired by a ranged attack.
+    pub projectile: Option<ProjectileKind>,
 }
 
 impl MobSpec {
@@ -282,6 +376,171 @@ impl ItemType {
 /// Largest stack any base item declares. The server keeps this as a defensive
 /// cap so a malformed pack cannot request an unbounded stack.
 pub const MAX_ITEM_STACK: u8 = 64;
+
+/// One weighted entry in the structure-chest loot table.
+///
+/// The table is deliberately small and code-defined in 1.3: it is the
+/// foundation for the data-driven loot-table pipeline, not the final schema.
+/// Every item is an existing base item so a chest never depends on a new block
+/// or tool tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructureLootEntry {
+    /// Stable namespaced item id.
+    pub item: &'static str,
+    /// Minimum stack count when this entry is chosen.
+    pub min: u8,
+    /// Maximum stack count when this entry is chosen.
+    pub max: u8,
+    /// Relative lottery weight.
+    pub weight: u32,
+}
+
+/// Structure-chest loot pool shared by every 1.3 structure kind.
+///
+/// The server adds one bread/wheat/seed entry per roll plus a small chance at
+/// the rarer metal/torch/string/bone/arrow entries. The pool contains exactly
+/// one entry per item so a roll order cannot depend on hash-map iteration.
+pub const STRUCTURE_LOOT_TABLE: [StructureLootEntry; 10] = [
+    StructureLootEntry {
+        item: "openblock:bread",
+        min: 1,
+        max: 2,
+        weight: 3,
+    },
+    StructureLootEntry {
+        item: "openblock:wheat",
+        min: 1,
+        max: 3,
+        weight: 3,
+    },
+    StructureLootEntry {
+        item: "openblock:seeds",
+        min: 1,
+        max: 3,
+        weight: 2,
+    },
+    StructureLootEntry {
+        item: "openblock:iron_ingot",
+        min: 1,
+        max: 2,
+        weight: 2,
+    },
+    StructureLootEntry {
+        item: "openblock:coal",
+        min: 1,
+        max: 4,
+        weight: 3,
+    },
+    StructureLootEntry {
+        item: "openblock:torch",
+        min: 2,
+        max: 4,
+        weight: 2,
+    },
+    StructureLootEntry {
+        item: "openblock:string",
+        min: 1,
+        max: 2,
+        weight: 2,
+    },
+    StructureLootEntry {
+        item: "openblock:bone",
+        min: 1,
+        max: 2,
+        weight: 2,
+    },
+    StructureLootEntry {
+        item: "openblock:apple",
+        min: 1,
+        max: 2,
+        weight: 1,
+    },
+    StructureLootEntry {
+        item: "openblock:arrow",
+        min: 4,
+        max: 8,
+        weight: 2,
+    },
+];
+
+/// Number of loot rolls for one chest (`4..=6`, derived from the structure hash).
+pub const fn structure_loot_rolls(structure_hash: u64) -> u8 {
+    4 + (structure_hash % 3) as u8
+}
+
+/// One splitmix64 finaliser, duplicated locally so `ob_content` does not depend
+/// on the math crate for a single hash. Determinism is the contract, not the
+/// implementation.
+const fn loot_mix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut x = z;
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// Rolls the structure-chest loot for one chest.
+///
+/// `seed` is the world seed and `structure_hash` the worldgen region hash. The
+/// chest block position mixes in as well, so two chests in the same structure
+/// never share a roll sequence. The result is sorted by item id order (the
+/// table order), contains no empty stacks and depends on no RNG state.
+pub fn roll_structure_loot(
+    seed: u64,
+    structure_hash: u64,
+    chest: (i32, i32, i32),
+    rolls: u8,
+) -> Vec<(&'static str, u8)> {
+    let total_weight: u64 = STRUCTURE_LOOT_TABLE.iter().map(|entry| u64::from(entry.weight)).sum();
+    if total_weight == 0 {
+        return Vec::new();
+    }
+    let pos_hash = loot_mix64(
+        (chest.0 as i64 as u64)
+            ^ loot_mix64((chest.1 as i64 as u64).wrapping_mul(31))
+            ^ loot_mix64((chest.2 as i64 as u64).wrapping_mul(131)),
+    );
+    let base = loot_mix64(seed ^ structure_hash.rotate_left(23)) ^ pos_hash;
+    let mut out = Vec::with_capacity(usize::from(rolls));
+    for roll in 0..u64::from(rolls) {
+        let hash = loot_mix64(base ^ roll.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut pick = hash % total_weight;
+        let mut chosen = STRUCTURE_LOOT_TABLE[STRUCTURE_LOOT_TABLE.len() - 1];
+        for entry in STRUCTURE_LOOT_TABLE {
+            let weight = u64::from(entry.weight);
+            if pick < weight {
+                chosen = entry;
+                break;
+            }
+            pick -= weight;
+        }
+        let span = u64::from(chosen.max.saturating_sub(chosen.min)) + 1;
+        let count = chosen.min + ((hash >> 32) % span) as u8;
+        out.push((chosen.item, count.max(1)));
+    }
+    out.sort_by_key(|(item, _)| *item);
+    out
+}
+
+/// Resolves [`roll_structure_loot`] names against a registry.
+///
+/// Custom packs that omit an item simply drop that entry, matching the mob and
+/// recipe tables. The result is in ascending [`ItemId`] order so chest slots are
+/// stable across builds.
+pub fn structure_loot_stacks(
+    registry: &Registry,
+    seed: u64,
+    structure_hash: u64,
+    chest: (i32, i32, i32),
+    rolls: u8,
+) -> Vec<(ItemId, u8)> {
+    let mut stacks: Vec<(ItemId, u8)> = roll_structure_loot(seed, structure_hash, chest, rolls)
+        .into_iter()
+        .filter_map(|(name, count)| registry.item_id(name).map(|item| (item, count)))
+        .collect();
+    stacks.sort_by_key(|(item, _)| *item);
+    stacks
+}
 
 /// Index into the block texture array.
 ///
@@ -1030,6 +1289,41 @@ const LIGHT_ITEMS: [NewItemDef; 6] = [
     },
 ];
 
+/// 1.3 "Weather & Danger" items, appended after the 1.2 catalogue.
+///
+/// Ids are stable: bone, string, gunpowder then arrow. The arrow is craftable
+/// from one stick and one string; flint/feathers are out of scope for 1.3.
+const DANGER_ITEMS: [NewItemDef; 4] = [
+    NewItemDef {
+        id: "openblock:bone",
+        max_stack: 64,
+        food: None,
+        tool: None,
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:string",
+        max_stack: 64,
+        food: None,
+        tool: None,
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:gunpowder",
+        max_stack: 64,
+        food: None,
+        tool: None,
+        armor: None,
+    },
+    NewItemDef {
+        id: "openblock:arrow",
+        max_stack: 64,
+        food: None,
+        tool: None,
+        armor: None,
+    },
+];
+
 /// One name-resolved mob definition used to build [`Registry::base`].
 ///
 /// Stats are copied verbatim into [`MobSpec`]; drop item names are resolved
@@ -1043,14 +1337,22 @@ struct MobDef {
     width: f32,
     height: f32,
     drops: &'static [(&'static str, u8)],
+    attack: MobAttack,
+    xp_reward: u32,
+    neutral_in_light: bool,
+    climbs: bool,
+    burns_in_daylight: bool,
+    projectile: Option<ProjectileKind>,
 }
 
-/// The interim 1.0 mob catalogue, in stable [`MobKind`] order.
+/// The 1.3 mob catalogue, in stable [`MobKind`] order (1.0 kinds keep their
+/// indices; spider/skeleton/creeper append).
 ///
-/// Passive animals drop their food plus leather; zombies deliberately drop
-/// nothing (they are the hostile combat target, not a resource). Counts are
-/// fixed rather than rolled: a kill always produces exactly this list.
-const MOB_DEFS: [MobDef; 5] = [
+/// Counts are fixed rather than rolled: a kill always produces exactly this
+/// list. A skeleton drops one bone and one arrow; a creeper drops one gunpowder;
+/// a spider drops one string. No passive mob drops XP more than once, and a
+/// baby never drops anything (enforced by the host).
+const MOB_DEFS: [MobDef; 8] = [
     MobDef {
         kind: MobKind::Cow,
         display_name: "Cow",
@@ -1060,6 +1362,12 @@ const MOB_DEFS: [MobDef; 5] = [
         width: 0.9,
         height: 1.3,
         drops: &[("openblock:raw_beef", 1), ("openblock:leather", 1)],
+        attack: MobAttack::None,
+        xp_reward: 1,
+        neutral_in_light: false,
+        climbs: false,
+        burns_in_daylight: false,
+        projectile: None,
     },
     MobDef {
         kind: MobKind::Pig,
@@ -1070,6 +1378,12 @@ const MOB_DEFS: [MobDef; 5] = [
         width: 0.9,
         height: 0.9,
         drops: &[("openblock:raw_porkchop", 1)],
+        attack: MobAttack::None,
+        xp_reward: 1,
+        neutral_in_light: false,
+        climbs: false,
+        burns_in_daylight: false,
+        projectile: None,
     },
     MobDef {
         kind: MobKind::Sheep,
@@ -1080,6 +1394,12 @@ const MOB_DEFS: [MobDef; 5] = [
         width: 0.9,
         height: 1.3,
         drops: &[("openblock:leather", 1)],
+        attack: MobAttack::None,
+        xp_reward: 1,
+        neutral_in_light: false,
+        climbs: false,
+        burns_in_daylight: false,
+        projectile: None,
     },
     MobDef {
         kind: MobKind::Chicken,
@@ -1090,6 +1410,12 @@ const MOB_DEFS: [MobDef; 5] = [
         width: 0.4,
         height: 0.7,
         drops: &[],
+        attack: MobAttack::None,
+        xp_reward: 1,
+        neutral_in_light: false,
+        climbs: false,
+        burns_in_daylight: false,
+        projectile: None,
     },
     MobDef {
         kind: MobKind::Zombie,
@@ -1100,6 +1426,80 @@ const MOB_DEFS: [MobDef; 5] = [
         width: 0.6,
         height: 1.8,
         drops: &[],
+        attack: MobAttack::Melee {
+            damage: 3.0,
+            range: 1.6,
+            cooldown: 1.0,
+            windup: 0.5,
+        },
+        xp_reward: 3,
+        neutral_in_light: false,
+        climbs: false,
+        burns_in_daylight: true,
+        projectile: None,
+    },
+    MobDef {
+        kind: MobKind::Spider,
+        display_name: "Spider",
+        health: 16.0,
+        speed: 4.0,
+        hostile: true,
+        width: 1.0,
+        height: 0.9,
+        drops: &[("openblock:string", 1)],
+        attack: MobAttack::Melee {
+            damage: 2.0,
+            range: 1.7,
+            cooldown: 1.0,
+            windup: 0.4,
+        },
+        xp_reward: 5,
+        neutral_in_light: true,
+        climbs: true,
+        burns_in_daylight: false,
+        projectile: None,
+    },
+    MobDef {
+        kind: MobKind::Skeleton,
+        display_name: "Skeleton",
+        health: 20.0,
+        speed: 3.5,
+        hostile: true,
+        width: 0.6,
+        height: 1.8,
+        drops: &[("openblock:bone", 1), ("openblock:arrow", 1)],
+        attack: MobAttack::Ranged {
+            damage: 3.0,
+            min_range: 6.0,
+            max_range: 12.0,
+            cooldown: 2.0,
+        },
+        xp_reward: 5,
+        neutral_in_light: false,
+        climbs: false,
+        burns_in_daylight: true,
+        projectile: Some(ProjectileKind::Arrow),
+    },
+    MobDef {
+        kind: MobKind::Creeper,
+        display_name: "Creeper",
+        health: 20.0,
+        speed: 3.0,
+        hostile: true,
+        width: 0.6,
+        height: 1.8,
+        drops: &[("openblock:gunpowder", 1)],
+        attack: MobAttack::Explosive {
+            trigger_range: 3.0,
+            fuse: 1.5,
+            radius: 3.5,
+            max_damage: 12.0,
+        },
+        xp_reward: 5,
+        neutral_in_light: false,
+        climbs: false,
+        burns_in_daylight: false,
+        projectile: None,
     },
 ];
 
@@ -1169,7 +1569,7 @@ struct RecipeDef {
     needs_table: bool,
 }
 
-const BASE_RECIPES: [RecipeDef; 30] = [
+const BASE_RECIPES: [RecipeDef; 31] = [
     RecipeDef {
         id: "openblock:planks",
         name: "Planks",
@@ -1380,6 +1780,14 @@ const BASE_RECIPES: [RecipeDef; 30] = [
         output: ("openblock:iron_hoe", 1),
         ingredients: &[("openblock:iron_ingot", 2), ("openblock:stick", 2)],
         needs_table: true,
+    },
+    // 1.3 "Weather & Danger" recipe, append-only.
+    RecipeDef {
+        id: "openblock:arrow",
+        name: "Arrows",
+        output: ("openblock:arrow", 4),
+        ingredients: &[("openblock:stick", 1), ("openblock:string", 1)],
+        needs_table: false,
     },
 ];
 
@@ -1892,7 +2300,7 @@ impl Registry {
             });
         }
 
-        let capacity = blocks.len() + NON_BLOCK_ITEMS.len() + NEW_ITEMS.len() + LIGHT_ITEMS.len();
+        let capacity = blocks.len() + NON_BLOCK_ITEMS.len() + NEW_ITEMS.len() + LIGHT_ITEMS.len() + DANGER_ITEMS.len();
         let mut items: Vec<ItemType> = Vec::with_capacity(capacity);
         let mut item_by_id = FxHashMap::default();
         let mut item_for_block = vec![None; blocks.len()];
@@ -1966,6 +2374,19 @@ impl Registry {
         // 1.2 non-block items append after every block item, so the existing
         // item ids 0..=60 cannot move when blocks are appended later.
         for def in LIGHT_ITEMS {
+            add_item(
+                &mut items,
+                &mut item_by_id,
+                def.id,
+                def.food,
+                def.tool,
+                def.armor,
+                def.max_stack,
+            );
+        }
+
+        // 1.3 "Weather & Danger" items append after the 1.2 catalogue.
+        for def in DANGER_ITEMS {
             add_item(
                 &mut items,
                 &mut item_by_id,
@@ -2059,6 +2480,12 @@ impl Registry {
                 width: def.width,
                 height: def.height,
                 drops: leaked,
+                attack: def.attack,
+                xp_reward: def.xp_reward,
+                neutral_in_light: def.neutral_in_light,
+                climbs: def.climbs,
+                burns_in_daylight: def.burns_in_daylight,
+                projectile: def.projectile,
             });
         }
         debug_assert_eq!(mobs.len(), MobKind::ALL.len());
@@ -2590,7 +3017,7 @@ mod tests {
         // v0.0.7/v0.0.8 item ids are frozen: eleven block items, the apple,
         // three block items, then the stick and eight tools. v0.0.9 appends 23
         // non-block items at 24..=46 and five block items at 47..=51.
-        assert_eq!(reg.item_len(), 67);
+        assert_eq!(reg.item_len(), 71);
         assert_eq!(reg.item_id("openblock:stone"), Some(ItemId(0)));
         assert_eq!(reg.item_id("openblock:dirt"), Some(ItemId(1)));
         assert_eq!(reg.item_id("openblock:grass"), Some(ItemId(2)));
@@ -2636,6 +3063,11 @@ mod tests {
         assert_eq!(reg.item_id("openblock:wood_hoe"), Some(ItemId(64)));
         assert_eq!(reg.item_id("openblock:stone_hoe"), Some(ItemId(65)));
         assert_eq!(reg.item_id("openblock:iron_hoe"), Some(ItemId(66)));
+        // 1.3: four non-block items append after the 1.2 catalogue.
+        assert_eq!(reg.item_id("openblock:bone"), Some(ItemId(67)));
+        assert_eq!(reg.item_id("openblock:string"), Some(ItemId(68)));
+        assert_eq!(reg.item_id("openblock:gunpowder"), Some(ItemId(69)));
+        assert_eq!(reg.item_id("openblock:arrow"), Some(ItemId(70)));
 
         // The v0.0.9 non-block item ids 24..=46 are frozen in this exact order.
         let appended = [
@@ -2945,7 +3377,7 @@ mod tests {
     #[test]
     fn recipe_table_is_stable_and_complete() {
         let reg = Registry::base();
-        assert_eq!(reg.recipe_len(), 30);
+        assert_eq!(reg.recipe_len(), 31);
         let expected = [
             "openblock:planks",
             "openblock:sticks",
@@ -2977,6 +3409,7 @@ mod tests {
             "openblock:wood_hoe",
             "openblock:stone_hoe",
             "openblock:iron_hoe",
+            "openblock:arrow",
         ];
         for (index, id) in expected.iter().enumerate() {
             let recipe_id = reg.recipe_id(id).expect("base recipe exists");
@@ -3022,6 +3455,16 @@ mod tests {
             ]
         );
         assert!(wood_pick.needs_table);
+        let arrow = recipe("openblock:arrow");
+        assert_eq!(arrow.output, (name_id(&reg, "openblock:arrow"), 4));
+        assert_eq!(
+            arrow.ingredients,
+            &[
+                (name_id(&reg, "openblock:stick"), 1),
+                (name_id(&reg, "openblock:string"), 1)
+            ]
+        );
+        assert!(!arrow.needs_table);
         let stone_sword = recipe("openblock:stone_sword");
         assert_eq!(
             stone_sword.ingredients,
@@ -3176,7 +3619,7 @@ mod tests {
     #[test]
     fn mob_ids_and_kinds_are_stable_and_unique() {
         let reg = Registry::base();
-        assert_eq!(reg.mob_len(), 5);
+        assert_eq!(reg.mob_len(), 8);
         assert_eq!(MobKind::ALL.len(), reg.mobs().count());
         let mut names = std::collections::HashSet::new();
         for (index, kind) in MobKind::ALL.into_iter().enumerate() {
@@ -3208,6 +3651,9 @@ mod tests {
             (MobKind::Sheep, "Sheep", 8.0, 1.4, false, 0.9, 1.3),
             (MobKind::Chicken, "Chicken", 4.0, 1.5, false, 0.4, 0.7),
             (MobKind::Zombie, "Zombie", 20.0, 2.2, true, 0.6, 1.8),
+            (MobKind::Spider, "Spider", 16.0, 4.0, true, 1.0, 0.9),
+            (MobKind::Skeleton, "Skeleton", 20.0, 3.5, true, 0.6, 1.8),
+            (MobKind::Creeper, "Creeper", 20.0, 3.0, true, 0.6, 1.8),
         ];
         for (kind, display_name, health, speed, hostile, width, height) in expected {
             let spec = reg.mob(kind);
@@ -3221,14 +3667,26 @@ mod tests {
             assert!(spec.health > 0.0 && spec.speed > 0.0);
             assert!(spec.width > 0.0 && spec.height > 0.0);
         }
-        for spec in reg.mobs().filter(|spec| spec.hostile) {
-            assert_eq!(spec.kind, MobKind::Zombie);
-        }
         assert_eq!(
             reg.mobs().filter(|spec| spec.hostile).count(),
-            1,
-            "only the zombie is hostile in this slice"
+            4,
+            "zombie, spider, skeleton and creeper are hostile in 1.3"
         );
+        assert!(matches!(
+            reg.mob(MobKind::Zombie).attack,
+            crate::MobAttack::Melee { .. }
+        ));
+        assert!(matches!(
+            reg.mob(MobKind::Skeleton).attack,
+            crate::MobAttack::Ranged { .. }
+        ));
+        assert!(matches!(
+            reg.mob(MobKind::Creeper).attack,
+            crate::MobAttack::Explosive { .. }
+        ));
+        assert!(reg.mob(MobKind::Spider).neutral_in_light);
+        assert!(reg.mob(MobKind::Spider).climbs);
+        assert!(reg.mob(MobKind::Skeleton).burns_in_daylight);
     }
 
     #[test]
@@ -3243,12 +3701,41 @@ mod tests {
         assert_eq!(reg.mob(MobKind::Sheep).drops, &[(item("openblock:leather"), 1)]);
         assert!(reg.mob(MobKind::Chicken).drops.is_empty());
         assert!(reg.mob(MobKind::Zombie).drops.is_empty());
+        assert_eq!(reg.mob(MobKind::Spider).drops, &[(item("openblock:string"), 1)]);
+        assert_eq!(
+            reg.mob(MobKind::Skeleton).drops,
+            &[(item("openblock:bone"), 1), (item("openblock:arrow"), 1)]
+        );
+        assert_eq!(reg.mob(MobKind::Creeper).drops, &[(item("openblock:gunpowder"), 1)]);
         for spec in reg.mobs() {
             for &(drop, count) in spec.drops {
                 assert!(count > 0, "{:?} has a zero-count drop", spec.kind);
                 assert!((drop.0 as usize) < reg.item_len(), "{:?} drop is invalid", spec.kind);
                 assert!(!reg.item(drop).id.is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn structure_loot_is_deterministic_and_resolves() {
+        let reg = Registry::base();
+        let first = structure_loot_stacks(&reg, 42, 0x1234_5678_9ABC_DEF0, (10, 64, -3), 5);
+        let second = structure_loot_stacks(&reg, 42, 0x1234_5678_9ABC_DEF0, (10, 64, -3), 5);
+        assert_eq!(first, second);
+        assert!(!first.is_empty());
+        assert!(first.len() <= 5);
+        assert!(
+            first
+                .iter()
+                .all(|(item, count)| *count > 0 && (item.0 as usize) < reg.item_len())
+        );
+        let other = structure_loot_stacks(&reg, 42, 0x1234_5678_9ABC_DEF0, (11, 64, -3), 5);
+        assert_ne!(first, other, "chest position must salt the roll");
+        let seed_changed = structure_loot_stacks(&reg, 43, 0x1234_5678_9ABC_DEF0, (10, 64, -3), 5);
+        assert_ne!(first, seed_changed, "world seed must salt the roll");
+        for (name, count) in roll_structure_loot(42, 0x1234_5678_9ABC_DEF0, (10, 64, -3), 5) {
+            assert!(reg.item_id(name).is_some(), "{name}");
+            assert!(count > 0);
         }
     }
 

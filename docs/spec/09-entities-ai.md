@@ -658,3 +658,59 @@ line-of-sight checks for attacks, step-up, lava/fire damage, mob-to-mob
 collision, mob merging/despawning rules tied to daylight (beyond zombie burn),
 network replication and client prediction. The interim state hash and save
 format are not the normative entity record of §4.2.
+
+## Appendix B — 1.3/1.4 danger-slice entity implementation (2026-11-25)
+
+This appendix records the shipped interim behaviour; §3 remains the normative
+long-term design.
+
+### B.1 Catalogue and AI
+
+`MobKind::ALL` appends `Spider`, `Skeleton` and `Creeper` after the 1.0 five.
+`MobSpec` gains `attack: MobAttack`, `xp_reward`, `neutral_in_light`, `climbs`,
+`burns_in_daylight` and `projectile`. `Mob` gains `variant`, `love_timer`,
+`breed_cooldown`, `growth_timer`, `fuse_timer`, `windup_timer`, `leap_cooldown`
+and `persistent`.
+
+- Passive animals use the 1.0 idle/wander/flee brain and cliff probe.
+- Melee hostiles chase within 16 m, stop just inside reach, and use a wind-up
+  (`zombie 0.5 s`, `spider 0.4 s`) followed by a reach + line-of-sight check and
+  a 1.0 s cooldown. A broken line of sight cancels the wind-up.
+- Spiders are neutral at gameplay light `>= 9` unless hurt; they leap at players
+  2–6 m away (6 m/s up, 1.5× speed, 2 s cooldown) and climb one-block steps by
+  raising the AABB 1.001 m and retrying the horizontal sweep (revert on
+  collision). They do not burn.
+- Skeletons keep a 6–12 m band, require line of sight, and fire a ballistic
+  arrow every 2.0 s. Aim solves `t = horizontal/20`,
+  `vy = dy/t + ½·28·t`, so gravity is compensated. They burn in daylight.
+- Creepers chase to 3 m, start a 1.5 s fuse, reset it when the player escapes,
+  and emit one explosion event (radius 3.5 m, ≤12 HP falloff). They do not burn.
+- Daylight burn applies only to species with `burns_in_daylight` (zombie,
+  skeleton), one HP/s when sky-exposed. Burn deaths drop normal loot with no XP.
+- Melee wind-up, ranged cooldown, fuse, leap and breeding timers are transient;
+  AI restarts idle after reload. Determinism uses `mix64` of kind/position/age
+  and purpose salts; there is no mutable RNG state.
+
+### B.2 Projectiles
+
+`ob_sim::Projectile`/`step_projectile` implement arrows: gravity 28 m/s²,
+speed 20 m/s, 4 s lifetime and a ≤0.4 m substep raycast. `ProjectileEvents`
+reports a block hit/despawn; the host resolves player AABB hits because only it
+knows targetability. The server keeps `ProjectileEntity { id, projectile,
+target_player }`; arrows are replicated as `EntityKind::Projectile` and rendered
+as two small cubes in both client paths. Arrows are transient and not persisted;
+a server restart clears them.
+
+### B.3 Breeding, growth and persistence
+
+Feed mapping is wheat → cow/sheep/pig, seeds → chicken. Love lasts 30 s, parent
+cooldown 30 s, pair radius 8 m and gestation 60 ticks; pairing awards 1–7 XP and
+schedules a birth at the midpoint. Babies are 0.5× scale, inherit one parent's
+variant, grow for 300 s, cannot breed and never drop loot. Bred parents and
+babies are `persistent` and skip age/distance despawn (void still applies); wild
+mobs keep the 1.0 rules. The global passive cap (10) and a 6-per-24 m local cap
+refuse births.
+
+`mobs.txt` rows append `variant love cooldown growth persistent` to the 1.0
+`id kind x y z yaw health age`; 8-field rows load with neutral defaults.
+`MobEntity` replication carries `variant` and `baby` in spawn/state DTOs.

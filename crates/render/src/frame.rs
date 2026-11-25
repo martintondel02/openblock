@@ -35,6 +35,7 @@ use std::collections::HashMap;
 
 use ob_math::SectionPos;
 
+use crate::cloud_shadow::CloudNoise;
 use crate::entities::{EntitiesRenderer, EntityInstance};
 use crate::far_terrain::{self, FarTerrainMesh, GpuFarTerrain};
 use crate::frustum::{aabb_visible, aabb_within_distance, section_visible};
@@ -43,6 +44,7 @@ use crate::graphics::{GraphicsSettings, ShadowConfig};
 use crate::lod::LodBatchKey;
 use crate::pipeline;
 use crate::shadow::{MAX_SHADOW_CASCADES, ShadowCascades};
+use crate::ssao::{self, SsaoPipelines, SsaoResources, SsaoUniform};
 use crate::textures::BlockTextureArray;
 use crate::{BlockOutline, Camera, MeshData, OUTLINE_VERTEX_COUNT, RenderError, RenderStats, SceneParams, Vertex};
 
@@ -230,13 +232,22 @@ impl ShadowTargets {
     }
 }
 
-/// HDR colour, depth and bloom targets plus all size-dependent bind groups.
+/// HDR colour, depth, depth copy and bloom targets plus all size-dependent
+/// bind groups.
 struct Targets {
     width: u32,
     height: u32,
     _hdr_texture: wgpu::Texture,
     hdr_view: wgpu::TextureView,
+    /// Scene depth, attached to the world/sky/water passes.
+    depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
+    /// Depth-only copy sampled by depth-responsive water. Kept at render size
+    /// and refreshed before the water pass when `WaterQuality::High` is active;
+    /// with the cheaper water path the copy is stale/cleared and the shader
+    /// branches away from it.
+    _depth_copy_texture: wgpu::Texture,
+    depth_copy_view: wgpu::TextureView,
     _bloom_texture: wgpu::Texture,
     bloom_views: [wgpu::TextureView; pipeline::BLOOM_MIPS],
     post_bind_group: wgpu::BindGroup,
@@ -258,6 +269,7 @@ impl Targets {
         post_sampler: &wgpu::Sampler,
         post_layout: &wgpu::BindGroupLayout,
         bloom_layout: &wgpu::BindGroupLayout,
+        ao_view: &wgpu::TextureView,
     ) -> Self {
         let width = width.max(1);
         let height = height.max(1);
@@ -279,7 +291,29 @@ impl Targets {
             label: Some("hdr-scene-view"),
             ..Default::default()
         });
-        let depth_view = pipeline::create_depth_view(device, width, height);
+        let depth_texture = pipeline::create_depth_texture(device, width, height);
+        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("depth-view"),
+            ..Default::default()
+        });
+        let depth_copy_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene-depth-copy"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: pipeline::DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let depth_copy_view = depth_copy_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("scene-depth-copy-view"),
+            ..Default::default()
+        });
         let bloom_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("bloom-chain"),
             size: wgpu::Extent3d {
@@ -304,8 +338,15 @@ impl Targets {
                 ..Default::default()
             })
         });
-        let post_bind_group =
-            pipeline::create_post_bind_group(device, post_layout, post_buffer, &hdr_view, &bloom_views, post_sampler);
+        let post_bind_group = pipeline::create_post_bind_group(
+            device,
+            post_layout,
+            post_buffer,
+            &hdr_view,
+            &bloom_views,
+            ao_view,
+            post_sampler,
+        );
         let bloom_bind_groups = std::array::from_fn(|level| {
             let source = if level == 0 { &hdr_view } else { &bloom_views[level - 1] };
             pipeline::create_bloom_bind_group(device, bloom_layout, post_buffer, source, post_sampler)
@@ -315,7 +356,10 @@ impl Targets {
             height,
             _hdr_texture: hdr_texture,
             hdr_view,
+            depth_texture,
             depth_view,
+            _depth_copy_texture: depth_copy_texture,
+            depth_copy_view,
             _bloom_texture: bloom_texture,
             bloom_views,
             post_bind_group,
@@ -610,6 +654,19 @@ enum WaterKey {
     Section(SectionPos),
 }
 
+/// One visible opaque draw in the main pass.
+///
+/// Sections and far LOD batches share the chunk pipeline; merging them into one
+/// front-to-back list lets the depth test reject the terrain (and the leaf
+/// cut-outs) hidden behind nearer geometry before their fragment shaders run.
+/// The distance is squared so sorting needs no square roots; the tie-break by
+/// key keeps submission deterministic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum OpaqueKey {
+    Section(SectionPos),
+    Batch(LodBatchKey),
+}
+
 /// The shared scene renderer.
 pub(crate) struct SceneRenderer {
     pub(crate) graphics: GraphicsSettings,
@@ -638,6 +695,20 @@ pub(crate) struct SceneRenderer {
     bloom_threshold_pipeline: wgpu::RenderPipeline,
     bloom_down_pipeline: wgpu::RenderPipeline,
     post_sampler: wgpu::Sampler,
+    /// Two SSAO pipelines and their layouts; created once at start-up even on
+    /// Low/Medium so enabling the high tiers never compiles a shader mid-run.
+    ssao_pipelines: SsaoPipelines,
+    /// Per-frame SSAO parameters (projection terms and target sizes).
+    ssao_uniform: wgpu::Buffer,
+    /// Half-resolution AO targets and bind groups, present only when the
+    /// quality gate is open.
+    ssao: Option<SsaoResources>,
+    /// 1×1 white fallback sampled by the post pass when SSAO is disabled, so
+    /// the post shader has one variant for every preset.
+    _ao_fallback_texture: wgpu::Texture,
+    ao_fallback_view: wgpu::TextureView,
+    /// Baked tiling cloud density for the terrain/water cloud shadows.
+    cloud_noise: CloudNoise,
     targets: Targets,
     /// Display (surface/offscreen texture) size. The camera aspect, shadow fit
     /// and UI use this size even when the scene targets are smaller.
@@ -677,6 +748,43 @@ impl SceneRenderer {
         let post_layout = pipeline::create_post_bind_group_layout(device);
         let bloom_layout = pipeline::create_bloom_bind_group_layout(device);
         let post_sampler = pipeline::create_post_sampler(device);
+        let cloud_noise = CloudNoise::new(device, queue);
+        let ssao_pipelines = ssao::create_pipelines(device);
+        let ssao_uniform = ssao::create_uniform_buffer(device);
+        let ao_fallback_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ao-fallback-white"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: ssao::SSAO_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &ao_fallback_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255u8],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(1),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let ao_fallback_view = ao_fallback_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let display_width = width.max(1);
         let display_height = height.max(1);
         // Create the upscaler (if requested) before the targets so the native
@@ -701,6 +809,7 @@ impl SceneRenderer {
             &post_sampler,
             &post_layout,
             &bloom_layout,
+            &ao_fallback_view,
         );
         let bind_group_layout = pipeline::create_bind_group_layout(device);
         let shadow_bind_group_layout = pipeline::create_shadow_bind_group_layout(device);
@@ -712,6 +821,9 @@ impl SceneRenderer {
             &textures,
             &targets.shadow.view,
             &shadow_sampler,
+            &targets.depth_copy_view,
+            &cloud_noise.view,
+            &cloud_noise.sampler,
         );
         let shadow_cascade_buffers = std::array::from_fn(|index| pipeline::create_shadow_cascade_buffer(device, index));
         let shadow_bind_groups = std::array::from_fn(|index| {
@@ -752,7 +864,7 @@ impl SceneRenderer {
             &bind_group_layout,
             &shadow_bind_group_layout,
         );
-        Ok(Self {
+        let mut renderer = Self {
             graphics,
             textures,
             camera_buffer,
@@ -779,6 +891,12 @@ impl SceneRenderer {
             bloom_threshold_pipeline,
             bloom_down_pipeline,
             post_sampler,
+            ssao_pipelines,
+            ssao_uniform,
+            ssao: None,
+            _ao_fallback_texture: ao_fallback_texture,
+            ao_fallback_view,
+            cloud_noise,
             targets,
             display_width,
             display_height,
@@ -790,7 +908,9 @@ impl SceneRenderer {
             lod_batches: HashMap::new(),
             far_terrain: None,
             stats: RenderStats::default(),
-        })
+        };
+        renderer.rebuild_ssao(device);
+        Ok(renderer)
     }
 
     /// Current **render** size (the scene targets and post pass resolution).
@@ -799,6 +919,45 @@ impl SceneRenderer {
     /// active. Use the surface/UI size for camera aspect, shadows and UI.
     pub(crate) fn size(&self) -> (u32, u32) {
         (self.targets.width, self.targets.height)
+    }
+
+    /// View of the blurred AO target, or the white fallback when SSAO is off.
+    fn ao_view(&self) -> &wgpu::TextureView {
+        self.ssao
+            .as_ref()
+            .map_or(&self.ao_fallback_view, |ssao| &ssao.blur_view)
+    }
+
+    /// (Re)allocates the SSAO targets for the current render size and quality
+    /// gate, then rebuilds the post bind group that samples them.
+    ///
+    /// Called at start-up, after every resize and after a quality change that
+    /// opens or closes the gate. It never creates a pipeline or sampler.
+    fn rebuild_ssao(&mut self, device: &wgpu::Device) {
+        let (width, height) = self.size();
+        self.ssao = if self.graphics.ssao_enabled() {
+            Some(SsaoResources::new(
+                device,
+                &self.ssao_pipelines,
+                &self.ssao_uniform,
+                &self.targets.depth_copy_view,
+                width,
+                height,
+                self.graphics.ssao_resolution_divisor(),
+            ))
+        } else {
+            None
+        };
+        let ao_view = self.ao_view().clone();
+        self.targets.post_bind_group = pipeline::create_post_bind_group(
+            device,
+            &self.post_layout,
+            &self.post_buffer,
+            &self.targets.hdr_view,
+            &self.targets.bloom_views,
+            &ao_view,
+            &self.post_sampler,
+        );
     }
 
     /// Whether the FSR EASU+RCAS pass is active.
@@ -842,6 +1001,9 @@ impl SceneRenderer {
             &self.textures,
             &self.targets.shadow.view,
             &self.shadow_sampler,
+            &self.targets.depth_copy_view,
+            &self.cloud_noise.view,
+            &self.cloud_noise.sampler,
         );
         self.shadow_bind_groups = std::array::from_fn(|index| {
             pipeline::create_shadow_bind_group(
@@ -882,6 +1044,7 @@ impl SceneRenderer {
         // bind groups. The shadow map is sized independently of the output and
         // is reallocated too; resizes are rare and correctness is worth the
         // simpler ownership.
+        let ao_view = self.ao_view().clone();
         self.targets = Targets::new(
             device,
             render_width,
@@ -891,8 +1054,10 @@ impl SceneRenderer {
             &self.post_sampler,
             &self.post_layout,
             &self.bloom_layout,
+            &ao_view,
         );
         self.rebuild_scene_bind_groups(device);
+        self.rebuild_ssao(device);
     }
 
     /// Rebuilds the FSR setup after a quality change.
@@ -938,6 +1103,7 @@ impl SceneRenderer {
         if (render_width, render_height) == (self.targets.width, self.targets.height) {
             return false;
         }
+        let ao_view = self.ao_view().clone();
         self.targets = Targets::new(
             device,
             render_width,
@@ -947,6 +1113,7 @@ impl SceneRenderer {
             &self.post_sampler,
             &self.post_layout,
             &self.bloom_layout,
+            &ao_view,
         );
         self.rebuild_scene_bind_groups(device);
         true
@@ -962,6 +1129,7 @@ impl SceneRenderer {
             return;
         }
         let previous_shadow = self.graphics.shadow_config();
+        let previous_ssao = self.graphics.ssao_enabled();
         let fsr_changed = self.graphics.fsr_quality != graphics.fsr_quality;
         self.graphics = graphics;
         let reallocated = if fsr_changed {
@@ -969,6 +1137,11 @@ impl SceneRenderer {
         } else {
             false
         };
+        // Opening or closing the SSAO gate reallocates the half-resolution AO
+        // targets and rebuilds the post bind group. Pipelines stay untouched.
+        if reallocated || previous_ssao != self.graphics.ssao_enabled() {
+            self.rebuild_ssao(device);
+        }
         let next_shadow = self.graphics.shadow_config();
         if !reallocated && previous_shadow != next_shadow {
             self.targets.shadow = ShadowTargets::new(device, next_shadow);
@@ -979,6 +1152,9 @@ impl SceneRenderer {
                 &self.textures,
                 &self.targets.shadow.view,
                 &self.shadow_sampler,
+                &self.targets.depth_copy_view,
+                &self.cloud_noise.view,
+                &self.cloud_noise.sampler,
             );
         }
     }
@@ -1001,6 +1177,9 @@ impl SceneRenderer {
             &textures,
             &self.targets.shadow.view,
             &self.shadow_sampler,
+            &self.targets.depth_copy_view,
+            &self.cloud_noise.view,
+            &self.cloud_noise.sampler,
         );
         self.shadow_bind_groups = std::array::from_fn(|index| {
             pipeline::create_shadow_bind_group(
@@ -1190,6 +1369,123 @@ impl SceneRenderer {
         Some((min, max, written))
     }
 
+    /// Whether the camera sits in a water column this frame.
+    ///
+    /// The renderer has no fluid query, so this is a geometric test: the eye
+    /// must be below the top of a water mesh's bounds and inside its XZ extent,
+    /// and at most 64 blocks below that surface. A dry cave under land is
+    /// therefore not tinted, while an ocean, lake or flooded cave with a water
+    /// surface above the eye is. The post pass uses the result for its cheap
+    /// underwater grade.
+    fn is_underwater(&self, eye: [f32; 3]) -> bool {
+        let submerged = |min: [f32; 3], max: [f32; 3]| {
+            eye[0] >= min[0] - 1.0
+                && eye[0] <= max[0] + 1.0
+                && eye[2] >= min[2] - 1.0
+                && eye[2] <= max[2] + 1.0
+                && eye[1] < max[1] - 0.01
+                && max[1] - eye[1] < 64.0
+        };
+        self.meshes
+            .values()
+            .any(|mesh| mesh.water_vertex_count > 0 && submerged(mesh.min, mesh.max))
+            || self
+                .lod_batches
+                .values()
+                .any(|batch| batch.water_vertex_count > 0 && submerged(batch.min, batch.max))
+    }
+
+    /// Debug helper: `(min depth, max depth, pixels written)` for the scene
+    /// depth target. Used by the SSAO tests to distinguish "AO is neutral"
+    /// from "the depth the AO pass samples is empty".
+    #[cfg(test)]
+    pub(crate) fn debug_scene_depth(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> (f32, f32, usize) {
+        let width = self.targets.width;
+        let height = self.targets.height;
+        let bytes_per_row =
+            (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("scene-depth-readback"),
+            size: u64::from(bytes_per_row) * u64::from(height),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("scene-depth-debug"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.targets.depth_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::DepthOnly,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        let slice = buffer.slice(..);
+        let mapped: std::sync::Arc<std::sync::Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        {
+            let mapped = std::sync::Arc::clone(&mapped);
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                if let Ok(mut slot) = mapped.lock() {
+                    *slot = Some(result);
+                }
+            });
+        }
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let mapped_result = pollster::block_on(std::future::poll_fn(|_| {
+            let mut slot = mapped.lock().expect("depth debug map state poisoned");
+            match slot.take() {
+                Some(result) => std::task::Poll::Ready(result),
+                None => std::task::Poll::Pending,
+            }
+        }));
+        if mapped_result.is_err() {
+            return (1.0, 1.0, 0);
+        }
+        let mut min = 1.0f32;
+        let mut max = 0.0f32;
+        let mut written = 0usize;
+        {
+            let Ok(data) = slice.get_mapped_range() else {
+                return (1.0, 1.0, 0);
+            };
+            for row in 0..height as usize {
+                let start = row * bytes_per_row as usize;
+                for chunk in data[start..start + (width * 4) as usize].as_chunks::<4>().0 {
+                    let depth = f32::from_le_bytes(*chunk);
+                    min = min.min(depth);
+                    max = max.max(depth);
+                    if depth < 0.999_999 {
+                        written += 1;
+                    }
+                }
+            }
+        }
+        buffer.unmap();
+        (min, max, written)
+    }
+
+    /// Reads the blurred SSAO target for GPU tests: `(min, max, mean, pixels)`.
+    #[cfg(test)]
+    pub(crate) fn debug_ssao(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<(u8, u8, f32, Vec<u8>)> {
+        self.ssao.as_ref().map(|ssao| ssao.debug_read(device, queue))
+    }
+
     /// Short description of the shadow settings for F3.
     pub(crate) fn shadow_summary(&self) -> String {
         // Report the allocated map rather than a freshly derived config; they
@@ -1232,6 +1528,7 @@ impl SceneRenderer {
         if self.fsr_restore_native {
             self.fsr = None;
             self.fsr_restore_native = false;
+            let ao_view = self.ao_fallback_view.clone();
             self.targets = Targets::new(
                 device,
                 self.display_width,
@@ -1241,8 +1538,10 @@ impl SceneRenderer {
                 &self.post_sampler,
                 &self.post_layout,
                 &self.bloom_layout,
+                &ao_view,
             );
             self.rebuild_scene_bind_groups(device);
+            self.rebuild_ssao(device);
         }
         let (width, height) = self.size();
         // The camera and shadow fit always use the display aspect: FSR maps the
@@ -1251,6 +1550,15 @@ impl SceneRenderer {
         let aspect = self.display_width as f32 / self.display_height.max(1) as f32;
         let visual = scene.environment.visual();
         let shadow = ShadowCascades::fit(camera, aspect, &self.graphics.shadow_config(), visual.sun_direction);
+        // The visible near-world edge is the simulation radius stored on the
+        // far mesh. A frame without a far mesh (near-only scenes and tests)
+        // uploads a zero radius, which disables the seam fade in both shaders.
+        let seam = self
+            .far_terrain
+            .as_ref()
+            .map(|far| (far.seam_radius, far_terrain::FAR_SEAM_BLEND_BAND))
+            // Low/Medium keep their 1.3 path: no seam blend, no height fog.
+            .filter(|(radius, _)| *radius > 0.0 && self.graphics.ssao_enabled());
         let uniform = pipeline::CameraUniform::new(
             camera,
             aspect,
@@ -1258,9 +1566,16 @@ impl SceneRenderer {
             scene.time_seconds,
             self.graphics,
             &shadow,
+            seam,
         );
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
-        let post = pipeline::PostUniform::new(width, height, self.graphics, scene.time_seconds);
+        let eye = [
+            camera.position.x as f32,
+            camera.position.y as f32,
+            camera.position.z as f32,
+        ];
+        let underwater = self.is_underwater(eye);
+        let post = pipeline::PostUniform::new(width, height, self.graphics, scene.time_seconds, underwater);
         queue.write_buffer(&self.post_buffer, 0, bytemuck::bytes_of(&post));
 
         let outline_vertices = scene
@@ -1272,11 +1587,6 @@ impl SceneRenderer {
         }
 
         let frustum = camera.frustum_planes(aspect);
-        let eye = [
-            camera.position.x as f32,
-            camera.position.y as f32,
-            camera.position.z as f32,
-        ];
         let draw_distance = camera.far + 24.0;
 
         let mut stats = RenderStats {
@@ -1293,6 +1603,47 @@ impl SceneRenderer {
 
         // --- 1. Sun shadow cascades -----------------------------------------
         self.record_shadows(device, queue, encoder, &shadow, &order, &lod_order, eye, &mut stats);
+
+        // Collect the visible opaque draws once, front-to-back. Both section
+        // meshes and far LOD batches use the chunk pipeline, so one sorted list
+        // minimises shaded fragments through early depth rejection. Culling
+        // counters are still reported exactly as before.
+        let center_distance_sq = |min: [f32; 3], max: [f32; 3]| {
+            let dx = (min[0] + max[0]) * 0.5 - eye[0];
+            let dy = (min[1] + max[1]) * 0.5 - eye[1];
+            let dz = (min[2] + max[2]) * 0.5 - eye[2];
+            dx * dx + dy * dy + dz * dz
+        };
+        let mut opaque_draws: Vec<(f32, OpaqueKey)> = Vec::with_capacity(order.len() + lod_order.len());
+        for pos in &order {
+            let Some(mesh) = self.meshes.get(pos) else {
+                continue;
+            };
+            if !section_visible(&frustum, *pos) || !aabb_within_distance(eye, mesh.min, mesh.max, draw_distance) {
+                stats.culled_sections += 1;
+                continue;
+            }
+            if mesh.vertex_count == 0 {
+                continue;
+            }
+            opaque_draws.push((center_distance_sq(mesh.min, mesh.max), OpaqueKey::Section(*pos)));
+        }
+        for key in &lod_order {
+            let Some(batch) = self.lod_batches.get(key) else {
+                continue;
+            };
+            if !aabb_visible(&frustum, batch.min, batch.max)
+                || !aabb_within_distance(eye, batch.min, batch.max, draw_distance)
+            {
+                stats.culled_lod_batches += 1;
+                continue;
+            }
+            if batch.vertex_count == 0 {
+                continue;
+            }
+            opaque_draws.push((center_distance_sq(batch.min, batch.max), OpaqueKey::Batch(*key)));
+        }
+        opaque_draws.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
         // --- 2. Opaque world -----------------------------------------------
         // The HDR target is cleared to the horizon (the sky pass overwrites it
@@ -1323,42 +1674,30 @@ impl SceneRenderer {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            for pos in &order {
-                let Some(mesh) = self.meshes.get(pos) else {
-                    continue;
-                };
-                if !section_visible(&frustum, *pos) || !aabb_within_distance(eye, mesh.min, mesh.max, draw_distance) {
-                    stats.culled_sections += 1;
-                    continue;
+            for (_, key) in &opaque_draws {
+                match key {
+                    OpaqueKey::Section(pos) => {
+                        let Some(mesh) = self.meshes.get(pos) else {
+                            continue;
+                        };
+                        pass.set_vertex_buffer(0, mesh.buffer.slice(..));
+                        pass.draw(0..mesh.vertex_count, 0..1);
+                        stats.draw_calls += 1;
+                        stats.vertices += u64::from(mesh.vertex_count);
+                        stats.sections += 1;
+                    }
+                    OpaqueKey::Batch(key) => {
+                        let Some(batch) = self.lod_batches.get(key) else {
+                            continue;
+                        };
+                        pass.set_vertex_buffer(0, batch.buffer.slice(..));
+                        pass.draw(0..batch.vertex_count, 0..1);
+                        stats.draw_calls += 1;
+                        stats.vertices += u64::from(batch.vertex_count);
+                        stats.lod_batches += 1;
+                        stats.lod_vertices += u64::from(batch.vertex_count);
+                    }
                 }
-                if mesh.vertex_count == 0 {
-                    continue;
-                }
-                pass.set_vertex_buffer(0, mesh.buffer.slice(..));
-                pass.draw(0..mesh.vertex_count, 0..1);
-                stats.draw_calls += 1;
-                stats.vertices += u64::from(mesh.vertex_count);
-                stats.sections += 1;
-            }
-            for key in &lod_order {
-                let Some(batch) = self.lod_batches.get(key) else {
-                    continue;
-                };
-                if !aabb_visible(&frustum, batch.min, batch.max)
-                    || !aabb_within_distance(eye, batch.min, batch.max, draw_distance)
-                {
-                    stats.culled_lod_batches += 1;
-                    continue;
-                }
-                if batch.vertex_count == 0 {
-                    continue;
-                }
-                pass.set_vertex_buffer(0, batch.buffer.slice(..));
-                pass.draw(0..batch.vertex_count, 0..1);
-                stats.draw_calls += 1;
-                stats.vertices += u64::from(batch.vertex_count);
-                stats.lod_batches += 1;
-                stats.lod_vertices += u64::from(batch.vertex_count);
             }
             // Visual-only far terrain is drawn after the near world and far
             // batches, so early depth rejection removes every far fragment
@@ -1424,6 +1763,33 @@ impl SceneRenderer {
                 && aabb_visible(&frustum, far.min, far.max)
                 && aabb_within_distance(eye, far.min, far.max, draw_distance)
         });
+        // Depth-responsive water (High/Ultra only) needs the opaque scene depth
+        // while the original target is still attached for depth testing, so copy
+        // it once here. Low/Medium skip the copy and the shader branches away
+        // from binding 5 (`shadow_params.y == 0`).
+        let depth_copy_needed =
+            self.ssao.is_some() || (self.graphics.water == crate::graphics::WaterQuality::High && !water.is_empty());
+        if depth_copy_needed {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.targets.depth_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::DepthOnly,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.targets._depth_copy_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::DepthOnly,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         if !water.is_empty() || far_water.is_some() || outline_vertices.is_some() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("water"),
@@ -1507,7 +1873,62 @@ impl SceneRenderer {
             stats.passes += 1;
         }
 
-        // --- 5. Bloom and post --------------------------------------------
+        // --- 5. SSAO (High/Ultra) ------------------------------------------
+        // Runs after the water pass so it sees the final opaque depth. The
+        // raw pass is half-resolution and the second pass is a depth-aware
+        // blur; the post pass multiplies the result into the HDR scene before
+        // bloom and tonemapping. Sky pixels and everything past the 96–192 m
+        // fade are exactly 1.0, so there is no darkening on the horizon.
+        if let Some(ssao) = &self.ssao {
+            let ssao_uniform = SsaoUniform::new(
+                camera.near,
+                camera.far,
+                width,
+                height,
+                (camera.fov_y * 0.5).tan(),
+                aspect,
+                self.graphics.ssao_resolution_divisor(),
+            );
+            queue.write_buffer(&self.ssao_uniform, 0, bytemuck::bytes_of(&ssao_uniform));
+            for (label, pipeline, view, bind_group) in [
+                (
+                    "ssao-raw",
+                    &self.ssao_pipelines.raw_pipeline,
+                    &ssao.raw_view,
+                    &ssao.raw_bind_group,
+                ),
+                (
+                    "ssao-blur",
+                    &self.ssao_pipelines.blur_pipeline,
+                    &ssao.blur_view,
+                    &ssao.blur_bind_group,
+                ),
+            ] {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some(label),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.draw(0..3, 0..1);
+                stats.ssao_passes += 1;
+                stats.passes += 1;
+            }
+        }
+
+        // --- 6. Bloom and post --------------------------------------------
         if self.graphics.bloom {
             for level in 0..pipeline::BLOOM_MIPS {
                 let (pipeline, bind_group) = if level == 0 {

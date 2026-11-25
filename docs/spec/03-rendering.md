@@ -1,6 +1,6 @@
 # 03 — Rendering: Device, Render Graph and the Voxel Geometry Pipeline
 
-> Status: normative - Last updated: 2026-11-24
+> Status: normative - Last updated: 2026-11-25
 > Depends on: DEC-002, DEC-004, DEC-005, DEC-011, DEC-012, DEC-013, DEC-014, DEC-016, DEC-017, DEC-018, DEC-035, DEC-038, DEC-048; [conventions](00-conventions.md), [technical architecture](01-technical-architecture.md), [world model](05-world-model.md), [performance budgets](25-performance-budgets.md)
 > Implements: MS-03, MS-04
 
@@ -431,6 +431,14 @@ for barriers and driver overhead, while the compositor reserve and present margi
 this envelope ([25 §3.2](25-performance-budgets.md#32-the-frame-envelope)). A preset removes rows
 and the graph re-derives barriers and aliasing.
 
+**v1.4 shipping additions.** Two passes and one transfer are recorded between the water
+pass and bloom on the high tiers: `water-depth-copy` (transfer, only when High/Ultra water
+is visible and enabled; ~0.15 ms at 1080p), and `ssao-raw` + `ssao-blur` (raster full-screen
+pair at quarter resolution on High or half on Ultra; ~0.8/1.1 ms). They are declared here so
+REQ-RENDER-025's pass inventory stays complete; the graph table above remains the MS-04
+target shape. The main opaque pass also draws its visible sections and far batches in one
+front-to-back list since v1.4; this changes submission order, not the pass set.
+
 ### 3.10 LOD, frame pacing and latency
 
 **v1.1 interim distance LOD.** The clustered GPU path in §3.5 is still the target design, but
@@ -476,6 +484,20 @@ the 512-block radius is playable now:
   result more than 1.5 hysteresis behind a teleport/fast flight is discarded.
   Fixed world-space geometry means no per-frame recenter and no pop while the
   worker runs.
+* **v1.4 seam and atmosphere.** `FarTerrainMesh` carries the simulation radius
+  as `seam_radius`; both the near and far shaders fade towards a shared seam
+  colour over a 64-block band around it (22% haze peak, squared-distance ramp,
+  no dither). The far mesh evaluates height fog, seam and distance fog per
+  vertex and the Ultra cloud-shadow field per vertex; its fragment stage only
+  applies the interpolated factors. The cloud field for ground shadows is a
+  baked 128² tiling `R8Unorm` texture on High/Ultra, replacing per-fragment
+  value noise. High uses a quarter-resolution SSAO target, Ultra half;
+  projected cloud shadows are Ultra-only. Low/Medium keep the 1.3 path.
+* **v1.4 ordering.** The opaque pass merges sections and far LOD batches into
+  one front-to-back list by squared AABB-centre distance (deterministic key
+  tie-break) so early depth rejection removes hidden fragments. Water keeps its
+  back-to-front order. This is a submission-order change only; draw counts,
+  culling counters and geometry are unchanged.
 
 Measured at 1280×720 on the shared RADV integrated reference (1.2 scene, before
 far terrain): 4,225 columns, 716 draws (433 full sections + 283 far batches),
@@ -533,6 +555,16 @@ Presets select the simulation/quality envelope above; they do not change the
 persisted `render.view_distance_chunks` visual horizon (default 128), which is
 independent of preset. A player may keep `potato` and still request the 8,192-block
 far horizon; the resulting GPU cost is reported, not silently clamped.
+
+**v1.4 implementation mapping (measured).** The shipping renderer gates the new
+effects from the existing rows rather than adding settings: High and Ultra run the
+quarter/half-resolution SSAO and height fog; Ultra additionally runs projected cloud
+shadows and the half-resolution AO target. Low and Medium record no new passes and,
+after the front-to-back opaque ordering, measure faster than their v1.3 counterparts.
+At a 512-chunk view, native 1920×1080 High is 16.6 ms p50 (59.9 FPS) in the
+offscreen-readback harness, 0.9 ms above the 15.7 ms v1.3 baseline; 720p is 11.8 ms.
+Ultra is 17.7 ms and 12.3 ms. Full tables and costs are in
+[25 §5.11](25-performance-budgets.md#511-v14-graphics-polish-measured-512-chunk-report-2026-11-25).
 
 `potato` is the integrated-GPU preset: it drops memory-bandwidth-bound effects and lowers render
 scale, the cheapest lever on any GPU. `performance` is the 144 FPS mode: 512-block radius, 0.85

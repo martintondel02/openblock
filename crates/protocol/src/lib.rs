@@ -1,4 +1,4 @@
-//! The OpenBlock interim wire protocol v3: JSON messages and chunk snapshots.
+//! The OpenBlock interim wire protocol v4: JSON messages and chunk snapshots.
 //!
 //! **Status: implemented for the 1.0 self-hosted multiplayer milestone.** This
 //! crate is the shared contract between the dedicated server
@@ -39,7 +39,7 @@
 //!
 //! # Survival state (v3)
 //!
-//! Protocol v3 makes the server authoritative for network-player survival:
+//! Protocol v3 first made the server authoritative for network-player survival (v4 keeps it):
 //! vitals (`PlayerVitals`), the 36-slot player inventory (nine hotbar plus 27
 //! main stacks) and four armor slots (`InventorySync`/`SelectedSlot`), furnace
 //! and chest windows
@@ -58,7 +58,7 @@
 //!
 //! # Light and sleep (still v3)
 //!
-//! The 1.2 gameplay slice adds additive v3 messages without changing any
+//! The 1.2 / 1.3 gameplay slices add additive v3/v4 messages without changing any
 //! existing payload: [`ServerMessage::LightUpdate`] carries compressed dense
 //! sky+RGB words for the sections a relight changed (see [`LightSectionDto`]
 //! and [`encode_light_words`]); [`ServerMessage::TimeSync`] publishes the

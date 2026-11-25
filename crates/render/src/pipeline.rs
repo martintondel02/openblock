@@ -43,12 +43,12 @@ pub(crate) const BLOOM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16
 /// Number of bloom mip levels written by the threshold/downsample chain.
 pub(crate) const BLOOM_MIPS: usize = 3;
 
-/// Byte size of the camera uniform block: four `mat4x4<f32>` rows plus thirteen
+/// Byte size of the camera uniform block: four `mat4x4<f32>` rows plus fifteen
 /// `vec4<f32>` rows.
-pub(crate) const CAMERA_UNIFORM_SIZE: wgpu::BufferAddress = 512;
+pub(crate) const CAMERA_UNIFORM_SIZE: wgpu::BufferAddress = 544;
 
-/// Byte size of the post-processing uniform block (two `vec4<f32>` rows).
-pub(crate) const POST_UNIFORM_SIZE: wgpu::BufferAddress = 32;
+/// Byte size of the post-processing uniform block (three `vec4<f32>` rows).
+pub(crate) const POST_UNIFORM_SIZE: wgpu::BufferAddress = 48;
 
 /// Byte size of one per-cascade shadow matrix uniform (one `mat4x4<f32>`).
 pub(crate) const SHADOW_CASCADE_UNIFORM_SIZE: wgpu::BufferAddress = 64;
@@ -103,11 +103,18 @@ pub(crate) struct CameraUniform {
     /// `w` reserved.
     pub(crate) graphics: [f32; 4],
     /// `x` wave strength, `y` water surface alpha, `z` specular strength,
-    /// `w` reserved.
+    /// `w` sea-surface height in world blocks (for the underwater tint).
     pub(crate) water: [f32; 4],
     /// `x`/`y`/`z` UV scale of shadow cascades 0..2 (1.0 full layer, 0.5 for the
     /// half-resolution far cascade); `w` reserved.
     pub(crate) shadow_scale: [f32; 4],
+    /// `x` near/far seam radius in blocks (0 disables the seam fade),
+    /// `y` seam band half-width in blocks, `z` height-fog density (0 disables
+    /// it), `w` height-fog scale height in blocks.
+    pub(crate) atmosphere: [f32; 4],
+    /// `x` near plane, `y` far plane, `z` 1 when the scene-depth copy bound at
+    /// binding 5 is fresh this frame (depth-responsive water), `w` reserved.
+    pub(crate) clip: [f32; 4],
 }
 
 // Keep the GPU layout in sync with the shader's `Camera` struct.
@@ -131,6 +138,8 @@ const _: () = assert!(std::mem::offset_of!(CameraUniform, shadow_params) == 448)
 const _: () = assert!(std::mem::offset_of!(CameraUniform, graphics) == 464);
 const _: () = assert!(std::mem::offset_of!(CameraUniform, water) == 480);
 const _: () = assert!(std::mem::offset_of!(CameraUniform, shadow_scale) == 496);
+const _: () = assert!(std::mem::offset_of!(CameraUniform, atmosphere) == 512);
+const _: () = assert!(std::mem::offset_of!(CameraUniform, clip) == 528);
 
 impl CameraUniform {
     /// Builds the per-frame uniform for a camera, viewport aspect ratio,
@@ -147,6 +156,7 @@ impl CameraUniform {
         time_seconds: f32,
         graphics: GraphicsSettings,
         shadow: &ShadowCascades,
+        seam: Option<(f32, f32)>,
     ) -> Self {
         let eye = camera.position.as_vec3();
         let (fog_start, fog_end) = camera.fog_range();
@@ -157,6 +167,13 @@ impl CameraUniform {
         let up = camera.up();
         let tangent = (camera.fov_y * 0.5).tan();
         let (wave_strength, surface_alpha, specular) = graphics.water.shader_params();
+        let (seam_radius, seam_band) = seam.unwrap_or((0.0, 0.0));
+        let sea_surface = crate::pipeline::SEA_SURFACE_HEIGHT;
+        let (height_fog_density, height_fog_scale) = if graphics.height_fog_enabled() {
+            (HEIGHT_FOG_DENSITY, HEIGHT_FOG_SCALE_HEIGHT)
+        } else {
+            (0.0, HEIGHT_FOG_SCALE_HEIGHT)
+        };
         Self {
             view_proj: camera.view_projection(aspect).to_cols_array_2d(),
             camera_pos: [eye.x, eye.y, eye.z, 1.0],
@@ -207,10 +224,21 @@ impl CameraUniform {
                 time_seconds.max(0.0),
                 graphics.cloud_coverage,
                 graphics.cloud_factor(),
+                graphics.cloud_shadow_strength(),
+            ],
+            water: [wave_strength, surface_alpha, specular, sea_surface],
+            shadow_scale: shadow.uv_scale_vec4(),
+            atmosphere: [seam_radius, seam_band, height_fog_density, height_fog_scale],
+            clip: [
+                camera.near,
+                camera.far,
+                if graphics.water == crate::graphics::WaterQuality::High {
+                    1.0
+                } else {
+                    0.0
+                },
                 0.0,
             ],
-            water: [wave_strength, surface_alpha, specular, 0.0],
-            shadow_scale: shadow.uv_scale_vec4(),
         }
     }
 
@@ -245,9 +273,27 @@ impl CameraUniform {
                 &ShadowQuality::High.config(),
                 environment.visual().sun_direction,
             ),
+            None,
         )
     }
 }
+
+/// Height of the sea surface the near and far water passes draw.
+///
+/// The world stores the topmost sea block at `SEA_LEVEL` and the water surface
+/// fills the block above it, so the surface sits at `SEA_LEVEL + 1`. The
+/// renderer uses one constant so the near-water, far-water and underwater-post
+/// terms agree.
+pub(crate) const SEA_SURFACE_HEIGHT: f32 = ob_math::SEA_LEVEL as f32 + 1.0;
+
+/// Aerial-perspective density for the height fog on High/Ultra, per block.
+///
+/// At a 512-block distance and sea-level height the term reaches about 10%,
+/// so the 512-chunk vista gains depth without a visible haze wall; it is kept
+/// well below the main fog curve, which owns the last kilometre.
+pub(crate) const HEIGHT_FOG_DENSITY: f32 = 0.000_18;
+/// Scale height of the height fog in blocks: mountains above the sea get less.
+pub(crate) const HEIGHT_FOG_SCALE_HEIGHT: f32 = 160.0;
 
 /// Post-processing parameters (group 0 of the post and bloom pipelines).
 #[repr(C, align(16))]
@@ -257,6 +303,9 @@ pub(crate) struct PostUniform {
     pub(crate) params: [f32; 4],
     /// `x` `1 / width`, `y` `1 / height`, `z` bloom threshold, `w` time.
     pub(crate) texels: [f32; 4],
+    /// `x` SSAO strength (0 = disabled), `y` underwater amount (0..1),
+    /// `z` reserved, `w` reserved.
+    pub(crate) effects: [f32; 4],
 }
 
 const _: () = assert!(std::mem::size_of::<PostUniform>() == POST_UNIFORM_SIZE as usize);
@@ -264,7 +313,13 @@ const _: () = assert!(std::mem::align_of::<PostUniform>() == 16);
 
 impl PostUniform {
     /// Builds the uniform for a target size, graphics settings and scene time.
-    pub(crate) fn new(width: u32, height: u32, graphics: GraphicsSettings, time_seconds: f32) -> Self {
+    pub(crate) fn new(
+        width: u32,
+        height: u32,
+        graphics: GraphicsSettings,
+        time_seconds: f32,
+        underwater: bool,
+    ) -> Self {
         Self {
             params: [
                 graphics.exposure,
@@ -278,6 +333,7 @@ impl PostUniform {
                 crate::graphics::BLOOM_THRESHOLD,
                 time_seconds.max(0.0),
             ],
+            effects: [graphics.ssao_strength(), if underwater { 1.0 } else { 0.0 }, 0.0, 0.0],
         }
     }
 }
@@ -362,11 +418,46 @@ pub(crate) fn create_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroup
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                // Depth-only copy of the scene depth buffer, refreshed before
+                // the water pass when depth-responsive water is enabled. The
+                // water shader reads it with `textureLoad` to derive water
+                // thickness; every other pipeline ignores the binding.
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                // Baked tiling cloud density for the ground cloud shadows.
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                // Linear/repeat sampler for the cloud-density texture; the
+                // block sampler stays nearest for the pixel-art layers.
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     })
 }
 
-/// Binds the camera buffer, block texture array, shadow map and samplers.
+/// Binds the camera buffer, block texture array, shadow map, samplers, the
+/// scene-depth copy and the cloud-density texture.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -374,6 +465,9 @@ pub(crate) fn create_bind_group(
     textures: &BlockTextureArray,
     shadow_view: &wgpu::TextureView,
     shadow_sampler: &wgpu::Sampler,
+    scene_depth: &wgpu::TextureView,
+    cloud_view: &wgpu::TextureView,
+    cloud_sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("chunk-bind-group"),
@@ -402,6 +496,18 @@ pub(crate) fn create_bind_group(
             wgpu::BindGroupEntry {
                 binding: 4,
                 resource: wgpu::BindingResource::Sampler(shadow_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(scene_depth),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(cloud_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::Sampler(cloud_sampler),
             },
         ],
     })
@@ -685,6 +791,18 @@ pub(crate) fn create_post_bind_group_layout(device: &wgpu::Device) -> wgpu::Bind
         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
         count: None,
     });
+    // Binding 6 is the blurred SSAO texture (or a white 1×1 fallback when the
+    // pass is disabled, so the post shader needs no variant).
+    entries.push(wgpu::BindGroupLayoutEntry {
+        binding: 3 + BLOOM_MIPS as u32,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    });
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("post-bind-group-layout"),
         entries: &entries,
@@ -698,6 +816,7 @@ pub(crate) fn create_post_bind_group(
     post: &wgpu::Buffer,
     hdr: &wgpu::TextureView,
     bloom: &[wgpu::TextureView; BLOOM_MIPS],
+    ao: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -731,6 +850,10 @@ pub(crate) fn create_post_bind_group(
             wgpu::BindGroupEntry {
                 binding: 5,
                 resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(ao),
             },
         ],
     })
@@ -1264,25 +1387,27 @@ pub(crate) fn create_bloom_pipeline(
     })
 }
 
-/// Creates the depth texture and view for the given drawable size.
-pub(crate) fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
+/// Creates the scene depth texture for the given drawable size.
+///
+/// `TEXTURE_BINDING` lets the SSAO and water passes read it without another
+/// copy, and `COPY_SRC` lets the water path take the depth-only copy it samples
+/// while the original is still attached for depth testing.
+pub(crate) fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth"),
         size: wgpu::Extent3d {
-            width,
-            height,
+            width: width.max(1),
+            height: height.max(1),
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
-    });
-    texture.create_view(&wgpu::TextureViewDescriptor {
-        label: Some("depth-view"),
-        ..Default::default()
     })
 }
 
@@ -1298,7 +1423,7 @@ mod tests {
 
     #[test]
     fn camera_uniform_matches_the_shader_layout() {
-        assert_eq!(std::mem::size_of::<CameraUniform>(), 512);
+        assert_eq!(std::mem::size_of::<CameraUniform>(), 544);
         assert_eq!(std::mem::align_of::<CameraUniform>(), 16);
         assert_eq!(std::mem::offset_of!(CameraUniform, view_proj), 0);
         assert_eq!(std::mem::offset_of!(CameraUniform, camera_pos), 64);
@@ -1318,21 +1443,31 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CameraUniform, graphics), 464);
         assert_eq!(std::mem::offset_of!(CameraUniform, water), 480);
         assert_eq!(std::mem::offset_of!(CameraUniform, shadow_scale), 496);
+        assert_eq!(std::mem::offset_of!(CameraUniform, atmosphere), 512);
+        assert_eq!(std::mem::offset_of!(CameraUniform, clip), 528);
     }
 
     #[test]
     fn post_uniform_matches_the_shader_layout() {
-        assert_eq!(std::mem::size_of::<PostUniform>(), 32);
+        assert_eq!(std::mem::size_of::<PostUniform>(), 48);
         assert_eq!(std::mem::align_of::<PostUniform>(), 16);
         assert_eq!(std::mem::offset_of!(PostUniform, params), 0);
         assert_eq!(std::mem::offset_of!(PostUniform, texels), 16);
-        let uniform = PostUniform::new(1920, 1080, GraphicsSettings::default(), 3.0);
+        assert_eq!(std::mem::offset_of!(PostUniform, effects), 32);
+        let uniform = PostUniform::new(1920, 1080, GraphicsSettings::default(), 3.0, false);
         assert!((uniform.texels[0] - 1.0 / 1920.0).abs() < 1e-9);
         assert!((uniform.texels[1] - 1.0 / 1080.0).abs() < 1e-9);
         assert_eq!(uniform.texels[3], 3.0);
         assert_eq!(uniform.params[3], 1.0);
         assert_eq!(
-            PostUniform::new(1920, 1080, GraphicsSettings::from_preset(GraphicsPreset::Low), 0.0).params[3],
+            PostUniform::new(
+                1920,
+                1080,
+                GraphicsSettings::from_preset(GraphicsPreset::Low),
+                0.0,
+                false
+            )
+            .params[3],
             0.0
         );
     }
@@ -1449,7 +1584,15 @@ mod tests {
             Environment::default().visual().sun_direction,
         );
         assert!(!shadow.split_vec4().is_empty());
-        let uniform = CameraUniform::new(&camera, 16.0 / 9.0, Environment::default(), 12.5, graphics, &shadow);
+        let uniform = CameraUniform::new(
+            &camera,
+            16.0 / 9.0,
+            Environment::default(),
+            12.5,
+            graphics,
+            &shadow,
+            None,
+        );
         assert_eq!(uniform.shadow_view_proj, shadow.view_proj_array());
         assert_eq!(uniform.shadow_split, shadow.split_vec4());
         assert_eq!(uniform.shadow_split[3], 2.0);
@@ -1472,9 +1615,69 @@ mod tests {
                 &ShadowQuality::Off.config(),
                 Environment::default().visual().sun_direction,
             ),
+            None,
         );
         assert_eq!(low.shadow_split, [0.0; 4]);
         assert_eq!(low.water[1], 0.80);
+    }
+
+    #[test]
+    fn atmosphere_uniform_carries_the_seam_and_height_fog_gate() {
+        let mut camera = Camera::new(WorldVec::new(0.0, 80.0, 0.0), 0.0, -0.2);
+        camera.far = 8_320.0;
+        let shadow = ShadowCascades::fit(
+            &camera,
+            16.0 / 9.0,
+            &GraphicsSettings::default().shadow_config(),
+            Environment::default().visual().sun_direction,
+        );
+        let high = CameraUniform::new(
+            &camera,
+            16.0 / 9.0,
+            Environment::default(),
+            0.0,
+            GraphicsSettings::default(),
+            &shadow,
+            Some((512.0, 64.0)),
+        );
+        assert_eq!(high.atmosphere[0], 512.0);
+        assert_eq!(high.atmosphere[1], 64.0);
+        assert!(high.atmosphere[2] > 0.0, "High must enable height fog");
+        assert!(high.atmosphere[3] > 1.0);
+        // Sea level for the underwater tint; water shader parameters are kept.
+        assert!((high.water[3] - SEA_SURFACE_HEIGHT).abs() < 1e-6);
+        assert_eq!(high.clip[2], 1.0, "High water binds a depth copy");
+        assert_eq!(high.shadow_params[1], 0.0, "reserved shadow bias must stay zero");
+        assert_eq!(high.graphics[3], 0.0, "High keeps cloud shadows Ultra-only");
+
+        let low = CameraUniform::new(
+            &camera,
+            16.0 / 9.0,
+            Environment::default(),
+            0.0,
+            GraphicsSettings::from_preset(GraphicsPreset::Low),
+            &ShadowCascades::fit(
+                &camera,
+                16.0 / 9.0,
+                &ShadowQuality::Off.config(),
+                Environment::default().visual().sun_direction,
+            ),
+            None,
+        );
+        assert_eq!(low.atmosphere[0], 0.0);
+        assert_eq!(low.atmosphere[2], 0.0, "Low must keep the cheap atmosphere");
+        assert_eq!(low.clip[2], 0.0, "Low water must not sample the copy");
+        assert_eq!(low.graphics[3], 0.0);
+        let ultra = CameraUniform::new(
+            &camera,
+            16.0 / 9.0,
+            Environment::default(),
+            0.0,
+            GraphicsSettings::from_preset(GraphicsPreset::Ultra),
+            &shadow,
+            Some((512.0, 64.0)),
+        );
+        assert!(ultra.graphics[3] > 0.0, "Ultra projects cloud shadows");
     }
 
     #[test]

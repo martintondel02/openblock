@@ -45,10 +45,11 @@ pub use crops::{
 };
 pub use items::ItemEntity;
 pub use mobs::{
-    AttackOutcome, DAY_LENGTH_TICKS, HOSTILE_SPAWN_MAX_DISTANCE, HOSTILE_SPAWN_MIN_DISTANCE, MAX_HOSTILE_MOBS,
-    MAX_PASSIVE_MOBS, MOB_ATTACK_REACH, MOB_BURN_DAMAGE_PER_SECOND, MOB_SPAWN_ATTEMPTS_PER_CATEGORY,
-    MOB_SPAWN_INTERVAL_TICKS, MOB_SPAWN_MIN_DISTANCE, MobEntity, NIGHT_END_TICK, NIGHT_START_TICK,
-    PASSIVE_SPAWN_MAX_DISTANCE, PASSIVE_SPAWN_MIN_DISTANCE,
+    AttackOutcome, DAY_LENGTH_TICKS, HOSTILE_SPAWN_MAX_DISTANCE, HOSTILE_SPAWN_MIN_DISTANCE, InteractOutcome,
+    MAX_HOSTILE_MOBS, MAX_PASSIVE_MOBS, MAX_PASSIVE_MOBS_PER_AREA, MOB_ATTACK_REACH, MOB_BREED_AREA_RADIUS,
+    MOB_BURN_DAMAGE_PER_SECOND, MOB_SPAWN_ATTEMPTS_PER_CATEGORY, MOB_SPAWN_INTERVAL_TICKS, MOB_SPAWN_MIN_DISTANCE,
+    MobEntity, NIGHT_END_TICK, NIGHT_START_TICK, PASSIVE_SPAWN_MAX_DISTANCE, PASSIVE_SPAWN_MIN_DISTANCE,
+    ProjectileEntity,
 };
 pub use net::{ConfigError, DedicatedServer, NetConfig, ServerFileConfig, load_server_config, parse_server_config};
 pub use net_players::{
@@ -361,6 +362,15 @@ struct SleepSkip {
     elapsed: u32,
 }
 
+/// One explosion event drained by the client or network layer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExplosionEvent {
+    /// Centre position.
+    pub pos: WorldVec,
+    /// Radius in metres.
+    pub radius: f32,
+}
+
 /// The authoritative game host.
 pub struct Host {
     world: World,
@@ -410,6 +420,29 @@ pub struct Host {
     sleep_wait_start: Option<u64>,
     /// Block changes for the network replication layer, keyed by position.
     pending_block_updates: BTreeMap<BlockPos, BlockId>,
+    /// Server-simulated arrows (1.3).
+    projectiles: Vec<mobs::ProjectileEntity>,
+    /// Next projectile id (at least 1).
+    next_projectile_id: u64,
+    /// Tick of the internal player's last charged melee hit (transient).
+    last_attack_tick: Option<u64>,
+    /// Pending 60-tick breeding births (transient).
+    pending_births: Vec<PendingBirth>,
+    /// Explosion cues for the client/network layer (runtime only).
+    explosion_events: Vec<ExplosionEvent>,
+}
+
+/// One breeding birth waiting for its 60-tick gestation.
+#[derive(Debug, Clone, Copy)]
+struct PendingBirth {
+    /// Seconds left before the baby appears.
+    timer: f64,
+    /// Species of both parents.
+    kind: ob_content::MobKind,
+    /// Spawn feet position (midpoint between the parents).
+    pos: WorldVec,
+    /// Inherited colour variant.
+    variant: u8,
 }
 
 /// One background save in flight. Only one may exist: the host never overlaps
@@ -489,6 +522,11 @@ impl Host {
                 sleep_skip: None,
                 sleep_wait_start: None,
                 pending_block_updates: BTreeMap::new(),
+                projectiles: Vec::new(),
+                next_projectile_id: 1,
+                last_attack_tick: None,
+                pending_births: Vec::new(),
+                explosion_events: Vec::new(),
             };
             host.inventory = load_inventory(&host.world_dir, &host.registry);
             host.items = items::load_items(&host.world_dir, &host.registry);
@@ -545,6 +583,11 @@ impl Host {
                 sleep_skip: None,
                 sleep_wait_start: None,
                 pending_block_updates: BTreeMap::new(),
+                projectiles: Vec::new(),
+                next_projectile_id: 1,
+                last_attack_tick: None,
+                pending_births: Vec::new(),
+                explosion_events: Vec::new(),
             };
             host.ensure_streaming(3);
             // Generate the chosen candidate column before reading its surface,
@@ -560,6 +603,7 @@ impl Host {
         let (furnaces, chests) = block_entities::load_block_entities(&host.world_dir, &host.registry, &host.world);
         host.furnaces = furnaces;
         host.chests = chests;
+        host.register_resident_structure_chests();
         host.saved_network_players = net_players::load_network_players(&host.world_dir, &host.registry);
         Ok(host)
     }
@@ -2853,10 +2897,51 @@ impl Host {
             .collect();
         batch.sort_by_key(|(pos, _)| (pos.x, pos.z));
         let generated = batch.len();
-        for (_, chunk) in batch {
+        for (pos, chunk) in batch {
             self.world.insert_chunk(chunk);
+            self.register_structure_chests_at(pos);
         }
         generated
+    }
+
+    /// Registers deterministic block-entity chests for one structure chunk.
+    ///
+    /// The chest block is written by worldgen. If a chest record is already
+    /// present (loaded from `block_entities.txt`) it is left untouched, so
+    /// looting and reloading can never refill a chest. Player-placed chests are
+    /// never selected because only worldgen's [`ob_worldgen::structure_chests`]
+    /// positions are considered.
+    fn register_structure_chests_at(&mut self, pos: ChunkPos) {
+        let Some(structure) = self.generator.structure_in_chunk(pos) else {
+            return;
+        };
+        let chest_id = self.registry.id_or_air("openblock:chest");
+        if chest_id == BlockId::AIR {
+            return;
+        }
+        for chest_pos in ob_worldgen::structure_chests(&structure) {
+            if !chest_pos.in_world() || self.world.chunk(chest_pos.chunk()).is_none() {
+                continue;
+            }
+            if self.world.get_block(chest_pos) != chest_id || self.chests.contains_key(&chest_pos) {
+                continue;
+            }
+            let state = block_entities::structure_chest_state(&self.registry, self.world.seed(), &structure, chest_pos);
+            self.chests.insert(chest_pos, state);
+        }
+    }
+
+    /// Registers missing structure chests in every currently resident chunk.
+    ///
+    /// Called once when the host opens: a save written by an older build has
+    /// chest blocks but no sidecar records, and a 1.3 save can also be opened
+    /// after an interrupted sidecar write. Loot is still deterministic and a
+    /// present (even empty) record is authoritative.
+    fn register_resident_structure_chests(&mut self) {
+        let positions: Vec<ChunkPos> = self.world.chunks().map(|(pos, _)| *pos).collect();
+        for pos in positions {
+            self.register_structure_chests_at(pos);
+        }
     }
 
     /// Unloads every resident column that is farther than `radius_chunks` from
@@ -3605,9 +3690,9 @@ fn load_spawn(world_dir: &Path) -> Option<WorldVec> {
     Some(WorldVec::new(x, y, z))
 }
 
-/// Serialized player state: ten whitespace-separated fields.
+/// Serialized player state: twelve whitespace-separated fields.
 ///
-/// `x y z yaw pitch flying ticks health hunger dead`
+/// `x y z yaw pitch flying ticks health hunger dead xp_points xp_level`
 ///
 /// Look angles are stored in their canonical range (yaw `-PI..=PI`, pitch
 /// `-PI/2..=PI/2`) so `save -> load -> save` is byte-stable and the state hash
@@ -3616,7 +3701,7 @@ fn player_state(player: &Player, ticks: u64) -> String {
     let yaw = net_players::normalise_angle(player.yaw);
     let pitch = net_players::clamp_pitch(player.pitch);
     format!(
-        "{:?} {:?} {:?} {:?} {:?} {} {} {:?} {:?} {}\n",
+        "{:?} {:?} {:?} {:?} {:?} {} {} {:?} {:?} {} {} {}\n",
         player.pos.x,
         player.pos.y,
         player.pos.z,
@@ -3627,11 +3712,13 @@ fn player_state(player: &Player, ticks: u64) -> String {
         player.health,
         player.hunger,
         player.dead as u8,
+        player.xp_points,
+        player.xp_level.min(100),
     )
 }
 
 fn parse_player_state(parts: &[&str]) -> Option<(Player, u64)> {
-    if parts.len() != 7 && parts.len() != 10 {
+    if parts.len() != 7 && parts.len() != 10 && parts.len() != 12 {
         return None;
     }
     let x = parts[0].parse::<f64>().ok()?;
@@ -3646,20 +3733,31 @@ fn parse_player_state(parts: &[&str]) -> Option<(Player, u64)> {
     }
 
     // Old (7-field) saves predate survival and default to full health/hunger.
-    let health = if parts.len() == 10 {
+    // Ten-field saves predate 1.3 XP; twelve-field saves append points/level.
+    let health = if parts.len() >= 10 {
         parts[7].parse::<f32>().ok()?
     } else {
         MAX_HEALTH
     };
-    let hunger = if parts.len() == 10 {
+    let hunger = if parts.len() >= 10 {
         parts[8].parse::<f32>().ok()?
     } else {
         MAX_HUNGER
     };
-    let dead = if parts.len() == 10 {
+    let dead = if parts.len() >= 10 {
         parts[9].parse::<u8>().ok()? != 0
     } else {
         false
+    };
+    let xp_points = if parts.len() == 12 {
+        parts[10].parse::<u32>().ok()?
+    } else {
+        0
+    };
+    let xp_level = if parts.len() == 12 {
+        parts[11].parse::<u32>().ok()?.min(100)
+    } else {
+        0
     };
 
     // A sidecar is untrusted input: a finite but absurd coordinate must not
@@ -3688,6 +3786,8 @@ fn parse_player_state(parts: &[&str]) -> Option<(Player, u64)> {
     if player.health <= 0.0 {
         player.health = 0.0;
     }
+    player.xp_points = xp_points;
+    player.xp_level = xp_level;
     Some((player, ticks))
 }
 
@@ -5601,8 +5701,8 @@ mod tests {
         let player_text = std::fs::read_to_string(test_world_dir(&dir).join("player.txt")).expect("player.txt");
         assert_eq!(
             player_text.split_whitespace().count(),
-            10,
-            "player.txt must use the 10-field format"
+            12,
+            "player.txt must use the 12-field 1.3 format (10 vitals + XP)"
         );
         let inventory_text =
             std::fs::read_to_string(test_world_dir(&dir).join("inventory.txt")).expect("inventory.txt");
@@ -7401,7 +7501,14 @@ mod tests {
                 }
                 let spec = host.registry().mob(entity.mob.kind);
                 assert!(spec.hostile);
-                assert_eq!(entity.mob.kind, MobKind::Zombie);
+                assert!(
+                    matches!(
+                        entity.mob.kind,
+                        MobKind::Zombie | MobKind::Spider | MobKind::Skeleton | MobKind::Creeper
+                    ),
+                    "unexpected hostile kind {:?}",
+                    entity.mob.kind
+                );
                 let distance = horizontal_distance(entity.mob.pos, host.player().pos);
                 assert!(
                     (16.0..=48.0).contains(&distance),
@@ -7640,6 +7747,7 @@ mod tests {
 
         let mut outcome = first;
         for _ in 0..9 {
+            host.tick_count = host.tick_count.saturating_add(20);
             outcome = host.attack_mob(cow_id);
         }
         assert!(outcome.hit);
@@ -7683,6 +7791,7 @@ mod tests {
             .expect("cow spawns");
         let slot = host.hotbar_selection();
         host.inventory[slot] = Some(worn.with_durability(1u16));
+        host.tick_count = host.tick_count.saturating_add(20);
         let broken = host.attack_mob(cow_id);
         assert!(broken.hit);
         assert_eq!(broken.tool_broke, Some(sword));
@@ -7699,6 +7808,7 @@ mod tests {
                 WorldVec::new(player.x + 2.0, player.y, player.z - 2.0),
             )
             .expect("chicken spawns");
+        host.tick_count = host.tick_count.saturating_add(20);
         let hit = host.attack_mob(chicken_id);
         assert!(hit.hit);
         assert_eq!(hit.damage, 4.0);
@@ -7723,7 +7833,12 @@ mod tests {
             .spawn_mob(MobKind::Zombie, WorldVec::new(player.x + 1.0, player.y, player.z))
             .expect("zombie spawns next to the player");
         let health_before = host.player().health;
-        host.tick(&PlayerInput::default());
+        for _ in 0..12 {
+            host.tick(&PlayerInput::default());
+            if host.player().health < health_before {
+                break;
+            }
+        }
         let mitigated = 3.0 * (1.0 - armor_damage_reduction(1));
         let health_after = host.player().health;
         assert!(
@@ -7840,7 +7955,11 @@ mod tests {
             .collect();
         assert_eq!(ids, vec![cow_id.min(zombie_id), cow_id.max(zombie_id)]);
         for line in &lines {
-            assert_eq!(line.split_whitespace().count(), 8, "id kind x y z yaw health age");
+            assert_eq!(
+                line.split_whitespace().count(),
+                13,
+                "id kind x y z yaw health age variant love cooldown growth persistent"
+            );
         }
         assert!(text.contains("openblock:cow"));
         assert!(text.contains("openblock:zombie"));

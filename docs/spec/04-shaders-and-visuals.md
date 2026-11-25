@@ -1,6 +1,6 @@
 # 04 — Shaders and Visuals: Lighting, Shadows, Sky, Post and Shader Packs
 
-> Status: normative - Last updated: 2026-11-24
+> Status: normative - Last updated: 2026-11-25
 > Depends on: DEC-005, DEC-011, DEC-014, DEC-015, DEC-016, DEC-017, DEC-022, DEC-029, DEC-032, DEC-045, DEC-048, DEC-051; [conventions](00-conventions.md), [rendering](03-rendering.md), [light and weather](07-light-and-weather.md), [performance budgets](25-performance-budgets.md)
 > Implements: MS-04, MS-12
 
@@ -201,14 +201,33 @@ fragment shader still reads only `Camera.fog`. Shader modules and packs must not
 hardcode distances; the same uniform drives opaque, cutout, entity, near-water
 and far-terrain fog.
 
-**Far-terrain material and draw.** The v1.3 visual far mesh stores position,
+**Far-terrain material and draw.** The v1.4 visual far mesh stores position,
 linear albedo and a heightfield normal per vertex; there are no texture or
-shadow samples. Its fragment stage applies the same sun direction, world-light
-tint and fog uniform as the near world, using `0.78 + 0.22 × max(n·sun, 0)` for
-direct/ambient mix and no cascade visibility. Far water is alpha blended with a
-cheap sky-reflect tint and sun highlight. Both pipelines are created once in
+shadow samples. The vertex stage evaluates the height-fog, near/far seam and
+distance-fog factors once per vertex — all three are smooth at the 8–128 m
+far-LOD cell size — and the fragment stage applies them with three mixes. The
+sun/ambient mix is `0.82 + 0.18 × max(n·sun, 0)`, matching the near world's
+baked face-light range, and the Ultra cloud-shadow field is sampled per vertex
+as well. Far water is alpha blended with the same Fresnel/reflected-sky model as
+near water, animated low-frequency waves, a luminance-derived depth proxy for
+opacity, and the shared fog/seam factors. Both pipelines are created once in
 `SceneRenderer::new`; far terrain casts no shadows, and only one far opaque and
-one far water draw are issued.
+one far water draw are issued. Since v1.4 the coarse palette blends beach,
+snowline and slope transitions over several blocks and perturbs them with
+smooth baked noise, so a hard threshold cannot draw a jagged contour at the
+coarse tiers.
+
+**Near/far seam cross-fade (v1.4).** The full-detail world ends at the simulation
+radius (512 blocks at the maximum). Both shaders blend towards a shared
+`seam_colour` within a 64-block band around that radius: the near side fades over
+`radius − 64 .. radius`, the far side reaches its own shading by
+`radius + 64`, and both evaluate exactly the same haze value *at* the radius.
+The fade peaks at 22% haze and is calculated from squared horizontal distances
+(no square root); fragments outside the band skip the ramp. Low and Medium keep
+their 1.3 path and upload a zero radius. The cross-fade is colour-only: the near
+and far meshes already overlap by the recenter hysteresis, so there is no
+geometric crack and no dither/depth discontinuity for TAA. This replaces the
+v1.3 statement that distance fog is the only blend between tiers.
 
 **Shader work implied by the LOD.** Shadow cascades are unchanged in count and
 distance (§3.3.1): far surface-shell batches are opaque geometry and are included in
@@ -301,10 +320,13 @@ are complete:
 6. **Underwater**, when the camera is submerged, a full-screen volume tint, increased fog
    density, reduced sun, and procedural caustics projected on surfaces below the surface.
 
-**1.1 status:** water is split out of the opaque mesh and drawn after it in a sorted,
+**1.1/1.4 status:** water is split out of the opaque mesh and drawn after it in a sorted,
 alpha-blended pass with animated normals, Fresnel sky reflection, a sun highlight and
-cascade shadows. SSR, refraction, foam and the underwater volume are future work — see
-§3.13.5.
+cascade shadows. Since 1.4 the High/Ultra water path also takes a depth-only copy of the
+scene depth before the water pass: water thickness drives a depth-based tint/opacity,
+shoreline foam, and a below-surface shading branch, while a full-screen post grade tints
+the frame when the camera is submerged. SSR, refraction and caustics remain future work —
+see §3.13.5.
 
 #### 3.4.2 Translucency policy
 
@@ -372,12 +394,14 @@ v1.3 (§3.13.9): it is source code, not a binary SDK, so it does not conflict wi
 repository's MIT/Apache grant. It is optional and off by default; TAA with render scale
 remains the long-term default path.
 
-**1.1 status:** the shipped chain is HDR scene → bloom threshold + 3 mip downsample →
-one final pass with ACES-fit tonemap, two bloom mip samples, conditional FXAA-lite,
-saturation and a 6% vignette. Exposure is fixed, not histogram-adapted, and there is no TAA,
-GTAO, volumetric fog or colour LUT yet. UI is drawn after post. See §3.13.6. Two post
-pipelines (full and bloom/FXAA-free) are compiled at start-up. v1.3 optionally inserts FSR
-1.0 EASU+RCAS between post and UI (§3.13.9).
+**1.1/1.4 status:** the shipped chain is HDR scene → depth-reconstructed SSAO
+(High/Ultra) → bloom threshold + 3 mip downsample → one final pass with ACES-fit tonemap,
+two bloom mip samples, the SSAO multiply, conditional FXAA-lite, saturation, a 6% vignette
+and the cheap underwater grade. Exposure is fixed, not histogram-adapted, and there is no
+TAA, volumetric fog or colour LUT yet. UI is drawn after post. See §3.13.6/§3.13.10. Two
+post pipelines (full and bloom/FXAA-free) are compiled at start-up; both bind a white 1×1
+AO fallback when the pass is off, so no shader variant is needed. v1.3 optionally inserts
+FSR 1.0 EASU+RCAS between post and UI (§3.13.9).
 
 ### 3.7 Materials, WGSL modules and pipeline variants
 
@@ -553,6 +577,19 @@ together (REQ-RENDER-025). The `performance` column is the 144 FPS mode of
 Hi-Z build and cull is the 3.33 ms pass sum inside the 4.00 ms envelope. Every row must be
 measurable by toggling exactly that feature in the `flythrough` scene and recording the delta.
 
+**v1.4 interim mapping (measured, not estimated).** The shipping renderer does not yet
+have the graph's GTAO compute pass or volumetric froxel volume. Instead it spends the high
+tiers' budget on depth-reconstructed SSAO and atmosphere terms gated directly by the
+existing quality rows: both High and Ultra run SSAO, height fog and the seam cross-fade;
+High uses a quarter-resolution AO target and Ultra half; projected cloud shadows are
+**Ultra-only** because their measured 1080p cost (~1.1 ms) would push High below 60 FPS.
+At 1920×1080 the added cost over the v1.3 High path is ~0.8 ms for SSAO, ~0.65 ms for
+height fog + seam, ~0.2 ms for depth-responsive water, and the Ultra cloud-shadow row
+costs ~1.1 ms. Medium and Low record no added passes and, after the v1.4 front-to-back
+opaque ordering, are ~1.2 ms / ~0.4 ms faster than v1.3. The exact numbers and the
+over-budget note are in [25 §5.11](25-performance-budgets.md#511-v14-graphics-polish-measured-512-chunk-report-2026-11-25)
+and [08-measurements §v1.4](../plan/08-measurements.md#2026-11-25--v14-graphics-polish-512-chunks-native).
+
 ### 3.11 Visual parity and deliberate divergence
 
 Parity items are verified by the parity corpus ([MS-14](../plan/01-milestones.md)); the
@@ -713,9 +750,24 @@ elevation, attenuates the surface by the shadow (45% darkening in shade), and ap
 same distance fog as opaque terrain. Water `Off` still draws (fully opaque, no waves);
 `Low`/`High` vary wave and specular strength and surface alpha.
 
-Not shipped: SSR/planar reflection, refraction, shoreline foam, water volume/underwater
-tint or caustics. Far water is drawn in the same translucent pass, which avoids LOD-seam
-holes; both sides are kept, with the same alpha as the top.
+**v1.4 water response (High/Ultra).** Before the water pass the renderer copies the scene
+depth into a `Depth32Float` texture that the water shader samples with `textureLoad` (the
+original target is still attached for depth testing). Water thickness is
+`scene_eye_depth − surface_eye_depth`; it drives a depth-based tint and opacity (shallow
+water lets a warm sandy bed show through, deep water absorbs to blue-green), a soft animated
+shoreline foam band that fades with distance, and a below-surface branch. The normal is
+perturbed by three travelling waves, Fresnel uses `F0 = 0.02`, the reflection samples the
+same horizon/zenith gradient as the sky, and a two-lobe sun glint plus cascade shadow keeps
+the highlight on the sun side. At `WaterQuality::Off`/`Low` the depth copy is not taken
+(`clip.z = 0`) and the shader keeps the v1.3 cheap path. The post pass adds a cheap
+underwater grade (red absorption, blue-green veil) when the eye is below a water surface
+inside a water-mesh AABB.
+
+Not shipped: SSR/planar reflection, refraction, caustics and a true underwater volume/fog
+raymarch. Far water has no depth copy: it uses the baked water-colour luminance as a depth
+proxy for opacity, with animated low-frequency waves, reflected-sky Fresnel and the shared
+fog/seam factors. Far water is drawn in the same translucent pass before the sorted near
+water, which avoids LOD-seam holes.
 
 #### 3.13.6 Post-processing
 
@@ -734,9 +786,20 @@ pipeline and a simple pipeline with no bloom/FXAA fetches, selected when both ar
 mirror of the ACES/vignette math lives in `tonemap.rs` and is used by tests to predict pixel
 values exactly.
 
-Not shipped: TAA, histogram exposure, GTAO, volumetric fog and colour LUT. MSAA stays at
-1; FXAA-lite is the shipped antialiasing, and optional FSR 1.0 EASU+RCAS (§3.13.9) provides
-render-scale upscaling plus adaptive sharpening when the user selects it.
+**v1.4 SSAO and underwater grade.** On High/Ultra the renderer records a quarter- or
+half-resolution depth-reconstructed SSAO pair (`ssao-raw`, then a depth-aware
+`ssao-blur`) after the water pass and before bloom. The raw pass reconstructs view-space
+positions from the depth target and derives normals from the right/up neighbours (there is
+no normal buffer), then tests six rotated hemisphere taps; sky pixels (depth 1.0) output
+1.0, the effect fades between 96 and 192 m, and the blur weights five taps by eye-depth
+similarity so a silhouette cannot bleed AO across the edge. The post pass multiplies the
+HDR scene by `mix(1, ao, 0.85)` before bloom/tonemap. The post pass also applies the cheap
+underwater grade described in §3.13.5.
+
+Not shipped: TAA, histogram exposure, the full GTAO horizon search, volumetric fog and
+colour LUT. MSAA stays at 1; FXAA-lite is the shipped antialiasing, and optional FSR 1.0
+EASU+RCAS (§3.13.9) provides render-scale upscaling plus adaptive sharpening when the user
+selects it.
 
 #### 3.13.7 Settings, presets and F3
 
@@ -841,6 +904,65 @@ and [1.3-fsr](../plan/1.3-fsr.md).
 
 **Not shipped:** FSR 2/3 (temporal), DLSS/XeSS, frame generation, dynamic resolution
 (auto-scaling), and an FSR sharpness row (RCAS stays at the reference 0.20 stops).
+
+#### 3.13.10 v1.4 render polish (2026-11-25)
+
+The 1.4 graphics slice improves the 512-chunk (8,192-block) visual horizon and the near
+world without changing the simulation, streaming, protocol or settings schema. Every new
+effect is selected from the existing quality rows; no new core/client setting is added.
+
+**Near/far seam.** Full-detail sections and surface-shell batches end at the simulation
+radius. Both the near and far shaders fade towards a shared seam colour in a 64-block band
+around that radius (near: `r − 64 .. r`, far: `r .. r + 64`), peaking at 22% haze and
+sqrt-free, so the textured world and the coarse palette meet in the same aerial band rather
+than at a hard style/luminance step. The existing tier overlap still guarantees no crack;
+the blend is colour-only and does not dither depth. Low/Medium upload a zero radius and are
+unchanged. The far palette now blends beach, snowline and slope transitions and adds
+smooth baked multi-scale colour variation; far light matches the near bake at
+`0.82 + 0.18 × n·sun`.
+
+**Atmosphere.** High/Ultra add a rational height fog (density 0.00018/block, 160-block scale
+height, sea-level base, skipped below 96 m) evaluated per fragment in the near world and
+per vertex on the far heightfield, plus Ultra cloud-shadow modulation. The cloud field is
+baked once into a 128² tiling `R8Unorm` texture (`cloud_shadow.rs`) and sampled with one
+bilinear fetch; the per-fragment value-noise version measured ~4.5 ms at 1080p and was
+replaced. Shadows are projected along the sun onto the shared cloud plane and fade out
+between 1,024 and 1,536 m. High keeps the same sky cloud layer but no ground modulation.
+
+**Water.** High/Ultra take a depth-only scene copy before the translucent pass and derive
+water thickness; the shader uses it for depth-based tint/opacity, a soft distance-faded
+foam band, and a below-surface branch. The normal gets three travelling waves, Fresnel
+reflects the sky gradient, and a two-lobe glint adds sun sparkle while keeping cascade
+shadowing. The post pass applies an underwater red-absorption/blue-veil grade when the eye
+is below a water-mesh surface. Low/Off keep the v1.3 shader path and no copy. Far water
+matches the same Fresnel/sky model using the baked water-colour luminance as its depth
+proxy and adds low-frequency animated ripples, removing the flat horizon band.
+
+**SSAO.** High/Ultra record a depth-reconstructed SSAO pass pair before bloom. There is no
+normal buffer: normals come from reconstructed right/up neighbours. Six rotated hemisphere
+taps are tested against the depth buffer; sky and the 96–192 m fade stay exactly 1.0, the
+blur is depth-aware, and the post pass multiplies `mix(1, ao, 0.85)` into the HDR scene.
+High uses a quarter-resolution target, Ultra half-resolution; the pass pair costs ~0.8 ms
+(High) and ~1.1 ms (Ultra) at 1080p. Low/Medium allocate no target and record no passes.
+
+**Performance work.** The opaque pass now collects visible sections and far LOD batches
+into one front-to-back list (squared AABB-centre distance, deterministic key tie-break) so
+early depth rejection removes hidden tree/terrain fragments before their heavy shaders run.
+Far-terrain fog, seam and cloud shadows are evaluated per vertex where they are smooth.
+Depth-responsive water reads a copy instead of the attached depth target. The net result
+at native 1920×1080 High is 16.6 ms p50 in the offscreen-readback harness (59.9 FPS), 0.9 ms
+above the 15.7 ms v1.3 baseline; 720p High is 11.8 ms (84.3 FPS). Medium and Low are faster
+than their v1.3 counterparts, and FSR remains functional on the split render/display path.
+See [25 §5.11](25-performance-budgets.md#511-v14-graphics-polish-measured-512-chunk-report-2026-11-25)
+for the full table and costs.
+
+**Limitations.** No SSR, refraction, caustics or volumetric froxel fog; far terrain still
+omits trees/structures, so a tree line can end at the seam; the far snow tint at dusk is
+brighter than near snow; SSAO is ambient-only by nature (it darkens the whole HDR before
+tonemap rather than separating direct sun); projected cloud shadows are Ultra-only; and
+Low/Medium intentionally keep the 1.3 look. A dedicated `cloud_shadows` quality row (or
+`gtao`/`ssao` row) would let High trade the quarter-res AO or cloud shadows explicitly and
+is recommended for the Lead rather than added here.
 
 ## 4. Data structures and formats
 

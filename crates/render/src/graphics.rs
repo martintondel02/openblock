@@ -401,6 +401,68 @@ impl GraphicsSettings {
         if self.bloom { BLOOM_STRENGTH } else { 0.0 }
     }
 
+    /// Whether the depth-reconstructed SSAO pass runs.
+    ///
+    /// The 1.4 slice spends the extra fill-rate only on the two high tiers:
+    /// Low and Medium (`ShadowQuality::Off`/`Low`) keep their 1.1–1.3 cheap
+    /// path. `Custom` stays coherent because it is keyed off the shadow row,
+    /// not off the preset name: a player who turned shadows down to Low also
+    /// gets the cheaper ambient term instead of a full-price AO pass.
+    pub fn ssao_enabled(&self) -> bool {
+        matches!(self.shadow_quality, ShadowQuality::High | ShadowQuality::Ultra)
+    }
+
+    /// Strength of the SSAO multiplier in the post pass, zero when disabled.
+    pub fn ssao_strength(&self) -> f32 {
+        if self.ssao_enabled() { SSAO_STRENGTH } else { 0.0 }
+    }
+
+    /// Whether the terrain/water shaders project the cloud layer onto the
+    /// ground as moving cloud shadows.
+    ///
+    /// This is an **Ultra-only** effect after measurement: on the reference
+    /// RADV integrated GPU it costs ~1.1 ms at 1920×1080 (a full-screen
+    /// cloud-density fetch plus the projection), which would take High below
+    /// the 60 FPS target. High keeps the same cloud layer in the sky and the
+    /// height fog, so only the ground modulation is deferred to Ultra.
+    pub fn cloud_shadows_enabled(&self) -> bool {
+        self.shadow_quality == ShadowQuality::Ultra && self.clouds == CloudQuality::High
+    }
+
+    /// Resolution divisor of the SSAO target: Ultra uses half resolution,
+    /// High a quarter. Ambient occlusion is low-frequency, and the measured
+    /// 0.3 ms saved by the quarter target is what keeps High at 60 FPS.
+    pub fn ssao_resolution_divisor(&self) -> u32 {
+        match self.shadow_quality {
+            ShadowQuality::Ultra => 2,
+            _ => 4,
+        }
+    }
+
+    /// Strength of the cloud-shadow modulation on terrain, water and far
+    /// terrain (zero on Low/Medium and when clouds are off).
+    pub fn cloud_shadow_strength(&self) -> f32 {
+        if self.cloud_shadows_enabled() {
+            CLOUD_SHADOW_STRENGTH
+        } else {
+            0.0
+        }
+    }
+
+    /// Whether the cheap height-fog / aerial-perspective term is applied.
+    ///
+    /// This is a few ALU operations in the terrain/water/far shaders, so both
+    /// High and Ultra keep it; Low and Medium stay at their 1.3 look.
+    pub fn height_fog_enabled(&self) -> bool {
+        self.ssao_enabled()
+    }
+
+    /// Multiplier for the sun glints on water (High keeps the full specular
+    /// response, Low is dimmer, Off has none).
+    pub fn water_glints(&self) -> f32 {
+        self.water.shader_params().2
+    }
+
     /// Short one-line description for F3 and the benchmark report.
     pub fn summary(&self) -> String {
         let shadows = match self.shadow_quality {
@@ -435,6 +497,10 @@ pub const MAX_EXPOSURE: f32 = 2.0;
 pub const BLOOM_STRENGTH: f32 = 0.07;
 /// Luminance above which the bloom threshold pass emits light.
 pub const BLOOM_THRESHOLD: f32 = 1.00;
+/// Strength of the half-resolution SSAO multiplier on High/Ultra.
+pub const SSAO_STRENGTH: f32 = 0.85;
+/// Maximum darkening applied to ambient light by a cloud shadow.
+pub const CLOUD_SHADOW_STRENGTH: f32 = 0.30;
 
 #[cfg(test)]
 mod tests {
@@ -481,6 +547,47 @@ mod tests {
 
         let ultra = ShadowQuality::Ultra.config();
         assert_eq!((ultra.resolution, ultra.cascades, ultra.pcf_radius), (2048, 2, 2));
+    }
+
+    #[test]
+    fn high_tier_effects_are_gated_by_the_existing_quality_fields() {
+        let low = GraphicsSettings::from_preset(GraphicsPreset::Low);
+        let medium = GraphicsSettings::from_preset(GraphicsPreset::Medium);
+        let high = GraphicsSettings::from_preset(GraphicsPreset::High);
+        let ultra = GraphicsSettings::from_preset(GraphicsPreset::Ultra);
+        for cheap in [low, medium] {
+            assert!(!cheap.ssao_enabled(), "{} must not run SSAO", cheap.preset.name());
+            assert_eq!(cheap.ssao_strength(), 0.0);
+            assert_eq!(cheap.cloud_shadow_strength(), 0.0);
+            assert!(!cheap.height_fog_enabled());
+        }
+        for expensive in [high, ultra] {
+            assert!(expensive.ssao_enabled(), "{} should run SSAO", expensive.preset.name());
+            assert!(expensive.ssao_strength() > 0.5);
+            assert!(expensive.height_fog_enabled());
+        }
+        // Cloud shadows are Ultra-only after measurement; High keeps the sky
+        // clouds and height fog.
+        assert!(!high.cloud_shadows_enabled());
+        assert_eq!(high.cloud_shadow_strength(), 0.0);
+        assert!(ultra.cloud_shadows_enabled());
+        assert!(ultra.cloud_shadow_strength() > 0.0);
+        assert_eq!(high.ssao_resolution_divisor(), 4);
+        assert_eq!(ultra.ssao_resolution_divisor(), 2);
+        // A disabled cloud layer removes the Ultra effect too.
+        let no_clouds = GraphicsSettings {
+            clouds: CloudQuality::Off,
+            ..ultra
+        };
+        assert!(!no_clouds.cloud_shadows_enabled());
+        assert_eq!(no_clouds.cloud_shadow_strength(), 0.0);
+        // A custom shadow row drives the gate, not the preset name.
+        let custom_cheap = GraphicsSettings {
+            preset: GraphicsPreset::Custom,
+            shadow_quality: ShadowQuality::Low,
+            ..high
+        };
+        assert!(!custom_cheap.ssao_enabled());
     }
 
     #[test]

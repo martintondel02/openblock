@@ -222,6 +222,18 @@ impl OffscreenRenderer {
         self.scene.debug_shadow_depth(&self.device, &self.queue)
     }
 
+    /// Debug helper: `(min, max, pixels written)` of the scene depth target.
+    #[cfg(test)]
+    pub(crate) fn debug_scene_depth(&self) -> (f32, f32, usize) {
+        self.scene.debug_scene_depth(&self.device, &self.queue)
+    }
+
+    /// Debug helper: blurred SSAO statistics `(min, max, mean, pixels)`.
+    #[cfg(test)]
+    pub(crate) fn debug_ssao(&self) -> Option<(u8, u8, f32, Vec<u8>)> {
+        self.scene.debug_ssao(&self.device, &self.queue)
+    }
+
     /// Pushes a wgpu validation error scope (tests and diagnostics).
     #[cfg(test)]
     pub(crate) fn push_validation_scope(&self) -> wgpu::ErrorScopeGuard {
@@ -2702,6 +2714,18 @@ mod tests {
                 preset.name(),
                 stats.passes
             );
+            let expected_ssao = if matches!(preset, crate::GraphicsPreset::High | crate::GraphicsPreset::Ultra) {
+                2
+            } else {
+                0
+            };
+            assert_eq!(
+                stats.ssao_passes,
+                expected_ssao,
+                "{} preset recorded {} SSAO passes",
+                preset.name(),
+                stats.ssao_passes
+            );
             assert!(
                 pixels
                     .as_chunks::<4>()
@@ -3365,5 +3389,321 @@ mod tests {
         assert!(OffscreenRenderer::pop_validation_scope(scope).is_none());
         let pixels = renderer.read_rgba();
         assert!(mean_luma(&pixels) > 5.0, "the far scene must not be fully black");
+    }
+
+    // ------------------------------------------------------------------
+    // v1.4 graphics: SSAO, depth-responsive water and underwater post.
+    // ------------------------------------------------------------------
+
+    /// One sea-level chunk: stone floor at y=61, a full water block at y=62
+    /// (surface at y=63) and the same 16×16 footprint. Deep enough to submerge
+    /// the eye, shallow enough that the bottom shows through the water.
+    /// A 4×4-block well, 10 blocks deep, with a stone floor and walls. The
+    /// depth-derived AO has a real concave corner to darken, so it is a much
+    /// stronger regression target than the flat platform.
+    fn occlusion_well_world(registry: &Arc<Registry>) -> World {
+        let stone = registry.id_or_air("openblock:stone");
+        let mut column = ChunkColumn::new(ChunkPos::new(0, 0));
+        for z in 0..SECTION_SIZE as i32 {
+            for x in 0..SECTION_SIZE as i32 {
+                for y in 60..=70 {
+                    let inside = (4..=11).contains(&x) && (4..=11).contains(&z);
+                    if !inside || y == 60 {
+                        column.set_block(BlockPos::new(x, y, z), stone);
+                    }
+                }
+            }
+        }
+        column.recompute_heightmap();
+        let mut world = World::new(Arc::clone(registry), 8);
+        world.insert_chunk(column);
+        world
+    }
+
+    fn sea_level_water_world(registry: &Arc<Registry>) -> World {
+        let stone = registry.id_or_air("openblock:stone");
+        let water = registry.id_or_air("openblock:water");
+        assert_ne!(water, BlockId::AIR);
+        let mut column = ChunkColumn::new(ChunkPos::new(0, 0));
+        for z in 0..SECTION_SIZE as i32 {
+            for x in 0..SECTION_SIZE as i32 {
+                column.set_block(BlockPos::new(x, 61, z), stone);
+                column.set_block(BlockPos::new(x, 62, z), water);
+            }
+        }
+        column.recompute_heightmap();
+        let mut world = World::new(Arc::clone(registry), 7);
+        world.insert_chunk(column);
+        world
+    }
+
+    #[test]
+    fn ssao_runs_on_high_ground_and_never_darkens_the_sky() {
+        let Some(mut renderer) = open_renderer(240, 135, "ssao_runs_on_high_ground_and_never_darkens_the_sky") else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let sky_world = test_world(&registry);
+        let well = occlusion_well_world(&registry);
+        let sky_camera = Camera::new(WorldVec::new(8.0, 76.0, 8.0), 0.3, -0.5);
+        let mut camera = Camera::new(WorldVec::new(8.0, 68.5, 8.0), 0.4, -0.9);
+        camera.far = 160.0;
+        let scene = SceneParams::new(Environment::new(0.42));
+
+        // Both rows keep clouds, bloom and FXAA off so the comparison isolates
+        // SSAO (and its shadow-quality gate) rather than the sky layer.
+        let clear_options = crate::GraphicsSettings {
+            clouds: crate::CloudQuality::Off,
+            bloom: false,
+            fxaa: false,
+            ..crate::GraphicsSettings::default()
+        };
+        let high_graphics = crate::GraphicsSettings { ..clear_options };
+        let low_graphics = crate::GraphicsSettings {
+            shadow_quality: crate::ShadowQuality::Off,
+            ..clear_options
+        };
+        // High/Ultra gate: both raw and blur passes, and an AO target exists.
+        renderer.set_graphics(high_graphics);
+        renderer.render_world_scene(&well, &camera, &scene).expect("High frame");
+        let stats = renderer.stats();
+        assert_eq!(stats.ssao_passes, 2, "High must record the raw and blur SSAO passes");
+        let (_, _, depth_written) = renderer.debug_scene_depth();
+        assert!(depth_written > 1000, "the AO pass saw an empty depth target");
+        let (min, max, mean, ao) = renderer.debug_ssao().expect("High has an AO target");
+        assert_eq!(ao.len(), (240 / 4) * (135 / 4));
+        assert!(max >= 250, "AO never reaches neutral: max {max}");
+        assert!(
+            min < 220 && mean < 250.0,
+            "SSAO did not occlude the well: min {min}, mean {mean:.1}"
+        );
+
+        // Sky rows are neutral: the blur output must be exactly white where the
+        // depth is still 1.0, otherwise a dark halo would appear at the horizon.
+        renderer
+            .render_world_scene(&sky_world, &sky_camera, &scene)
+            .expect("sky frame");
+        let high = renderer.read_rgba();
+        let (_, _, _, sky_ao) = renderer.debug_ssao().expect("sky AO target");
+        let ao_width = (240 / 4) as usize;
+        let sky_height = (135 / 4) as usize;
+        let sky_rows = sky_height / 5;
+        for row in 0..sky_rows {
+            for column in 0..ao_width {
+                let value = sky_ao[row * ao_width + column];
+                assert_eq!(
+                    value, 255,
+                    "SSAO darkened the sky at row {row} column {column}: {value}"
+                );
+            }
+        }
+        let high_stats = renderer.stats();
+
+        // Low/Medium keep the cheap path: no AO target and no passes.
+        renderer.set_graphics(low_graphics);
+        renderer
+            .render_world_scene(&sky_world, &sky_camera, &scene)
+            .expect("Low frame");
+        let low = renderer.read_rgba();
+        let low_stats = renderer.stats();
+        assert_eq!(low_stats.ssao_passes, 0);
+        assert!(renderer.debug_ssao().is_none(), "Low must not allocate an AO target");
+        assert!(
+            low_stats.passes + 2 <= high_stats.passes,
+            "High should record two more passes than Low ({} vs {})",
+            high_stats.passes,
+            low_stats.passes
+        );
+
+        // The sky itself is identical between the two: SSAO multiplies nothing
+        // at depth 1.0, so the top row must not shift.
+        for y in 0..(135 / 8) {
+            let high_row = row_rgb(&high, 240, y);
+            let low_row = row_rgb(&low, 240, y);
+            for channel in 0..3 {
+                assert!(
+                    (high_row[channel] - low_row[channel]).abs() < 1.5,
+                    "sky row {y} changed with SSAO: {high_row:?} vs {low_row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn underwater_camera_is_tinted_and_depth_responsive_water_validates() {
+        let Some(mut renderer) = open_renderer(
+            200,
+            120,
+            "underwater_camera_is_tinted_and_depth_responsive_water_validates",
+        ) else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let world = sea_level_water_world(&registry);
+        renderer.set_graphics(crate::GraphicsSettings::from_preset(crate::GraphicsPreset::High));
+        let scene = SceneParams::new(Environment::new(0.45));
+
+        // Underwater: eye at 62.5 is inside the water block (surface at 63).
+        let mut camera = Camera::new(WorldVec::new(8.0, 62.5, 8.0), 0.0, 0.25);
+        camera.far = 160.0;
+        let scope = renderer.push_validation_scope();
+        renderer
+            .render_world_scene(&world, &camera, &scene)
+            .expect("underwater frame");
+        let error = OffscreenRenderer::pop_validation_scope(scope);
+        assert!(error.is_none(), "underwater/depth-copy validation error: {error:?}");
+        let underwater_stats = renderer.stats();
+        assert!(
+            underwater_stats.water_draw_calls > 0,
+            "underwater frame must draw water"
+        );
+        assert_eq!(underwater_stats.ssao_passes, 2);
+        let underwater = renderer.read_rgba();
+        let underwater_mean = mean_colour(&underwater, &vec![true; (200 * 120) as usize]);
+
+        // Above the same water block, same view direction.
+        let above = Camera::new(WorldVec::new(8.0, 64.5, 8.0), 0.0, 0.25);
+        renderer
+            .render_world_scene(&world, &above, &scene)
+            .expect("above-water frame");
+        let above_pixels = renderer.read_rgba();
+        let above_mean = mean_colour(&above_pixels, &vec![true; (200 * 120) as usize]);
+
+        assert!(mean_luma(&underwater) > 4.0, "underwater frame is black");
+        assert!(
+            underwater_mean[2] > underwater_mean[0] * 1.5,
+            "underwater grade is not blue-green: {underwater_mean:?}"
+        );
+        assert!(
+            underwater_mean[0] < above_mean[0] * 0.8,
+            "underwater grade did not absorb red: {underwater_mean:?} vs {above_mean:?}"
+        );
+        assert!(
+            mean_luma(&underwater) < mean_luma(&above_pixels) * 0.95,
+            "underwater frame is not dimmer than above water"
+        );
+    }
+
+    #[test]
+    fn ssao_water_and_post_reallocate_across_resize_and_quality_changes() {
+        let Some(mut renderer) = open_renderer(
+            240,
+            135,
+            "ssao_water_and_post_reallocate_across_resize_and_quality_changes",
+        ) else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let world = sea_level_water_world(&registry);
+        let camera = Camera::new(WorldVec::new(8.0, 64.5, 8.0), 0.0, -0.4);
+        let scene = SceneParams::new(Environment::new(0.5));
+
+        let scope = renderer.push_validation_scope();
+        renderer.set_graphics(crate::GraphicsSettings::from_preset(crate::GraphicsPreset::Ultra));
+        renderer
+            .render_world_scene(&world, &camera, &scene)
+            .expect("ultra frame");
+        assert_eq!(renderer.stats().ssao_passes, 2);
+
+        renderer.resize(160, 90);
+        renderer
+            .render_cached_scene(&camera, &scene)
+            .expect("resized high frame");
+        assert_eq!(renderer.stats().ssao_passes, 2);
+        let (_, _, _, ao) = renderer.debug_ssao().expect("resized AO target");
+        assert_eq!(ao.len(), (160 / 2) * (90 / 2));
+
+        // Quality changes between tiers keep the post bind group valid.
+        for preset in [
+            crate::GraphicsPreset::Medium,
+            crate::GraphicsPreset::High,
+            crate::GraphicsPreset::Ultra,
+        ] {
+            renderer.set_graphics(crate::GraphicsSettings::from_preset(preset));
+            renderer.render_cached_scene(&camera, &scene).expect("preset frame");
+            let expected = if matches!(preset, crate::GraphicsPreset::High | crate::GraphicsPreset::Ultra) {
+                2
+            } else {
+                0
+            };
+            assert_eq!(renderer.stats().ssao_passes, expected, "{} SSAO passes", preset.name());
+        }
+        let error = OffscreenRenderer::pop_validation_scope(scope);
+        assert!(error.is_none(), "resize/quality validation error: {error:?}");
+    }
+
+    /// v1.4 visual verification: a surface lake, an underwater view and the
+    /// depth-reconstructed SSAO on a concave well, at native 1080p.
+    ///
+    /// Run with:
+    /// `./dev-cargo test -p ob_render --lib -- --ignored write_v14_water_and_ssao_screenshots`
+    #[test]
+    #[ignore = "GPU screenshot verification; writes /tmp/openblock-1.4-{water,underwater,ssao}.png"]
+    fn write_v14_water_and_ssao_screenshots() {
+        const WIDTH: u32 = 1920;
+        const HEIGHT: u32 = 1080;
+        if std::env::var_os("OPENBLOCK_NO_GPU_TESTS").is_some() {
+            eprintln!("skipping v1.4 screenshots: OPENBLOCK_NO_GPU_TESTS is set");
+            return;
+        }
+        let registry = Arc::new(Registry::base());
+        let lake = screenshot_water_world(&registry);
+        let well = occlusion_well_world(&registry);
+        let mut renderer = match OffscreenRenderer::new_with_source_and_graphics(
+            WIDTH,
+            HEIGHT,
+            crate::TextureSource::Style(crate::TexturePackStyle::Classic),
+            crate::GraphicsSettings::from_preset(crate::GraphicsPreset::High),
+        ) {
+            Ok(renderer) => renderer,
+            Err(RenderError::NoAdapter(reason)) => {
+                eprintln!("skipping v1.4 screenshots: no GPU adapter ({reason})");
+                return;
+            }
+            Err(error) => panic!("offscreen renderer: {error}"),
+        };
+        renderer.set_graphics(crate::GraphicsSettings {
+            cloud_coverage: 0.55,
+            ..crate::GraphicsSettings::from_preset(crate::GraphicsPreset::High)
+        });
+
+        let mut surface = Camera::new(WorldVec::new(8.0, 72.0, 20.0), 0.0, -0.30);
+        surface.far = 128.0;
+        let scene = SceneParams::new(Environment::new(0.42)).with_time_seconds(12.0);
+        renderer
+            .render_world_scene(&lake, &surface, &scene)
+            .expect("surface water frame");
+        write_test_png(
+            std::path::Path::new("/tmp/openblock-1.4-water.png"),
+            WIDTH,
+            HEIGHT,
+            &renderer.read_rgba(),
+        );
+
+        // Eye inside the lake (water fills y=61..=64, surface at 65), looking up
+        // towards the surface and the shore.
+        let mut underwater = Camera::new(WorldVec::new(8.0, 64.35, 8.0), 0.4, 0.20);
+        underwater.far = 128.0;
+        renderer
+            .render_world_scene(&lake, &underwater, &scene)
+            .expect("underwater frame");
+        write_test_png(
+            std::path::Path::new("/tmp/openblock-1.4-underwater.png"),
+            WIDTH,
+            HEIGHT,
+            &renderer.read_rgba(),
+        );
+
+        let mut well_camera = Camera::new(WorldVec::new(8.0, 68.5, 8.0), 0.4, -0.9);
+        well_camera.far = 160.0;
+        renderer
+            .render_world_scene(&well, &well_camera, &scene)
+            .expect("SSAO frame");
+        write_test_png(
+            std::path::Path::new("/tmp/openblock-1.4-ssao.png"),
+            WIDTH,
+            HEIGHT,
+            &renderer.read_rgba(),
+        );
     }
 }

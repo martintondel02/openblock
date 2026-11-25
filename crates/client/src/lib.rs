@@ -77,8 +77,6 @@ use ui_state::{
 const TICK: Duration = Duration::from_millis(50);
 /// Cooldown between right-click block placements.
 const PLACE_COOLDOWN: Duration = Duration::from_millis(200);
-/// Cooldown between two melee attacks at a mob.
-const ATTACK_COOLDOWN: Duration = Duration::from_millis(400);
 /// Peak camera pitch offset, in radians, after the player takes damage.
 const DAMAGE_SHAKE_RADIANS: f32 = 0.05;
 /// Maximum dirty sections handed to the mesh scheduler per frame. The rest are
@@ -576,7 +574,7 @@ pub fn screenshot(options: &ClientOptions, path: &std::path::Path) -> Result<(),
     screenshot_with_mode(options, path, ScreenshotMode::Hud)
 }
 
-/// Renders one offscreen protocol v3 survival frame from an in-process server.
+/// Renders one offscreen protocol v4 survival frame from an in-process server.
 ///
 /// This is the documentation/demo probe for the network runtime. It opens a
 /// temporary world, installs a small survival scene (mobs, dropped items and a
@@ -2743,6 +2741,13 @@ fn draw_vitals_for_mode(frame: &mut UiFrame, _ui: &UiState, host: &Host, screen:
         let player = host.player();
         ui_state::draw_vitals(frame, screen, player.health, player.hunger);
         ui_state::draw_armor(frame, screen, host.armor_defense());
+        ui_state::draw_xp_bar(
+            frame,
+            screen,
+            player.xp_level,
+            player.xp_points,
+            ob_sim::xp_required_for_level(player.xp_level),
+        );
     }
 }
 
@@ -3045,8 +3050,6 @@ struct GameState {
     container: Option<ContainerSession>,
     /// Per-mob tick interpolation cache for smooth avatar movement.
     mob_render: MobRenderCache,
-    /// Earliest instant the next melee attack is allowed.
-    attack_ready: Option<Instant>,
     /// Decaying camera pitch offset after taking damage.
     camera_shake: f32,
     /// Simulated ticks spent asleep (single-player countdown estimate).
@@ -3293,7 +3296,6 @@ impl GameState {
         self.accumulator = Duration::ZERO;
         self.damage_flash.reset();
         self.camera_shake = 0.0;
-        self.attack_ready = None;
         self.container = None;
         self.mob_render.sync(self.host.mobs(), 0.0);
         self.last_audio_health = self.host.player().health;
@@ -3762,16 +3764,18 @@ impl GameState {
         }
     }
 
-    /// Sends one melee attack to the host, respecting the 0.4 s cooldown.
+    /// Sends one charged melee attack to the host.
     ///
     /// The crosshair mob is selected by the same AABB raycast the host uses for
-    /// validation. The first-person hit marker and red hurt tint come from the
-    /// server-side hurt timer; the toasts report the damage/kill.
+    /// validation. The host enforces the 625/1,000 ms sword/hand cooldown and
+    /// the 0.9 charge gate; this method simply refuses to send a swing the host
+    /// would reject. The first-person hit marker and red hurt tint come from the
+    /// server-side hurt timer; the toasts report damage/kill and criticals.
     fn try_attack_mob(&mut self, id: u64) {
         if self.host.is_dead() || self.ui.screen != Screen::Playing {
             return;
         }
-        if self.attack_ready.is_some_and(|ready| ready > Instant::now()) {
+        if self.host.attack_cooldown_remaining_ms() > 0 {
             return;
         }
         let Some(entity) = self.host.mob_entity(id) else {
@@ -3784,11 +3788,11 @@ impl GameState {
         if !outcome.hit {
             return;
         }
-        self.attack_ready = Some(Instant::now() + ATTACK_COOLDOWN);
         self.ui.flash_mob_hit();
+        let critical = if outcome.critical { " (critical)" } else { "" };
         self.ui
             .toasts
-            .push(format!("Hit {name} for {:.1}", outcome.damage.max(0.0)));
+            .push(format!("Hit {name} for {:.1}{critical}", outcome.damage.max(0.0)));
         self.play_world_sfx(AudioSfx::Hurt, position, 0.45);
         if outcome.killed {
             self.ui.toasts.push_success(format!("Killed {name}"));
@@ -3830,6 +3834,9 @@ impl GameState {
     /// The server collects dropped entities during its fixed ticks; this is the
     /// only place that announces them so break drops are never double-toasted.
     fn drain_pickup_events(&mut self) {
+        // Explosion cues are drained even though 1.3 has no particle pass; a
+        // later render slice can turn these into smoke/flash effects.
+        let _ = self.host.take_explosion_events();
         for stack in self.host.take_pickup_events() {
             if stack.count == 0 || stack.item.0 as usize >= self.registry.item_len() {
                 continue;
@@ -4706,6 +4713,7 @@ impl GameState {
         let elapsed = self.started.elapsed().as_secs_f32();
         let mut entity_instances = entity_instances_for(self.host.item_entities(), &self.registry, elapsed);
         entity_instances.extend(self.mob_render.instances(&self.registry, alpha));
+        entity_instances.extend(mobs::projectile_instances(self.host.projectiles()));
         self.renderer.set_entities(&entity_instances);
         let ui_frame = self.build_ui_frame();
         let outline = self
@@ -4781,6 +4789,7 @@ impl GameState {
         let elapsed = self.started.elapsed().as_secs_f32();
         let mut entities = entity_instances_for(self.host.item_entities(), &self.registry, elapsed);
         entities.extend(mobs::mob_instances(&self.registry, self.host.mobs(), elapsed));
+        entities.extend(mobs::projectile_instances(self.host.projectiles()));
         renderer.set_entities(&entities);
         let scene = SceneParams {
             environment: *environment,
@@ -4873,6 +4882,21 @@ impl GameState {
                 frame.rect(centre_x - 9.0, centre_y - 1.0, 18.0, 2.0, cross);
                 if self.mining.is_mining() {
                     mining::draw_progress(&mut frame, (centre_x, centre_y), self.mining.progress());
+                }
+                let remaining = self.host.attack_cooldown_remaining_ms();
+                if remaining > 0 {
+                    let cooldown =
+                        ob_sim::attack_cooldown_ms(&self.registry, self.host.selected_stack().map(|stack| stack.item));
+                    ui_state::draw_attack_cooldown(&mut frame, screen, remaining, cooldown as u32);
+                }
+                let player = self.host.player();
+                if let Some(id) = self
+                    .host
+                    .mob_hit_by_ray(player.eye(), player.forward(), ob_server::MOB_ATTACK_REACH)
+                    && let Some(entity) = self.host.mob_entity(id)
+                {
+                    let spec = self.registry.mob(entity.mob.kind);
+                    ui_state::draw_mob_health(&mut frame, screen, spec.display_name, entity.mob.health, spec.health);
                 }
                 if self.ui.hit_marker_seconds > 0.0 {
                     let alpha = (self.ui.hit_marker_seconds / 0.22).clamp(0.0, 1.0);
@@ -5194,6 +5218,45 @@ impl GameState {
             return;
         }
         let player = self.host.player();
+        // Feeding takes priority over block use when a passive mob is under the
+        // crosshair and the selected item is breeding food. The host validates
+        // reach, species and food and returns a rejection reason otherwise.
+        if let Some(id) = self
+            .host
+            .mob_hit_by_ray(player.eye(), player.forward(), ob_sim::MOB_INTERACT_REACH)
+        {
+            let selected = self.host.selected_stack();
+            let passive = self
+                .host
+                .mob_entity(id)
+                .is_some_and(|entity| self.registry.mob(entity.mob.kind).passive());
+            let is_food = passive
+                && selected.is_some_and(|stack| {
+                    matches!(self.registry.item(stack.item).id, "openblock:wheat" | "openblock:seeds")
+                });
+            if is_food {
+                let outcome = self.host.interact_mob(id);
+                if outcome.accepted {
+                    if let Some(child) = outcome.child {
+                        let kind = self
+                            .host
+                            .mob_entity(child)
+                            .map(|entity| self.registry.mob(entity.mob.kind).display_name)
+                            .unwrap_or("baby");
+                        self.ui
+                            .toasts
+                            .push_success(format!("A baby {kind} was born (+{} XP)", outcome.xp_awarded));
+                    } else {
+                        self.ui.toasts.push("The animal is in love");
+                    }
+                } else {
+                    self.ui
+                        .toasts
+                        .push_warning(format!("Cannot feed: {}", outcome.reason.replace('_', " ")));
+                }
+                return;
+            }
+        }
         if let Some(hit) = self.host.world().raycast(player.eye(), player.forward(), REACH) {
             let target = self.host.world().get_block(hit.block);
             let selected = self.host.selected_stack();
@@ -5911,7 +5974,6 @@ impl ApplicationHandler for App {
             fsr_setting_touched: false,
             container: None,
             mob_render: MobRenderCache::new(),
-            attack_ready: None,
             camera_shake: 0.0,
             sleep_ticks: 0,
             was_sleeping: false,

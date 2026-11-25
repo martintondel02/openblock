@@ -15,6 +15,7 @@
 #![allow(missing_docs)] // TODO(MS-04): re-enable once the v0.0.1 API surface settles
 #![forbid(unsafe_code)]
 
+mod cloud_shadow;
 pub mod entities;
 pub mod environment;
 pub mod far_terrain;
@@ -29,6 +30,7 @@ pub mod outline;
 mod pipeline;
 pub mod resource_pack;
 pub mod shadow;
+mod ssao;
 pub mod textures;
 pub mod tonemap;
 pub mod ui;
@@ -403,6 +405,8 @@ pub struct RenderStats {
     pub bloom_passes: u32,
     /// FSR EASU+RCAS passes recorded this frame (0 on the native path).
     pub fsr_passes: u32,
+    /// SSAO raw and blur passes recorded this frame (0 on Low/Medium).
+    pub ssao_passes: u32,
 }
 
 /// Errors from renderer initialisation or presentation.

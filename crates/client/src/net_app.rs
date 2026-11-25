@@ -11,7 +11,7 @@
 //! * the game loop pauses simulation (and sends no `Move`) while Settings,
 //!   inventory, containers or chat are open;
 //! * vitals, inventory, equipment, containers, mobs and dropped items are
-//!   driven exclusively by protocol v3 messages, never by a local Host.
+//!   driven exclusively by protocol v4 messages, never by a local Host.
 //!
 //! UI drawing that is shared with single-player comes from the crate root and
 //! `inventory`/`containers`/`ui_state`; the multiplayer-specific overlays live
@@ -60,8 +60,6 @@ use crate::{ClientOptions, MAX_MESH_SUBMISSIONS_PER_FRAME, MESH_STATS_INTERVAL, 
 const TICK: Duration = Duration::from_millis(50);
 /// Cooldown between right-click block placements.
 const PLACE_COOLDOWN: Duration = Duration::from_millis(200);
-/// Local cooldown between melee attack intents.
-const ATTACK_COOLDOWN: Duration = Duration::from_millis(400);
 /// Peak camera pitch offset, in radians, after the player takes damage.
 const DAMAGE_SHAKE_RADIANS: f32 = 0.05;
 /// Seconds the "multiplayer survival" notice stays visible.
@@ -1249,17 +1247,47 @@ impl NetGameState {
                     self.end_death_screen();
                 }
                 NetEvent::AttackResult {
-                    hit, damage, killed, ..
+                    hit,
+                    damage,
+                    killed,
+                    critical,
+                    cooldown_remaining_ms,
+                    ..
                 } => {
+                    // Mirror the server's remaining cooldown so a rejected or
+                    // landed swing leaves the crosshair cue exact even when the
+                    // local send time drifted.
+                    let full = self.attack_cooldown().as_millis() as u32;
+                    self.attack_ready = Some(
+                        Instant::now() - Duration::from_millis(u64::from(full.saturating_sub(cooldown_remaining_ms))),
+                    );
                     if hit {
                         self.ui.flash_mob_hit();
                         log::debug!("attack hit for {damage:.1}");
+                        let label = if critical { "Critical hit" } else { "Mob hit" };
+                        self.ui.toasts.push(format!("{label} for {damage:.1}"));
                         if killed {
                             self.ui.toasts.push_success("Mob defeated");
                         }
+                    } else if cooldown_remaining_ms > 0 {
+                        self.ui.toasts.push_warning("The attack is not charged yet");
                     } else {
                         self.ui.toasts.push_warning("The attack missed");
                     }
+                }
+                NetEvent::InteractResult { accepted, reason, .. } => {
+                    if accepted {
+                        // The server also sends the love/birth hint as a chat
+                        // line; avoid duplicating the same toast here.
+                    } else {
+                        self.ui
+                            .toasts
+                            .push_warning(format!("Cannot feed: {}", reason.replace('_', " ")));
+                    }
+                }
+                NetEvent::XpChanged { .. } => {}
+                NetEvent::Explosion { radius, .. } => {
+                    log::debug!("explosion of radius {radius:.1}");
                 }
                 NetEvent::ActionRejected { reason, hint, .. } => {
                     log::debug!("action rejected: {reason}");
@@ -1736,7 +1764,11 @@ impl NetGameState {
     }
 
     fn try_attack_mob(&mut self, id: u64) {
-        if self.sleeping() || self.attack_ready.is_some_and(|ready| ready.elapsed() < ATTACK_COOLDOWN) {
+        if self.sleeping() {
+            return;
+        }
+        let cooldown = self.attack_cooldown();
+        if self.attack_ready.is_some_and(|ready| ready.elapsed() < cooldown) {
             return;
         }
         let Some(client) = &mut self.client else {
@@ -1745,6 +1777,16 @@ impl NetGameState {
         if client.send_attack(Some(id)) {
             self.attack_ready = Some(Instant::now());
         }
+    }
+
+    /// Full swing cooldown for the authoritative selected item.
+    fn attack_cooldown(&self) -> Duration {
+        let millis = self
+            .client
+            .as_ref()
+            .map(|client| ob_sim::attack_cooldown_ms(&self.registry, client.selected_stack().map(|stack| stack.item)))
+            .unwrap_or(ob_sim::ATTACK_COOLDOWN_MS_DEFAULT);
+        Duration::from_millis(millis)
     }
 
     /// Advances hold-to-mine from the frame clock.
@@ -1838,6 +1880,31 @@ impl NetGameState {
                 .map(|hit| (hit.block, client.world().get_block(hit.block)));
             (hit, client.selected_stack(), client.hunger())
         };
+        // Feeding a mob takes priority when a passive animal is under the
+        // crosshair and the authoritative selected item is breeding food.
+        let feeding_target = self.client.as_ref().and_then(|client| {
+            let id = client.mob_target_with_reach(ob_sim::MOB_INTERACT_REACH)?;
+            let passive = client.entities().kind(id).is_some_and(|kind| {
+                matches!(
+                    kind,
+                    crate::net_state::ReplicatedKind::Mob(kind) if self.registry.mob(*kind).passive()
+                )
+            });
+            passive.then_some(id)
+        });
+        if selected
+            .is_some_and(|stack| matches!(self.registry.item(stack.item).id, "openblock:wheat" | "openblock:seeds"))
+            && let Some(id) = feeding_target
+        {
+            let sent = self
+                .client
+                .as_mut()
+                .is_some_and(|client| client.send_interact_entity(id));
+            if !sent {
+                self.ui.toasts.push_warning("Could not feed that animal");
+            }
+            return;
+        }
         if let Some((pos, target)) = hit {
             match interaction::route_use(&self.registry, target, selected, false) {
                 interaction::UseRoute::CraftingTable => {
@@ -2513,6 +2580,28 @@ impl NetGameState {
                     if self.mining.is_mining() {
                         crate::mining::draw_progress(&mut frame, (centre_x, centre_y), self.mining.progress());
                     }
+                    if let Some(ready) = self.attack_ready {
+                        let cooldown = self.attack_cooldown();
+                        let elapsed = ready.elapsed().min(cooldown);
+                        let remaining = cooldown.saturating_sub(elapsed).as_millis() as u32;
+                        crate::ui_state::draw_attack_cooldown(
+                            &mut frame,
+                            screen,
+                            remaining,
+                            cooldown.as_millis() as u32,
+                        );
+                    }
+                    if let Some(client) = client
+                        && let Some(id) = client.mob_target()
+                        && let Some(kind) = client.entities().kind(id).and_then(|kind| match kind {
+                            crate::net_state::ReplicatedKind::Mob(kind) => Some(*kind),
+                            _ => None,
+                        })
+                    {
+                        let spec = self.registry.mob(kind);
+                        let health = client.entities().health(id).unwrap_or(spec.health);
+                        crate::ui_state::draw_mob_health(&mut frame, screen, spec.display_name, health, spec.health);
+                    }
                 }
                 if self.ui.hit_marker_seconds > 0.0 {
                     let alpha = (self.ui.hit_marker_seconds / 0.22).clamp(0.0, 1.0);
@@ -2553,6 +2642,13 @@ impl NetGameState {
                     }
                     crate::ui_state::draw_vitals(&mut frame, screen, client.health(), client.hunger());
                     crate::ui_state::draw_armor(&mut frame, screen, client.armor_defense());
+                    crate::ui_state::draw_xp_bar(
+                        &mut frame,
+                        screen,
+                        client.xp_level(),
+                        client.xp_points(),
+                        client.xp_required(),
+                    );
                 }
                 crate::ui_state::draw_toasts(&mut frame, &self.ui.toasts, screen);
                 crate::ui_state::draw_damage_flash(&mut frame, screen, self.damage_flash.alpha());

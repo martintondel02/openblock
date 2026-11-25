@@ -59,6 +59,11 @@ struct Camera {
     // x/y/z: UV scale of the shadow cascade when sampling (0.5 for the
     // half-resolution far cascade).
     shadow_scale: vec4<f32>,
+    // x: near/far seam radius in blocks (0 disables the seam fade),
+    // y: seam band half-width, z: height-fog density, w: height-fog scale.
+    atmosphere: vec4<f32>,
+    // x: near plane, y: far plane, z: fresh depth copy bound, w: reserved.
+    clip: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -75,6 +80,20 @@ var shadow_map: texture_depth_2d_array;
 
 @group(0) @binding(4)
 var shadow_sampler: sampler_comparison;
+
+// Depth-only copy of the scene depth buffer, refreshed before the water pass
+// on the High/Ultra water path. `camera.clip.z` is 1 only when this frame's
+// copy is valid.
+@group(0) @binding(5)
+var scene_depth: texture_depth_2d;
+
+// Baked tiling cloud density and its linear/repeat sampler (see
+// `cloud_shadow.rs`). One fetch replaces four octaves of per-fragment value
+// noise for the ground cloud shadows.
+@group(0) @binding(6)
+var cloud_density: texture_2d<f32>;
+@group(0) @binding(7)
+var cloud_density_sampler: sampler;
 
 // Subtle additive warm haze below the (screen-space) horizon, scaled by the
 // ambient light so the night sky stays dark.
@@ -432,10 +451,126 @@ fn face_normal(world_position: vec3<f32>) -> vec3<f32> {
 }
 
 // Distance fog shared by the opaque, water and entity passes.
-fn apply_fog(colour: vec3<f32>, world_position: vec3<f32>) -> vec3<f32> {
-    let view_distance = distance(world_position, camera.camera_pos.xyz);
+fn apply_fog(colour: vec3<f32>, view_distance: f32) -> vec3<f32> {
     let amount = ramp(camera.fog.x, camera.fog.y, view_distance);
     return mix(colour, camera.horizon.rgb, amount);
+}
+
+// Colour the aerial perspective approaches: a slightly blue horizon haze, not
+// a flat grey wall. Both near and far terrain use it, so the seam matches.
+fn haze_colour() -> vec3<f32> {
+    return mix(camera.horizon.rgb, camera.zenith.rgb, 0.16);
+}
+
+// Colour the near/far seam fades towards. It sits between the haze and the
+// horizon so the coarse heightfield and the textured near world meet in the
+// same soft band instead of showing a hard style/luminance step.
+fn seam_colour() -> vec3<f32> {
+    // Close to the terrain's aerial colour rather than the bright horizon, so
+    // the cross-fade reads as distance rather than a pale ring.
+    return mix(haze_colour(), camera.horizon.rgb, 0.25);
+}
+
+// Cheap height fog: one exponential height term and one optical-depth term.
+// Gated by `atmosphere.z` (High/Ultra), so Low and Medium pay one uniform test.
+fn height_fog_amount(world_position: vec3<f32>, distance_to_eye: f32) -> f32 {
+    let density = camera.atmosphere.z;
+    if density <= 0.0 || distance_to_eye < 96.0 {
+        return 0.0;
+    }
+    // Rational height falloff and optical depth instead of two exponentials:
+    // the curve is visually indistinguishable at this density and measured
+    // noticeably cheaper across a 1080p frame.
+    let scale = max(camera.atmosphere.w, 1.0);
+    let height = 1.0 / (1.0 + max(world_position.y - camera.water.w, 0.0) / scale);
+    let optical_depth = density * distance_to_eye * height;
+    return optical_depth / (1.0 + optical_depth);
+}
+
+// Aerial perspective plus the near/far seam cross-fade.
+//
+// The near world fades towards `seam_colour` over `seam - band .. seam`; the
+// far heightfield starts at the same colour at `seam` and reaches its own
+// shading by `seam + band`. Both sides therefore evaluate the *same* colour at
+// the streamed-world edge, which masks the change from textured blocks to the
+// coarse palette without a depth discontinuity or extra geometry.
+fn apply_atmosphere(colour: vec3<f32>, world_position: vec3<f32>, far_side: bool, view_distance: f32) -> vec3<f32> {
+    let seam = camera.atmosphere.x;
+    let density = camera.atmosphere.z;
+    // One branch for the cheap path: Low/Medium upload zeroes for both fields,
+    // so their fragments never run the aerial-perspective or seam math.
+    if seam <= 0.0 && (density <= 0.0 || view_distance < 96.0) {
+        return colour;
+    }
+    var result = colour;
+    let haziness = height_fog_amount(world_position, view_distance);
+    if haziness > 0.0 {
+        result = mix(result, haze_colour(), haziness);
+    }
+    if seam > 0.0 {
+        // Squared horizontal distance: no square root for a radial band, which
+        // measured ~1 ms at 1080p when computed with `distance()`.
+        let band = max(camera.atmosphere.y, 1.0);
+        let dx = world_position.x - camera.camera_pos.x;
+        let dz = world_position.z - camera.camera_pos.z;
+        let plane_squared = dx * dx + dz * dz;
+        let seam_squared = seam * seam;
+        let band_squared = band * band;
+        // Skip the ramp and mix for the overwhelming majority of fragments that
+        // are nowhere near the cross-fade band.
+        let close_to_band = plane_squared > seam_squared - 2.0 * seam * band + band_squared
+            && plane_squared < seam_squared + 2.0 * seam * band + band_squared;
+        if close_to_band {
+            var fade: f32;
+            if far_side {
+                let outer = seam + band;
+                fade = clamp((outer * outer - plane_squared) / max(outer * outer - seam_squared, 1.0), 0.0, 1.0);
+            } else {
+                let inner = max(seam - band, 0.0);
+                fade = clamp((plane_squared - inner * inner) / max(seam_squared - inner * inner, 1.0), 0.0, 1.0);
+            }
+            fade = fade * fade * (3.0 - 2.0 * fade);
+            result = mix(result, seam_colour(), fade * 0.22);
+        }
+    }
+    return result;
+}
+
+// Moving cloud shadows projected on the ground.
+//
+// The fragment is projected along the sun direction onto the same world-space
+// cloud plane the sky pass shades, so a cloud crossing the sun darkens the
+// terrain underneath it. One value-noise pair (two octaves of the same field)
+// is enough at ground scale and much cheaper than the sky pass's four-octave
+// domain-warped noise. `camera.graphics.w` is zero on Low/Medium and when the
+// cloud layer is off, making the whole function a single uniform test.
+fn cloud_shadow(world_position: vec3<f32>, view_distance: f32) -> f32 {
+    var strength = camera.graphics.w;
+    // Cloud shadows fade out into the haze; skipping the fetch for the far
+    // heightfield keeps the 512-chunk vista affordable.
+    if strength <= 0.0 || view_distance > 1536.0 {
+        return 1.0;
+    }
+    strength = strength * (1.0 - smoothstep(1024.0, 1536.0, view_distance));
+    let sun_dir = normalize(camera.sun.xyz);
+    if sun_dir.y <= 0.03 {
+        return 1.0;
+    }
+    let travel = (CLOUD_HEIGHT - world_position.y) / sun_dir.y;
+    if travel <= 0.0 || travel > 20000.0 {
+        return 1.0;
+    }
+    let world = world_position.xz + sun_dir.xz * travel;
+    let wind = CLOUD_WIND * (camera.graphics.x * 0.004);
+    let uv = world * 0.0055 + wind;
+    // One bilinear fetch of the baked value-noise field, sharing the sky's
+    // coverage threshold. At ground scale this is visually indistinguishable
+    // from evaluating the noise per fragment, which measured ~4.5 ms at 1080p.
+    let density = textureSampleLevel(cloud_density, cloud_density_sampler, uv, 0.0).r;
+    let coverage = clamp(camera.graphics.y, 0.0, 1.0);
+    let threshold = mix(0.62, 0.30, coverage);
+    let occluded = smoothstep(threshold, threshold + 0.16, density);
+    return 1.0 - occluded * strength;
 }
 
 // Vertex inputs carry no interpolation attribute in WGSL; `layer` is a flat
@@ -496,56 +631,131 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let warm = mix(vec3<f32>(1.0), vec3<f32>(1.0, 0.82, 0.58), input.block * 0.85);
     let sky_light = input.sky * camera.world_light.rgb * shadow;
     let block_light = input.block * warm;
-    let lit = albedo * (sky_light + block_light);
-    return vec4<f32>(apply_fog(lit, input.world_position), 1.0);
+    let lit = albedo * (sky_light * cloud_shadow(input.world_position, view_distance) + block_light);
+    return vec4<f32>(apply_fog(apply_atmosphere(lit, input.world_position, false, view_distance), view_distance), 1.0);
 }
 
 // ---------------------------------------------------------------------------
 // Transparent water
 // ---------------------------------------------------------------------------
 
+// Water needs the fragment's pixel coordinate to fetch the scene-depth copy
+// (foam/depth response). The builtin `position` is available to a fragment
+// entry point independently of the vertex output, so only the water entry
+// declares it here.
+struct WaterFragmentInput {
+    @builtin(position) frag_coord: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) layer: u32,
+    @location(2) sky: f32,
+    @location(3) block: f32,
+    @location(4) world_position: vec3<f32>,
+};
+
+// Eye-space distance from the stored NDC depth.
+//
+// For the right-handed zero-to-one perspective used by the renderer,
+// `ndc = m32 / eye_depth - m22`; inverting is the expression below. The near
+// and far planes come from the camera uniform, so the water pass needs no
+// inverse projection matrix and no extra render target.
+fn linear_eye_depth(depth: f32) -> f32 {
+    let near = camera.clip.x;
+    let far = camera.clip.y;
+    return (near * far) / max(far - depth * (far - near), 1e-4);
+}
+
 @fragment
-fn fs_water(input: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_water(input: WaterFragmentInput) -> @location(0) vec4<f32> {
     let texel = textureSample(blocks, block_sampler, input.uv, input.layer);
     if texel.a < 0.5 {
         discard;
     }
-    let view_distance = distance(input.world_position, camera.camera_pos.xyz);
-    let base_normal = face_normal(input.world_position);
+    let world_position = input.world_position;
+    let view_distance = distance(world_position, camera.camera_pos.xyz);
+    let base_normal = face_normal(world_position);
     let time = camera.graphics.x;
     let wave = camera.water.x;
-    // Two cheap travelling waves perturb the geometric normal. The scale is
-    // deliberately larger than the ripple so the highlights drift rather than
-    // shimmer at 1080p.
-    let p = input.world_position.xz;
+    let underwater = camera.camera_pos.y < camera.water.w;
+    // Two travelling wave bands (plus one finer diagonal band) perturb the
+    // geometric normal. The scale is deliberately larger than the ripple so
+    // the highlights drift rather than shimmer at 1080p.
+    let p = world_position.xz;
     let ripple = vec2<f32>(
-        sin(p.x * 0.55 + time * 1.6) + 0.5 * sin(p.y * 1.05 - time * 2.2),
-        cos(p.y * 0.62 + time * 1.25) + 0.5 * cos(p.x * 0.95 + time * 1.9),
+        sin(p.x * 0.55 + time * 1.6)
+            + 0.5 * sin(p.y * 1.05 - time * 2.2)
+            + 0.35 * sin((p.x + p.y) * 2.7 + time * 3.1),
+        cos(p.y * 0.62 + time * 1.25)
+            + 0.5 * cos(p.x * 0.95 + time * 1.9)
+            + 0.35 * cos((p.x - p.y) * 3.3 - time * 2.6),
     );
     let normal = normalize(base_normal + vec3<f32>(ripple.x * 0.075 * wave, 0.0, ripple.y * 0.075 * wave));
-    let view = normalize(camera.camera_pos.xyz - input.world_position);
-    let fresnel = pow(1.0 - clamp(dot(normal, view), 0.0, 1.0), 5.0);
+    let view = normalize(camera.camera_pos.xyz - world_position);
+    let fresnel = 0.02 + 0.98 * pow(1.0 - clamp(dot(normal, view), 0.0, 1.0), 5.0);
 
-    let shadow = sun_light_factor(input.world_position, normal, view_distance);
+    let shadow = sun_light_factor(world_position, normal, view_distance);
     let sun_dir = normalize(camera.sun.xyz);
     let half_dir = normalize(view + sun_dir);
     let sun_up = smoothstep(0.0, 0.08, sun_dir.y);
-    let specular = pow(max(dot(normal, half_dir), 0.0), 96.0) * camera.water.z
-        * sun_up * shadow * clamp(camera.sun.w, 0.0, 2.0);
+    let ndh = max(dot(normal, half_dir), 0.0);
+    // A tight glint plus a broader sheen reads as sun sparkle on waves instead
+    // of one uniform bright spot.
+    let glint = pow(ndh, 220.0) + 0.22 * pow(ndh, 42.0);
+    let specular = glint * camera.water.z * sun_up * shadow * clamp(camera.sun.w, 0.0, 2.0);
 
-    // Deep water tinted by the albedo; shallower/facing views reflect more sky.
-    let deep = texel.rgb * vec3<f32>(0.30, 0.62, 0.82) * (camera.world_light.rgb + input.sky * 0.15);
-    let reflected = mix(camera.horizon.rgb, camera.zenith.rgb, 0.45);
-    var colour = mix(deep, reflected, fresnel * 0.55);
-    // Water receives the same cascade shadows as opaque terrain. The shadowed
-    // share is larger than on land because the direct-sun reflection is what
-    // makes water bright; ambient sky reflection remains.
-    colour = colour * (0.55 + 0.45 * shadow);
-    colour = colour + camera.sun_colour.rgb * specular * 0.55;
+    // Water thickness from the scene-depth copy (High/Ultra water only). The
+    // scene depth is eye-space distance, so subtracting the surface's own eye
+    // depth gives the water column under this fragment in blocks.
+    let depth_available = camera.clip.z > 0.5;
+    var thickness = 0.0;
+    if depth_available {
+        let scene_depth = textureLoad(scene_depth, vec2<i32>(input.frag_coord.xy), 0);
+        let scene_eye = linear_eye_depth(scene_depth);
+        let surface_eye = dot(camera.camera_pos.xyz - world_position, camera.basis_forward.xyz);
+        thickness = clamp(scene_eye - surface_eye, 0.0, 12.0);
+    }
+    let depth_response = smoothstep(0.15, 3.0, thickness);
 
-    let base_alpha = camera.water.y * texel.a;
-    let alpha = clamp(mix(base_alpha, 0.92, fresnel * 0.6), 0.0, 1.0);
-    return vec4<f32>(apply_fog(colour, input.world_position), alpha);
+    // Shallow water lets a warm sandy bottom show through; deep water takes
+    // the blue-green absorption tint. The depth response also drives opacity.
+    let body_deep = texel.rgb * vec3<f32>(0.34, 0.65, 0.82) * (camera.world_light.rgb + input.sky * 0.15);
+    let body_shallow = texel.rgb * vec3<f32>(1.02, 0.94, 0.72) * (camera.world_light.rgb * max(input.sky, 0.4));
+    let mixed_body = select(body_deep, mix(body_shallow, body_deep, depth_response), depth_available);
+
+    // Reflect the sky about the perturbed normal (cheap environment
+    // reflection): the horizon near glancing angles, the zenith when the
+    // reflection points up.
+    let reflected = reflect(-view, normal);
+    let sky_reflection = mix(camera.horizon.rgb, camera.zenith.rgb, smoothstep(0.0, 0.45, reflected.y));
+    var colour = mix(mixed_body, sky_reflection, fresnel * 0.62);
+    // Water receives the same cascade shadows as opaque terrain; the direct-sun
+    // share is what makes water bright, ambient reflection remains.
+    colour = colour * (0.58 + 0.42 * shadow);
+    colour = colour + camera.sun_colour.rgb * specular * 0.58;
+    colour = colour * cloud_shadow(world_position, view_distance);
+
+    // Shoreline foam: a soft animated band where the column is very thin. It
+    // fades out with distance and with thickness, so there is no hard edge at a
+    // block boundary and no halo where the depth copy is unavailable.
+    var alpha = camera.water.y * texel.a;
+    if depth_available {
+        let foam_edge = 1.0 - smoothstep(0.0, 0.5, thickness);
+        let foam_noise = 0.5 + 0.5 * sin(p.x * 2.1 + time * 1.3) * cos(p.y * 1.7 - time * 1.1);
+        let foam = foam_edge * (0.45 + 0.55 * foam_noise) * (1.0 - smoothstep(40.0, 120.0, view_distance));
+        let foam_colour = mix(camera.world_light.rgb * 0.86, camera.sun_colour.rgb * 0.25, 0.3);
+        colour = mix(colour, foam_colour, foam * 0.5);
+        let shallow_alpha = camera.water.y * 0.5;
+        alpha = mix(shallow_alpha, camera.water.y, depth_response) * texel.a;
+        alpha = mix(alpha, 0.90, foam * 0.6);
+    }
+    alpha = clamp(mix(alpha, 0.92, fresnel * 0.62), 0.04, 0.96);
+    if underwater {
+        // Seen from below the surface is a dim, saturated blue sheet rather than
+        // a sky mirror. The full-screen underwater tint is applied in post.
+        colour = mix(colour, vec3<f32>(0.03, 0.12, 0.18) * (0.5 + 0.5 * camera.world_light.r), 0.45);
+        alpha = mix(alpha, 0.85, 0.3);
+    }
+    colour = apply_fog(apply_atmosphere(colour, world_position, false, view_distance), view_distance);
+    return vec4<f32>(colour, alpha);
 }
 
 // ---------------------------------------------------------------------------
