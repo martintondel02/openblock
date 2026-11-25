@@ -6,18 +6,18 @@
 <p align="center">
   <a href=".github/workflows/ci.yml"><img alt="CI" src="https://github.com/martintondel02/openblock/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE-MIT"><img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-1.0.1%20early%20access-orange.svg">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.0.2%20early%20access-orange.svg">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.100%2B-B7410E.svg?logo=rust">
   <img alt="Primary platform" src="https://img.shields.io/badge/platform-Fedora%2044%2F45%20%7C%20Linux-51A2DA.svg?logo=fedora">
 </p>
 
 OpenBlock is an open-source voxel sandbox: mine, build, explore and survive alone
-or with friends on servers you host yourself. **1.0.1 is an Early Access
+or with friends on servers you host yourself. **1.0.2 is an Early Access
 release**: the core survival game and self-hosted multiplayer are playable and
 tested end-to-end, while crafting-grid, lighting, farming, weather and the
 modding track are explicitly post-1.0 (see [Known limitations](#known-limitations)).
 
-![OpenBlock 1.0 title screen](docs/img/v1.0.0-title.png)
+![OpenBlock 1.0.2 title screen with the new Minecraft-style UI font](docs/img/v1.0.2-title.png)
 
 ## What's in 1.0
 
@@ -45,8 +45,12 @@ modding track are explicitly post-1.0 (see [Known limitations](#known-limitation
 - **Front-end and accessibility** — title screen (Continue/New World/Load World/
   Multiplayer/Settings/Quit), world browser, direct connect with recent servers,
   interactive key rebinding for 17 actions, reduced motion, persisted HUD
-  visibility, **GUI scale (Auto/75/100/125/150)** and readable spaced UI at
-  1280×720 and 960×540.
+  visibility, **GUI scale (Auto/75/100/125/150)**, readable spaced UI at
+  1280×720 and 960×540, and a **Minecraft-style UI font** (Monocraft, SIL OFL)
+  with the original 8×8 pixel font kept for titles/headings. Body text uses a bundled **Monocraft** (SIL OFL 1.1)
+  Minecraft-style font; titles and panel headings keep the original 8×8
+  bitmap look, and a personal `Minecraftia.ttf` can be selected with
+  `--ui-font PATH` or dropped into `<data-dir>/fonts/`.
 - **Resource packs** — load Minecraft-format pack directories at runtime
   (`--texture-pack PATH`), with biome tinting, animated first frames and
   per-layer fallback. No third-party assets are bundled or redistributed.
@@ -109,6 +113,40 @@ packaging wave publishes binaries (tracked in the
 | Esc | settings (or back) |
 
 All gameplay keys can be rebound in **Settings → Controls**.
+
+### UI font (1.0.2)
+
+Body text, HUD, menus and chat use a Minecraft-style TTF font — **Monocraft**,
+bundled under the SIL Open Font License 1.1 — while the logo, panel titles and
+big headings keep the original 8×8 bitmap font. You can use the exact
+**Minecraftia** font locally (its licence is personal-use only, so it is not
+bundled):
+
+```sh
+mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}/openblock/fonts"
+cp /path/to/Minecraftia.ttf "${XDG_DATA_HOME:-$HOME/.local/share}/openblock/fonts/"
+# or persist a path:
+openblock --ui-font /path/to/Minecraftia.ttf
+# back to the bundled font:
+openblock --default-ui-font
+```
+
+**Settings → Display → UI font** shows the active font/source and has Reset and
+Reload actions; F3 reports it too. Any `.ttf`/`.otf` in `<data-dir>/fonts/` is
+auto-discovered (files named `minecraftia` are preferred), with system-font
+discovery as a fallback. See [docs/client-ui-font.md](docs/client-ui-font.md).
+
+| Font/UI | Settings → UI font |
+| --- | --- |
+| ![Survival with Minecraft-style UI font](docs/img/v1.0.2-survival.png) | ![UI font settings](docs/img/v1.0.2-settings.png) |
+
+UI font: **Settings → Display → UI font** shows the active font and source, with
+**Reset UI font** and **Reload UI font** actions. `--ui-font PATH` loads a
+TTF/OTF for this and future runs; `--default-ui-font` returns to the bundled
+Monocraft; placing `Minecraftia.ttf` in `<data-dir>/fonts/` selects it
+automatically. Titles remain in the 8×8 bitmap font by design. See
+[client UI font](docs/client-ui-font.md) for the exact paths, fallback rules and
+Minecraftia licensing note.
 
 ## Multiplayer and servers
 

@@ -21,5 +21,6 @@ bytemuck.workspace = true
 pollster.workspace = true
 log.workspace = true
 font8x8.workspace = true
+ab_glyph.workspace = true
 winit.workspace = true
 png.workspace = true

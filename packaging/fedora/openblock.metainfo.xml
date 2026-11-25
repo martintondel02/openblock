@@ -43,6 +43,14 @@
     <content_attribute id="social-chat">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="1.0.2" date="2026-11-25" type="stable">
+      <description>
+        <p>Minecraft-style UI font: body/HUD/menu/chat text now uses a bundled
+        Monocraft TTF (SIL OFL 1.1) with the original 8x8 font retained for
+        titles, plus runtime Minecraftia/custom font overrides and a settings
+        UI-font row.</p>
+      </description>
+    </release>
     <release version="1.0.1" date="2026-11-25" type="stable">
       <description>
         <p>Post-release audit and polish: GUI scale and compact layouts,

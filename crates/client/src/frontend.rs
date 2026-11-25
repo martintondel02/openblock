@@ -216,7 +216,7 @@ pub fn draw_title_screen(frame: &mut UiFrame, menu: &TitleMenu, cursor: (f32, f3
     draw_backdrop(frame, screen);
     let logo_scale = (screen[0] * 0.8 / (9.0 * 8.0)).clamp(2.0, 9.0);
     let logo_y = (screen[1] * 0.08).max(8.0);
-    frame.text_centered(
+    frame.title_text_centered(
         screen[0] / 2.0,
         logo_y,
         logo_scale,
@@ -224,7 +224,7 @@ pub fn draw_title_screen(frame: &mut UiFrame, menu: &TitleMenu, cursor: (f32, f3
         "OPENBLOCK",
     );
     let line = ob_render::line_height(logo_scale);
-    frame.text_centered(
+    frame.title_text_centered(
         screen[0] / 2.0,
         logo_y + line + 6.0,
         if screen[1] < 420.0 { 0.9 } else { 1.5 },
@@ -707,7 +707,7 @@ pub fn draw_delete_confirmation(frame: &mut UiFrame, name: &str, cursor: (f32, f
     );
     frame.rect(dialog.x, dialog.y, dialog.w, dialog.h, [0.10, 0.09, 0.11, 0.99]);
     frame.outline(dialog.x, dialog.y, dialog.w, dialog.h, 2.0, [0.86, 0.48, 0.40, 1.0]);
-    frame.text_centered(
+    frame.title_text_centered(
         dialog.x + dialog.w / 2.0,
         dialog.y + 22.0,
         2.0,
@@ -1500,7 +1500,7 @@ fn draw_panel(frame: &mut UiFrame, panel: UiRect, title: &str) {
         1.0,
         [0.15, 0.18, 0.24, 1.0],
     );
-    frame.text(panel.x + 30.0, panel.y + 22.0, 2.2, [0.98, 0.99, 1.0, 1.0], title);
+    frame.title_text(panel.x + 30.0, panel.y + 22.0, 2.2, [0.98, 0.99, 1.0, 1.0], title);
     let version = format!("OpenBlock v{}", ob_core::VERSION);
     let width = frame.text_width(1.0, &version);
     frame.text(
@@ -1696,6 +1696,23 @@ mod tests {
         assert_eq!(continue_target(&dir, Some("deleted")), None);
         assert_eq!(continue_target(&dir, None), None);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn title_screen_combines_bitmap_headings_with_ui_body_text() {
+        let menu = TitleMenu::new(Some("harbor".to_string()));
+        let screen = [1280.0, 720.0];
+        let mut frame = UiFrame::new(screen[0], screen[1]);
+        draw_title_screen(&mut frame, &menu, (-100.0, -100.0), screen);
+        let debug = format!("{frame:?}");
+        assert!(
+            debug.contains("texture: Font"),
+            "the OPENBLOCK logo/heading must use the bitmap atlas"
+        );
+        assert!(
+            debug.contains("texture: UiFont"),
+            "buttons and footer text must use the UI font atlas"
+        );
     }
 
     #[test]

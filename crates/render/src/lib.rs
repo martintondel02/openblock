@@ -20,6 +20,7 @@ mod pipeline;
 pub mod resource_pack;
 pub mod textures;
 pub mod ui;
+pub mod ui_font;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,6 +38,9 @@ pub use outline::{BlockOutline, DEFAULT_EDGE_COLOR, DEFAULT_INFLATION, OUTLINE_V
 pub use resource_pack::{ResourcePackLayers, TextureLoadError, TextureSource, load_resource_pack};
 pub use textures::{TexturePack, TexturePackStyle};
 pub use ui::{GLYPH_SIZE, LINE_HEIGHT, UiFrame, UiRenderer, UiStats, UiTexture, UiVertex, glyph_advance, line_height};
+pub use ui_font::{
+    UI_GLYPH_SIZE, UI_LINE_HEIGHT, UiFontAtlas, UiFontError, default_ui_font, default_ui_font_name, rasterize_ui_font,
+};
 
 use pipeline::CameraUniform;
 use textures::BlockTextureArray;
@@ -462,7 +466,10 @@ impl Renderer {
         let textures = BlockTextureArray::new_with_source(&self.device, &self.queue, &source)?;
         let layout = pipeline::create_bind_group_layout(&self.device);
         self.bind_group = pipeline::create_bind_group(&self.device, &layout, &self.uniform_buffer, &textures);
-        self.ui = ui::UiRenderer::new(&self.device, &self.queue, &textures, self.config.format);
+        // The UI renderer owns its font atlases and pipeline; only its block
+        // bind group refers to the replaced textures, so keep the active UI
+        // font instead of rebuilding the whole renderer.
+        self.ui.set_block_textures(&textures);
         self._textures = textures;
         log::info!("texture source set to {}", source.label());
         Ok(())
@@ -695,6 +702,21 @@ impl Renderer {
     /// Renders one frame of the world without a UI overlay.
     pub fn render(&mut self, camera: &Camera) -> Result<(), RenderError> {
         self.render_with_ui(camera, None)
+    }
+
+    /// Replaces the Minecraft-style UI font used by [`UiFrame::text`].
+    ///
+    /// `font` is the raw contents of a TrueType/OpenType file; `None` restores
+    /// the embedded Monocraft font. On error the previous font is kept and the
+    /// error is returned. Titles drawn with [`UiFrame::title_text`] keep the
+    /// built-in 8×8 bitmap font regardless.
+    pub fn set_ui_font(&mut self, font: Option<&[u8]>) -> Result<(), UiFontError> {
+        self.ui.set_ui_font(font)
+    }
+
+    /// Display name of the active UI font: `"Monocraft"` or `"custom"`.
+    pub fn ui_font_name(&self) -> &str {
+        self.ui.ui_font_name()
     }
 
     /// Counters from the last UI frame, if any.

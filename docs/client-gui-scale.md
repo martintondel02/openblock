@@ -51,8 +51,9 @@ with `rescale_cursor`, so the pointer does not jump to a different widget.
 The 100% layouts are unchanged. `ui_state::settings_metrics` switches to a
 compact metric set when the logical panel height is below 420 px (for example
 960x540 at 125%, which is 768x432 logical, and at 150%, which is 640x360
-logical). In compact mode the Display tab still shows all seven rows, the tab
-strip, both footer buttons and two hint lines.
+logical). In compact mode the Display tab still shows all ten rows (including
+the UI-font row and its reset/reload actions), the tab strip, both footer
+buttons and two hint lines.
 
 Other small-logical-target handling:
 
@@ -66,9 +67,9 @@ Other small-logical-target handling:
 - **Survival inventory**: the panel contains its own hotbar row; the duplicate
   gameplay hotbar/vitals are not drawn over it.
 - **F3 overlay**: below 420 logical pixels it switches to a compact 10-line
-  left column (identity, FPS, position, vitals, world/UI scale, target) that
-  clears the hotbar and footer; the regular full overlay is used at and above
-  that height.
+  left column (identity, FPS, position, vitals, world/UI scale, UI font, target)
+  that clears the hotbar and footer; the regular full overlay, including the
+  hardware column and its UI-font line, is used at and above that height.
 - **Connect/loading/failure**: the panel height is content-driven (220 px while
   contacting, 300 px with world/players/progress, 240 px on failure), endpoint
   and player name are shown on separate lines, stale world/roster/progress
@@ -83,10 +84,11 @@ inventory, crafting, furnace and chest layouts at 75/100/125/150% on both
 
 ## Limitations
 
-- The bitmap font is rendered at logical resolution and scaled by the GPU. At
-  non-integer scales (125/150%) individual glyph pixel columns can be one
-  physical pixel different in width; this is the same trade-off as a
-  framebuffer-scaled GUI. Integer-only scaling is a post-1.0.1 option.
+- The bitmap title font and the Monocraft UI atlas are rasterised at logical
+  resolution and scaled by the GPU. At non-integer scales (125/150%) individual
+  glyph pixel columns can be one physical pixel different in width; this is the
+  same trade-off as a framebuffer-scaled GUI. Integer-only scaling is a
+  post-1.0.1 option.
 - The compact F3 set intentionally omits some diagnostics; the full set is
   still available at 1280x720/960x540 with 100% or on larger physical targets.
 - At 960x540 with 150% only two recent servers fit on the multiplayer form.

@@ -779,7 +779,7 @@ fn draw_container_base(
         1.0,
         [0.15, 0.18, 0.24, 1.0],
     );
-    frame.text(
+    frame.title_text(
         layout.panel.x + CONTAINER_MARGIN,
         layout.panel.y + 16.0,
         2.6,
