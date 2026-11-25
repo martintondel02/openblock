@@ -1174,8 +1174,25 @@ pub(crate) fn create_far_water_pipeline(
 #[cfg(test)]
 mod gpu_tests {
     use super::*;
-    use crate::{Camera, FarTerrainMesh, OffscreenRenderer, RenderStats, SceneParams};
+    use crate::{Camera, FarTerrainMesh, OffscreenRenderer, RenderError, RenderStats, SceneParams};
     use ob_math::WorldVec;
+
+    /// Creates the offscreen renderer or returns `None` when the CI host has no
+    /// GPU adapter, so the CPU test jobs pass without a software Vulkan driver.
+    fn test_offscreen(width: u32, height: u32) -> Option<OffscreenRenderer> {
+        if std::env::var_os("OPENBLOCK_NO_GPU_TESTS").is_some() {
+            eprintln!("skipping far-terrain GPU test: OPENBLOCK_NO_GPU_TESTS is set");
+            return None;
+        }
+        match OffscreenRenderer::new(width, height) {
+            Ok(renderer) => Some(renderer),
+            Err(RenderError::NoAdapter(reason)) => {
+                eprintln!("skipping far-terrain GPU test: no GPU adapter ({reason})");
+                None
+            }
+            Err(error) => panic!("offscreen renderer: {error}"),
+        }
+    }
 
     fn plane_mesh() -> FarTerrainMesh {
         // A large red quad perpendicular to the initial view direction. It
@@ -1210,7 +1227,9 @@ mod gpu_tests {
 
     #[test]
     fn far_terrain_pipeline_draws_into_the_offscreen_scene() {
-        let mut renderer = OffscreenRenderer::new(160, 96).expect("offscreen renderer");
+        let Some(mut renderer) = test_offscreen(160, 96) else {
+            return;
+        };
         let mut camera = Camera::new(WorldVec::new(0.0, 100.0, 0.0), 0.0, 0.0);
         camera.far = 10_000.0;
         let scene = SceneParams::default();
@@ -1248,7 +1267,9 @@ mod gpu_tests {
 
     #[test]
     fn far_water_pipeline_draws_a_translucent_surface() {
-        let mut renderer = OffscreenRenderer::new(160, 96).expect("offscreen renderer");
+        let Some(mut renderer) = test_offscreen(160, 96) else {
+            return;
+        };
         let mut camera = Camera::new(WorldVec::new(0.0, 100.0, 0.0), 0.0, 0.0);
         camera.far = 10_000.0;
         let scene = SceneParams::default();
