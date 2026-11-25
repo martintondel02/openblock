@@ -19,6 +19,14 @@
 //! 5. the bloom threshold/downsample chain, then the ACES-fit post pass into
 //!    the LDR surface or offscreen target.
 //!
+//! When FSR 1.0 is enabled the scene targets (HDR colour, depth, bloom) are
+//! allocated at the **render size** (the preset's fraction of the display
+//! size), the post pass writes an internal LDR target at render size and
+//! EASU+RCAS upscale it to the display-sized surface/offscreen texture. The
+//! camera aspect, shadow fit and UI stay at display resolution; the post
+//! texel uniforms use the render size. With [`FsrQuality::Off`] the renderer
+//! takes exactly the native path above and never creates an upscaler.
+//!
 //! All pipelines are built once in [`SceneRenderer::new`]. A graphics quality
 //! change only reallocates the shadow map and updates uniforms; a resize
 //! reallocates the HDR/bloom/depth targets and their bind groups.
@@ -30,6 +38,7 @@ use ob_math::SectionPos;
 use crate::entities::{EntitiesRenderer, EntityInstance};
 use crate::far_terrain::{self, FarTerrainMesh, GpuFarTerrain};
 use crate::frustum::{aabb_visible, aabb_within_distance, section_visible};
+use crate::fsr::{self, FsrQuality, FsrUpscaler};
 use crate::graphics::{GraphicsSettings, ShadowConfig};
 use crate::lod::LodBatchKey;
 use crate::pipeline;
@@ -316,6 +325,140 @@ impl Targets {
     }
 }
 
+/// Internal LDR post target at the FSR render resolution.
+///
+/// It uses the display target's format so the existing post pipeline can be
+/// reused unchanged; both texture and view keep the base format (no sRGB view
+/// reinterpretation), as the FSR contract requires.
+struct LdrTarget {
+    width: u32,
+    height: u32,
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+impl LdrTarget {
+    fn new(device: &wgpu::Device, width: u32, height: u32, format: wgpu::TextureFormat) -> Self {
+        let width = width.max(1);
+        let height = height.max(1);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fsr-ldr-scene"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("fsr-ldr-scene-view"),
+            ..Default::default()
+        });
+        Self {
+            width,
+            height,
+            _texture: texture,
+            view,
+        }
+    }
+}
+
+/// Precompiled FSR upscaler plus the internal LDR target it consumes.
+///
+/// Created once per enabled configuration; a quality change replaces it and a
+/// resize only reallocates [`LdrTarget`]. The upscaler owns the output-sized
+/// EASU intermediate, so neither object allocates per frame.
+struct FsrResources {
+    upscaler: FsrUpscaler,
+    target: LdrTarget,
+}
+
+impl FsrResources {
+    /// Builds the FSR pass for one display size and output format.
+    ///
+    /// Returns `None` for [`FsrQuality::Off`], unsupported output formats and
+    /// sizes outside the FSR 1 contract. A rejected configuration is logged
+    /// once per change; the caller then keeps the native path.
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        display_width: u32,
+        display_height: u32,
+        format: wgpu::TextureFormat,
+        quality: FsrQuality,
+    ) -> Option<Self> {
+        if !quality.is_enabled() {
+            return None;
+        }
+        if !fsr::is_supported_format(format) || !format.is_srgb() {
+            // The internal LDR target shares the display format and the post
+            // pipeline writes linear values, so only sRGB outputs satisfy the
+            // perceptual-input contract. Other formats keep the native path.
+            log::warn!("FSR disabled: {format:?} output is not an sRGB 8-bit format; rendering natively");
+            return None;
+        }
+        let upscaler = match FsrUpscaler::new(device, queue, format) {
+            Ok(upscaler) => upscaler,
+            Err(error) => {
+                log::warn!("FSR disabled: {error}; rendering natively");
+                return None;
+            }
+        };
+        Self::with_upscaler(device, upscaler, display_width, display_height, quality)
+    }
+
+    /// Reuses a precompiled upscaler and (re)allocates the LDR target.
+    ///
+    /// Quality changes between enabled presets only change the target size, so
+    /// the two pipelines are compiled once per device/format as the module
+    /// contract requires.
+    fn with_upscaler(
+        device: &wgpu::Device,
+        upscaler: FsrUpscaler,
+        display_width: u32,
+        display_height: u32,
+        quality: FsrQuality,
+    ) -> Option<Self> {
+        let display_width = display_width.max(1);
+        let display_height = display_height.max(1);
+        let (render_width, render_height) = quality.render_size(display_width, display_height);
+        if let Err(error) = fsr::validate_sizes(render_width, render_height, display_width, display_height) {
+            log::warn!("FSR disabled: {error}; rendering natively");
+            return None;
+        }
+        log::info!(
+            "FSR {}: internal {}x{} -> display {}x{} ({:.2}x, RCAS {:.2} stops)",
+            quality.label(),
+            render_width,
+            render_height,
+            display_width,
+            display_height,
+            render_width as f32 / display_width as f32,
+            fsr::DEFAULT_RCAS_SHARPNESS,
+        );
+        let format = upscaler.output_format();
+        Some(Self {
+            upscaler,
+            target: LdrTarget::new(device, render_width, render_height, format),
+        })
+    }
+
+    fn into_upscaler(self) -> FsrUpscaler {
+        self.upscaler
+    }
+
+    fn render_size(&self) -> (u32, u32) {
+        (self.target.width, self.target.height)
+    }
+}
+
 /// Instanced unit cube used by the far-cascade proxy casters (36 vertices, CCW
 /// outside, coordinates 0 or 1 so instances can be an AABB min/max).
 const PROXY_CUBE_VERTICES: [[f32; 3]; 36] = [
@@ -496,6 +639,18 @@ pub(crate) struct SceneRenderer {
     bloom_down_pipeline: wgpu::RenderPipeline,
     post_sampler: wgpu::Sampler,
     targets: Targets,
+    /// Display (surface/offscreen texture) size. The camera aspect, shadow fit
+    /// and UI use this size even when the scene targets are smaller.
+    display_width: u32,
+    display_height: u32,
+    /// Format of the surface/offscreen target and of [`LdrTarget`].
+    output_format: wgpu::TextureFormat,
+    /// Active FSR pass, or `None` on the native path.
+    fsr: Option<FsrResources>,
+    /// Set after a driver-level FSR failure. The next recorded frame restores
+    /// native-size targets after the failed frame's command buffer has been
+    /// submitted.
+    fsr_restore_native: bool,
     entities: EntitiesRenderer,
     meshes: HashMap<SectionPos, GpuMesh>,
     lod_batches: HashMap<LodBatchKey, GpuLodBatch>,
@@ -522,10 +677,25 @@ impl SceneRenderer {
         let post_layout = pipeline::create_post_bind_group_layout(device);
         let bloom_layout = pipeline::create_bloom_bind_group_layout(device);
         let post_sampler = pipeline::create_post_sampler(device);
+        let display_width = width.max(1);
+        let display_height = height.max(1);
+        // Create the upscaler (if requested) before the targets so the native
+        // fallback for an unsupported format allocates at display size directly.
+        let fsr = FsrResources::new(
+            device,
+            queue,
+            display_width,
+            display_height,
+            output_format,
+            graphics.fsr_quality,
+        );
+        let (render_width, render_height) = fsr
+            .as_ref()
+            .map_or((display_width, display_height), FsrResources::render_size);
         let targets = Targets::new(
             device,
-            width,
-            height,
+            render_width,
+            render_height,
             graphics,
             &post_buffer,
             &post_sampler,
@@ -610,6 +780,11 @@ impl SceneRenderer {
             bloom_down_pipeline,
             post_sampler,
             targets,
+            display_width,
+            display_height,
+            output_format,
+            fsr,
+            fsr_restore_native: false,
             entities,
             meshes: HashMap::new(),
             lod_batches: HashMap::new(),
@@ -618,32 +793,48 @@ impl SceneRenderer {
         })
     }
 
-    /// Current drawable size.
+    /// Current **render** size (the scene targets and post pass resolution).
+    ///
+    /// This equals the display size when FSR is off and is smaller when it is
+    /// active. Use the surface/UI size for camera aspect, shadows and UI.
     pub(crate) fn size(&self) -> (u32, u32) {
         (self.targets.width, self.targets.height)
     }
 
-    /// Reallocates the HDR, depth and bloom targets after a resize.
-    pub(crate) fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
-        let width = width.max(1);
-        let height = height.max(1);
-        if (width, height) == (self.targets.width, self.targets.height) {
-            return;
+    /// Whether the FSR EASU+RCAS pass is active.
+    pub(crate) fn fsr_enabled(&self) -> bool {
+        self.fsr.is_some()
+    }
+
+    /// Internal render resolution when FSR is active, else `None`.
+    pub(crate) fn fsr_internal_size(&self) -> Option<(u32, u32)> {
+        self.fsr.as_ref().map(FsrResources::render_size)
+    }
+
+    /// One-line FSR description for F3, settings and benchmark reports.
+    pub(crate) fn fsr_summary(&self) -> String {
+        match &self.fsr {
+            Some(fsr) => {
+                let (width, height) = fsr.render_size();
+                format!(
+                    "{} {}x{} -> {}x{} ({:.2}x)",
+                    self.graphics.fsr_quality.label(),
+                    width,
+                    height,
+                    self.display_width,
+                    self.display_height,
+                    width as f32 / self.display_width.max(1) as f32,
+                )
+            }
+            None if self.graphics.fsr_quality.is_enabled() => {
+                format!("off ({:?} unsupported)", self.output_format)
+            }
+            None => "native".to_string(),
         }
-        // A resize reallocates the HDR, depth and bloom targets, including their
-        // bind groups. The shadow map is sized independently of the output and
-        // is reallocated too; resizes are rare and correctness is worth the
-        // simpler ownership.
-        self.targets = Targets::new(
-            device,
-            width,
-            height,
-            self.graphics,
-            &self.post_buffer,
-            &self.post_sampler,
-            &self.post_layout,
-            &self.bloom_layout,
-        );
+    }
+
+    /// Rebuilds every bind group that references the shadow/HDR targets.
+    fn rebuild_scene_bind_groups(&mut self, device: &wgpu::Device) {
         self.bind_group = pipeline::create_bind_group(
             device,
             &self.bind_group_layout,
@@ -663,15 +854,124 @@ impl SceneRenderer {
         });
     }
 
+    /// Reallocates the HDR, depth and bloom targets after a resize.
+    ///
+    /// `width`/`height` are the new **display** size; the scene targets follow
+    /// the active FSR preset. The FSR upscaler itself is kept (its intermediate
+    /// follows the output size) and only its LDR post target is reallocated.
+    pub(crate) fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        let width = width.max(1);
+        let height = height.max(1);
+        if (width, height) == (self.display_width, self.display_height) {
+            return;
+        }
+        self.display_width = width;
+        self.display_height = height;
+        let (render_width, render_height) = match &mut self.fsr {
+            Some(fsr) => {
+                let (render_width, render_height) = self.graphics.fsr_quality.render_size(width, height);
+                fsr.target = LdrTarget::new(device, render_width, render_height, self.output_format);
+                (render_width, render_height)
+            }
+            None => (width, height),
+        };
+        if (render_width, render_height) == (self.targets.width, self.targets.height) {
+            return;
+        }
+        // A resize reallocates the HDR, depth and bloom targets, including their
+        // bind groups. The shadow map is sized independently of the output and
+        // is reallocated too; resizes are rare and correctness is worth the
+        // simpler ownership.
+        self.targets = Targets::new(
+            device,
+            render_width,
+            render_height,
+            self.graphics,
+            &self.post_buffer,
+            &self.post_sampler,
+            &self.post_layout,
+            &self.bloom_layout,
+        );
+        self.rebuild_scene_bind_groups(device);
+    }
+
+    /// Rebuilds the FSR setup after a quality change.
+    ///
+    /// Returns whether the size-dependent targets were reallocated, so
+    /// [`Self::set_graphics`] can avoid allocating the shadow map twice.
+    fn reconfigure_fsr(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+        self.fsr_restore_native = false;
+        let quality = self.graphics.fsr_quality;
+        // Keep the compiled pipelines across quality changes between enabled
+        // presets; only the LDR target size changes. Turning FSR off drops the
+        // upscaler so the native path owns no FSR resources.
+        let previous = self.fsr.take();
+        self.fsr = if quality.is_enabled() {
+            if !fsr::is_supported_format(self.output_format) || !self.output_format.is_srgb() {
+                log::warn!(
+                    "FSR disabled: {:?} output is not an sRGB 8-bit format; rendering natively",
+                    self.output_format
+                );
+                None
+            } else {
+                let upscaler = previous.map_or_else(
+                    || match FsrUpscaler::new(device, queue, self.output_format) {
+                        Ok(upscaler) => Some(upscaler),
+                        Err(error) => {
+                            log::warn!("FSR disabled: {error}; rendering natively");
+                            None
+                        }
+                    },
+                    |resources| Some(resources.into_upscaler()),
+                );
+                upscaler.and_then(|upscaler| {
+                    FsrResources::with_upscaler(device, upscaler, self.display_width, self.display_height, quality)
+                })
+            }
+        } else {
+            None
+        };
+        let (render_width, render_height) = self
+            .fsr
+            .as_ref()
+            .map_or((self.display_width, self.display_height), FsrResources::render_size);
+        if (render_width, render_height) == (self.targets.width, self.targets.height) {
+            return false;
+        }
+        self.targets = Targets::new(
+            device,
+            render_width,
+            render_height,
+            self.graphics,
+            &self.post_buffer,
+            &self.post_sampler,
+            &self.post_layout,
+            &self.bloom_layout,
+        );
+        self.rebuild_scene_bind_groups(device);
+        true
+    }
+
     /// Applies a new visual quality, reallocating the shadow map when its
-    /// resolution or cascade count changed. No shader is recompiled.
-    pub(crate) fn set_graphics(&mut self, device: &wgpu::Device, graphics: GraphicsSettings) {
+    /// resolution or cascade count changed and the FSR targets when the
+    /// independent FSR row changed. No shader is recompiled on the native path;
+    /// enabling FSR compiles its two pipelines once.
+    pub(crate) fn set_graphics(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, graphics: GraphicsSettings) {
         let graphics = graphics.normalised();
-        let previous = self.graphics.shadow_config();
+        if graphics == self.graphics {
+            return;
+        }
+        let previous_shadow = self.graphics.shadow_config();
+        let fsr_changed = self.graphics.fsr_quality != graphics.fsr_quality;
         self.graphics = graphics;
-        let next = graphics.shadow_config();
-        if previous != next {
-            self.targets.shadow = ShadowTargets::new(device, next);
+        let reallocated = if fsr_changed {
+            self.reconfigure_fsr(device, queue)
+        } else {
+            false
+        };
+        let next_shadow = self.graphics.shadow_config();
+        if !reallocated && previous_shadow != next_shadow {
+            self.targets.shadow = ShadowTargets::new(device, next_shadow);
             self.bind_group = pipeline::create_bind_group(
                 device,
                 &self.bind_group_layout,
@@ -919,8 +1219,36 @@ impl SceneRenderer {
         camera: &Camera,
         scene: &SceneParams<'_>,
     ) -> RenderStats {
+        // A surface/offscreen target can change size without the caller having
+        // delivered a resize (first frame, odd capture sizes). Reconcile before
+        // sizing any pass so FSR never sees a stale render/display mismatch.
+        let output_size = (output_view.texture().width(), output_view.texture().height());
+        if output_size != (self.display_width, self.display_height) {
+            self.resize(device, output_size.0, output_size.1);
+        }
+        // A failed FSR pass left the targets at render size for one frame (the
+        // failed command buffer still referenced them). Restore the native
+        // path now that the previous submission is complete.
+        if self.fsr_restore_native {
+            self.fsr = None;
+            self.fsr_restore_native = false;
+            self.targets = Targets::new(
+                device,
+                self.display_width,
+                self.display_height,
+                self.graphics,
+                &self.post_buffer,
+                &self.post_sampler,
+                &self.post_layout,
+                &self.bloom_layout,
+            );
+            self.rebuild_scene_bind_groups(device);
+        }
         let (width, height) = self.size();
-        let aspect = width as f32 / height as f32;
+        // The camera and shadow fit always use the display aspect: FSR maps the
+        // full render target to the full output, so using the render aspect
+        // would stretch the image.
+        let aspect = self.display_width as f32 / self.display_height.max(1) as f32;
         let visual = scene.environment.visual();
         let shadow = ShadowCascades::fit(camera, aspect, &self.graphics.shadow_config(), visual.sun_direction);
         let uniform = pipeline::CameraUniform::new(
@@ -1211,10 +1539,15 @@ impl SceneRenderer {
             }
         }
         {
+            // On the FSR path the post pass writes the internal LDR target at
+            // render size; RCAS below writes the display-sized output. The LDR
+            // target shares the display format, so both post pipelines are
+            // reused unchanged.
+            let post_view = self.fsr.as_ref().map_or(output_view, |fsr| &fsr.target.view);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("post"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: output_view,
+                    view: post_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -1237,7 +1570,29 @@ impl SceneRenderer {
             stats.passes += 1;
         }
 
-        let _ = device;
+        // --- 6. FSR EASU + RCAS (display-sized output) ----------------------
+        // Recorded after the post pass and before the caller draws the UI, so
+        // the HUD/menus stay at native resolution.
+        let upscale = self.fsr.as_mut().map(|fsr| {
+            let FsrResources { upscaler, target } = fsr;
+            upscaler.upscale(encoder, &target.view, output_view, fsr::DEFAULT_RCAS_SHARPNESS)
+        });
+        match upscale {
+            Some(Ok(())) => {
+                stats.fsr_passes = 2;
+                stats.passes += 2;
+            }
+            Some(Err(error)) => {
+                // The configuration is validated before recording, so this is
+                // a driver-level failure. Keep the current targets alive until
+                // this command buffer is submitted; the next frame restores
+                // native-size targets and skips FSR.
+                log::error!("FSR upscale failed ({error}); falling back to native rendering");
+                self.fsr_restore_native = true;
+            }
+            None => {}
+        }
+
         self.stats = stats;
         stats
     }

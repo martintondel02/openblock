@@ -1,6 +1,6 @@
 # 25 — Performance Budgets and Their Enforcement
 
-> Status: normative - Last updated: 2026-11-24
+> Status: normative - Last updated: 2026-11-25
 > Depends on: [DEC-004](../decisions.md), [DEC-007](../decisions.md), [DEC-013](../decisions.md), [DEC-018](../decisions.md), [DEC-025](../decisions.md), [DEC-035](../decisions.md), [DEC-038](../decisions.md), [DEC-039](../decisions.md), [DEC-048](../decisions.md), [DEC-049](../decisions.md), [DEC-051](../decisions.md), [DEC-052](../decisions.md); [conventions](00-conventions.md), [technical architecture](01-technical-architecture.md), [rendering](03-rendering.md), [shaders and visuals](04-shaders-and-visuals.md), [world model](05-world-model.md), [persistence](17-persistence.md)
 > Implements: MS-00 onward; gate owner for the MS-04, MS-06, MS-07, MS-15 and MS-16 performance exits
 
@@ -174,6 +174,13 @@ Preset scaling, from [chapter 03 §3.11](03-rendering.md); estimates are ±15%, 
 > its two-cascade HDR/shadow/water/post implementation reaches 61.7 FPS p50 at 1080p on the
 > integrated RADV test machine (Ultra) but does not meet the p95 gate methodology above; it
 > is a Report row, not a replacement for the envelope.
+
+Optional FSR 1.0 upscaling (v1.3, off by default) is **not** part of the envelope above and
+does not satisfy `taa + upscale`. Its isolated EASU+RCAS cost on the integrated RADV test
+machine is 3.5 ms at 1280×720 and 7.8 ms at 1920×1080; paired 512-chunk High runs are 47–68%
+slower than native because the scene is not fill-rate bound. It stays a Report-only,
+opt-in row; see [§5.10](#510-v13-fsr-10-on-far-terrain-measured-512-chunk-report-2026-11-25) and
+[1.3-fsr](../plan/1.3-fsr.md).
 
 ### 3.5 Tick budget at 20 Hz
 
@@ -595,6 +602,40 @@ fixed exposure, FXAA-lite instead of TAA) live in
 [08-measurements §v1.1 shaders](../plan/08-measurements.md#2026-11-25--v11-high-quality-built-in-shaders-hdr-sun-shadows-water-clouds-post).
 The gate tables in §3.4 and §5.1 remain the long-term target; a future gate run must use
 GPU timestamp queries and the p95 methodology of §3.7 before it can replace this report.
+
+### 5.10 v1.3 FSR 1.0 on far terrain: measured 512-chunk report (2026-11-25)
+
+This is a **Report** measurement of the optional FSR 1.0 row, not a gate and not a change
+to the envelope in §3.4. It uses the same `render_distance_bench` harness and scene as the
+v1.3 far-terrain runs (§5.9): seed 42, simulation radius 32 chunks, view distance 512
+chunks (4,225 columns, 2,620 near sections + 1,010 far batches, 47,950 far quads), High
+preset, offscreen `Rgba8UnormSrgb` with a blocking readback, 20 warm-up + 240 measured
+frames, release build on the integrated RADV `RAPHAEL_MENDOCINO` machine. The FSR row never
+marks the preset Custom and is off by default.
+
+| Display | FSR row | Internal | p50 ms | p95 ms | p99 ms | p50 FPS | p95 FPS |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 1280×720 | Native (Off) | 1280×720 | **11.79** | 13.11 | 13.38 | **83.3** | 76.3 |
+| 1280×720 | Quality | 858×482 | 18.13 | 19.14 | 19.45 | 55.0 | 52.2 |
+| 1280×720 | Balanced | 756×426 | 18.46 | 19.74 | 20.26 | 54.0 | 50.7 |
+| 1280×720 | Performance | 640×360 | 17.35 | 18.88 | 19.92 | 56.9 | 52.9 |
+| 1920×1080 | Native (Off) | 1920×1080 | **15.84** | 16.53 | 16.91 | **62.6** | 60.5 |
+| 1920×1080 | Quality | 1286×724 | 26.63 | 27.96 | 28.32 | 37.4 | 35.8 |
+| 1920×1080 | Balanced | 1134×638 | 24.00 | 25.95 | 26.67 | 41.3 | 38.5 |
+| 1920×1080 | Performance | 960×540 | 25.42 | 26.99 | 27.98 | 39.4 | 37.1 |
+
+The native controls are within 5% (720p) and 1% (1080p) of the recorded quiet-box
+far-terrain baseline (11.19 / 15.70 ms), so the native path did not regress. Every FSR row
+is slower: **+5.6 to +6.7 ms at 720p and +8.2 to +10.8 ms at 1080p**. Geometry and draw
+counters are unchanged (751 opaque draws, 312 shadow draws, 19 water draws); FSR adds two
+passes (9 → 11) and two targets whose memory is offset by the smaller HDR/depth/bloom
+targets (RSS 277–282 MiB FSR vs 278–282 MiB native). The isolated EASU+RCAS probe measured
+3.5 ms at 720p and 7.8 ms at 1080p on sRGB input (4.6 ms at 1080p on a non-sRGB input),
+which already exceeds the saving from rendering at 0.5–0.67× on this GPU; the scene is bound
+by shadows, geometry and memory traffic rather than fill rate. The feature therefore stays
+**off by default** and is an honest negative result for this machine, not a preset
+recommendation. Full detail, screenshots and limitations are in
+[1.3-fsr](../plan/1.3-fsr.md).
 
 ## 6. Failure modes and edge cases
 

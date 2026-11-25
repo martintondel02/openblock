@@ -23,6 +23,7 @@ use std::time::Instant;
 
 use ob_content::Registry;
 use ob_math::{BlockPos, ChunkPos, N_SECTIONS, SEA_LEVEL, SECTION_SIZE, SectionPos, WORLD_MIN_Y, WorldVec};
+use ob_render::fsr::FsrQuality;
 use ob_render::{
     Camera, DEFAULT_FULL_DETAIL_RADIUS_CHUNKS, DEFAULT_LOD_GROUP_CHUNKS, DEFAULT_SHELL_DEPTH_BLOCKS, Environment,
     FarBiome, FarSample, FarTerrainConfig, GraphicsPreset, GraphicsSettings, LodBatchKey, LodConfig, LodTier,
@@ -201,6 +202,14 @@ pub struct Report {
     pub shadow_draw_calls: u32,
     /// Active shadow cascades in the last frame.
     pub shadow_cascades: u32,
+    /// Internal FSR render size used by the measured frames.
+    pub render_width: u32,
+    /// Internal FSR render height used by the measured frames.
+    pub render_height: u32,
+    /// FSR preset/internal-resolution line reported by the renderer.
+    pub fsr: String,
+    /// FSR EASU+RCAS passes in the last frame (0 native).
+    pub fsr_passes: u32,
     /// Screenshot path, when written.
     pub png: Option<PathBuf>,
 }
@@ -209,6 +218,7 @@ pub struct Report {
 pub fn options_from_flags(flags: &[(String, String)]) -> Result<Options, String> {
     let mut options = Options::default();
     let mut graphics_override = false;
+    let mut fsr_override: Option<FsrQuality> = None;
     for (name, value) in flags {
         match name.as_str() {
             "render-distance" | "radius" => {
@@ -329,14 +339,25 @@ pub fn options_from_flags(flags: &[(String, String)]) -> Result<Options, String>
                 options.graphics.fxaa = false;
                 graphics_override = true;
             }
+            "fsr" => {
+                let raw = required(name, value)?;
+                fsr_override = Some(FsrQuality::parse(raw).ok_or_else(|| {
+                    format!("invalid --fsr value '{raw}' (off, ultra_quality, quality, balanced, performance)")
+                })?);
+            }
             "help" | "version" => {}
             other => return Err(format!("unknown option --{other}")),
         }
     }
     if graphics_override {
         options.graphics.preset = GraphicsPreset::Custom;
-        options.graphics = options.graphics.normalised();
     }
+    // FSR is an independent row: it never marks the preset custom, and applying
+    // it after the loop keeps `--fsr` order-independent from `--graphics`.
+    if let Some(fsr) = fsr_override {
+        options.graphics.fsr_quality = fsr;
+    }
+    options.graphics = options.graphics.normalised();
     Ok(options)
 }
 
@@ -434,6 +455,8 @@ pub fn run(options: &Options) -> Result<Report, String> {
     let adapter = renderer.adapter_summary().to_string();
     let graphics_summary = renderer.graphics().summary();
     let shadow_summary = renderer.shadow_summary();
+    let fsr_summary = renderer.fsr_summary();
+    let (render_width, render_height) = renderer.render_size();
 
     let mesh_start = Instant::now();
     let mut report = Report {
@@ -448,6 +471,9 @@ pub fn run(options: &Options) -> Result<Report, String> {
         stream_calls,
         graphics: graphics_summary,
         shadow: shadow_summary,
+        fsr: fsr_summary,
+        render_width,
+        render_height,
         ..Report::default()
     };
     let lod = LodConfig {
@@ -515,6 +541,7 @@ pub fn run(options: &Options) -> Result<Report, String> {
     report.water_vertices = last_stats.water_vertices;
     report.shadow_draw_calls = last_stats.shadow_draw_calls;
     report.shadow_cascades = last_stats.shadow_cascades;
+    report.fsr_passes = last_stats.fsr_passes;
     report.peak_rss_mib = measure::peak_rss_kib().map_or(0.0, |kib| kib as f64 / 1024.0);
 
     if let Some(path) = &options.png {
@@ -684,10 +711,17 @@ pub fn format_report(options: &Options, report: &Report) -> String {
         report.far_sections,
         report.skipped_sections
     ));
+    let (render_width, render_height) = if report.render_width == 0 {
+        (options.width, options.height)
+    } else {
+        (report.render_width, report.render_height)
+    };
     out.push_str(&format!(
-        "  targets: {}x{}, {} measured frames ({} warm-up), {}\n",
+        "  targets: {}x{} display, {}x{} internal, {} measured frames ({} warm-up), {}\n",
         options.width,
         options.height,
+        render_width,
+        render_height,
         options.frames,
         options.warmup,
         if options.full_detail {
@@ -698,6 +732,10 @@ pub fn format_report(options: &Options, report: &Report) -> String {
     ));
     out.push_str(&format!("  graphics: {}\n", report.graphics));
     out.push_str(&format!("  shadows: {}\n", report.shadow));
+    out.push_str(&format!(
+        "  fsr: {} ({} FSR passes in the last frame)\n",
+        report.fsr, report.fsr_passes
+    ));
     out.push_str(&format!("  adapter: {}\n", report.adapter));
     out.push_str(&format!("  CPU: {}\n", report.cpu));
     out.push_str(&format!("  OS: {}\n", report.os));
@@ -784,6 +822,7 @@ pub fn usage() -> &'static str {
        --water QUALITY       off, low or high\n\
        --bloom / --no-bloom  enable or disable HDR bloom\n\
        --fxaa / --no-fxaa    enable or disable FXAA-lite\n\
+       --fsr QUALITY         FSR 1.0: off, ultra_quality, quality, balanced or performance\n\
        --time T              time of day 0.0..1.0 (default 0.5 noon)\n\
        --scene-time S        cloud/water animation clock in seconds (default 0)\n\
        --yaw RADIANS         camera yaw override\n\
@@ -843,6 +882,7 @@ mod tests {
         assert!(!options.full_detail);
         assert_eq!(options.png.as_deref(), Some(Path::new("/tmp/openblock-512.png")));
         assert_eq!(options.graphics, GraphicsSettings::default());
+        assert_eq!(options.graphics.fsr_quality, FsrQuality::Off);
         assert_eq!(options.time_of_day, 0.5);
         assert_eq!(options.time_seconds, 0.0);
     }
@@ -895,6 +935,15 @@ mod tests {
         assert!(options_from_flags(&flags(&[("graphics", "nope")])).is_err());
         assert!(options_from_flags(&flags(&[("shadows", "nope")])).is_err());
         assert!(options_from_flags(&flags(&[("graphics", "custom")])).is_err());
+        let fsr = options_from_flags(&flags(&[("graphics", "high"), ("fsr", "quality")])).expect("FSR override parses");
+        assert_eq!(fsr.graphics.preset, GraphicsPreset::High);
+        assert_eq!(fsr.graphics.fsr_quality, FsrQuality::Quality);
+        let fsr_first = options_from_flags(&flags(&[("fsr", "performance"), ("graphics", "high")]))
+            .expect("FSR override is order independent");
+        assert_eq!(fsr_first.graphics.fsr_quality, FsrQuality::Performance);
+        assert_eq!(fsr_first.graphics.preset, GraphicsPreset::High);
+        assert!(options_from_flags(&flags(&[("fsr", "off")])).is_ok());
+        assert!(options_from_flags(&flags(&[("fsr", "nope")])).is_err());
         assert!(options_from_flags(&flags(&[("time", "1.5")])).is_err());
         assert!(options_from_flags(&flags(&[("scene-time", "-1")])).is_err());
         assert!(options_from_flags(&flags(&[("render-distance", "0")])).is_err());
@@ -941,6 +990,7 @@ mod tests {
             "targets:",
             "graphics:",
             "shadows:",
+            "fsr:",
             "adapter:",
             "CPU:",
             "OS:",

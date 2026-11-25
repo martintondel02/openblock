@@ -165,6 +165,8 @@ impl ApplicationHandler for MenuApp {
             audio_status,
             audio_enabled_before_mute,
             audio_setting_touched: false,
+            fsr_run_override: self.options.fsr.is_some(),
+            fsr_setting_touched: false,
             window_size,
             fullscreen: false,
             started: Instant::now(),
@@ -300,6 +302,10 @@ struct MenuRuntime {
     audio_status: String,
     audio_enabled_before_mute: Option<bool>,
     audio_setting_touched: bool,
+    /// Whether `--fsr` supplied a run-only override for this launch.
+    fsr_run_override: bool,
+    /// Whether the user changed the FSR row after a `--fsr` launch.
+    fsr_setting_touched: bool,
     window_size: (f32, f32),
     fullscreen: bool,
     started: Instant,
@@ -369,6 +375,12 @@ impl MenuRuntime {
         {
             settings.audio_enabled = saved;
         }
+        crate::restore_fsr_after_run_only_override(
+            &mut settings,
+            self.fsr_run_override,
+            self.fsr_setting_touched,
+            &self.data_dir,
+        );
         if let Err(error) = save_settings(&self.data_dir, &settings) {
             log::warn!("could not save settings: {error}");
         }
@@ -705,7 +717,11 @@ impl MenuRuntime {
             | SettingsRow::WaterQuality
             | SettingsRow::CloudCoverage
             | SettingsRow::Bloom
-            | SettingsRow::Fxaa => {
+            | SettingsRow::Fxaa
+            | SettingsRow::Fsr => {
+                if row == SettingsRow::Fsr {
+                    self.fsr_setting_touched = true;
+                }
                 self.renderer
                     .set_graphics(crate::graphics_settings_from_settings(&self.ui.settings));
             }
@@ -922,6 +938,7 @@ impl MenuRuntime {
                     mesh_workers: self.mesh_workers,
                     ui_scale_percent: resolved_ui_scale_percent(self.ui.settings.ui_scale_percent, self.window_size.1),
                     audio_status: self.audio_status.clone(),
+                    fsr_internal: self.renderer.fsr_internal_size().map(|(width, height)| [width, height]),
                     ..SettingsInfo::default()
                 };
                 crate::ui_state::draw_settings_screen(&mut frame, &self.ui, &info, screen);

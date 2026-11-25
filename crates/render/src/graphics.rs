@@ -12,6 +12,13 @@
 //! settings row changes. The offscreen renderer and the benchmarks use the
 //! same type, so a saved preset renders identically in the window, in
 //! screenshots and in the headless harness.
+//!
+//! FSR is deliberately an **independent** quality row: presets never enable it
+//! and changing it does not mark a preset custom, because it only trades
+//! internal resolution for frame time and does not alter the scene's visual
+//! feature set.
+
+use crate::fsr::FsrQuality;
 
 /// Built-in visual preset.
 ///
@@ -331,6 +338,9 @@ pub struct GraphicsSettings {
     /// Exposure multiplier applied before tonemapping. The default 0.8 keeps
     /// the pre-1.1 sky and terrain midtones close under the ACES fit.
     pub exposure: f32,
+    /// FidelityFX Super Resolution 1.0 quality, or [`FsrQuality::Off`] for the
+    /// native path. Presets always leave this off; it is an independent row.
+    pub fsr_quality: FsrQuality,
 }
 
 impl Default for GraphicsSettings {
@@ -359,6 +369,7 @@ impl GraphicsSettings {
             fxaa,
             cloud_coverage: 0.45,
             exposure: DEFAULT_EXPOSURE,
+            fsr_quality: FsrQuality::Off,
         }
     }
 
@@ -402,13 +413,14 @@ impl GraphicsSettings {
             ),
         };
         format!(
-            "{} preset | {} | clouds {} | water {} | bloom {} | FXAA {}",
+            "{} preset | {} | clouds {} | water {} | bloom {} | FXAA {} | FSR {}",
             self.preset.label(),
             shadows,
             self.clouds.name(),
             self.water.name(),
             if self.bloom { "on" } else { "off" },
             if self.fxaa { "on" } else { "off" },
+            self.fsr_quality.key(),
         )
     }
 }
@@ -446,6 +458,10 @@ mod tests {
         assert_eq!(ultra.shadow_quality, ShadowQuality::Ultra);
         assert!(ultra.shadow_config().pcf_radius > high.shadow_config().pcf_radius);
         assert_eq!(GraphicsSettings::default(), high);
+        // FSR is an independent row: every preset starts native.
+        for settings in [low, medium, high, ultra] {
+            assert_eq!(settings.fsr_quality, FsrQuality::Off);
+        }
     }
 
     #[test]
@@ -519,6 +535,7 @@ mod tests {
             "water high",
             "bloom on",
             "FXAA on",
+            "FSR off",
         ] {
             assert!(summary.contains(needle), "missing {needle}: {summary}");
         }

@@ -8,8 +8,8 @@ use std::collections::VecDeque;
 
 use ob_content::{BlockType, Registry};
 use ob_core::config::{
-    Action, BindKey, CloudQuality, GameMode, GraphicsPreset, KeybindError, Settings, ShadowQuality, TextureStyle,
-    WaterQuality,
+    Action, BindKey, CloudQuality, FsrQuality, GameMode, GraphicsPreset, KeybindError, Settings, ShadowQuality,
+    TextureStyle, WaterQuality,
 };
 use ob_render::UiFrame;
 
@@ -367,6 +367,8 @@ pub enum SettingsRow {
     Bloom,
     /// FXAA-lite toggle.
     Fxaa,
+    /// FSR 1.0 upscaling quality (independent of the preset).
+    Fsr,
 }
 
 impl SettingsRow {
@@ -402,6 +404,7 @@ impl SettingsRow {
             SettingsRow::CloudCoverage => "Cloud coverage",
             SettingsRow::Bloom => "Bloom",
             SettingsRow::Fxaa => "FXAA",
+            SettingsRow::Fsr => "FSR",
         }
     }
 
@@ -414,7 +417,8 @@ impl SettingsRow {
             | SettingsRow::GraphicsPreset
             | SettingsRow::ShadowQuality
             | SettingsRow::Clouds
-            | SettingsRow::WaterQuality => SettingsRowKind::Choice,
+            | SettingsRow::WaterQuality
+            | SettingsRow::Fsr => SettingsRowKind::Choice,
             SettingsRow::ShowHud
             | SettingsRow::DebugOverlay
             | SettingsRow::Fullscreen
@@ -573,6 +577,8 @@ pub struct SettingsInfo {
     pub ui_scale_percent: u16,
     /// One-line audio output description, or `off` when unavailable.
     pub audio_status: String,
+    /// Internal FSR render resolution when the upscaler is active, else `None`.
+    pub fsr_internal: Option<[u32; 2]>,
 }
 
 impl Default for SettingsInfo {
@@ -585,6 +591,7 @@ impl Default for SettingsInfo {
             mesh_workers: 1,
             ui_scale_percent: 100,
             audio_status: "off (headless)".to_string(),
+            fsr_internal: None,
         }
     }
 }
@@ -937,6 +944,8 @@ pub struct DebugStats {
     pub graphics_summary: String,
     /// Shadow mode, resolution and cascade count (`high 2048² ×3 3×3 PCF`).
     pub shadow_summary: String,
+    /// FSR preset, internal resolution and scale, or `native`.
+    pub fsr_summary: String,
 }
 
 impl DebugStats {
@@ -1125,6 +1134,14 @@ impl DebugStats {
                     "off"
                 } else {
                     &self.shadow_summary
+                }
+            ),
+            format!(
+                "FSR {}",
+                if self.fsr_summary.is_empty() {
+                    "native"
+                } else {
+                    &self.fsr_summary
                 }
             ),
         ] {
@@ -1989,6 +2006,7 @@ impl UiState {
                 SettingsRow::CloudCoverage,
                 SettingsRow::Bloom,
                 SettingsRow::Fxaa,
+                SettingsRow::Fsr,
             ],
         }
     }
@@ -2128,6 +2146,7 @@ impl UiState {
             | SettingsRow::ShadowQuality
             | SettingsRow::Clouds
             | SettingsRow::WaterQuality
+            | SettingsRow::Fsr
             | SettingsRow::Bloom
             | SettingsRow::Fxaa => true,
             SettingsRow::ShowHud
@@ -2249,6 +2268,17 @@ impl UiState {
             }
             SettingsRow::Bloom => checkbox(self.settings.bloom),
             SettingsRow::Fxaa => checkbox(self.settings.fxaa),
+            SettingsRow::Fsr => {
+                if self.settings.fsr_quality.is_enabled() {
+                    let label = self.settings.fsr_quality.label();
+                    match info.fsr_internal {
+                        Some([width, height]) => format!("{label} ({width}x{height})"),
+                        None => format!("{label} (unavailable)"),
+                    }
+                } else {
+                    "Off".to_string()
+                }
+            }
         }
     }
 
@@ -2527,6 +2557,17 @@ impl UiState {
                 self.settings.fxaa = !self.settings.fxaa;
                 self.settings.mark_graphics_custom();
                 true
+            }
+            SettingsRow::Fsr => {
+                // FSR is independent of the preset: changing it never marks
+                // the graphics preset Custom.
+                let next = cycle_quality(&FsrQuality::ALL, self.settings.fsr_quality, delta);
+                if next == self.settings.fsr_quality {
+                    false
+                } else {
+                    self.settings.fsr_quality = next;
+                    true
+                }
             }
             SettingsRow::MeshWorkers
             | SettingsRow::UiFont
@@ -3742,6 +3783,11 @@ fn draw_settings_footer(frame: &mut UiFrame, panel: UiRect, ui: &UiState, metric
         "Far terrain beyond the Simulation distance is low-poly and visual-only.",
         "Above 128 chunks it costs GPU time; gameplay, saves and servers are unaffected.",
     ]);
+    let fsr_help = (ui.settings_tab == SettingsTab::Graphics && ui.settings_focused_row() == Some(SettingsRow::Fsr))
+        .then_some([
+            "FSR renders the world at a lower internal resolution, then sharpens on upscale.",
+            "The UI stays native. Off renders natively; applies immediately.",
+        ]);
     let lines: &[&str] = if let Some(lines) = ui_scale_help.as_ref() {
         lines
     } else if let Some(lines) = ui_font_help.as_ref() {
@@ -3749,6 +3795,8 @@ fn draw_settings_footer(frame: &mut UiFrame, panel: UiRect, ui: &UiState, metric
     } else if let Some(lines) = simulation_help.as_ref() {
         lines
     } else if let Some(lines) = view_distance_help.as_ref() {
+        lines
+    } else if let Some(lines) = fsr_help.as_ref() {
         lines
     } else if ui.settings_tab == SettingsTab::Controls {
         &SETTINGS_CONTROLS_HINT_LINES
@@ -4368,6 +4416,7 @@ mod tests {
             graphics_summary: "High preset | shadows high 2048² ×3 | clouds high | water high | bloom on | FXAA on"
                 .into(),
             shadow_summary: "high 2048² ×3 3×3 PCF".into(),
+            fsr_summary: "Quality 1286x724 -> 1920x1080 (0.67x)".into(),
         }
     }
 
@@ -5606,6 +5655,7 @@ mod tests {
             defense: 0,
             graphics_summary: "High preset | shadows high | clouds high | water high | bloom on | FXAA on".into(),
             shadow_summary: "high 2048² ×3 3×3 PCF".into(),
+            fsr_summary: "native".into(),
         };
         let left = stats.left_lines();
         assert_eq!(left.len(), 17);
@@ -5631,6 +5681,7 @@ mod tests {
         let right = stats.right_lines();
         assert!(right[0].contains("Test GPU"));
         assert!(right[1].contains("1280x720"));
+        assert!(right.iter().any(|line| line.contains("FSR native")));
     }
 
     #[test]
@@ -6042,6 +6093,66 @@ mod tests {
         draw_settings_screen(&mut frame, &state, &info, [1280.0, 720.0]);
         let (_, quads) = frame.measure();
         assert!(quads > 0);
+    }
+
+    #[test]
+    fn fsr_row_cycles_live_and_is_independent_of_the_preset() {
+        let mut state = UiState::default();
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Graphics);
+        let index = state
+            .settings_rows()
+            .iter()
+            .position(|row| *row == SettingsRow::Fsr)
+            .expect("Graphics tab has an FSR row");
+        state.settings_selected_row = index;
+        assert_eq!(state.settings_focused_row(), Some(SettingsRow::Fsr));
+        assert_eq!(state.settings.graphics_preset, GraphicsPreset::High);
+        let info = SettingsInfo {
+            fsr_internal: Some([858, 482]),
+            ..SettingsInfo::default()
+        };
+        assert_eq!(state.settings_row_value(SettingsRow::Fsr, &info), "Off");
+
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::Fsr));
+        assert_eq!(state.settings.fsr_quality, FsrQuality::UltraQuality);
+        assert_eq!(
+            state.settings.graphics_preset,
+            GraphicsPreset::High,
+            "FSR is independent and must not mark the preset Custom"
+        );
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::Fsr));
+        assert_eq!(state.settings.fsr_quality, FsrQuality::Quality);
+        assert_eq!(state.settings_row_value(SettingsRow::Fsr, &info), "Quality (858x482)");
+        assert_eq!(state.settings_adjust(-1), Some(SettingsRow::Fsr));
+        assert_eq!(state.settings.fsr_quality, FsrQuality::UltraQuality);
+
+        // Cycling wraps Ultra Quality -> Quality -> Balanced -> Performance -> Off -> Ultra.
+        for expected in [
+            FsrQuality::Quality,
+            FsrQuality::Balanced,
+            FsrQuality::Performance,
+            FsrQuality::Off,
+            FsrQuality::UltraQuality,
+        ] {
+            assert_eq!(state.settings_adjust(1), Some(SettingsRow::Fsr));
+            assert_eq!(state.settings.fsr_quality, expected);
+        }
+
+        // Applying a different preset keeps the independent FSR choice.
+        state.settings.fsr_quality = FsrQuality::Balanced;
+        state.settings_selected_row = 0;
+        state.settings_adjust(1);
+        assert_eq!(state.settings.fsr_quality, FsrQuality::Balanced);
+        assert_ne!(state.settings.graphics_preset, GraphicsPreset::High);
+
+        // An inactive row has no internal resolution to show.
+        state.settings.fsr_quality = FsrQuality::Quality;
+        let unavailable = SettingsInfo::default();
+        assert_eq!(
+            state.settings_row_value(SettingsRow::Fsr, &unavailable),
+            "Quality (unavailable)"
+        );
     }
 
     #[test]

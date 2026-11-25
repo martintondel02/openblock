@@ -20,6 +20,7 @@ pub mod environment;
 pub mod far_terrain;
 mod frame;
 pub mod frustum;
+pub mod fsr;
 pub mod graphics;
 pub mod lod;
 pub mod mesh;
@@ -400,6 +401,8 @@ pub struct RenderStats {
     pub passes: u32,
     /// Bloom threshold/downsample passes recorded this frame.
     pub bloom_passes: u32,
+    /// FSR EASU+RCAS passes recorded this frame (0 on the native path).
+    pub fsr_passes: u32,
 }
 
 /// Errors from renderer initialisation or presentation.
@@ -585,6 +588,26 @@ impl Renderer {
         (self.config.width, self.config.height)
     }
 
+    /// Current internal scene render size (smaller than [`Self::size`] under FSR).
+    pub fn render_size(&self) -> (u32, u32) {
+        self.scene.size()
+    }
+
+    /// Whether the FSR EASU+RCAS pass is active.
+    pub fn fsr_enabled(&self) -> bool {
+        self.scene.fsr_enabled()
+    }
+
+    /// Internal render resolution when FSR is active, else `None`.
+    pub fn fsr_internal_size(&self) -> Option<(u32, u32)> {
+        self.scene.fsr_internal_size()
+    }
+
+    /// One-line FSR preset/internal-resolution description for F3 and logs.
+    pub fn fsr_summary(&self) -> String {
+        self.scene.fsr_summary()
+    }
+
     /// Reconfigures the surface after a resize and reallocates the HDR targets.
     /// Zero-sized sizes are ignored.
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -597,10 +620,14 @@ impl Renderer {
         self.scene.resize(&self.device, width, height);
     }
 
-    /// Applies a new visual quality without recompiling any shader.
+    /// Applies a new visual quality without recompiling any scene shader.
+    ///
+    /// Changing the independent FSR row may compile its two pipelines once and
+    /// reallocates the scene targets at the new internal resolution.
     pub fn set_graphics(&mut self, graphics: GraphicsSettings) {
-        self.scene.set_graphics(&self.device, graphics);
+        self.scene.set_graphics(&self.device, &self.queue, graphics);
         log::info!("graphics: {}", self.scene.graphics.summary());
+        log::info!("fsr: {}", self.scene.fsr_summary());
     }
 
     /// Current visual quality.

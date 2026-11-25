@@ -20,7 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ob_audio::{AudioEngine, Material as AudioMaterial, Sfx as AudioSfx};
 use ob_content::{ArmorSlot, BlockId, MobKind, Registry};
 use ob_core::config::{
-    Action, BindKey, GameMode as SettingsGameMode, KeyName, Settings, TextureStyle, load_settings, save_settings,
+    Action, BindKey, FsrQuality as SettingsFsrQuality, GameMode as SettingsGameMode, KeyName, Settings, TextureStyle,
+    load_settings, save_settings,
 };
 use ob_math::{BlockPos, ChunkPos, N_SECTIONS, SEA_LEVEL, SECTION_SIZE, SectionPos, WorldVec};
 use ob_render::{
@@ -146,6 +147,11 @@ pub struct ClientOptions {
     /// Normalised to the supported choices. Used by `--screenshot` audits and
     /// diagnostics; the settings screen persists its own choice.
     pub ui_scale: Option<u16>,
+    /// FSR quality override for this run (`--fsr`).
+    ///
+    /// Run-only like `--view-distance`: the renderer and every screenshot/bench
+    /// path use it, but the persisted settings are not changed.
+    pub fsr: Option<SettingsFsrQuality>,
     /// Render the death screen in the offscreen screenshot frame.
     pub screenshot_dead: bool,
     /// Use the network death wording (server keep-inventory, Disconnect).
@@ -245,6 +251,7 @@ impl Default for ClientOptions {
             time_of_day: None,
             game_mode: None,
             ui_scale: None,
+            fsr: None,
             screenshot_dead: false,
             screenshot_dead_network: false,
             screenshot_settings: false,
@@ -1132,6 +1139,7 @@ fn screenshot_network_demo_inner(
         defense: client.armor_defense(),
         graphics_summary: renderer.graphics().summary(),
         shadow_summary: renderer.shadow_summary(),
+        fsr_summary: renderer.fsr_summary(),
     };
 
     let mut ui = UiState::from_settings(settings.clone());
@@ -1542,6 +1550,7 @@ fn screenshot_with_mode(
                 mesh_workers: options.mesh_workers,
                 ui_scale_percent: effective_ui_scale,
                 audio_status: "off (headless screenshot)".to_string(),
+                fsr_internal: renderer.fsr_internal_size().map(|(width, height)| [width, height]),
             };
             ui_state::draw_settings_screen(&mut frame, &ui, &info, screen);
             log::info!(
@@ -2019,6 +2028,7 @@ fn screenshot_debug_stats(
         defense: host.armor_defense(),
         graphics_summary: renderer.graphics().summary(),
         shadow_summary: renderer.shadow_summary(),
+        fsr_summary: renderer.fsr_summary(),
     }
 }
 
@@ -3027,6 +3037,10 @@ struct GameState {
     audio_enabled_before_mute: Option<bool>,
     /// Whether the user changed the Sound row after a `--mute` launch.
     audio_setting_touched: bool,
+    /// Whether `--fsr` supplied a run-only override for this launch.
+    fsr_run_override: bool,
+    /// Whether the user changed the FSR row after a `--fsr` launch.
+    fsr_setting_touched: bool,
     /// Open furnace/chest screen state, if any.
     container: Option<ContainerSession>,
     /// Per-mob tick interpolation cache for smooth avatar movement.
@@ -3051,6 +3065,12 @@ impl GameState {
             // the Sound row.
             settings.audio_enabled = saved;
         }
+        restore_fsr_after_run_only_override(
+            &mut settings,
+            self.fsr_run_override,
+            self.fsr_setting_touched,
+            &self.data_dir,
+        );
         if let Err(err) = save_settings(&self.data_dir, &settings) {
             log::warn!("could not save settings: {err}");
         }
@@ -3861,7 +3881,13 @@ impl GameState {
             | SettingsRow::WaterQuality
             | SettingsRow::CloudCoverage
             | SettingsRow::Bloom
-            | SettingsRow::Fxaa => {
+            | SettingsRow::Fxaa
+            | SettingsRow::Fsr => {
+                if row == SettingsRow::Fsr {
+                    // A live FSR change is a user preference and may supersede
+                    // a run-only `--fsr` override.
+                    self.fsr_setting_touched = true;
+                }
                 self.renderer
                     .set_graphics(graphics_settings_from_settings(&self.ui.settings));
             }
@@ -4109,6 +4135,7 @@ impl GameState {
             defense: self.host.armor_defense(),
             graphics_summary: self.renderer.graphics().summary(),
             shadow_summary: self.renderer.shadow_summary(),
+            fsr_summary: self.renderer.fsr_summary(),
         };
     }
 
@@ -4133,6 +4160,7 @@ impl GameState {
             mesh_workers: self.mesh_scheduler.workers(),
             ui_scale_percent: resolved_ui_scale_percent(self.ui.settings.ui_scale_percent, self.window_size.1),
             audio_status: self.audio_status.clone(),
+            fsr_internal: self.renderer.fsr_internal_size().map(|(width, height)| [width, height]),
         }
     }
 
@@ -5879,6 +5907,8 @@ impl ApplicationHandler for App {
             was_in_water,
             audio_enabled_before_mute,
             audio_setting_touched: false,
+            fsr_run_override: self.options.fsr.is_some(),
+            fsr_setting_touched: false,
             container: None,
             mob_render: MobRenderCache::new(),
             attack_ready: None,
@@ -6563,6 +6593,23 @@ fn audio_material_for(registry: &Registry, block: BlockId) -> Option<AudioMateri
     })
 }
 
+/// Restores the persisted FSR row when `--fsr` was only a run-only override.
+///
+/// The CLI value is applied to the live settings (and therefore to the
+/// renderer), but saving unrelated settings must not turn a one-shot override
+/// into a persistent preference. Once the player edits the FSR row itself,
+/// [`restore_fsr_after_run_only_override`] leaves the new choice alone.
+pub(crate) fn restore_fsr_after_run_only_override(
+    settings: &mut Settings,
+    run_override: bool,
+    touched: bool,
+    data_dir: &Path,
+) {
+    if run_override && !touched {
+        settings.fsr_quality = load_settings(data_dir).fsr_quality;
+    }
+}
+
 /// Resolves persisted settings, with explicit CLI flags taking precedence.
 fn effective_settings(options: &ClientOptions) -> (Settings, PathBuf) {
     let data_dir = options.data_dir.clone().unwrap_or_else(ob_core::data_dir);
@@ -6581,6 +6628,9 @@ fn effective_settings(options: &ClientOptions) -> (Settings, PathBuf) {
     }
     if let Some(percent) = options.ui_scale {
         settings.ui_scale_percent = percent;
+    }
+    if let Some(fsr) = options.fsr {
+        settings.fsr_quality = fsr;
     }
     if options.mute {
         settings.audio_enabled = false;
@@ -6666,6 +6716,7 @@ pub fn graphics_settings_from_settings(settings: &Settings) -> ob_render::Graphi
         CoreWater::Low => ob_render::WaterQuality::Low,
         CoreWater::High => ob_render::WaterQuality::High,
     };
+    let fsr_quality = render_fsr_quality(settings.fsr_quality);
     ob_render::GraphicsSettings {
         preset,
         shadow_quality,
@@ -6675,8 +6726,20 @@ pub fn graphics_settings_from_settings(settings: &Settings) -> ob_render::Graphi
         fxaa: settings.fxaa,
         cloud_coverage: settings.cloud_coverage,
         exposure: ob_render::DEFAULT_EXPOSURE,
+        fsr_quality,
     }
     .normalised()
+}
+
+/// Maps the persisted FSR row to the renderer's GPU-facing quality enum.
+pub fn render_fsr_quality(quality: SettingsFsrQuality) -> ob_render::fsr::FsrQuality {
+    match quality {
+        SettingsFsrQuality::Off => ob_render::fsr::FsrQuality::Off,
+        SettingsFsrQuality::UltraQuality => ob_render::fsr::FsrQuality::UltraQuality,
+        SettingsFsrQuality::Quality => ob_render::fsr::FsrQuality::Quality,
+        SettingsFsrQuality::Balanced => ob_render::fsr::FsrQuality::Balanced,
+        SettingsFsrQuality::Performance => ob_render::fsr::FsrQuality::Performance,
+    }
 }
 
 /// Resolves which texture source this run should use.
@@ -6995,6 +7058,11 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
             "texture-style" => {
                 options.texture_style =
                     Some(TextureStyle::from_name(value).ok_or_else(|| format!("unknown texture style '{value}'"))?);
+            }
+            "fsr" => {
+                options.fsr = Some(SettingsFsrQuality::parse(value).ok_or_else(|| {
+                    format!("invalid --fsr value '{value}' (off, ultra_quality, quality, balanced, performance)")
+                })?);
             }
             "texture-pack" | "resource-pack" => {
                 if value.is_empty() {
@@ -8347,6 +8415,105 @@ mod tests {
             settings.render_distance_chunks,
             ClientOptions::default().render_distance_chunks
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fsr_flag_parses_maps_and_stays_run_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "openblock-fsr-flag-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("temp settings dir");
+        let options = options_from_args(&[
+            ("fsr".to_string(), "quality".to_string()),
+            ("data-dir".to_string(), dir.to_string_lossy().into_owned()),
+        ])
+        .expect("FSR flag parses");
+        assert_eq!(options.fsr, Some(SettingsFsrQuality::Quality));
+        let (settings, _) = effective_settings(&options);
+        assert_eq!(settings.fsr_quality, SettingsFsrQuality::Quality);
+        // Run-only: the override is not written to the settings file.
+        let persisted = load_settings(&dir);
+        assert_eq!(persisted.fsr_quality, SettingsFsrQuality::Off);
+
+        for (name, expected) in [
+            ("off", ob_render::fsr::FsrQuality::Off),
+            ("ultra_quality", ob_render::fsr::FsrQuality::UltraQuality),
+            ("quality", ob_render::fsr::FsrQuality::Quality),
+            ("balanced", ob_render::fsr::FsrQuality::Balanced),
+            ("performance", ob_render::fsr::FsrQuality::Performance),
+        ] {
+            let options = options_from_args(&[("fsr".to_string(), name.to_string())]).expect("valid FSR name");
+            assert_eq!(options.fsr.map(render_fsr_quality), Some(expected), "{name}");
+        }
+        // The renderer's GPU enum and the persisted enum use the same names.
+        for quality in SettingsFsrQuality::ALL {
+            let rendered = render_fsr_quality(quality);
+            assert_eq!(rendered.key(), quality.name());
+            assert_eq!(rendered.label(), quality.label());
+        }
+        for value in ["nope", "high", ""] {
+            let error = options_from_args(&[("fsr".to_string(), value.to_string())])
+                .expect_err("invalid FSR quality must fail");
+            assert!(error.contains("--fsr"), "{value}: {error}");
+        }
+        assert_eq!(
+            graphics_settings_from_settings(&Settings {
+                fsr_quality: SettingsFsrQuality::Performance,
+                ..Settings::default()
+            })
+            .fsr_quality,
+            ob_render::fsr::FsrQuality::Performance
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fsr_run_only_override_is_not_persisted_by_unrelated_saves() {
+        let dir = std::env::temp_dir().join(format!(
+            "openblock-fsr-run-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("temp settings dir");
+        save_settings(
+            &dir,
+            &Settings {
+                fsr_quality: SettingsFsrQuality::Off,
+                ..Settings::default()
+            },
+        )
+        .expect("save baseline");
+
+        // A live settings document carries the CLI override until it is saved.
+        let mut live = Settings {
+            fsr_quality: SettingsFsrQuality::Quality,
+            ..Settings::default()
+        };
+        restore_fsr_after_run_only_override(&mut live, true, false, &dir);
+        assert_eq!(live.fsr_quality, SettingsFsrQuality::Off);
+
+        // A live FSR edit is a real preference and must survive the save.
+        let mut edited = Settings {
+            fsr_quality: SettingsFsrQuality::Balanced,
+            ..Settings::default()
+        };
+        restore_fsr_after_run_only_override(&mut edited, true, true, &dir);
+        assert_eq!(edited.fsr_quality, SettingsFsrQuality::Balanced);
+
+        // Without a CLI override there is nothing to restore.
+        let mut persisted = Settings {
+            fsr_quality: SettingsFsrQuality::Performance,
+            ..Settings::default()
+        };
+        restore_fsr_after_run_only_override(&mut persisted, false, false, &dir);
+        assert_eq!(persisted.fsr_quality, SettingsFsrQuality::Performance);
         let _ = std::fs::remove_dir_all(dir);
     }
 

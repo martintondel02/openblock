@@ -134,10 +134,15 @@ impl OffscreenRenderer {
         self.scene.stats()
     }
 
-    /// Applies a new visual quality without recompiling any shader.
+    /// Applies a new visual quality without recompiling any scene shader.
+    ///
+    /// Changing the independent FSR row may compile its two pipelines once and
+    /// reallocates the scene targets at the new internal resolution. The
+    /// offscreen colour texture and readback size stay at display size.
     pub fn set_graphics(&mut self, graphics: GraphicsSettings) {
-        self.scene.set_graphics(&self.device, graphics);
+        self.scene.set_graphics(&self.device, &self.queue, graphics);
         log::info!("graphics: {}", self.scene.graphics.summary());
+        log::info!("fsr: {}", self.scene.fsr_summary());
     }
 
     /// Current visual quality.
@@ -150,9 +155,29 @@ impl OffscreenRenderer {
         self.scene.shadow_summary()
     }
 
-    /// Current offscreen target size.
+    /// Current offscreen (display) target size.
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// Current internal scene render size (smaller than [`Self::size`] under FSR).
+    pub fn render_size(&self) -> (u32, u32) {
+        self.scene.size()
+    }
+
+    /// Whether the FSR EASU+RCAS pass is active.
+    pub fn fsr_enabled(&self) -> bool {
+        self.scene.fsr_enabled()
+    }
+
+    /// Internal render resolution when FSR is active, else `None`.
+    pub fn fsr_internal_size(&self) -> Option<(u32, u32)> {
+        self.scene.fsr_internal_size()
+    }
+
+    /// One-line FSR preset/internal-resolution description for F3 and reports.
+    pub fn fsr_summary(&self) -> String {
+        self.scene.fsr_summary()
     }
 
     /// Reallocates the offscreen colour target and every size-dependent scene
@@ -2718,6 +2743,305 @@ mod tests {
         renderer.resize(1, 1);
         renderer.render_world(&world, &camera).expect("1x1 frame");
         assert_eq!(renderer.read_rgba().len(), 4);
+    }
+
+    // ------------------------------------------------------------------
+    // FSR 1.0 integration GPU tests.
+    // ------------------------------------------------------------------
+
+    /// Creates an offscreen renderer with an explicit FSR quality.
+    fn open_fsr_renderer(
+        width: u32,
+        height: u32,
+        quality: crate::fsr::FsrQuality,
+        test: &str,
+    ) -> Option<OffscreenRenderer> {
+        if std::env::var_os("OPENBLOCK_NO_GPU_TESTS").is_some() {
+            eprintln!("skipping {test}: OPENBLOCK_NO_GPU_TESTS is set");
+            return None;
+        }
+        let graphics = crate::GraphicsSettings {
+            clouds: crate::CloudQuality::Off,
+            fsr_quality: quality,
+            ..crate::GraphicsSettings::default()
+        };
+        match OffscreenRenderer::new_with_source_and_graphics(
+            width,
+            height,
+            crate::TextureSource::Style(crate::TexturePackStyle::Classic),
+            graphics,
+        ) {
+            Ok(renderer) => {
+                eprintln!("{test} GPU: {}", renderer.adapter_summary());
+                Some(renderer)
+            }
+            Err(RenderError::NoAdapter(reason)) => {
+                eprintln!("skipping {test}: no GPU adapter ({reason})");
+                None
+            }
+            Err(err) => panic!("failed to create the offscreen renderer: {err}"),
+        }
+    }
+
+    #[test]
+    fn fsr_upscales_to_the_display_size_at_1080p_720p_and_odd_sizes() {
+        let Some(mut renderer) = open_fsr_renderer(
+            1920,
+            1080,
+            crate::fsr::FsrQuality::Quality,
+            "fsr_upscales_to_the_display_size_at_1080p_720p_and_odd_sizes",
+        ) else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let world = test_world(&registry);
+        let camera = look_at(WorldVec::new(8.0, 72.0, 8.0), [8.0, 65.0, 0.0]);
+
+        for (width, height, quality) in [
+            (1920u32, 1080u32, crate::fsr::FsrQuality::Quality),
+            (1280, 720, crate::fsr::FsrQuality::Balanced),
+            (1001, 777, crate::fsr::FsrQuality::Performance),
+            (1, 1, crate::fsr::FsrQuality::Performance),
+        ] {
+            renderer.resize(width, height);
+            renderer.set_graphics(crate::GraphicsSettings {
+                clouds: crate::CloudQuality::Off,
+                fsr_quality: quality,
+                ..crate::GraphicsSettings::default()
+            });
+            assert!(renderer.fsr_enabled(), "{width}x{height} {quality:?}");
+            assert_eq!(renderer.size(), (width, height), "display stays native-sized");
+            let expected = quality.render_size(width, height);
+            assert_eq!(renderer.render_size(), expected, "{width}x{height} {quality:?}");
+            assert!(expected.0 <= width && expected.1 <= height);
+            let summary = renderer.fsr_summary();
+            assert!(summary.contains(quality.label()), "{summary}");
+            assert!(summary.contains(&format!("{width}x{height}")), "{summary}");
+            assert!(summary.contains(&format!("{}x{}", expected.0, expected.1)), "{summary}");
+
+            let scope = renderer.push_validation_scope();
+            renderer.render_world(&world, &camera).expect("FSR frame");
+            let error = OffscreenRenderer::pop_validation_scope(scope);
+            assert!(error.is_none(), "{width}x{height} wgpu validation error: {error:?}");
+
+            let pixels = renderer.read_rgba();
+            assert_eq!(pixels.len(), (width * height * 4) as usize);
+            assert!(
+                pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[..3].iter().any(|c| *c > 0)),
+                "{width}x{height} FSR output is black"
+            );
+            assert_eq!(renderer.stats().fsr_passes, 2, "{width}x{height}");
+            assert!(
+                renderer.stats().passes >= 3,
+                "two FSR passes must be counted in the frame pass total"
+            );
+        }
+
+        // A native frame at the same display size has one fewer stage and an
+        // internal size equal to the output size.
+        renderer.resize(1280, 720);
+        renderer.set_graphics(crate::GraphicsSettings {
+            clouds: crate::CloudQuality::Off,
+            fsr_quality: crate::fsr::FsrQuality::Off,
+            ..crate::GraphicsSettings::default()
+        });
+        assert!(!renderer.fsr_enabled());
+        assert_eq!(renderer.render_size(), (1280, 720));
+        assert_eq!(renderer.fsr_summary(), "native");
+        renderer.render_world(&world, &camera).expect("native frame");
+        assert_eq!(renderer.stats().fsr_passes, 0);
+    }
+
+    #[test]
+    fn fsr_resize_and_quality_changes_reallocate_and_keep_the_ui_native() {
+        let Some(mut renderer) = open_fsr_renderer(
+            1280,
+            720,
+            crate::fsr::FsrQuality::Quality,
+            "fsr_resize_and_quality_changes_reallocate_and_keep_the_ui_native",
+        ) else {
+            return;
+        };
+        let registry = Arc::new(Registry::base());
+        let world = test_world(&registry);
+        let camera = look_at(WorldVec::new(8.0, 72.0, 8.0), [8.0, 65.0, 0.0]);
+        assert_eq!(renderer.render_size(), (858, 482));
+        assert_eq!(crate::fsr::FsrQuality::Quality.render_size(1280, 720), (858, 482));
+
+        let scope = renderer.push_validation_scope();
+        renderer.render_world(&world, &camera).expect("initial FSR frame");
+        assert!(OffscreenRenderer::pop_validation_scope(scope).is_none());
+
+        // A UI rectangle drawn after FSR must land on exact display pixels.
+        let mut frame = UiFrame::new(1280.0, 720.0);
+        frame.rect(10.0, 10.0, 40.0, 20.0, [1.0, 0.0, 0.0, 1.0]);
+        renderer
+            .render_cached_with_ui(&camera, Some(&frame))
+            .expect("FSR frame with UI");
+        let pixels = renderer.read_rgba();
+        let pixel = |x: u32, y: u32| {
+            let offset = ((y * 1280 + x) * 4) as usize;
+            [pixels[offset], pixels[offset + 1], pixels[offset + 2]]
+        };
+        assert_eq!(pixel(20, 15), [255, 0, 0], "UI rectangle centre must be native");
+        assert_eq!(pixel(12, 12), [255, 0, 0], "UI rectangle edge must be native");
+        assert_ne!(pixel(5, 15), [255, 0, 0], "nothing outside the rectangle");
+
+        // Resize: the display target and UI size change; FSR follows the new
+        // internal size and the upscaler reallocates its intermediate.
+        renderer.resize(1920, 1088);
+        assert_eq!(renderer.size(), (1920, 1088));
+        assert_eq!(renderer.render_size(), (1286, 730));
+        let mut frame = UiFrame::new(1920.0, 1088.0);
+        frame.rect(10.0, 10.0, 40.0, 20.0, [0.0, 1.0, 0.0, 1.0]);
+        let scope = renderer.push_validation_scope();
+        renderer
+            .render_cached_with_ui(&camera, Some(&frame))
+            .expect("resized FSR frame");
+        let error = OffscreenRenderer::pop_validation_scope(scope);
+        assert!(error.is_none(), "resize validation error: {error:?}");
+        let pixels = renderer.read_rgba();
+        assert_eq!(pixels.len(), (1920 * 1088 * 4) as usize);
+        let offset = ((15 * 1920 + 20) * 4) as usize;
+        assert_eq!(&pixels[offset..offset + 3], &[0, 255, 0], "UI is native after resize");
+
+        // Changing the independent FSR row reallocates the scene targets at the
+        // new preset size without a resize and without recompiling scene shaders.
+        renderer.set_graphics(crate::GraphicsSettings {
+            clouds: crate::CloudQuality::Off,
+            fsr_quality: crate::fsr::FsrQuality::Performance,
+            ..crate::GraphicsSettings::default()
+        });
+        assert_eq!(renderer.render_size(), (960, 544));
+        assert_eq!(renderer.graphics().preset, crate::GraphicsPreset::High);
+        let scope = renderer.push_validation_scope();
+        renderer
+            .render_cached_scene(&camera, &SceneParams::new(Environment::new(0.4)))
+            .expect("performance FSR frame");
+        assert!(OffscreenRenderer::pop_validation_scope(scope).is_none());
+        assert_eq!(renderer.stats().fsr_passes, 2);
+
+        // Turning FSR off restores the native targets and removes the pass.
+        renderer.set_graphics(crate::GraphicsSettings {
+            clouds: crate::CloudQuality::Off,
+            fsr_quality: crate::fsr::FsrQuality::Off,
+            ..crate::GraphicsSettings::default()
+        });
+        assert!(!renderer.fsr_enabled());
+        assert_eq!(renderer.render_size(), (1920, 1088));
+        let scope = renderer.push_validation_scope();
+        renderer
+            .render_cached_scene(&camera, &SceneParams::new(Environment::new(0.4)))
+            .expect("native frame after FSR");
+        assert!(OffscreenRenderer::pop_validation_scope(scope).is_none());
+        assert_eq!(renderer.stats().fsr_passes, 0);
+    }
+
+    #[test]
+    fn fsr_is_skipped_gracefully_for_an_unsupported_output_format() {
+        if std::env::var_os("OPENBLOCK_NO_GPU_TESTS").is_some() {
+            eprintln!("skipping FSR format fallback: OPENBLOCK_NO_GPU_TESTS is set");
+            return;
+        }
+        let renderer = match OffscreenRenderer::new(320, 180) {
+            Ok(renderer) => renderer,
+            Err(RenderError::NoAdapter(reason)) => {
+                eprintln!("skipping FSR format fallback: no GPU adapter ({reason})");
+                return;
+            }
+            Err(err) => panic!("failed to create the offscreen renderer: {err}"),
+        };
+        // Rgba16Float is a valid render target but outside FSR 1's 8-bit unorm
+        // input/output contract. The scene must fall back to native instead of
+        // creating an unusable pipeline or panicking.
+        let scope = renderer.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut scene = match crate::frame::SceneRenderer::new(
+            &renderer.device,
+            &renderer.queue,
+            320,
+            180,
+            wgpu::TextureFormat::Rgba16Float,
+            renderer.texture_source(),
+            crate::GraphicsSettings {
+                clouds: crate::CloudQuality::Off,
+                fsr_quality: crate::fsr::FsrQuality::Quality,
+                ..crate::GraphicsSettings::default()
+            },
+        ) {
+            Ok(scene) => scene,
+            Err(err) => panic!("unsupported-format scene creation failed: {err}"),
+        };
+        let error = pollster::block_on(scope.pop());
+        assert!(
+            error.is_none(),
+            "unsupported-format creation validation error: {error:?}"
+        );
+        assert!(!scene.fsr_enabled());
+        assert_eq!(scene.size(), (320, 180));
+        assert!(scene.fsr_summary().contains("unsupported"), "{}", scene.fsr_summary());
+
+        // The native fallback still records a valid frame into the 16-float
+        // target (this is what a hypothetical HDR surface would use).
+        let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fsr-unsupported-format-target"),
+            size: wgpu::Extent3d {
+                width: 320,
+                height: 180,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let camera = Camera::new(WorldVec::new(8.0, 72.0, 8.0), 0.0, -0.3);
+        let scope = renderer.push_validation_scope();
+        let mut encoder = renderer.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fsr-fallback"),
+        });
+        scene.record(
+            &renderer.device,
+            &renderer.queue,
+            &mut encoder,
+            &view,
+            &camera,
+            &SceneParams::new(Environment::new(0.5)),
+        );
+        renderer.queue.submit([encoder.finish()]);
+        let error = OffscreenRenderer::pop_validation_scope(scope);
+        assert!(error.is_none(), "unsupported-format frame validation error: {error:?}");
+
+        // A linear (non-sRGB) 8-bit output is accepted by the FSR module itself
+        // but not by this integration: the post pipeline writes linear values
+        // and the internal LDR target shares the display format, so FSR's
+        // perceptual contract would be violated. It must fall back to native
+        // rather than render a gamma-broken image.
+        let linear_scene = match crate::frame::SceneRenderer::new(
+            &renderer.device,
+            &renderer.queue,
+            320,
+            180,
+            wgpu::TextureFormat::Rgba8Unorm,
+            renderer.texture_source(),
+            crate::GraphicsSettings {
+                clouds: crate::CloudQuality::Off,
+                fsr_quality: crate::fsr::FsrQuality::Quality,
+                ..crate::GraphicsSettings::default()
+            },
+        ) {
+            Ok(scene) => scene,
+            Err(err) => panic!("linear-format scene creation failed: {err}"),
+        };
+        assert!(!linear_scene.fsr_enabled());
+        assert_eq!(linear_scene.size(), (320, 180));
+        assert!(linear_scene.fsr_summary().contains("unsupported"));
     }
 
     #[test]
