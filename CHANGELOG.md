@@ -67,8 +67,10 @@ Protocol **v3** (36-slot inventory, light/sleep sync); save format 4 remains and
   macOS.
 - New v1.2.0 screenshots: torch-lit room, wheat farm, sleep overlay, 36-slot
   inventory and compact 960×540@125; design docs `docs/plan/1.2-*.md`.
-- Seed-42 smoke hash (now covers light, crops and personal respawn)
-  `9b8962d1352bbcc0`.
+- Seed-42 smoke hash (covers blocks/entities/crops/personal respawn; derived
+  light is verified by world save/load and relight tests instead, since border
+  propagation can legitimately settle differently across streaming reloads)
+  `ed80bbaf244bc31d`.
 
 ### Known limitations
 - No weather yet; sleep has no thunder window; crops freeze in unloaded

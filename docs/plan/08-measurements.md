@@ -1937,9 +1937,10 @@ a5ad3cb, server gameplay b18b551, client integration 3e28ef0):
 - `cargo clippy --workspace --all-targets -- -D warnings`, `fmt --check`,
   `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps`,
   `check-arch.sh` and `check-docs.py` all clean.
-- Seed-42 headless smoke twice on fresh dirs: `smoke OK hash=9b8962d1352bbcc0`
-  (the hash now covers light, crops and personal respawn; 1.1's was
-  `eba0c42219691190`).
+- Seed-42 headless smoke twice on fresh dirs: `smoke OK hash=ed80bbaf244bc31d`
+  (hash covers blocks/entities/crops/personal respawn; derived light is covered
+  by world save/load + relight tests rather than the host hash because border
+  propagation may settle differently across streaming reloads).
 - Quick multiplayer load gate PASS (676 chunks, 20 TPS, RSS 14.1 MiB for the
   server); backup/restore PASS.
 - Lighting/migration measurements remain in the 1.2 lighting section above;

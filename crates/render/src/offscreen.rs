@@ -1729,6 +1729,9 @@ mod tests {
 
     /// Writes one RGBA8 image to disk.
     fn write_test_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
         let file = std::fs::File::create(path).expect("create screenshot png");
         let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
         encoder.set_color(png::ColorType::Rgba);
@@ -1966,7 +1969,7 @@ mod tests {
             .render_cached_scene(&camera, &scene)
             .expect("render water with shadows again");
         write_test_png(
-            std::path::Path::new("/tmp/openblock-shaders-water.png"),
+            &std::env::temp_dir().join("openblock-shaders-water.png"),
             1280,
             720,
             &rgba,
@@ -2204,7 +2207,7 @@ mod tests {
             .expect("render UI font sample");
         let pixels = renderer.read_rgba();
         assert_eq!(pixels.len(), (640 * 360 * 4) as usize);
-        write_test_png(std::path::Path::new("/tmp/ui-font-sample.png"), 640, 360, &pixels);
+        write_test_png(&std::env::temp_dir().join("ui-font-sample.png"), 640, 360, &pixels);
         eprintln!("wrote /tmp/ui-font-sample.png");
     }
 
@@ -2791,7 +2794,7 @@ mod tests {
         let dark = renderer.read_rgba();
         let dark_luma = mean_luma(&dark);
         write_test_png(
-            std::path::Path::new("/tmp/openblock-light-cave-dark.png"),
+            &std::env::temp_dir().join("openblock-light-cave-dark.png"),
             WIDTH,
             HEIGHT,
             &dark,
@@ -2806,7 +2809,7 @@ mod tests {
         let lit = renderer.read_rgba();
         let lit_luma = mean_luma(&lit);
         write_test_png(
-            std::path::Path::new("/tmp/openblock-light-torch.png"),
+            &std::env::temp_dir().join("openblock-light-torch.png"),
             WIDTH,
             HEIGHT,
             &lit,
@@ -2916,7 +2919,7 @@ mod tests {
         assert!(OffscreenRenderer::pop_validation_scope(scope).is_none());
         let lit = renderer.read_rgba();
         write_test_png(
-            std::path::Path::new("/tmp/openblock-light-cross.png"),
+            &std::env::temp_dir().join("openblock-light-cross.png"),
             WIDTH,
             HEIGHT,
             &lit,

@@ -82,8 +82,8 @@ Expected tail (the hash depends on the exact build and seed):
 
 ```text
 [INFO ] openblock_server: smoke test: generating, ticking, saving, reloading
-[INFO ] openblock_server: smoke OK: state hash 9b8962d1352bbcc0
-smoke OK hash=9b8962d1352bbcc0
+[INFO ] openblock_server: smoke OK: state hash ed80bbaf244bc31d
+smoke OK hash=ed80bbaf244bc31d
 ```
 
 That hash is the 1.0.0 reference (seed 42, save format 4); the value changes
