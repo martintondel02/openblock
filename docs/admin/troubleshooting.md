@@ -140,7 +140,7 @@ The client shows the server's machine-readable disconnect reason. Common ones:
 
 | Reason | Meaning / fix |
 | --- | --- |
-| `protocol_mismatch` | Client and server are from different protocol generations (server protocol v2). Rebuild/update both from the same release |
+| `protocol_mismatch` | Client and server are from different protocol generations (server protocol v3). Rebuild/update both from the same release |
 | `content_mismatch` | Server `--pack`/block manifest differs from the client's registry. Use the same content pack or the default base registry on both |
 | `server_full` | `max_players` reached; wait or raise it and restart |
 | `name_taken` | Another online connection uses that name (case-insensitive); pick another or wait for the old connection to time out |

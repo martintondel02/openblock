@@ -6,6 +6,78 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [1.2.0] — 2026-11-25 (Light & Home)
+
+The survival-comfort release: caves go dark and torches matter, beds end the
+night, wheat makes food renewable, and the inventory grows from 9 to 36 slots.
+Protocol **v3** (36-slot inventory, light/sleep sync); save format 4 remains and
+1.0/1.1 worlds migrate their fake sky light automatically.
+
+### Added — real lighting and torches
+- Full sky + RGB block-light engine: top-down sky seeding, 6-neighbour BFS with
+  per-block attenuation, 31³ edit relighting, chunk-border propagation, and a
+  cached deterministic light hash. Block light is stored in save v4 as before.
+- New content (append-only ids): torch (emission 14), dry/wet farmland, four
+  wheat stages and beds, plus seeds/wheat/bread and wood/stone/iron hoes,
+  recipes and 11 texture layers; cross-shaped cut-out models.
+- Renderer: packed sky/block light per vertex (smooth 3×3 light + AO), warm torch
+  tint, cutout cross models, cutout shadows; 512-block scenes still render.
+- Migration: additive `world_meta.txt` with `light_version=2`; 1.0/1.1 worlds
+  get a one-time relight (dark caves) with the marker written only after the
+  save commits. No save-format change.
+- Server-authoritative lighting sync: `LightUpdate` batches changed section
+  light to nearby players (raw/zstd, rate-limited, interest-filtered); clients
+  apply verbatim and remesh affected sections/neighbours. Single-player consumes
+  dirty light sections through the existing mesh scheduler.
+- Measured: seeding +0.14–0.16 ms/chunk; ordinary edit relight p50 <0.15 ms
+  (deep-shaft worst 1.9 ms); 512 streaming 470 ms and 512 mesh+upload ~399 ms;
+  world heap fell (fake light removed) to 132 MiB, RSS ~270 MiB.
+
+### Added — beds, sleep, farming and spawning
+- Beds (two blocks, fixed orientation), personal respawn, night/thunder sleep:
+  single-player fast-forwards to sunrise over 100 ticks; multiplayer requires
+  all alive players asleep, one awake blocks and timeout/damage wakes everyone;
+  obstructed beds refuse, damage wakes.
+- Wheat farming: hoe grass/dirt to farmland, plant seeds (light ≥9), hydration
+  from water within 4 blocks, 2,400/1,200 ticks per stage dry/wet, stage block
+  updates, harvest wheat + seeds, grass seed drops (12.5%); `crops.txt` persists
+  crop state and old saves without it still load.
+- Hostile spawning now requires gameplay light ≤7, so torches suppress spawns;
+  night/day factor derived from the server clock.
+- Server-authoritative `UseBlock` routing with rejection reasons for missing
+  hoe/seeds, darkness, wrong time, obstruction, reach, support, sleep state.
+
+### Added — 36-slot inventory and protocol v3
+- 9 hotbar + 27 main + 4 armor slots (equipment now 36..40, windows 100+);
+  inventory UI is four rows with Armor/Main/Hotbar labels in both single-player
+  and network clients; click pick/place, Shift-click quick transfer, armor
+  equip/unequip; compact 960×540@125 layout.
+- Server inventories grow to 36, pickup fills hotbar→main→drop, death keeps the
+  full inventory; `inventory.txt` migrates old 9-slot saves and writes only
+  non-empty rows; furnace/chest windows unchanged.
+- Protocol v3: InventorySync carries hotbar/main/equipment; LightUpdate,
+  TimeSync, SleepState, SleepRequest and Wake added; v1/v2 peers are rejected
+  with an actionable mismatch message.
+
+### Verification
+- Workspace tests pass (client 289 lib + loopback, server 118 lib + 66
+  integration, content 42, world 62, render 174, protocol 35+, core 44, tools);
+  clippy `-D warnings`, fmt, rustdoc, architecture/docs checks, smoke twice,
+  load gate and backup/restore pass; CI covers Fedora 44/45, Ubuntu, Windows and
+  macOS.
+- New v1.2.0 screenshots: torch-lit room, wheat farm, sleep overlay, 36-slot
+  inventory and compact 960×540@125; design docs `docs/plan/1.2-*.md`.
+- Seed-42 smoke hash (now covers light, crops and personal respawn)
+  `9b8962d1352bbcc0`.
+
+### Known limitations
+- No weather yet; sleep has no thunder window; crops freeze in unloaded
+  columns; no bone meal, tool tiers beyond iron, or offhand slot; bed pillow is
+  always +Z; no wall torches or coloured light; predicted multiplayer block
+  placement still relights locally before the authoritative LightUpdate;
+  dedicated-server chunk memory still grows with exploration; far shadows/LOD
+  limits from 1.1 remain.
+
 ## [1.1.0] — 2026-11-25 (Reach: 512-block view distance and shaders)
 
 The "reach" release: the world is now visible 512 blocks away and the renderer

@@ -2,7 +2,7 @@
 
 This is the operator handbook for the **interim 1.0 dedicated server**: the
 headless `openblock-server` binary speaking plain TCP with length-prefixed JSON
-(protocol v2). It is deliberately practical and describes what this build does,
+(protocol v3). It is deliberately practical and describes what this build does,
 not the QUIC/TLS design reserved for a later milestone.
 
 > **Read [security](security.md) before opening a port.** The interim protocol
@@ -56,7 +56,7 @@ world and exits.
 | Capability | Interim 1.0 build | Notes |
 | --- | --- | --- |
 | Headless CPU-only server | Yes | No Vulkan, X11, Wayland, PulseAudio or ALSA dependency; verified by [`scripts/check-server-deps.sh`](../../scripts/check-server-deps.sh) |
-| TCP JSON protocol v2 | Yes | 2 MiB frames; see [spec 18 §3.13](../spec/18-networking-multiplayer.md#313-interim-jsontcp-protocol-implemented-for-10) |
+| TCP JSON protocol v3 | Yes | 2 MiB frames; see [spec 18 §3.13](../spec/18-networking-multiplayer.md#313-interim-jsontcp-protocol-implemented-for-10) |
 | Chunk interest streaming, movement, edits, chat, ping | Yes | 20 Hz tick, 4 chunks/tick/client, configurable interest radius |
 | Survival state and entity replication | Yes, partial | Vitals/inventory/equipment, drops, mobs; client movement remains client-authoritative |
 | Persistent network-player records | Yes | `network_players.txt`; the same name resumes the record, so names are not authentication |

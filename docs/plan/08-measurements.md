@@ -1925,3 +1925,31 @@ cloud, shadow and water passes without validation errors.
 `docs/spec/03-rendering.md`, `docs/spec/07-light-and-weather.md` and this file.
 `CHANGELOG.md`, `README.md`, packaging, client/protocol/server/core and
 `docs/plan/1.2-inventory.md` were left untouched.
+
+## 2026-11-25 — 1.2.0 release verification (Light & Home)
+
+Final verification of the shipped 1.2.0 tree (lighting 24b50ac, inventory
+a5ad3cb, server gameplay b18b551, client integration 3e28ef0):
+
+- `cargo test --workspace --all-targets`: **967 passed, 0 failed, 18 ignored**
+  (protocol 35, core 44, content 42, world 62, sim 30, render 174, server 118 +
+  66 integration, client 289 + 18 loopback, tools/acceptance/misc).
+- `cargo clippy --workspace --all-targets -- -D warnings`, `fmt --check`,
+  `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps`,
+  `check-arch.sh` and `check-docs.py` all clean.
+- Seed-42 headless smoke twice on fresh dirs: `smoke OK hash=9b8962d1352bbcc0`
+  (the hash now covers light, crops and personal respawn; 1.1's was
+  `eba0c42219691190`).
+- Quick multiplayer load gate PASS (676 chunks, 20 TPS, RSS 14.1 MiB for the
+  server); backup/restore PASS.
+- Lighting/migration measurements remain in the 1.2 lighting section above;
+  protocol is v3 (36-slot inventory + LightUpdate/TimeSync/SleepState);
+  save format stays v4 with additive `world_meta.txt`, `crops.txt`, personal
+  respawn in `spawn.txt` and 36-slot inventory rows.
+- v1.2.0 screenshots: `docs/img/v1.2.0-{torch,farm,sleep,inventory,inventory-960x540-125}.png`
+
+Known limits at release: no weather, crops pause in unloaded columns, no bone
+meal/tool tiers beyond iron/offhand, bed pillow fixed +Z, wall torches/coloured
+light absent, predicted multiplayer placement relights locally before the
+authoritative LightUpdate, server chunk memory still grows with exploration, and
+the 1.1 far-shadow/LOD limits apply.
