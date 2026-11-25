@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use crate::mixer::{CommandQueue, Control, Mixer, PlayCommand, group_info};
 use crate::synth::{self, GROUP_COUNT};
-use crate::{Material, Sfx};
+use crate::{ClipCue, ClipId, Material, Sfx, distance_attenuation, world_pan};
 
 /// Nominal synthesis rate. All clips are generated at this rate; the Pulse
 /// backend requests exactly this rate and the mixer can resample offline.
@@ -64,7 +64,8 @@ pub struct AudioStatus {
     pub buffer_frames: u32,
     /// Estimated buffer latency in milliseconds.
     pub latency_ms: f32,
-    /// Number of generated clips, including the two loops.
+    /// Number of generated clips, including the 1.5 loop beds and the two
+    /// legacy wind/music beds.
     pub clip_count: usize,
     /// Wall-clock time spent synthesising the bank at startup.
     pub synthesis_ms: f32,
@@ -149,7 +150,7 @@ impl AudioEngine {
         let synthesis_started = Instant::now();
         let bank = Arc::new(synth::build_bank());
         let synthesis_ms = synthesis_started.elapsed().as_secs_f32() * 1000.0;
-        let control = Arc::new(Control::new(0.8, 1.0, 0.55));
+        let control = Arc::new(Control::new(0.8, 1.0, 0.55, 1.0));
         let queue = Arc::new(CommandQueue::new());
         let started = crate::backend::start(Arc::clone(&bank), Arc::clone(&control), Arc::clone(&queue))?;
         let status = AudioStatus {
@@ -200,7 +201,7 @@ impl AudioEngine {
         let synthesis_started = Instant::now();
         let bank = Arc::new(synth::build_bank());
         let synthesis_ms = synthesis_started.elapsed().as_secs_f32() * 1000.0;
-        let control = Arc::new(Control::new(0.8, 1.0, 0.55));
+        let control = Arc::new(Control::new(0.8, 1.0, 0.55, 1.0));
         let queue = Arc::new(CommandQueue::new());
         let mixer = Mixer::new(
             Arc::clone(&bank),
@@ -289,39 +290,74 @@ impl AudioEngine {
     /// for the same group within its cooldown are dropped before they reach the
     /// ring.
     pub fn play_sfx_at(&mut self, sfx: Sfx, gain: f32, pan: Option<f32>) {
-        if !self.is_available() || !self.control.enabled() {
-            return;
-        }
-        let gain = if gain.is_finite() { gain.clamp(0.0, 4.0) } else { 0.0 };
-        if gain <= 0.0 {
-            return;
-        }
-        let (group, cooldown) = group_info(sfx);
-        let now = self.elapsed as f32;
-        if now - self.last_play[group] < cooldown {
-            self.skipped_commands = self.skipped_commands.saturating_add(1);
-            return;
-        }
-        self.last_play[group] = now;
-        self.seed = self.seed.wrapping_add(0x9e37_79b9);
-        let random = synth::hash_u64(u64::from(self.seed) ^ group as u64);
-        let unit = ((random >> 32) as f32) / 4_294_967_296.0;
-        let rate = 0.955 + 0.09 * unit;
-        let pan = pan.map_or(
-            0.0,
-            |value| if value.is_finite() { value.clamp(-1.0, 1.0) } else { 0.0 },
-        );
-        let command = PlayCommand {
-            group: group as u16,
-            seed: self.seed,
-            gain,
-            pan,
-            rate,
-        };
-        self.queue.push(command, &self.control);
+        let (group, _) = group_info(sfx);
+        self.play_group(group, gain, pan, None);
     }
 
-    /// Updates the listener used by [`AudioEngine::play_sfx_world`].
+    /// Sets the ambient loop bus volume, clamped to `0.0..=1.0`.
+    ///
+    /// This bus scales the 1.5 weather/fire beds. The legacy wind/music bed
+    /// remains on [`AudioEngine::set_music_volume`].
+    pub fn set_ambient_volume(&mut self, volume: f32) {
+        self.control.set_ambient(volume);
+    }
+
+    /// Changes a looping bed's target volume; returns `false` for a one-shot.
+    ///
+    /// The mixer ramps from the current gain to the new target over at most
+    /// [`crate::LOOP_FADE_SECONDS`] (1.2 s), so this can start, stop or adjust a
+    /// loop without a click. Call it only when the target changes; the mixer
+    /// remembers the value. Use `0.0` or [`AudioEngine::stop_loop`] to stop.
+    pub fn set_loop_volume(&mut self, clip: ClipId, volume: f32) -> bool {
+        if !self.is_available() {
+            return false;
+        }
+        let Some(index) = synth::loop_index_of(clip) else {
+            return false;
+        };
+        self.control.set_loop_target(index, volume);
+        true
+    }
+
+    /// Ramps a looping bed to silence; returns `false` for a one-shot.
+    pub fn stop_loop(&mut self, clip: ClipId) -> bool {
+        self.set_loop_volume(clip, 0.0)
+    }
+
+    /// Current target volume for a looping bed, or `None` for a one-shot.
+    ///
+    /// This is the value last passed to [`AudioEngine::set_loop_volume`], not
+    /// the instantaneous mixer gain during a ramp.
+    pub fn loop_volume(&self, clip: ClipId) -> Option<f32> {
+        synth::loop_index_of(clip).map(|index| self.control.loop_target(index))
+    }
+
+    /// Plays a non-looping 1.5 clip at unity gain and centre pan.
+    ///
+    /// Looping clips are rejected (`false`); use [`AudioEngine::set_loop_volume`]
+    /// for weather and fire beds. The variant and a small pitch offset are
+    /// chosen deterministically per call, like [`AudioEngine::play_sfx`].
+    pub fn play_clip(&mut self, clip: ClipId, gain: f32, pan: Option<f32>) -> bool {
+        let Some(group) = synth::clip_group_of(clip) else {
+            return false;
+        };
+        self.play_group(group, gain, pan, None)
+    }
+
+    /// Plays a distance-resolved cue (see [`crate::thunder_cue`] and
+    /// [`crate::explosion_cue`]) with its own gain and playback rate.
+    ///
+    /// The clip's variant is still selected by the engine; one-shot cooldowns
+    /// apply as usual. Looping clips are rejected.
+    pub fn play_cue(&mut self, cue: ClipCue, pan: Option<f32>) -> bool {
+        let Some(group) = synth::clip_group_of(cue.clip) else {
+            return false;
+        };
+        self.play_group(group, cue.gain, pan, Some(cue.rate))
+    }
+
+    /// Updates the listener used by [`AudioEngine::play_sfx_world`] and
+    /// [`AudioEngine::play_clip_world`].
     pub fn set_listener(&mut self, position: [f32; 3], yaw: f32) {
         if position.iter().all(|value| value.is_finite()) {
             self.listener_position = position;
@@ -335,16 +371,75 @@ impl AudioEngine {
     /// and a yaw-relative pan. The client normally passes the block or item
     /// position here.
     pub fn play_sfx_world(&mut self, sfx: Sfx, position: [f32; 3], gain: f32) {
+        let attenuation = self.world_attenuation(position, 24.0);
+        let pan = self.position_pan(position);
+        self.play_sfx_at(sfx, gain * attenuation, Some(pan));
+    }
+
+    /// Plays a 1.5 one-shot at a world position with the same 24 m linear
+    /// attenuation and yaw-relative pan as [`AudioEngine::play_sfx_world`].
+    ///
+    /// For thunder and explosions whose audible range is larger than 24 m, use
+    /// [`crate::thunder_cue`] or [`crate::explosion_cue`] and pass the result to
+    /// [`AudioEngine::play_cue`] with a pan from [`crate::world_pan`].
+    pub fn play_clip_world(&mut self, clip: ClipId, position: [f32; 3], gain: f32) -> bool {
         if !position.iter().all(|value| value.is_finite()) {
-            return;
+            return false;
+        }
+        let attenuation = self.world_attenuation(position, 24.0);
+        let pan = self.position_pan(position);
+        self.play_clip(clip, gain * attenuation, Some(pan))
+    }
+
+    fn world_attenuation(&self, position: [f32; 3], max_distance: f32) -> f32 {
+        if !position.iter().all(|value| value.is_finite()) {
+            return 0.0;
         }
         let dx = position[0] - self.listener_position[0];
         let dz = position[2] - self.listener_position[2];
         let distance = (dx * dx + dz * dz).sqrt().max(0.25);
-        let attenuation = (1.0 - distance / 24.0).clamp(0.0, 1.0);
-        let right = dx * self.listener_yaw.cos() - dz * self.listener_yaw.sin();
-        let pan = (right / distance * 0.8).clamp(-1.0, 1.0);
-        self.play_sfx_at(sfx, gain * attenuation, Some(pan));
+        distance_attenuation(distance, max_distance)
+    }
+
+    fn position_pan(&self, position: [f32; 3]) -> f32 {
+        world_pan(self.listener_position, self.listener_yaw, position)
+    }
+
+    /// Applies the per-group cooldown, deterministic variant/pitch selection and
+    /// pan sanitising, then pushes one command. Returns whether it was queued.
+    fn play_group(&mut self, group: usize, gain: f32, pan: Option<f32>, rate: Option<f32>) -> bool {
+        if !self.is_available() || !self.control.enabled() || group >= GROUP_COUNT {
+            return false;
+        }
+        let gain = if gain.is_finite() { gain.clamp(0.0, 4.0) } else { 0.0 };
+        if gain <= 0.0 {
+            return false;
+        }
+        let cooldown = synth::rate_limit_seconds(group);
+        let now = self.elapsed as f32;
+        if now - self.last_play[group] < cooldown {
+            self.skipped_commands = self.skipped_commands.saturating_add(1);
+            return false;
+        }
+        self.last_play[group] = now;
+        self.seed = self.seed.wrapping_add(0x9e37_79b9);
+        let random = synth::hash_u64(u64::from(self.seed) ^ group as u64);
+        let unit = ((random >> 32) as f32) / 4_294_967_296.0;
+        let rate = rate.map_or(0.955 + 0.09 * unit, |value| {
+            if value.is_finite() { value.clamp(0.5, 2.0) } else { 1.0 }
+        });
+        let pan = pan.map_or(
+            0.0,
+            |value| if value.is_finite() { value.clamp(-1.0, 1.0) } else { 0.0 },
+        );
+        let command = PlayCommand {
+            group: group as u16,
+            seed: self.seed,
+            gain,
+            pan,
+            rate,
+        };
+        self.queue.push(command, &self.control)
     }
 
     /// Advances the engine clock and footstep cooldown.

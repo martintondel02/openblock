@@ -7,26 +7,75 @@
 //! between libm implementations, which would make the determinism tests
 //! platform-dependent.
 
-use crate::{Material, SAMPLE_RATE, Sfx};
+use crate::{ClipId, Material, SAMPLE_RATE, Sfx};
 
 /// Number of material groups: footsteps, block breaks and block places.
-const MATERIALS: usize = 7;
-/// One-shot groups: pickup, hurt, death, eat, drink, craft, craft failure,
-/// tool break, splash, UI click and UI confirm.
-const ONESHOTS: usize = 11;
-/// Total number of SFX groups (every variant of an [`Sfx`] lives in one group).
-pub(crate) const GROUP_COUNT: usize = MATERIALS * 3 + ONESHOTS;
+const MATERIALS: usize = 8;
+/// Legacy one-shot groups: pickup, hurt, death, eat, drink, craft, craft
+/// failure, tool break, splash, UI click and UI confirm.
+const SFX_ONESHOTS: usize = 11;
+/// Index of the first 1.5 [`ClipId`] one-shot group.
+const CLIP_GROUP_BASE: usize = MATERIALS * 3 + SFX_ONESHOTS;
+/// One-shot groups backing the non-looping [`ClipId`] variants.
+const CLIP_ONESHOTS: usize = 12;
+/// Total number of one-shot groups (every variant of an [`Sfx`] or [`ClipId`]
+/// one-shot lives in one group).
+pub(crate) const GROUP_COUNT: usize = CLIP_GROUP_BASE + CLIP_ONESHOTS;
+/// Number of 1.5 ambient loop beds.
+pub(crate) const LOOP_COUNT: usize = 4;
 
-/// Number of variants stored for a group.
+/// Number of variants stored for a one-shot group.
 pub(crate) fn variant_count(group: usize) -> usize {
+    if group >= CLIP_GROUP_BASE {
+        return clip_variant_count(group - CLIP_GROUP_BASE);
+    }
     match group {
-        0..=6 => 4,   // footsteps
-        7..=13 => 3,  // block break
-        14..=20 => 2, // block place
+        group if group < MATERIALS => 4,     // footsteps
+        group if group < MATERIALS * 2 => 3, // block break
+        group if group < MATERIALS * 3 => 2, // block place
         _ => match group - MATERIALS * 3 {
             1 | 3 | 8 => 2, // hurt, eat, splash
             _ => 1,
         },
+    }
+}
+
+/// Number of variants for a 1.5 one-shot offset in `0..CLIP_ONESHOTS`.
+fn clip_variant_count(offset: usize) -> usize {
+    match offset {
+        0 | 1 | 3 | 4 | 8 | 9 => 2, // thunder (both), explosion, creeper, skeleton, spider
+        _ => 1,
+    }
+}
+
+/// Group index for a non-looping 1.5 clip, or `None` for a loop.
+pub(crate) fn clip_group_of(clip: ClipId) -> Option<usize> {
+    let offset = match clip {
+        ClipId::ThunderDistant => 0,
+        ClipId::ThunderNear => 1,
+        ClipId::LightningCrack => 2,
+        ClipId::Explosion => 3,
+        ClipId::CreeperHiss => 4,
+        ClipId::BowShoot => 5,
+        ClipId::ArrowImpact => 6,
+        ClipId::CriticalHit => 7,
+        ClipId::SkeletonRattle => 8,
+        ClipId::SpiderChitter => 9,
+        ClipId::XpPickup => 10,
+        ClipId::LevelUp => 11,
+        ClipId::RainLoop | ClipId::RainHeavyLoop | ClipId::SnowWindLoop | ClipId::FireCrackleLoop => return None,
+    };
+    Some(CLIP_GROUP_BASE + offset)
+}
+
+/// Loop-bed index for a 1.5 clip, or `None` for a one-shot.
+pub(crate) fn loop_index_of(clip: ClipId) -> Option<usize> {
+    match clip {
+        ClipId::RainLoop => Some(0),
+        ClipId::RainHeavyLoop => Some(1),
+        ClipId::SnowWindLoop => Some(2),
+        ClipId::FireCrackleLoop => Some(3),
+        _ => None,
     }
 }
 
@@ -55,10 +104,13 @@ pub(crate) fn group_of(sfx: Sfx) -> usize {
 /// This is the last line of defence against a machine-gun emitter; gameplay
 /// call sites also apply their own cadence (footsteps in particular).
 pub(crate) fn rate_limit_seconds(group: usize) -> f32 {
+    if group >= CLIP_GROUP_BASE {
+        return clip_rate_limit_seconds(group - CLIP_GROUP_BASE);
+    }
     match group {
-        0..=6 => 0.12,
-        7..=13 => 0.035,
-        14..=20 => 0.04,
+        group if group < MATERIALS => 0.12,
+        group if group < MATERIALS * 2 => 0.035,
+        group if group < MATERIALS * 3 => 0.04,
         _ => match group - MATERIALS * 3 {
             0 => 0.08, // pickup
             1 => 0.20, // hurt
@@ -72,6 +124,28 @@ pub(crate) fn rate_limit_seconds(group: usize) -> f32 {
             9 => 0.03, // UI click
             _ => 0.08, // UI confirm
         },
+    }
+}
+
+/// Cooldown for a 1.5 one-shot offset in `0..CLIP_ONESHOTS`.
+///
+/// The values are deliberately short: several different cues (for example a
+/// creeper hiss and an explosion) must be able to overlap, while a machine-gun
+/// emitter of the same cue is still capped.
+fn clip_rate_limit_seconds(offset: usize) -> f32 {
+    match offset {
+        0 => 0.60,  // distant thunder
+        1 => 0.50,  // near thunder
+        2 => 0.20,  // lightning crack
+        3 => 0.08,  // explosion
+        4 => 0.15,  // creeper hiss
+        5 => 0.05,  // bow shoot
+        6 => 0.04,  // arrow impact
+        7 => 0.03,  // critical hit
+        8 => 0.15,  // skeleton rattle
+        9 => 0.10,  // spider chitter
+        10 => 0.03, // XP pickup
+        _ => 0.40,  // level up
     }
 }
 
@@ -111,8 +185,11 @@ pub(crate) struct GroupRange {
 pub(crate) struct ClipBank {
     /// One range per group, indexed like [`Sfx`].
     pub groups: Vec<GroupRange>,
-    /// All SFX clips.
+    /// All one-shot clips (legacy [`Sfx`] groups followed by 1.5 [`ClipId`]
+    /// groups).
     pub clips: Vec<Clip>,
+    /// The 1.5 ambient beds, indexed by `loop_index_of`.
+    pub loops: Vec<Clip>,
     /// Quiet wind/forest ambience loop.
     pub ambient: Clip,
     /// Soft generative music-pad loop.
@@ -120,9 +197,10 @@ pub(crate) struct ClipBank {
 }
 
 impl ClipBank {
-    /// Total number of generated clips, including the two loops.
+    /// Total number of generated clips, including the 1.5 loops and the two
+    /// legacy beds.
     pub fn clip_count(&self) -> usize {
-        self.clips.len() + 2
+        self.clips.len() + self.loops.len() + 2
     }
 
     /// The group range for `group`, if it exists.
@@ -133,6 +211,11 @@ impl ClipBank {
     /// Clip by index; returns `None` for an out-of-range index.
     pub fn clip(&self, index: usize) -> Option<&Clip> {
         self.clips.get(index)
+    }
+
+    /// A 1.5 loop bed by its `loop_index_of` index.
+    pub fn loop_clip(&self, index: usize) -> Option<&Clip> {
+        self.loops.get(index)
     }
 }
 
@@ -175,8 +258,33 @@ pub(crate) fn build_bank() -> ClipBank {
     add_group(&mut groups, &mut clips, [ui_click()]);
     add_group(&mut groups, &mut clips, [ui_confirm()]);
 
+    debug_assert_eq!(groups.len(), CLIP_GROUP_BASE);
+
+    // 1.5 one-shots, in the exact order encoded by `clip_group_of`.
+    add_group(&mut groups, &mut clips, (0..clip_variant_count(0)).map(thunder_distant));
+    add_group(&mut groups, &mut clips, (0..clip_variant_count(1)).map(thunder_near));
+    add_group(&mut groups, &mut clips, [lightning_crack()]);
+    add_group(&mut groups, &mut clips, (0..clip_variant_count(3)).map(explosion));
+    add_group(&mut groups, &mut clips, (0..clip_variant_count(4)).map(creeper_hiss));
+    add_group(&mut groups, &mut clips, [bow_shoot()]);
+    add_group(&mut groups, &mut clips, [arrow_impact()]);
+    add_group(&mut groups, &mut clips, [critical_hit()]);
+    add_group(&mut groups, &mut clips, (0..clip_variant_count(8)).map(skeleton_rattle));
+    add_group(&mut groups, &mut clips, (0..clip_variant_count(9)).map(spider_chitter));
+    add_group(&mut groups, &mut clips, [xp_pickup()]);
+    add_group(&mut groups, &mut clips, [level_up()]);
+
     debug_assert_eq!(groups.len(), GROUP_COUNT);
     debug_assert_eq!(groups.iter().map(|group| group.count).sum::<usize>(), clips.len());
+    debug_assert_eq!(CLIP_ONESHOTS, ClipId::ONE_SHOTS.len());
+
+    let loops = vec![
+        Clip::new(make_loop(generate_rain(false), 0.50), 0.55),
+        Clip::new(make_loop(generate_rain(true), 0.50), 0.60),
+        Clip::new(make_loop(generate_snow_wind(), 0.55), 0.42),
+        Clip::new(make_loop(generate_fire_crackle(), 0.45), 0.70),
+    ];
+    debug_assert_eq!(loops.len(), LOOP_COUNT);
 
     let ambient = Clip::new(make_loop(generate_ambient(), 0.40), 0.42);
     let music = Clip::new(make_loop(generate_music(), 0.65), 0.30);
@@ -184,6 +292,7 @@ pub(crate) fn build_bank() -> ClipBank {
     ClipBank {
         groups,
         clips,
+        loops,
         ambient,
         music,
     }
@@ -235,6 +344,20 @@ fn decay(t: f32) -> f32 {
 fn smoothstep(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// A smooth quadratic bump centred on `centre` and non-zero within `width`.
+#[inline]
+fn burst(t: f32, centre: f32, width: f32) -> f32 {
+    if width <= 0.0 {
+        return 0.0;
+    }
+    let distance = (t - centre).abs();
+    if distance >= width {
+        return 0.0;
+    }
+    let x = 1.0 - distance / width;
+    x * x
 }
 
 /// Advances a phase by `step` and wraps it into `0.0..1.0`.
@@ -358,6 +481,14 @@ fn material_profile(material: Material) -> Profile {
             body_freq: 0.0,
             body_gain: 0.0,
             click_gain: 0.12,
+        },
+        Material::Fire => Profile {
+            alpha: 0.52,
+            noise_gain: 0.48,
+            bright_gain: 0.40,
+            body_freq: 0.0,
+            body_gain: 0.0,
+            click_gain: 0.24,
         },
     }
 }
@@ -667,6 +798,476 @@ fn ui_confirm() -> Clip {
     Clip::new(samples, 0.30)
 }
 
+// --- 1.5 one-shots ------------------------------------------------------------
+
+fn thunder_distant(variant: usize) -> Clip {
+    let seed = 0x7468_756e_6469_0000 ^ ((variant as u64 + 1) * 0x9e37_79b9);
+    let duration = 4.2 + 0.35 * variant as f32;
+    let count = (duration * SAMPLE_RATE as f32) as usize;
+    let mut samples = vec![0.0f32; count];
+    let mut low = 0.0f32;
+    let mut low2 = 0.0f32;
+    let mut sub_phase = 0.0f32;
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let t = index as f32 / count as f32;
+        let white = noise(seed, index as u64);
+        low += (white - low) * 0.012;
+        low2 += (low - low2) * 0.035;
+        // Three overlapping rolls; the last one is quiet so the tail decays
+        // rather than stopping abruptly at the end.
+        let envelope = (burst(t, 0.16, 0.26) * 0.95 + burst(t, 0.46, 0.30) * 0.75 + burst(t, 0.74, 0.24) * 0.45)
+            * (1.0 - 0.35 * t);
+        let sub = triangle(advance(
+            &mut sub_phase,
+            (34.0 + 3.0 * variant as f32) / SAMPLE_RATE as f32,
+        ));
+        *sample = (low2 * 1.15 + low * 0.55 + sub * 0.25 + white * 0.05) * envelope;
+    }
+    Clip::new(samples, 0.78)
+}
+
+fn thunder_near(variant: usize) -> Clip {
+    let seed = 0x7468_756e_6e65_0000 ^ ((variant as u64 + 1) * 0x85eb_ca6b);
+    let duration = 3.0 + 0.25 * variant as f32;
+    let count = (duration * SAMPLE_RATE as f32) as usize;
+    let mut samples = vec![0.0f32; count];
+    let mut low = 0.0f32;
+    let mut mid = 0.0f32;
+    let mut sub_phase = 0.0f32;
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let t = index as f32 / count as f32;
+        let white = noise(seed, index as u64);
+        low += (white - low) * 0.025;
+        mid += (white - mid) * 0.18;
+        let crack = if t < 0.030 {
+            let x = 1.0 - t / 0.030;
+            x * x * (white * 0.90 + (white - mid) * 0.80)
+        } else {
+            0.0
+        };
+        let envelope = burst(t, 0.08, 0.22) + burst(t, 0.36, 0.28) * 0.75 + burst(t, 0.72, 0.24) * 0.35;
+        let sub = triangle(advance(
+            &mut sub_phase,
+            (43.0 + 3.0 * variant as f32) / SAMPLE_RATE as f32,
+        ));
+        *sample = crack + (low * 0.80 + (white - mid) * 0.25 + sub * 0.18) * envelope;
+    }
+    Clip::new(samples, 0.88)
+}
+
+fn lightning_crack() -> Clip {
+    let count = (1.8 * SAMPLE_RATE as f32) as usize;
+    let mut samples = vec![0.0f32; count];
+    let mut low = 0.0f32;
+    let mut low2 = 0.0f32;
+    let mut sub_phase = 0.0f32;
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let t = index as f32 / count as f32;
+        let white = noise(0x6c69_6768_7400_0001, index as u64);
+        low += (white - low) * 0.020;
+        low2 += (low - low2) * 0.060;
+        // An 8 ms bright transient, a short sizzle and then a compact rumble.
+        let crack = if t < 0.008 {
+            let x = 1.0 - t / 0.008;
+            x * x * (white * 1.20 + (white - low) * 0.80)
+        } else {
+            0.0
+        };
+        let sizzle = if t < 0.15 {
+            (1.0 - t / 0.15) * (white - low) * 0.45
+        } else {
+            0.0
+        };
+        let envelope = burst(t, 0.18, 0.22) * 0.90 + burst(t, 0.55, 0.30) * 0.55 + burst(t, 0.82, 0.18) * 0.25;
+        let sub = triangle(advance(&mut sub_phase, 40.0 / SAMPLE_RATE as f32));
+        *sample = crack + sizzle + (low2 + low * 0.45 + sub * 0.25) * envelope;
+    }
+    Clip::new(samples, 0.92)
+}
+
+fn explosion(variant: usize) -> Clip {
+    let seed = 0x6578_706c_6f00_0000 ^ ((variant as u64 + 1) * 0x27d4_eb2f);
+    let duration = 2.2 + 0.2 * variant as f32;
+    let count = (duration * SAMPLE_RATE as f32) as usize;
+    let mut samples = vec![0.0f32; count];
+    let mut low = 0.0f32;
+    let mut low2 = 0.0f32;
+    let mut sub_phase = 0.0f32;
+    let mut pop_amp = 0.0f32;
+    let mut pop_pos = 0usize;
+    let mut pop_len = 0usize;
+    let mut pop_phase = 0.0f32;
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let t = index as f32 / count as f32;
+        let white = noise(seed, index as u64);
+        low += (white - low) * 0.035;
+        low2 += (low - low2) * 0.120;
+        let boom_envelope = smoothstep((t / 0.012).min(1.0)) * (1.0 - t) * (1.0 - t);
+        let frequency = (72.0 - 44.0 * t + 4.0 * variant as f32).max(24.0);
+        let sub = triangle(advance(&mut sub_phase, frequency / SAMPLE_RATE as f32));
+        if index % 384 == 0 && t > 0.10 {
+            let bits = hash_u64(seed ^ (index / 384) as u64);
+            let threshold = 0.50 + 0.35 * t;
+            let unit = ((bits >> 32) as f32) / 4_294_967_296.0;
+            if unit > threshold {
+                pop_amp = (0.12 + 0.30 * unit) * (1.0 - t);
+                pop_len = 70 + (bits as usize % 150);
+                pop_pos = 0;
+            }
+        }
+        let mut debris = 0.0f32;
+        if pop_amp > 0.0 && pop_pos < pop_len {
+            let progress = pop_pos as f32 / pop_len as f32;
+            let envelope = (1.0 - progress) * (1.0 - progress);
+            let grain = noise(seed ^ 0xdeb4, pop_pos as u64);
+            let ping = triangle(advance(&mut pop_phase, 820.0 / SAMPLE_RATE as f32));
+            debris = (grain * 0.65 + ping * 0.35) * pop_amp * envelope;
+            pop_pos += 1;
+            if pop_pos >= pop_len {
+                pop_amp = 0.0;
+            }
+        }
+        *sample =
+            (sub * 0.75 + low2 * 0.95 + low * 0.35) * boom_envelope + debris + (white - low) * 0.035 * boom_envelope;
+    }
+    Clip::new(samples, 0.92)
+}
+
+fn creeper_hiss(variant: usize) -> Clip {
+    let seed = 0x6372_6565_7065_0000 ^ ((variant as u64 + 1) * 0x1656_67b1);
+    let duration = 1.6 + 0.1 * variant as f32;
+    let count = (duration * SAMPLE_RATE as f32) as usize;
+    let mut samples = vec![0.0f32; count];
+    let mut low = 0.0f32;
+    let mut mid = 0.0f32;
+    let mut whistle_phase = 0.0f32;
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let t = index as f32 / count as f32;
+        let white = noise(seed, index as u64);
+        low += (white - low) * 0.080;
+        mid += (white - mid) * 0.400;
+        let air = white - mid;
+        let hiss = air * (0.25 + 0.55 * t);
+        let frequency = 480.0 + (420.0 + 70.0 * variant as f32) * t;
+        let whistle = triangle(advance(&mut whistle_phase, frequency / SAMPLE_RATE as f32)) * (0.08 + 0.18 * t);
+        let tremolo = 0.85 + 0.15 * triangle((13.0 * t).fract());
+        let release = if t > 0.93 {
+            ((1.0 - t) / 0.07).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let envelope = smoothstep((t / 0.12).min(1.0)) * release;
+        *sample = (hiss + low * 0.25 + whistle) * envelope * tremolo;
+    }
+    Clip::new(samples, 0.62)
+}
+
+fn bow_shoot() -> Clip {
+    let count = (0.26 * SAMPLE_RATE as f32) as usize;
+    let mut samples = vec![0.0f32; count];
+    let mut low = 0.0f32;
+    let mut mid = 0.0f32;
+    let mut twang_phase = 0.0f32;
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let t = index as f32 / count as f32;
+        let white = noise(0x626f_7700_0000_0001, index as u64);
+        low += (white - low) * 0.120;
+        mid += (white - mid) * 0.450;
+        let envelope = if t < 0.10 {
+            smoothstep(t / 0.10)
+        } else {
+            let x = (1.0 - t) / 0.90;
+            x * x
+        };
+        let air = (white - mid) * 0.65;
+        let twang_envelope = (1.0 - (t * 4.0).min(1.0)).max(0.0);
+        let twang =
+            triangle(advance(&mut twang_phase, (170.0 - 70.0 * t) / SAMPLE_RATE as f32)) * 0.25 * twang_envelope;
+        let wobble = 0.75 + 0.25 * triangle((t * 35.0).fract());
+        *sample = (air + twang + low * 0.15) * envelope * wobble;
+    }
+    Clip::new(samples, 0.48)
+}
+
+fn arrow_impact() -> Clip {
+    let count = (0.20 * SAMPLE_RATE as f32) as usize;
+    let mut samples = vec![0.0f32; count];
+    let mut low = 0.0f32;
+    let mut thud_phase = 0.0f32;
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let t = index as f32 / count as f32;
+        let white = noise(0x6172_726f_7700_0001, index as u64);
+        low += (white - low) * 0.180;
+        let click = if t < 0.006 {
+            let x = 1.0 - t / 0.006;
+            x * x * (white * 0.70 + triangle((t * 1900.0).fract()) * 0.30)
+        } else {
+            0.0
+        };
+        let thud = triangle(advance(&mut thud_phase, (130.0 - 50.0 * t) / SAMPLE_RATE as f32));
+        let body = (low * 0.70 + (white - low) * 0.25) * decay(t);
+        *sample = click + thud * 0.35 * decay(t) + body;
+    }
+    Clip::new(samples, 0.58)
+}
+
+fn critical_hit() -> Clip {
+    let count = (0.32 * SAMPLE_RATE as f32) as usize;
+    let mut samples = vec![0.0f32; count];
+    let mut low = 0.0f32;
+    let mut mid = 0.0f32;
+    let mut thump_phase = 0.0f32;
+    let mut ping_phase = 0.0f32;
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let t = index as f32 / count as f32;
+        let white = noise(0x6372_6974_0000_0001, index as u64);
+        low += (white - low) * 0.100;
+        mid += (white - mid) * 0.450;
+        let transient = if t < 0.008 {
+            let x = 1.0 - t / 0.008;
+            x * x * (white * 0.90 + (white - mid) * 0.70)
+        } else {
+            0.0
+        };
+        let thump = triangle(advance(&mut thump_phase, (95.0 - 40.0 * t) / SAMPLE_RATE as f32)) * decay(t) * 0.80;
+        let ping_envelope = (1.0 - (t * 8.0).min(1.0)).max(0.0);
+        let ping =
+            triangle(advance(&mut ping_phase, 1450.0 / SAMPLE_RATE as f32)) * 0.18 * ping_envelope * ping_envelope;
+        let body = (white - mid) * 0.18 * decay(t);
+        *sample = transient + thump + ping + body;
+    }
+    Clip::new(samples, 0.75)
+}
+
+fn skeleton_rattle(variant: usize) -> Clip {
+    let seed = 0x736b_656c_0000_0000 ^ ((variant as u64 + 1) * 0x2545_f491);
+    let duration = 0.55 + 0.05 * variant as f32;
+    let count = (duration * SAMPLE_RATE as f32) as usize;
+    let mut samples = vec![0.0f32; count];
+    let mut low = 0.0f32;
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let t = index as f32 / count as f32;
+        let white = noise(seed, index as u64);
+        low += (white - low) * 0.150;
+        let mut value = low * 0.18 * decay(t);
+        for click in 0..5u64 {
+            let jitter = ((hash_u64(seed ^ click) >> 40) as f32) / 16_777_216.0 * 0.02;
+            let start = 0.03 + click as f32 * 0.085 + jitter;
+            let local = t - start;
+            if (0.0..0.035).contains(&local) {
+                let x = 1.0 - local / 0.035;
+                let envelope = x * x;
+                let frequency = 780.0 + 90.0 * click as f32 + 60.0 * variant as f32;
+                let tone = triangle((local * frequency + 0.17 * click as f32).fract());
+                let grain = noise(seed ^ (0x51c1 + click), (local * SAMPLE_RATE as f32) as u64);
+                value += (tone * 0.45 + grain * 0.55) * envelope * (0.70 + 0.10 * click as f32);
+            }
+        }
+        *sample = value;
+    }
+    Clip::new(samples, 0.52)
+}
+
+fn spider_chitter(variant: usize) -> Clip {
+    let seed = 0x7370_6964_0000_0000 ^ ((variant as u64 + 1) * 0x27d4_eb2f);
+    let duration = 0.50 + 0.08 * variant as f32;
+    let count = (duration * SAMPLE_RATE as f32) as usize;
+    let mut samples = vec![0.0f32; count];
+    let mut low = 0.0f32;
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let t = index as f32 / count as f32;
+        let white = noise(seed, index as u64);
+        low += (white - low) * 0.200;
+        let pulse = (t / 0.030) as u64;
+        let local = t - pulse as f32 * 0.030;
+        let mut value = (white - low) * 0.06 * decay(t);
+        if local < 0.011 {
+            let x = 1.0 - local / 0.011;
+            let envelope = x * x;
+            let frequency = 1200.0 + (hash_u64(seed ^ pulse) >> 32) as f32 % 700.0;
+            let tone = triangle((local * frequency + 0.3).fract());
+            value += (tone * 0.50 + white * 0.50) * envelope * 0.70;
+        }
+        // A short global release keeps the final partial chitter from clicking.
+        let tail = smoothstep(((1.0 - t) / 0.04).min(1.0));
+        *sample = value * tail;
+    }
+    Clip::new(samples, 0.42)
+}
+
+fn xp_pickup() -> Clip {
+    let notes = [1567.98f32, 2093.00];
+    let note_seconds = 0.075;
+    let total = note_seconds * notes.len() as f32 + 0.04;
+    let count = (total * SAMPLE_RATE as f32) as usize;
+    let mut samples = vec![0.0f32; count];
+    for (note_index, frequency) in notes.iter().enumerate() {
+        let start = (note_index as f32 * note_seconds * SAMPLE_RATE as f32) as usize;
+        let note_count = (note_seconds * SAMPLE_RATE as f32) as usize;
+        let mut phase = 0.25 * note_index as f32;
+        for local in 0..note_count {
+            let index = start + local;
+            if index >= count {
+                break;
+            }
+            let t = local as f32 / note_count as f32;
+            let envelope = (1.0 - t) * (1.0 - t);
+            let fundamental = triangle(advance(&mut phase, frequency / SAMPLE_RATE as f32));
+            let harmonic = triangle((phase * 2.0).fract());
+            samples[index] += (fundamental * 0.40 + harmonic * 0.10) * envelope;
+        }
+    }
+    Clip::new(samples, 0.40)
+}
+
+fn level_up() -> Clip {
+    let notes = [523.25f32, 659.25, 783.99, 1046.50];
+    let note_seconds = 0.22;
+    let total = note_seconds * notes.len() as f32 + 0.10;
+    let count = (total * SAMPLE_RATE as f32) as usize;
+    let mut samples = vec![0.0f32; count];
+    let mut phase = 0.0f32;
+    let mut sub_phase = 0.0f32;
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let t = index as f32 / SAMPLE_RATE as f32;
+        let note_index = ((t / note_seconds) as usize).min(notes.len() - 1);
+        let local = (t - note_index as f32 * note_seconds) / note_seconds;
+        let attack = smoothstep((local / 0.08).min(1.0));
+        // Every note releases before the buffer ends; the final 0.1 s is silent
+        // rather than a hard cut.
+        let sustain = (1.0 - local).max(0.0);
+        let envelope = attack * sustain * sustain;
+        let tone = triangle(advance(&mut phase, notes[note_index] / SAMPLE_RATE as f32));
+        let harmonic = triangle((phase * 2.0).fract());
+        let sub = triangle(advance(&mut sub_phase, notes[note_index] * 0.5 / SAMPLE_RATE as f32));
+        *sample = (tone * 0.38 + harmonic * 0.08 + sub * 0.12) * envelope;
+    }
+    Clip::new(samples, 0.55)
+}
+
+// --- 1.5 loops ----------------------------------------------------------------
+
+fn generate_rain(heavy: bool) -> Vec<f32> {
+    let duration = 7.0;
+    let count = (duration * SAMPLE_RATE as f32) as usize;
+    let mut samples = vec![0.0f32; count];
+    let seed = if heavy {
+        0x7261_696e_6865_0001
+    } else {
+        0x7261_696e_6c69_0001
+    };
+    let mut low = 0.0f32;
+    let mut mid = 0.0f32;
+    let mut drop_amp = 0.0f32;
+    let mut drop_pos = 0usize;
+    let mut drop_len = 0usize;
+    let mut drop_phase = 0.0f32;
+    let low_alpha = if heavy { 0.085 } else { 0.045 };
+    let mid_alpha = if heavy { 0.38 } else { 0.22 };
+    let drop_threshold = if heavy { 0.40 } else { 0.72 };
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let t = index as f32 / SAMPLE_RATE as f32;
+        let white = noise(seed, index as u64);
+        low += (white - low) * low_alpha;
+        mid += (white - mid) * mid_alpha;
+        let hiss = white - mid;
+        let gust = 0.72 + 0.18 * triangle((0.031 * t + 0.11).fract()) + 0.10 * triangle((0.083 * t + 0.53).fract());
+        if index % 256 == 0 {
+            let bits = hash_u64(seed ^ (index / 256) as u64);
+            let unit = ((bits >> 32) as f32) / 4_294_967_296.0;
+            if unit > drop_threshold {
+                drop_amp = 0.10 + 0.25 * unit;
+                drop_len = 120 + (bits as usize % 180);
+                drop_pos = 0;
+            }
+        }
+        let mut drop = 0.0f32;
+        if drop_amp > 0.0 && drop_pos < drop_len {
+            let progress = drop_pos as f32 / drop_len as f32;
+            let envelope = (1.0 - progress) * (1.0 - progress);
+            let plink = triangle(advance(
+                &mut drop_phase,
+                (760.0 + 480.0 * progress) / SAMPLE_RATE as f32,
+            ));
+            drop = plink * drop_amp * envelope;
+            drop_pos += 1;
+            if drop_pos >= drop_len {
+                drop_amp = 0.0;
+            }
+        }
+        let body = if heavy {
+            low * 0.90 + mid * 0.36 + hiss * 0.16
+        } else {
+            low * 0.78 + mid * 0.26 + hiss * 0.13
+        };
+        *sample = body * gust + drop * 0.55;
+    }
+    samples
+}
+
+fn generate_snow_wind() -> Vec<f32> {
+    let duration = 8.0;
+    let count = (duration * SAMPLE_RATE as f32) as usize;
+    let mut samples = vec![0.0f32; count];
+    let mut low = 0.0f32;
+    let mut low2 = 0.0f32;
+    let mut air = 0.0f32;
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let t = index as f32 / SAMPLE_RATE as f32;
+        let white = noise(0x736e_6f77_0000_0001, index as u64);
+        low += (white - low) * 0.018;
+        low2 += (low - low2) * 0.090;
+        air += (white - air) * 0.350;
+        let gust = 0.55 + 0.25 * triangle((0.027 * t + 0.20).fract()) + 0.12 * triangle((0.061 * t + 0.70).fract());
+        let snow_hiss = (air - low) * 0.040;
+        *sample = low2 * 0.85 * gust + low * 0.20 * gust + snow_hiss * gust;
+    }
+    samples
+}
+
+fn generate_fire_crackle() -> Vec<f32> {
+    let duration = 6.0;
+    let count = (duration * SAMPLE_RATE as f32) as usize;
+    let mut samples = vec![0.0f32; count];
+    let mut low = 0.0f32;
+    let mut mid = 0.0f32;
+    let mut pop_amp = 0.0f32;
+    let mut pop_pos = 0usize;
+    let mut pop_len = 0usize;
+    let mut pop_phase = 0.0f32;
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let t = index as f32 / SAMPLE_RATE as f32;
+        let white = noise(0x6669_7265_0000_0001, index as u64);
+        low += (white - low) * 0.070;
+        mid += (white - mid) * 0.450;
+        let flicker = 0.70 + 0.20 * triangle((0.37 * t).fract()) + 0.10 * triangle((0.91 * t + 0.40).fract());
+        if index % 512 == 0 {
+            let bits = hash_u64(0x6669_7265_706f_0001 ^ (index / 512) as u64);
+            let unit = ((bits >> 32) as f32) / 4_294_967_296.0;
+            if unit > 0.62 {
+                pop_amp = 0.25 + 0.55 * unit;
+                pop_len = 90 + (bits as usize % 220);
+                pop_pos = 0;
+            }
+        }
+        let mut pop = 0.0f32;
+        if pop_amp > 0.0 && pop_pos < pop_len {
+            let progress = pop_pos as f32 / pop_len as f32;
+            let envelope = (1.0 - progress) * (1.0 - progress);
+            let grain = noise(0x6669_7265_7067_0001, pop_pos as u64);
+            let tone = triangle(advance(&mut pop_phase, 930.0 / SAMPLE_RATE as f32));
+            pop = (grain * 0.70 + tone * 0.30) * pop_amp * envelope;
+            pop_pos += 1;
+            if pop_pos >= pop_len {
+                pop_amp = 0.0;
+            }
+        }
+        let body = (low * 0.42 + mid * 0.15 + (white - mid) * 0.10) * flicker;
+        *sample = body + pop;
+    }
+    samples
+}
+
 // --- loops --------------------------------------------------------------------
 
 fn generate_ambient() -> Vec<f32> {
@@ -742,7 +1343,12 @@ mod tests {
 
     fn bank_hash(bank: &ClipBank) -> u64 {
         let mut bytes = Vec::new();
-        for clip in bank.clips.iter().chain([&bank.ambient, &bank.music]) {
+        for clip in bank
+            .clips
+            .iter()
+            .chain(bank.loops.iter())
+            .chain([&bank.ambient, &bank.music])
+        {
             for sample in clip.samples.iter() {
                 bytes.extend_from_slice(&sample.to_bits().to_le_bytes());
             }
@@ -801,6 +1407,70 @@ mod tests {
     }
 
     #[test]
+    fn every_clip_registry_entry_maps_to_audible_bounded_pcm() {
+        let bank = bank();
+        for clip in ClipId::ONE_SHOTS {
+            let group = clip_group_of(clip).expect("one-shot group");
+            let range = bank.group(group).expect("group exists");
+            let expected = match clip {
+                ClipId::ThunderDistant
+                | ClipId::ThunderNear
+                | ClipId::Explosion
+                | ClipId::CreeperHiss
+                | ClipId::SkeletonRattle
+                | ClipId::SpiderChitter => 2,
+                _ => 1,
+            };
+            assert_eq!(range.count, expected, "{clip:?} variant count");
+            assert!(range.count > 0);
+            assert!(range.start + range.count <= bank.clips.len());
+            for variant in &bank.clips[range.start..range.start + range.count] {
+                assert!(
+                    variant.len() >= (0.10 * SAMPLE_RATE as f32) as usize,
+                    "{clip:?} is too short"
+                );
+                assert!(
+                    variant.len() <= (5.0 * SAMPLE_RATE as f32) as usize,
+                    "{clip:?} is longer than 5 s"
+                );
+                assert!(variant.samples.iter().all(|sample| sample.is_finite()), "{clip:?}");
+                assert!(
+                    variant.samples.iter().all(|sample| sample.abs() <= 1.0),
+                    "{clip:?} exceeds full scale"
+                );
+                assert!(
+                    variant.samples.iter().any(|sample| sample.abs() > 1.0e-4),
+                    "{clip:?} variant is silent"
+                );
+            }
+        }
+        for clip in ClipId::LOOPS {
+            let index = loop_index_of(clip).expect("loop index");
+            assert!(clip_group_of(clip).is_none());
+            let loop_clip = bank.loop_clip(index).expect("loop clip");
+            assert!(
+                loop_clip.len() > (3.0 * SAMPLE_RATE as f32) as usize,
+                "{clip:?} loop is too short"
+            );
+            assert!(loop_clip.samples.iter().all(|sample| sample.is_finite()), "{clip:?}");
+            assert!(
+                loop_clip.samples.iter().all(|sample| sample.abs() <= 1.0),
+                "{clip:?} exceeds full scale"
+            );
+            assert!(
+                loop_clip.samples.iter().any(|sample| sample.abs() > 1.0e-4),
+                "{clip:?} loop is silent"
+            );
+        }
+        assert_eq!(
+            bank.clips.len(),
+            bank.groups.iter().map(|group| group.count).sum::<usize>()
+        );
+        assert_eq!(bank.loops.len(), LOOP_COUNT);
+        assert_eq!(bank.clip_count(), bank.clips.len() + LOOP_COUNT + 2);
+    }
+
+    #[test]
     fn synthesis_is_deterministic() {
         let first = bank_hash(&bank());
         let second = bank_hash(&bank());
@@ -809,6 +1479,9 @@ mod tests {
         let a = bank();
         let b = bank();
         for (left, right) in a.clips.iter().zip(&b.clips) {
+            assert_eq!(left.samples.as_ref(), right.samples.as_ref());
+        }
+        for (left, right) in a.loops.iter().zip(&b.loops) {
             assert_eq!(left.samples.as_ref(), right.samples.as_ref());
         }
         assert_eq!(a.ambient.samples.as_ref(), b.ambient.samples.as_ref());

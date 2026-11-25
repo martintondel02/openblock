@@ -15,7 +15,10 @@
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 mod pulse;
-#[cfg(not(target_os = "linux"))]
+// The silent stub is the production backend on Windows/macOS. It is also
+// compiled into Linux test builds so its no-device contract is exercised on
+// every CI platform without opening an audio device.
+#[cfg(any(not(target_os = "linux"), test))]
 pub(crate) mod stub;
 
 #[cfg(target_os = "linux")]

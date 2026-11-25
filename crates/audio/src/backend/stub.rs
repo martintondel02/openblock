@@ -17,3 +17,17 @@ use crate::AudioError;
 pub(crate) fn error() -> AudioError {
     AudioError::BackendDisabled
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stub_reports_backend_disabled_and_does_not_link_a_device() {
+        assert_eq!(error(), AudioError::BackendDisabled);
+        assert_eq!(
+            error().to_string(),
+            "no real-time audio backend on this platform (silent stub)"
+        );
+    }
+}

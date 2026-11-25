@@ -2,10 +2,10 @@
 //!
 //! The crate synthesises every sound into in-memory PCM at startup (there are
 //! no external audio assets), mixes up to [`MAX_VOICES`] sample voices plus a
-//! music pad and an ambience loop, and optionally feeds real-time output. A
-//! machine with no device is a first-class state: construct the engine with
-//! [`AudioEngine::headless`] or treat [`AudioEngine::new`]'s error as "run
-//! silently".
+//! music pad, a legacy wind bed and four 1.5 weather/fire loop beds, and
+//! optionally feeds real-time output. A machine with no device is a first-class
+//! state: construct the engine with [`AudioEngine::headless`] or treat
+//! [`AudioEngine::new`]'s error as "run silently".
 //!
 //! # Output backends
 //!
@@ -19,9 +19,14 @@
 //! # Architecture
 //!
 //! * [`Material`] selects the timbre family for footsteps, breaks and places.
-//! * [`Sfx`] is the small, closed set of events gameplay can request.
+//! * [`Sfx`] is the small, closed set of gameplay events from the 1.0 bank.
+//! * [`ClipId`] is the extended 1.5 registry for rain/snow/wind, fire, thunder,
+//!   lightning, explosions, creeper and subtle mob cues. [`ClipKind`] tells
+//!   looping beds from one-shots, and [`rain_intensity_gains`], [`thunder_cue`]
+//!   and [`explosion_cue`] fold intensity and distance into gain, pitch and pan.
 //! * [`AudioEngine`] applies category/master volumes, rate limits duplicate
-//!   events, and owns either the output writer or the offline mixer.
+//!   events, ramps ambient loops, and owns either the output writer or the
+//!   offline mixer.
 //!
 //! Synthesis uses only integer hashes and plain arithmetic (no `rand`, no
 //! `sin`/`exp`/`powf`), so the generated buffers are byte-identical across
@@ -48,10 +53,15 @@
 #![warn(missing_docs)]
 
 mod backend;
+mod catalog;
 mod engine;
 mod mixer;
 mod synth;
 
+pub use catalog::{
+    ClipCue, ClipId, ClipKind, LOOP_FADE_SECONDS, constant_power_pan, distance_attenuation, explosion_cue,
+    rain_intensity_gains, thunder_cue, world_pan,
+};
 pub use engine::{AudioEngine, AudioError, AudioStatus, CHANNELS, MAX_VOICES, SAMPLE_RATE};
 
 /// Physical material family used to select footstep and block timbres.
@@ -72,11 +82,13 @@ pub enum Material {
     Snow,
     /// Gravel: multiple small clicks.
     Gravel,
+    /// Fire: dry crackle and a soft snuff when a fire block is broken or placed.
+    Fire,
 }
 
 impl Material {
     /// Every material, in stable order.
-    pub const ALL: [Material; 7] = [
+    pub const ALL: [Material; 8] = [
         Material::Grass,
         Material::Dirt,
         Material::Stone,
@@ -84,6 +96,7 @@ impl Material {
         Material::Sand,
         Material::Snow,
         Material::Gravel,
+        Material::Fire,
     ];
 
     /// Stable lowercase name used by logs and diagnostics.
@@ -96,6 +109,7 @@ impl Material {
             Material::Sand => "sand",
             Material::Snow => "snow",
             Material::Gravel => "gravel",
+            Material::Fire => "fire",
         }
     }
 }
@@ -166,7 +180,10 @@ mod tests {
     #[test]
     fn material_names_cover_every_variant() {
         let names: Vec<&str> = Material::ALL.iter().map(|material| material.name()).collect();
-        assert_eq!(names, ["grass", "dirt", "stone", "wood", "sand", "snow", "gravel"]);
+        assert_eq!(
+            names,
+            ["grass", "dirt", "stone", "wood", "sand", "snow", "gravel", "fire"]
+        );
         for material in Material::ALL {
             assert!(!Sfx::Footstep(material).name().is_empty());
             assert!(!Sfx::BlockBreak(material).name().is_empty());
@@ -181,7 +198,11 @@ mod tests {
         assert_eq!(engine.status().backend, "headless");
         assert_eq!(engine.status().sample_rate, SAMPLE_RATE);
         assert_eq!(engine.status().channels, CHANNELS);
-        assert!(engine.status().clip_count > 60);
+        assert!(
+            engine.status().clip_count > 100,
+            "expected the legacy 79 clips plus the 1.5 bank, got {}",
+            engine.status().clip_count
+        );
         engine.set_master_volume(1.0);
         engine.set_sfx_volume(1.0);
         engine.set_music_volume(0.55);
@@ -214,6 +235,87 @@ mod tests {
         let a = first.render_offline(8_192);
         let b = second.render_offline(8_192);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn new_clips_overlap_and_loops_are_rejected_by_play_clip() {
+        let mut engine = AudioEngine::headless();
+        engine.set_master_volume(1.0);
+        engine.set_sfx_volume(1.0);
+        engine.set_music_volume(0.0);
+        let accepted = engine.accepted_commands();
+        assert!(engine.play_clip(ClipId::Explosion, 1.0, Some(0.0)));
+        assert!(engine.play_clip(ClipId::CreeperHiss, 0.8, Some(-0.5)));
+        assert!(engine.play_clip(ClipId::XpPickup, 0.7, None));
+        assert!(!engine.play_clip(ClipId::RainLoop, 1.0, None));
+        assert_eq!(engine.accepted_commands(), accepted + 3);
+        engine.tick(0.016);
+        let output = engine.render_offline(2_048);
+        assert_eq!(output.len(), 2_048 * usize::from(CHANNELS));
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        assert!(output.iter().all(|sample| sample.abs() <= 1.0));
+        assert!(output.iter().any(|sample| sample.abs() > 1.0e-4));
+        assert!(
+            engine.active_voices() >= 2,
+            "different one-shots must overlap: {} active",
+            engine.active_voices()
+        );
+        assert_eq!(engine.loop_volume(ClipId::Explosion), None);
+    }
+
+    #[test]
+    fn distance_cues_and_world_helpers_are_bounded() {
+        let mut engine = AudioEngine::headless();
+        engine.set_master_volume(1.0);
+        engine.set_sfx_volume(1.0);
+        engine.set_listener([0.0, 0.0, 0.0], 0.0);
+        let near = thunder_cue(16.0);
+        let far = thunder_cue(256.0);
+        assert_eq!(near.clip, ClipId::ThunderNear);
+        assert_eq!(far.clip, ClipId::ThunderDistant);
+        assert!(near.gain > far.gain);
+        assert!(engine.play_cue(near, Some(world_pan([0.0; 3], 0.0, [20.0, 0.0, 0.0]))));
+        assert!(engine.play_clip_world(ClipId::ArrowImpact, [1.0, 0.0, 3.0], 1.0));
+        assert!(!engine.play_clip_world(ClipId::ArrowImpact, [f32::NAN, 0.0, 0.0], 1.0));
+        assert_eq!(distance_attenuation(0.0, 24.0), 1.0);
+        assert_eq!(distance_attenuation(24.0, 24.0), 0.0);
+        assert!(engine.play_cue(ClipCue::new(ClipId::Explosion, 0.6, 1.05), None));
+        assert!(!engine.play_cue(ClipCue::new(ClipId::RainHeavyLoop, 1.0, 1.0), None));
+        let output = engine.render_offline(4_096);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        assert!(output.iter().all(|sample| sample.abs() <= 1.0));
+    }
+
+    #[test]
+    fn ambient_loops_ramp_up_and_stop_through_the_engine() {
+        let mut engine = AudioEngine::headless();
+        engine.set_master_volume(1.0);
+        engine.set_sfx_volume(0.0);
+        engine.set_music_volume(0.0);
+        engine.set_ambient_volume(1.0);
+        assert!(engine.set_loop_volume(ClipId::RainLoop, 1.0));
+        assert!(engine.set_loop_volume(ClipId::FireCrackleLoop, 0.5));
+        assert_eq!(engine.loop_volume(ClipId::RainLoop), Some(1.0));
+        assert_eq!(engine.loop_volume(ClipId::FireCrackleLoop), Some(0.5));
+        assert!(!engine.set_loop_volume(ClipId::Explosion, 1.0));
+        assert!(!engine.stop_loop(ClipId::XpPickup));
+
+        let fade = (LOOP_FADE_SECONDS * SAMPLE_RATE as f32) as usize;
+        let output = engine.render_offline(fade + 4_800);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        assert!(output.iter().all(|sample| sample.abs() <= 1.0));
+        assert!(
+            output.iter().any(|sample| sample.abs() > 1.0e-4),
+            "the rain/fire beds must become audible"
+        );
+
+        assert!(engine.stop_loop(ClipId::RainLoop));
+        assert!(engine.stop_loop(ClipId::FireCrackleLoop));
+        let tail = engine.render_offline(fade + 4_800);
+        assert!(
+            tail.iter().skip(tail.len() - 2_000).all(|sample| *sample == 0.0),
+            "stopped loops must reach silence after the ramp"
+        );
     }
 
     #[test]
@@ -286,9 +388,31 @@ mod tests {
         engine.play_sfx_at(Sfx::Hurt, f32::INFINITY, Some(f32::NAN));
         engine.play_sfx_at(Sfx::Hurt, -1.0, Some(9.0));
         engine.play_sfx_world(Sfx::Splash, [f32::NAN, 0.0, 0.0], 1.0);
+        engine.set_ambient_volume(f32::NAN);
+        assert!(!engine.play_clip(ClipId::Explosion, f32::NAN, Some(f32::NAN)));
+        assert!(!engine.play_clip(ClipId::RainLoop, 1.0, None));
+        engine.set_loop_volume(ClipId::RainLoop, f32::INFINITY);
+        engine.set_loop_volume(ClipId::RainLoop, f32::NAN);
+        engine.play_clip_world(ClipId::CreeperHiss, [f32::NAN, 0.0, 0.0], 1.0);
+        engine.play_cue(ClipCue::new(ClipId::ThunderDistant, f32::NAN, f32::NAN), Some(f32::NAN));
         let output = engine.render_offline(256);
         assert!(output.iter().all(|sample| sample.is_finite()));
         assert!(output.iter().all(|sample| sample.abs() <= 1.0));
+    }
+
+    #[test]
+    fn backend_disabled_error_is_documented_and_headless_remains_usable() {
+        let error = AudioError::BackendDisabled;
+        assert_eq!(
+            error.to_string(),
+            "no real-time audio backend on this platform (silent stub)"
+        );
+        assert!(!error.to_string().is_empty());
+        let mut engine = AudioEngine::headless();
+        assert!(engine.is_available());
+        assert!(engine.play_clip(ClipId::LevelUp, 0.5, None));
+        let output = engine.render_offline(512);
+        assert!(output.iter().all(|sample| sample.is_finite()));
     }
 
     #[test]
@@ -321,6 +445,7 @@ mod tests {
         engine.shutdown();
         engine.shutdown();
         assert!(!engine.is_available());
+        assert!(!engine.set_loop_volume(ClipId::RainLoop, 1.0));
         assert!(engine.render_offline(128).iter().all(|sample| *sample == 0.0));
         drop(engine);
     }
