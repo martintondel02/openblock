@@ -1075,6 +1075,223 @@ has a manual `reliability` job (20 cycles, 60 s churn, 300 s soak). No
 repository-setting or GitHub-permission change is required beyond the
 read-only `contents` token already added during the 1.0.1 audit.
 
+## 2026-11-25 — 1.1 worldgen slice (deterministic surface structures)
+
+### Environment and method
+
+Same host and profile as the cave and ore entries above: Fedora Linux 45,
+AMD Ryzen 7 9800X3D, test profile (`[profile.dev] opt-level = 1`,
+dependencies at `opt-level = 3`), CPU-only, no window. All runs used
+`CARGO_TARGET_DIR=/home/martintondel/Projects/openblock/target-structures`.
+"Without structures" is the same binary with the private structure pass
+disabled, so the added-cost column isolates the new pass rather than comparing
+two source revisions. Chunk hashes are FNV-1a over every finished block.
+
+### What ships
+
+| Kind | Footprint | Recognisable content | Biome variant |
+| --- | --- | --- | --- |
+| Ruined tower (`ruined_tower`) | 5×5 footprint, 5–11 blocks tall | Cobblestone plinth and broken walls, planks bands, hashed door and up to three windows, plank lintel, 2×2 planks rug, crafting table and two benches, three-wide porch, snow caps on some wall tops | Snow caps in snowy taiga; desert uses the same masonry |
+| Abandoned camp (`abandoned_camp`) | 7×7 clearing, 3×3 lean-to | Plank lean-to with solid back/side walls and roof, four corner posts, coal-ore fire pit ringed by four gravel/cobble blocks, crafting table, planks crate and bench | Planks floor in temperate/taiga (snow floor in taiga) plus a snow windbreak; sand floor and gravel fire ring in desert |
+| Stone circle (`stone_circle`) | 7×7 | Eight cobblestone monoliths of one to three blocks at radius three, 3×3 central platform, four-block plinth capped by coal ore, crafting table and planks offering bench | Sand ring bases in desert; snow bases and snow caps in taiga |
+| Mineshaft adit (`mineshaft`) | 9×5, four orientations | Four-step open staircase lined with cobble retaining walls, plank headframe, four-block timbered tunnel with two frames, cobble floor/walls and plank roof; end face exposes selected coal, iron and copper blocks in stone, or opens into a cave if the carvers left air there | None |
+
+Palette: cobblestone, planks, crafting table, coal/iron/copper ore, sand,
+gravel and snow. No new block ids or textures, and deliberately no logs,
+leaves, chests or furnaces.
+
+Rarity comes from region rejection, not a second density knob. In 96×96 chunks
+(9,216) the observed densities were:
+
+| Seed | Structures | Overall | Tower | Camp | Circle | Mineshaft |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 87 | 1 per 106 | 1 per 318 | 1 per 297 | 1 per 485 | 1 per 1,152 |
+| 42 | 111 | 1 per 83 | 1 per 297 | 1 per 243 | 1 per 384 | 1 per 512 |
+| `0xc0ffee0012345678` | 79 | 1 per 117 | 1 per 318 | 1 per 512 | 1 per 401 | 1 per 1,024 |
+
+The exact structural delta (chunks generated with the structure pass vs the
+same chunks without it; features and ores disabled in both) was 127–215 blocks
+for a tower (mean 155–167), 31–94 for a camp (mean 44–46), 27–76 for a circle
+(mean 42–43) and 144–176 for a mineshaft (mean 159–166). A structured chunk's
+heap grew by at most **10,254 B** when a section palette stepped up a width;
+there are no new columns, sections, sidecars or other persistent state. Averaged
+over the observed density this is roughly 90–125 B per generated chunk.
+
+### Placement and determinism
+
+- An 8×8-chunk region (128×128 blocks) derives one 64-bit hash from the world
+  seed and region coordinate (`derive_seed(seed, region_x, region_z, "STRU")`).
+  A counter-based `Rng` from that hash picks, in order: the candidate chunk
+  (0..7 on each axis), the weighted kind (tower 3, camp 3, circle 2, mineshaft 2
+  of 10) and the local anchor (4..=11 on each axis).
+- A chunk that is not its region's candidate does no height-field work and
+  returns no plan. The candidate is accepted only if every footprint column is
+  dry (`height >= sea + 3`, i.e. at least 65), the footprint's maximum minus
+  minimum terrain height is at most 4, no column lies in the 5×5-chunk
+  spawn-protection square, and no ravine candidate from the surrounding 3×3
+  ravine regions conservatively intersects the chunk. A failed site produces no
+  structure for that region; there is no retry or fallback, which keeps the
+  decision seed-local.
+- The anchor range plus the largest half-extent (4) keeps every write inside
+  the owning chunk (`4 - 4 = 0`, `11 + 4 = 15`). Structures therefore never need
+  neighbour reads, are independent of chunk generation order, and cannot share a
+  block with another structure or straddle a chunk boundary.
+- `floor_y` is the highest footprint column. Towers get a solid 5×5 cobblestone
+  foundation, a porch and a cleared volume above the floor. The camp and circle
+  fill only the columns under floors, props and ring stones via
+  `place_supported`, leaving the rest of the clearing natural. The mineshaft
+  carves its four stair steps and tunnel below `floor_y`, fills retaining walls
+  and floors down to terrain, and lays a plank roof carried by the side walls.
+  `set` and `clear` both refuse to replace water or bedrock as a final safety
+  net.
+- Ordering is: terrain → caves → surface entrances → ravines → **structures** →
+  trees → boulders → snow drifts → ores. Trees and boulders require natural
+  grass/snow and air, so they skip structure floors and cannot grow through a
+  roof; structures place no `stone`, so the later ore pass cannot speckle their
+  walls (the mineshaft's natural end face is the one intentional ore exposure,
+  and the ore pass can also seed that face). Clearing happens only above the
+  floor, never below it, and never touches water or bedrock.
+- The plan is a pure function of seed and chunk: `Generator::structure_in_chunk`
+  returns `Option<StructureInstance>` with kind, anchor, floor, biome and region
+  hash. It is the interim hook for tests, diagnostics and a future `/locate`;
+  nothing is persisted.
+
+### Throughput
+
+One representative 200-chunk run per seed, two interleaved rounds, test profile:
+
+| Seed | With structures (ms/chunk) | Without (ms/chunk) | Added |
+| --- | ---: | ---: | ---: |
+| `0x1` | 2.030 | 2.043 | **−0.013** |
+| `0x2a` (42) | 1.982 | 1.984 | **−0.002** |
+| `0xc0ffee0012345678` | 1.963 | 1.958 | **+0.004** |
+
+Across three repeat runs (nine seed/round pairs) the added cost ranged from
+−0.020 to +0.015 ms/chunk; the worst observed added cost is **+0.015**, far
+inside the ≤ 0.2 ms/chunk target. Total generation stays around 1.94–2.06
+ms/chunk, matching the cave/ore entries. The non-candidate path is a region
+hash and two RNG draws; only one chunk in 64 performs the footprint height
+probe, and only one in roughly 85–117 chunks writes 27–215 blocks, so the cost
+is amortised to noise.
+
+### Determinism and hashes
+
+`hash(0,0)` is unchanged from the 1.0.2 entries for all three seeds because the
+5×5 spawn-protection square never receives a structure:
+
+| Seed | `hash(0,0)` |
+| --- | --- |
+| 1 | `0x25d12c39c22015fd` |
+| 42 | `0x6716df9f5cf776b2` |
+| `0xc0ffee0012345678` | `0x0169a0c9bbc20e12` |
+
+Representative structured chunks change as expected (full chunk hash with
+structures vs the same chunk generated without structures; seed 42):
+
+| Kind | Anchor | Full hash | No-structure hash |
+| --- | --- | --- | --- |
+| ruined tower | (−327, −697) | `0x3b789e47cceb0017` | `0x60851f81c8461ea3` |
+| abandoned camp | (694, −696) | `0xe10b2ef30fe3e9a0` | `0x29c6fe6a98d92bff` |
+| stone circle | (−71, −631) | `0x73ad87ac8c47c633` | `0xdf1ce50df5197556` |
+| mineshaft | (484, −746) | `0x70c8f00e94d321cf` | `0x4f4a3c3a64feb5df` |
+
+Same-seed regeneration, reverse-order generation with unrelated neighbours
+generated between samples, and repeated `structure_in_chunk` calls all produce
+identical plans and blocks. The structure RNG shares no state with terrain,
+caves, ravines, trees or ores.
+
+### Tests
+
+`cargo test -p ob_worldgen --lib`: **30 passed, 0 failed, 7 ignored**. New
+non-ignored tests:
+
+- `structures_are_deterministic_and_order_independent` — plan and chunk hashes
+  in forward/reverse order with intervening neighbours and regeneration.
+- `structures_use_only_existing_blocks_and_are_supported` — one of each kind;
+  exact structural delta against a terrain-only chunk, palette, water/bedrock
+  protection, 6-neighbour support from natural ground, no floating water.
+- `sampled_structure_layouts_are_supported` — the same checks over every
+  structure in a 48×48-chunk window for seeds 1 and 42 (all orientations and
+  biome variants).
+- `structures_avoid_spawn_protection` — no plans in the 5×5 spawn square for
+  three seeds, and spawn-square chunks are block-identical with and without the
+  structure pass.
+- `structure_sites_are_dry_flat_and_ravine_free` — site contract over a
+  64×64-chunk window.
+- `structures_never_overlap_and_stay_in_their_chunk` — one plan per chunk,
+  conservative bounds inside the owning chunk, pairwise-disjoint structure
+  boxes.
+- `structure_types_appear_at_a_bounded_density` — all four kinds present in
+  96×96 chunks for three seeds, density between one per 512 and one per 16
+  chunks.
+
+New ignored reports: `structure_throughput_report` (the table above, asserts
+≤ 0.2 ms/chunk) and `structure_distribution_report` (counts, per-kind density,
+block deltas, heap delta, representative hashes). Existing terrain tests now
+generate without structures where they validate natural surfaces, snow, cave
+reports, tree density and ore streams; the ore determinism test is confined to
+spawn-protected chunks so the ore stream is still isolated. `cargo fmt
+-p ob_worldgen --check` and `cargo clippy -p ob_worldgen --all-targets -- -D
+warnings` are clean.
+
+### Deviations, limits and integration needed
+
+- **No chests or furnaces.** The host creates `ContainerState`/`FurnaceState`
+  only when a player or network edit places the block
+  (`Host::register_block_entity`); worldgen output is not scanned, and
+  `block_entities::load_block_entities` only loads records from the sidecar and
+  prunes missing blocks. A worldgen chest therefore has no record:
+  `Host::chest_at` returns `None`, the network server's `handle_use_block`
+  rejects it as `not_container`, and slot operations would return
+  `container_missing`. Loot is consequently absent. A future loot pass needs
+  the server to register natural block entities as a column is streamed/loaded
+  (or consume a worldgen block-entity descriptor), persist them in
+  `block_entities.txt`, and generate contents on first open from a loot table
+  and seed. This slice deliberately ships only crafting tables (usable through
+  `near_crafting_table` without a block entity) and real, mineable ore blocks.
+- **No `/locate` or persistence.** Starts are recomputed from the seed; there is
+  no structure sidecar, no `structure_set`, no jigsaw, no `structure_void`, no
+  mob-spawn override and no 3×3 separation pass. Spacing/separation/salt/spread
+  and persisted starts remain spec/06 §3.8 work.
+- **Whole-chunk structures.** Footprints are deliberately small (5×5, 7×7,
+  9×5) and anchor-margined so no cross-chunk writes are needed. This is simpler
+  and stronger than overlap-and-clip for 1.1, but it cannot express multi-chunk
+  villages or dungeons.
+- **Terrain interaction.** Structures are rejected in ravine chunks but do not
+  test cave air. A foundation can bridge or seal a rare 1×1 cave entrance, and a
+  mineshaft end face intentionally opens into a cave when the carvers left air
+  there. Trees and ores are placed after structures, so the ordering is
+  deterministic; no floating blocks or water are created in the sampled corpus.
+- **No underground dungeon.** A buried room was considered and deferred: a room
+  without usable chests/furnaces has little reward, and a stair shaft would
+  compete with the mineshaft, which already provides the underground payoff.
+- **Spawn search is not structure-aware.** Worldgen excludes structures from the
+  5×5 spawn-protection chunks, and the host's existing solid/dry/clear-column
+  checks reject structure walls and floors, but an open camp clearing just
+  outside that square could still pass as a spawn column. If strict "outside
+  every structure bounding box" spawn exclusion is wanted before the data-driven
+  spawn search lands, `Host::resolve_spawn` should consult
+  `Generator::structure_in_chunk`.
+- **Scale.** Plinths on sloped sites can be up to four blocks high. Structures
+  are landmarks, not set-pieces; they use the existing base block set and add
+  no textures, items or recipes.
+
+### Proposed spec/06 wording (for the Lead)
+
+> **1.1 interim structure layer.** Until the data-driven `structure_set`
+> pipeline lands, the generator MAY place engine-defined, chunk-local
+> structures. One candidate is derived per 8×8-chunk region from a region hash;
+> the hash selects the candidate chunk, weighted kind and local anchor, and the
+> whole footprint must remain inside that chunk. A candidate MUST be rejected on
+> wet ground (surface below sea + 3), on a footprint with more than four blocks
+> of relief, inside the spawn-protection square, or in a chunk touched by a
+> ravine candidate. Structures run after carvers and before features and ores,
+> MUST use only existing block ids, MUST NOT replace water or bedrock, and MUST
+> be supported by terrain or their own connected foundation. The interim API is
+> `Generator::structure_in_chunk(ChunkPos) -> Option<StructureInstance>`; starts
+> are not persisted. The full structure/template/sidecar/loot requirements of
+> §3.8 remain the target for MS-08 and later.
+
 ## 2026-11-25 — v1.1 distance-LOD / 512-block render distance
 
 ### Environment and methodology
