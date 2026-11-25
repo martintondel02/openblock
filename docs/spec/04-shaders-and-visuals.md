@@ -176,7 +176,23 @@ let amount = 1.0 - exp(-fog_density * h * d * d);
 color = mix(color, sky_color(dir) , amount);
 ```
 
-`fog_end` is the render distance, and the curve is tuned so opacity is ≥ 0.9 there
+`fog_end` is the render distance, and the curve is tuned so opacity is ≥ 0.9 there.
+For the v1.1 512-block radius the CPU supplies `(fog_start, fog_end)` as
+`max(far − 160, 0.55 × far)` and `0.95 × far`: 400–532 blocks at a 32-chunk radius.
+Smoothstep reaches 0.93 opacity at the 512-block world edge while 200 blocks stays
+perfectly clear, so the horizon reads as terrain fading into sky rather than a grey wall.
+At short render distances the historical 55% start is preserved so the last streamed ring
+still dissolves. Shader modules and packs must read `Camera.fog` and must not hardcode
+distances; the same uniform drives opaque, cutout and entity fog.
+
+**Shader work implied by the v1.1 LOD.** Shadow cascades are unchanged in count and
+distance (§3.3.1): far surface-shell batches are opaque geometry and must be included in
+the same cascades as near sections, so cascade 3 remains useful to 96 blocks. Water stays in
+the surface shell and keeps its normal material; a future translucent pass must keep far
+water sorted separately rather than folding it into the opaque batch. Distance fog is the
+only blend between near and far tiers — there is deliberately no LOD cross-fade, because the
+shell preserves the silhouette; a shader that adds dithering or TAA must not treat the tier
+seam as a depth discontinuity.
 (REQ-VIS-008). Underwater and lava override the parameters per fluid, with a Beer-Lambert
 absorption on the water colour; blindness and darkness effects scale the exponent and are
 driven by gameplay effect state, never by the shader.

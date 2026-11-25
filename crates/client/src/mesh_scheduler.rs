@@ -16,7 +16,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use ob_content::Registry;
 use ob_math::{ChunkPos, SectionPos};
-use ob_render::{MeshData, SectionSnapshot};
+use ob_render::{LodBatchKey, LodBatchMesh, LodConfig, MeshData, SectionSnapshot, mesh_lod_batch};
 use ob_world::World;
 use rayon::ThreadPool;
 
@@ -34,12 +34,30 @@ pub struct MeshResult {
     pub mesh: MeshData,
 }
 
+/// A completed merged far-LOD batch returned by a worker.
+#[derive(Debug)]
+pub struct LodBatchResult {
+    /// Group the batch belongs to.
+    pub key: LodBatchKey,
+    /// Epoch assigned when the job was submitted.
+    pub epoch: u64,
+    /// Merged shell geometry and its bounds.
+    pub batch: LodBatchMesh,
+}
+
 /// Internal completion message; `mesh` is moved to [`MeshResult`] only when
 /// the epoch is still current.
 struct Completion {
     pos: SectionPos,
     epoch: u64,
     mesh: MeshData,
+}
+
+/// Internal far-batch completion message.
+struct LodCompletion {
+    key: LodBatchKey,
+    epoch: u64,
+    batch: LodBatchMesh,
 }
 
 /// Snapshot capture and worker-pool scheduler for section meshes.
@@ -54,10 +72,21 @@ pub struct MeshScheduler {
     epochs: HashMap<SectionPos, u64>,
     /// Epoch of the job actually running for a section, if any.
     in_flight: HashMap<SectionPos, u64>,
+    /// Far-batch job channel, kept separate from the section channel so a
+    /// burst of section completions cannot delay a batch upload.
+    lod_sender: Sender<LodCompletion>,
+    lod_receiver: Receiver<LodCompletion>,
+    /// Epoch expected for a far group.
+    lod_epochs: HashMap<LodBatchKey, u64>,
+    /// Epoch of the far-batch job actually running, if any.
+    lod_in_flight: HashMap<LodBatchKey, u64>,
     next_epoch: u64,
     submitted: u64,
     completed: u64,
     dropped: u64,
+    lod_submitted: u64,
+    lod_completed: u64,
+    lod_dropped: u64,
 }
 
 impl MeshScheduler {
@@ -70,6 +99,7 @@ impl MeshScheduler {
             .build()
             .expect("failed to create the section mesh worker pool");
         let (sender, receiver) = mpsc::channel();
+        let (lod_sender, lod_receiver) = mpsc::channel();
         Self {
             pool,
             workers,
@@ -78,10 +108,17 @@ impl MeshScheduler {
             receiver,
             epochs: HashMap::new(),
             in_flight: HashMap::new(),
+            lod_sender,
+            lod_receiver,
+            lod_epochs: HashMap::new(),
+            lod_in_flight: HashMap::new(),
             next_epoch: 1,
             submitted: 0,
             completed: 0,
             dropped: 0,
+            lod_submitted: 0,
+            lod_completed: 0,
+            lod_dropped: 0,
         }
     }
 
@@ -172,6 +209,94 @@ impl MeshScheduler {
     /// Forgets one section's tracked epoch.
     pub fn forget_section(&mut self, pos: SectionPos) {
         self.epochs.remove(&pos);
+    }
+
+    /// Queues a merged far-LOD batch job for a small cloned world.
+    ///
+    /// `world` carries the group's 2x2 columns plus one chunk of border, so the
+    /// worker can cull boundary faces without touching the live world. Returns
+    /// `false` when a batch for this group is already in flight; its epoch is
+    /// advanced so the stale completion is discarded.
+    pub fn submit_lod_batch(&mut self, key: LodBatchKey, world: World, config: LodConfig) -> bool {
+        let epoch = self.next_epoch;
+        self.next_epoch += 1;
+        if self.lod_in_flight.contains_key(&key) {
+            self.lod_epochs.insert(key, epoch);
+            return false;
+        }
+        self.lod_epochs.insert(key, epoch);
+        self.lod_in_flight.insert(key, epoch);
+        let sender = self.lod_sender.clone();
+        self.pool.spawn(move || {
+            let config = config.normalised();
+            let batch = mesh_lod_batch(&world, key, &config);
+            let _ = sender.send(LodCompletion { key, epoch, batch });
+        });
+        self.lod_submitted += 1;
+        true
+    }
+
+    /// Invalidates an in-flight far batch without queueing a replacement.
+    pub fn invalidate_lod_batch(&mut self, key: LodBatchKey) {
+        if self.lod_in_flight.contains_key(&key) {
+            let epoch = self.next_epoch;
+            self.next_epoch += 1;
+            self.lod_epochs.insert(key, epoch);
+        }
+    }
+
+    /// Forgets all epoch state for a far group (unloaded or promoted to full).
+    pub fn forget_lod_batch(&mut self, key: LodBatchKey) {
+        self.lod_epochs.remove(&key);
+    }
+
+    /// Non-blocking drain of completed far batches.
+    pub fn try_recv_lod(&mut self) -> Option<LodBatchResult> {
+        loop {
+            match self.lod_receiver.try_recv() {
+                Ok(completion) => {
+                    self.lod_completed += 1;
+                    if self.lod_in_flight.get(&completion.key) == Some(&completion.epoch) {
+                        self.lod_in_flight.remove(&completion.key);
+                    }
+                    if self.lod_epochs.get(&completion.key) == Some(&completion.epoch) {
+                        self.lod_epochs.remove(&completion.key);
+                        return Some(LodBatchResult {
+                            key: completion.key,
+                            epoch: completion.epoch,
+                            batch: completion.batch,
+                        });
+                    }
+                    self.lod_dropped += 1;
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return None,
+            }
+        }
+    }
+
+    /// Whether a far-batch job for `key` is running.
+    pub fn lod_in_flight(&self, key: LodBatchKey) -> bool {
+        self.lod_in_flight.contains_key(&key)
+    }
+
+    /// Number of far-batch jobs currently running.
+    pub fn lod_in_flight_count(&self) -> usize {
+        self.lod_in_flight.len()
+    }
+
+    /// Number of far-batch completions received (current and stale).
+    pub fn lod_completed_count(&self) -> u64 {
+        self.lod_completed
+    }
+
+    /// Number of far-batch completions discarded as stale.
+    pub fn lod_dropped_count(&self) -> u64 {
+        self.lod_dropped
+    }
+
+    /// Number of far batches submitted since creation.
+    pub fn lod_submitted_count(&self) -> u64 {
+        self.lod_submitted
     }
 
     /// Number of jobs currently being meshed.
@@ -317,6 +442,86 @@ mod tests {
             result.mesh.vertices,
             SectionSnapshot::capture(&world, pos).mesh(&scheduler.registry).vertices
         );
+    }
+
+    /// Polls the scheduler until a current far-batch result arrives.
+    fn wait_for_lod_result(scheduler: &mut MeshScheduler, timeout: Duration) -> Option<LodBatchResult> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(result) = scheduler.try_recv_lod() {
+                return Some(result);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn lod_batch_worker_builds_a_shell_and_reports_counts() {
+        let (registry, world) = generated_world(42);
+        let local = World::from_columns(
+            Arc::clone(&registry),
+            world.seed(),
+            world.chunks().map(|(_, column)| column.clone()).collect::<Vec<_>>(),
+        );
+        let config = LodConfig {
+            full_detail_radius_chunks: 0,
+            group_chunks: 2,
+            shell_depth_blocks: 48,
+        };
+        let mut scheduler = MeshScheduler::new(2, registry);
+        let key = LodBatchKey { x: 0, z: 0 };
+        assert!(scheduler.submit_lod_batch(key, local, config));
+        assert!(scheduler.lod_in_flight(key));
+        let result = wait_for_lod_result(&mut scheduler, Duration::from_secs(10)).expect("far batch");
+        assert_eq!(result.key, key);
+        assert_eq!(result.batch.columns, 4, "the 2x2 group must use four columns");
+        assert!(
+            !result.batch.is_empty(),
+            "generated terrain must produce shell geometry"
+        );
+        assert!(result.batch.shell_sections > 0);
+        assert!(result.batch.skipped_sections > 0, "deep sections must be skipped");
+        assert!(!scheduler.lod_in_flight(key));
+        assert_eq!(scheduler.lod_completed_count(), 1);
+        assert_eq!(scheduler.lod_submitted_count(), 1);
+    }
+
+    #[test]
+    fn stale_lod_batch_epoch_is_dropped_and_retry_succeeds() {
+        let (registry, world) = generated_world(7);
+        let local = || {
+            World::from_columns(
+                Arc::clone(&registry),
+                world.seed(),
+                world.chunks().map(|(_, column)| column.clone()).collect::<Vec<_>>(),
+            )
+        };
+        let config = LodConfig {
+            full_detail_radius_chunks: 0,
+            group_chunks: 2,
+            shell_depth_blocks: 48,
+        };
+        let mut scheduler = MeshScheduler::new(2, Arc::clone(&registry));
+        let key = LodBatchKey { x: 0, z: 0 };
+        assert!(scheduler.submit_lod_batch(key, local(), config));
+        scheduler.invalidate_lod_batch(key);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while scheduler.lod_in_flight(key) {
+            assert!(
+                scheduler.try_recv_lod().is_none(),
+                "an invalidated batch must not surface"
+            );
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(scheduler.lod_dropped_count(), 1);
+        assert!(scheduler.submit_lod_batch(key, local(), config));
+        let result = wait_for_lod_result(&mut scheduler, Duration::from_secs(10)).expect("retry");
+        assert_eq!(result.key, key);
+        assert_eq!(scheduler.lod_dropped_count(), 1, "a fresh epoch must be accepted");
     }
 
     #[test]

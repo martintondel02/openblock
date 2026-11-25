@@ -124,7 +124,10 @@ pub const SETTINGS_HINT_STEP: f32 = 14.0;
 /// Smallest render distance the settings screen offers, in chunks.
 pub const SETTINGS_MIN_RENDER_DISTANCE: i32 = 2;
 /// Largest render distance the settings screen offers, in chunks.
-pub const SETTINGS_MAX_RENDER_DISTANCE: i32 = 16;
+///
+/// 32 chunks is 512 blocks. The settings row shows both values because the
+/// existing `--render-distance` flag and F3 line are chunk-based.
+pub const SETTINGS_MAX_RENDER_DISTANCE: i32 = 32;
 /// Smallest field of view the settings screen offers, in degrees.
 pub const SETTINGS_MIN_FOV_DEGREES: f32 = 50.0;
 /// Largest field of view the settings screen offers, in degrees.
@@ -792,8 +795,16 @@ pub struct DebugStats {
     pub loaded_chunks: usize,
     /// Sections drawn after frustum culling.
     pub drawn_sections: usize,
-    /// Sections with a cached GPU mesh.
+    /// Full-detail sections with a cached GPU mesh.
     pub cached_sections: usize,
+    /// Merged far-LOD batches with a cached GPU mesh.
+    pub lod_batches: usize,
+    /// Shell sections represented by the far batches.
+    pub lod_sections: usize,
+    /// Sections omitted from far columns by the surface shell.
+    pub lod_skipped_sections: usize,
+    /// Estimated CPU+GPU bytes held by section and far-batch vertex data.
+    pub mesh_bytes: usize,
     /// Triangles drawn.
     pub triangles: u64,
     /// Draw calls issued for the world.
@@ -899,8 +910,10 @@ impl DebugStats {
             ),
             self.held_line(),
             format!(
-                "FOV {:.0}   Render distance {} chunks",
-                self.fov_degrees, self.render_distance
+                "FOV {:.0}   Render distance {} chunks / {} blocks",
+                self.fov_degrees,
+                self.render_distance,
+                self.render_distance * 16
             ),
             format!(
                 "Textures: {}",
@@ -920,10 +933,16 @@ impl DebugStats {
                 }
             ),
             format!(
-                "Chunks {}   Sections drawn {}/{}   Draws {}",
-                self.loaded_chunks, self.drawn_sections, self.cached_sections, self.draw_calls
+                "Chunks {}  Drawn {}/{}  Draws {}  LOD {}",
+                self.loaded_chunks, self.drawn_sections, self.cached_sections, self.draw_calls, self.lod_batches
             ),
-            format!("Triangles {}", self.triangles),
+            format!(
+                "Tri {}  Verts {}  Far {}s/{}skip",
+                self.triangles,
+                self.triangles.saturating_mul(3),
+                self.lod_sections,
+                self.lod_skipped_sections
+            ),
             match &self.target {
                 Some((id, pos)) => {
                     format!("Target {} at {} {} {}", id, pos[0], pos[1], pos[2])
@@ -935,14 +954,11 @@ impl DebugStats {
                 self.mesh_workers, self.mesh_in_flight, self.mesh_backlog, self.mesh_completed
             ),
             format!(
-                "Heap {:.1} MiB  Ticks {}  Mobs {} ({}P/{}H)  {} {}t",
+                "Heap {:.1} MiB  Mesh {:.1} MiB  Ticks {}  Mobs {}",
                 self.heap_bytes as f64 / (1024.0 * 1024.0),
+                self.mesh_bytes as f64 / (1024.0 * 1024.0),
                 self.ticks,
                 self.mobs_total,
-                self.mobs_passive,
-                self.mobs_hostile,
-                if self.day { "Day" } else { "Night" },
-                self.day_phase,
             ),
         ];
         if lines.len() < 15 {
@@ -1037,8 +1053,11 @@ impl DebugStats {
                 self.health, self.hunger, self.defense
             ),
             format!(
-                "FOV {:.0}   Render distance {} chunks   Facing {}",
-                self.fov_degrees, self.render_distance, self.facing
+                "FOV {:.0}   Render distance {} chunks / {} blocks   Facing {}",
+                self.fov_degrees,
+                self.render_distance,
+                self.render_distance * 16,
+                self.facing
             ),
             format!(
                 "Seed {}   {}",
@@ -1050,16 +1069,22 @@ impl DebugStats {
                 }
             ),
             format!(
-                "Chunks {}  Sec {}/{}  Draws {}  Tri {}",
-                self.loaded_chunks, self.drawn_sections, self.cached_sections, self.draw_calls, self.triangles
+                "Chunks {}  Sec {}/{}  Draws {}  LOD {}  Tri {}",
+                self.loaded_chunks,
+                self.drawn_sections,
+                self.cached_sections,
+                self.draw_calls,
+                self.lod_batches,
+                self.triangles
             ),
             format!(
-                "Mesh {}w {}in {}done   Mobs {}   Heap {:.1} MiB",
+                "Mesh {}w {}in {}done   Mobs {}   Heap {:.1} MiB   Mesh {:.1} MiB",
                 self.mesh_workers,
                 self.mesh_in_flight,
                 self.mesh_completed,
                 self.mobs_total,
-                self.heap_bytes as f64 / (1024.0 * 1024.0)
+                self.heap_bytes as f64 / (1024.0 * 1024.0),
+                self.mesh_bytes as f64 / (1024.0 * 1024.0)
             ),
             match &self.target {
                 Some((id, pos)) => format!(
@@ -1990,7 +2015,11 @@ impl UiState {
             SettingsRow::GameMode => game_mode_label(self.settings.game_mode).to_string(),
             SettingsRow::ShowHud => checkbox(self.hud_visible),
             SettingsRow::DebugOverlay => checkbox(self.debug_overlay),
-            SettingsRow::RenderDistance => format!("{} chunks", self.settings.render_distance_chunks),
+            SettingsRow::RenderDistance => format!(
+                "{} chunks / {} blocks",
+                self.settings.render_distance_chunks,
+                self.settings.render_distance_chunks * 16
+            ),
             SettingsRow::Fov => format!("{:.0} deg", self.settings.fov_degrees),
             SettingsRow::MouseSensitivity => format!("{:.2}x", self.settings.mouse_sensitivity),
             SettingsRow::Fullscreen => checkbox(self.settings.fullscreen),
@@ -3846,6 +3875,10 @@ mod tests {
             loaded_chunks: 217,
             drawn_sections: 244,
             cached_sections: 1133,
+            lod_batches: 37,
+            lod_sections: 812,
+            lod_skipped_sections: 4100,
+            mesh_bytes: 3 * 1024 * 1024,
             triangles: 106398,
             draw_calls: 244,
             mesh_workers: 7,
@@ -4108,6 +4141,29 @@ mod tests {
             state.settings_focused_row(),
             Some(SettingsRow::Keybind(Action::MoveForward))
         );
+    }
+
+    #[test]
+    fn render_distance_row_shows_chunks_and_blocks() {
+        let mut state = UiState::default();
+        let info = SettingsInfo::default();
+        state.settings.render_distance_chunks = 32;
+        assert_eq!(
+            state.settings_row_value(SettingsRow::RenderDistance, &info),
+            "32 chunks / 512 blocks"
+        );
+        state.settings.render_distance_chunks = 2;
+        assert_eq!(
+            state.settings_row_value(SettingsRow::RenderDistance, &info),
+            "2 chunks / 32 blocks"
+        );
+        // The row clamps at the 512-block ceiling.
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Display);
+        state.settings_selected_row = 0;
+        state.settings.render_distance_chunks = SETTINGS_MAX_RENDER_DISTANCE;
+        assert_eq!(state.settings_adjust(1), None);
+        assert_eq!(state.settings.render_distance_chunks, SETTINGS_MAX_RENDER_DISTANCE);
     }
 
     #[test]
@@ -4972,6 +5028,10 @@ mod tests {
             loaded_chunks: 217,
             drawn_sections: 244,
             cached_sections: 1133,
+            lod_batches: 37,
+            lod_sections: 812,
+            lod_skipped_sections: 4100,
+            mesh_bytes: 3 * 1024 * 1024,
             triangles: 106398,
             draw_calls: 244,
             mesh_workers: 7,

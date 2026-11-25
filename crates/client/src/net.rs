@@ -81,7 +81,11 @@ use crate::net_state::{
 /// Default TCP connect and handshake timeout.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest client render/interest radius supported by the interim server.
-pub const MAX_RENDER_RADIUS: i32 = 16;
+///
+/// 32 chunks is the 512-block playable radius; the server accepts the same
+/// ceiling. Clients never request more than this even if a settings file was
+/// written by a future build.
+pub const MAX_RENDER_RADIUS: i32 = 32;
 /// Duration of one remote-player interpolation segment.
 pub const INTERPOLATION_SECONDS: f32 = 0.1;
 /// How long a chunk request stays deduplicated before it may be re-sent.
@@ -134,7 +138,7 @@ pub struct ConnectOptions {
     pub endpoint: String,
     /// Requested player name (`[A-Za-z0-9_.-]{1,32}`).
     pub name: String,
-    /// Desired chunk radius around the player, clamped to `1..=16`.
+    /// Desired chunk radius around the player, clamped to `1..=32`.
     pub render_radius: i32,
     /// Local content registry; the handshake must match its manifest.
     pub registry: Arc<Registry>,
@@ -722,7 +726,7 @@ pub struct ChunkTracker {
 }
 
 impl ChunkTracker {
-    /// Creates a tracker centred on `spawn` with a radius clamped to `1..=16`.
+    /// Creates a tracker centred on `spawn` with a radius clamped to `1..=32`.
     pub fn new(radius: i32, spawn: ChunkPos) -> Self {
         let radius = radius.clamp(1, MAX_RENDER_RADIUS);
         let target = ring(radius, spawn);
@@ -766,6 +770,15 @@ impl ChunkTracker {
     /// Marks a column resident.
     pub fn mark_loaded(&mut self, pos: ChunkPos) {
         self.loaded.insert(pos);
+        self.requested.remove(&pos);
+    }
+
+    /// Marks a column as no longer resident after local eviction.
+    ///
+    /// The column leaves the `loaded` set so the next ring request can fetch it
+    /// again, and any outstanding request token is forgotten.
+    pub fn mark_unloaded(&mut self, pos: ChunkPos) {
+        self.loaded.remove(&pos);
         self.requested.remove(&pos);
     }
 
@@ -1484,7 +1497,7 @@ impl NetworkClient {
             edit_limit: RateLimit::new(20.0, 20),
             chat_limit: RateLimit::new(0.5, 5),
             ping_limit: RateLimit::new(10.0, 10),
-            request_limit: RateLimit::new(16.0, 8),
+            request_limit: RateLimit::new(128.0, 64),
             select_limit: RateLimit::new(20.0, 20),
             use_limit: RateLimit::new(5.0, 5),
             attack_limit: RateLimit::new(10.0, 10),
@@ -2038,6 +2051,29 @@ impl NetworkClient {
             }
         }
         sent
+    }
+
+    /// Evicts replicated columns farther than the current interest ring plus
+    /// `margin` chunks, returning the removed positions.
+    ///
+    /// The network runtime calls this after a radius change or while moving so
+    /// world memory, GPU section buffers and merged LOD batches stay bounded.
+    /// The server's `sent_chunks` set is unchanged; a column that re-enters the
+    /// ring is requested again and replaced normally.
+    pub fn unload_far_chunks(&mut self, margin: i32) -> Vec<ChunkPos> {
+        let center = self.tracker.center();
+        let radius = self.tracker.radius() + margin.max(0);
+        let stale: Vec<ChunkPos> = self
+            .world
+            .chunks()
+            .map(|(pos, _)| *pos)
+            .filter(|pos| (pos.x - center.x).abs() > radius || (pos.z - center.z).abs() > radius)
+            .collect();
+        for pos in &stale {
+            self.world.remove_chunk(*pos);
+            self.tracker.mark_unloaded(*pos);
+        }
+        stale
     }
 
     /// Steps the local player against the replicated world and sends `Move`

@@ -82,7 +82,12 @@ const COMPRESSION_ZSTD: u8 = 1;
 const ZSTD_LEVEL: i32 = 3;
 /// Upper bound on a decompressed payload, to keep malformed headers from
 /// requesting an unbounded allocation before the payload is parsed.
-const MAX_PAYLOAD_LEN: usize = 256 * 1024 * 1024;
+///
+/// 512 MiB covers the v1.1 512-block client ceiling: a 65×65 generated world
+/// measured 338 MiB uncompressed, while the previous 256 MiB limit rejected
+/// every autosave of a full interest set. The loader still rejects anything
+/// above this bound before allocating the body.
+const MAX_PAYLOAD_LEN: usize = 512 * 1024 * 1024;
 /// Largest world payload this build can read back.
 ///
 /// This is the public half of the private loader cap. Writers must not
@@ -95,7 +100,7 @@ pub const MAX_SAVE_PAYLOAD_BYTES: usize = MAX_PAYLOAD_LEN;
 ///
 /// The compressed body can be slightly larger than the decompressed payload for
 /// incompressible data, so this is deliberately twice the decompressed cap.
-pub const MAX_SAVE_FILE_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_SAVE_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 /// Smallest possible on-disk chunk: position plus 24 uniform sections with
 /// three storage bytes and one uniform-zero light byte each.
 const MIN_CHUNK_BYTES: usize = 8 + N_SECTIONS * 4;

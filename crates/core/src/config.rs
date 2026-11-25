@@ -1005,8 +1005,11 @@ pub fn remember_recent_server(list: &mut Vec<RecentServer>, address: &str, name:
 
 /// Smallest supported render distance in chunks.
 pub const MIN_RENDER_DISTANCE: i32 = 2;
-/// Largest render distance offered by the settings screen in v0.0.x.
-pub const MAX_RENDER_DISTANCE: i32 = 24;
+/// Largest render distance offered by the settings screen.
+///
+/// 32 chunks is a 512-block radius, the v1.1 playable target. The vertical
+/// streaming radius is unchanged; only the horizontal column count grows.
+pub const MAX_RENDER_DISTANCE: i32 = 32;
 /// Smallest supported vertical field of view in degrees.
 pub const MIN_FOV_DEGREES: f32 = 30.0;
 /// Largest supported vertical field of view in degrees.
@@ -1539,6 +1542,39 @@ mod tests {
         fs::write(settings_path(&dir), b"{ not json").expect("write");
         assert_eq!(load_settings(&dir), Settings::default());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn render_distance_offers_the_512_block_target() {
+        assert_eq!(MAX_RENDER_DISTANCE, 32);
+        let mut settings = Settings {
+            render_distance_chunks: 32,
+            ..Settings::default()
+        };
+        assert!(!settings.clamp());
+        assert_eq!(settings.render_distance_chunks, 32);
+        settings.render_distance_chunks = 0;
+        assert!(settings.clamp());
+        assert_eq!(settings.render_distance_chunks, MIN_RENDER_DISTANCE);
+        settings.render_distance_chunks = 999;
+        assert!(settings.clamp());
+        assert_eq!(settings.render_distance_chunks, MAX_RENDER_DISTANCE);
+    }
+
+    #[test]
+    fn non_finite_settings_recover_to_safe_defaults() {
+        let mut settings = Settings {
+            fov_degrees: f32::NAN,
+            mouse_sensitivity: f32::INFINITY,
+            master_volume: f32::NEG_INFINITY,
+            ..Settings::default()
+        };
+        assert!(settings.clamp());
+        assert!(settings.fov_degrees.is_finite());
+        assert!(settings.mouse_sensitivity.is_finite());
+        assert!(settings.master_volume.is_finite());
+        assert!((MIN_FOV_DEGREES..=MAX_FOV_DEGREES).contains(&settings.fov_degrees));
+        assert!((MIN_AUDIO_VOLUME..=MAX_AUDIO_VOLUME).contains(&settings.master_volume));
     }
 
     #[test]

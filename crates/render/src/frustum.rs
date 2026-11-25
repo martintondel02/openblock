@@ -78,6 +78,28 @@ pub fn aabb_visible(frustum: &[[f32; 4]; FRUSTUM_PLANE_COUNT], min: [f32; 3], ma
     frustum.iter().all(|plane| !aabb_outside_plane(*plane, min, max))
 }
 
+/// Whether an AABB may lie within `max_distance` of `eye`.
+///
+/// The distance is measured to the nearest point of the box, not its centre,
+/// so a long far-LOD batch whose centre is behind the camera but whose near
+/// edge is visible is not rejected. Squared distances avoid a square root in
+/// the per-frame submission loop.
+pub fn aabb_within_distance(eye: [f32; 3], min: [f32; 3], max: [f32; 3], max_distance: f32) -> bool {
+    let axis_distance = |value: f32, low: f32, high: f32| {
+        if value < low {
+            low - value
+        } else if value > high {
+            value - high
+        } else {
+            0.0
+        }
+    };
+    let dx = axis_distance(eye[0], min[0], max[0]);
+    let dy = axis_distance(eye[1], min[1], max[1]);
+    let dz = axis_distance(eye[2], min[2], max[2]);
+    dx * dx + dy * dy + dz * dz <= max_distance * max_distance
+}
+
 /// The world-space bounds of a 16³ section.
 pub fn section_bounds(pos: SectionPos) -> ([f32; 3], [f32; 3]) {
     let origin = pos.origin();
@@ -173,5 +195,21 @@ mod tests {
         let frustum = [[0.0, 0.0, 1.0, 0.0]; FRUSTUM_PLANE_COUNT];
         assert!(aabb_visible(&frustum, [0.0, 0.0, 1.0], [1.0, 1.0, 2.0]));
         assert!(!aabb_visible(&frustum, [0.0, 0.0, -2.0], [1.0, 1.0, -1.0]));
+    }
+
+    #[test]
+    fn aabb_distance_uses_the_nearest_box_point() {
+        let eye = [0.0, 0.0, 0.0];
+        assert!(aabb_within_distance(eye, [3.0, 3.0, 3.0], [5.0, 5.0, 5.0], 6.0));
+        assert!(!aabb_within_distance(eye, [3.0, 3.0, 3.0], [5.0, 5.0, 5.0], 5.0));
+        // A batch spanning the eye is distance zero even when its box centre
+        // lies far away.
+        assert!(aabb_within_distance(
+            eye,
+            [-100.0, -1.0, -100.0],
+            [100.0, 1.0, 100.0],
+            1.0
+        ));
+        assert!(aabb_within_distance(eye, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0.0));
     }
 }

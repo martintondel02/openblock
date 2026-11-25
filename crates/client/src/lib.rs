@@ -22,10 +22,10 @@ use ob_content::{ArmorSlot, BlockId, MobKind, Registry};
 use ob_core::config::{
     Action, BindKey, GameMode as SettingsGameMode, KeyName, Settings, TextureStyle, load_settings, save_settings,
 };
-use ob_math::{BlockPos, ChunkPos, SEA_LEVEL, SectionPos, WorldVec};
+use ob_math::{BlockPos, ChunkPos, N_SECTIONS, SEA_LEVEL, SECTION_SIZE, SectionPos, WorldVec};
 use ob_render::{
-    BlockOutline, Camera, DAY_LENGTH_TICKS, EntityInstance, Environment, OffscreenRenderer, Renderer, SceneParams,
-    TextureSource, UiFrame,
+    BlockOutline, Camera, DAY_LENGTH_TICKS, EntityInstance, Environment, LodBatchKey, LodConfig, OffscreenRenderer,
+    Renderer, SceneParams, TextureSource, UiFrame, far_plane_for_render_distance,
 };
 use ob_server::{
     CHEST_SLOTS, DedicatedServer, FurnaceSlot, GameMode as HostGameMode, Host, HostConfig, ItemEntity, ItemStack,
@@ -43,6 +43,7 @@ pub mod containers;
 pub mod crafting;
 pub mod frontend;
 pub mod inventory;
+pub mod lod_state;
 mod menu_app;
 pub mod mesh_scheduler;
 pub mod mining;
@@ -59,6 +60,7 @@ pub mod ui_state;
 use containers::{ClickButton, ContainerAction, ContainerKind, ContainerSession, ContainerSnapshot};
 use crafting::{CraftingRow, crafting_rows};
 use inventory::inventory_blocks;
+use lod_state::LodState;
 use mesh_scheduler::MeshScheduler;
 use mining::MiningState;
 use mobs::MobRenderCache;
@@ -94,8 +96,8 @@ const INITIAL_RADIUS: i32 = 4;
 const SCREENSHOT_WIDTH: u32 = 1280;
 const SCREENSHOT_HEIGHT: u32 = 720;
 /// Chunks generated per streaming step while preparing a screenshot.
-const SCREENSHOT_STREAM_BUDGET: usize = 8;
-/// Safety bound on screenshot streaming loops (a full 33x33 world needs ~137).
+const SCREENSHOT_STREAM_BUDGET: usize = 64;
+/// Safety bound on screenshot streaming loops (a full 65x65 world needs ~67).
 const SCREENSHOT_STREAM_GUARD: usize = 500;
 
 /// Options parsed from the command line.
@@ -980,7 +982,7 @@ fn screenshot_network_demo_inner(
     let screen = ui_screen(physical, settings.ui_scale_percent);
     let eye = client.player().eye();
     let mut camera = Camera::new(eye, client.player().yaw, client.player().pitch);
-    camera.far = (client.render_radius() as f32 * 16.0 + 48.0).max(128.0);
+    camera.far = far_plane_for_render_distance(client.render_radius());
     let environment = Environment::from_ticks(client.server_tick() + DAY_LENGTH_TICKS / 4, DAY_LENGTH_TICKS);
     let now = Instant::now();
     let entities = client.entity_instances(now);
@@ -1030,6 +1032,10 @@ fn screenshot_network_demo_inner(
         loaded_chunks: client.loaded_chunks(),
         drawn_sections: render_stats.sections as usize,
         cached_sections: renderer.cached_mesh_count(),
+        lod_batches: render_stats.lod_batches as usize,
+        lod_sections: 0,
+        lod_skipped_sections: 0,
+        mesh_bytes: render_stats.vertices as usize * std::mem::size_of::<ob_render::Vertex>() * 2,
         triangles: render_stats.vertices / 3,
         draw_calls: render_stats.draw_calls as usize,
         mesh_workers: 0,
@@ -1246,7 +1252,7 @@ fn screenshot_with_mode(
         (player.eye(), player.yaw, player.pitch)
     };
     let mut camera = Camera::new(eye, yaw, pitch);
-    camera.far = (host.render_distance_chunks() as f32 * 16.0 + 48.0).max(128.0);
+    camera.far = far_plane_for_render_distance(host.render_distance_chunks());
 
     let (mut renderer, texture_source, font_source) = create_offscreen_renderer(options, &settings, &data_dir, None)?;
     log_texture_source(&texture_source);
@@ -1284,7 +1290,7 @@ fn screenshot_with_mode(
     // without the overlay to fill `RenderStats` deterministically, then compose
     // the final frame with the HUD and F3 overlay on top.
     let debug_render_stats = if matches!(mode, ScreenshotMode::Debug | ScreenshotMode::Mobs) {
-        renderer.render_world_scene(
+        renderer.render_world_scene_lod(
             host.world(),
             &camera,
             &SceneParams {
@@ -1292,6 +1298,7 @@ fn screenshot_with_mode(
                 ui: None,
                 outline: None,
             },
+            &LodConfig::for_render_distance(host.render_distance_chunks()),
         )?;
         Some(renderer.stats())
     } else {
@@ -1707,7 +1714,12 @@ fn screenshot_with_mode(
         ui: Some(&frame),
         outline: None,
     };
-    renderer.render_world_scene(host.world(), &camera, &scene)?;
+    renderer.render_world_scene_lod(
+        host.world(),
+        &camera,
+        &scene,
+        &LodConfig::for_render_distance(host.render_distance_chunks()),
+    )?;
     let rgba = renderer.read_rgba();
     if rgba.len() != (width * height * 4) as usize {
         return Err(format!(
@@ -1796,6 +1808,10 @@ fn screenshot_debug_stats(
         loaded_chunks: host.world().chunk_count(),
         drawn_sections: render_stats.sections as usize,
         cached_sections: renderer.cached_mesh_count(),
+        lod_batches: render_stats.lod_batches as usize,
+        lod_sections: 0,
+        lod_skipped_sections: 0,
+        mesh_bytes: render_stats.vertices as usize * std::mem::size_of::<ob_render::Vertex>() * 2,
         triangles: render_stats.vertices / 3,
         draw_calls: render_stats.draw_calls as usize,
         mesh_workers: options.mesh_workers,
@@ -2506,6 +2522,11 @@ impl App {
     }
 }
 
+/// Maximum merged far batches a worker may be building at once.
+const MAX_LOD_IN_FLIGHT: usize = 4;
+/// Seconds before the initial loading overlay stops waiting for a straggler.
+const INITIAL_LOAD_TIMEOUT: Duration = Duration::from_secs(45);
+
 struct GameState {
     window: Arc<Window>,
     renderer: Renderer,
@@ -2535,6 +2556,18 @@ struct GameState {
     fps: u32,
     last_save: Instant,
     meshes: HashMap<SectionPos, usize>,
+    /// Distance-LOD state shared with the multiplayer runtime.
+    lod: LodState,
+    /// True while the initial near ring is still streaming/meshing.
+    initial_load: bool,
+    /// Initial near-ring radius in chunks (smaller than the full setting).
+    initial_target_radius: i32,
+    /// Coarse 0..=1 progress shown by the loading overlay.
+    loading_progress: f32,
+    /// Human-readable progress detail for the overlay.
+    loading_detail: String,
+    /// Start time of the initial load, used for the timeout fallback.
+    loading_started: Instant,
     started: Instant,
     auto_exit: Option<Duration>,
     frame_times: Vec<f32>,
@@ -3333,9 +3366,15 @@ impl GameState {
     fn apply_settings_row(&mut self, row: SettingsRow) {
         match row {
             SettingsRow::RenderDistance => {
+                let previous = self.host.render_distance_chunks();
                 let requested = self.ui.settings.render_distance_chunks;
                 if self.host.set_render_distance_chunks(requested) {
                     self.applied_render_distance = requested;
+                    if requested > 16 && previous <= 16 {
+                        self.ui
+                            .toasts
+                            .push_warning("Above 16 chunks uses far LOD; terrain memory and GPU cost rise");
+                    }
                 }
             }
             SettingsRow::Fullscreen => self.apply_fullscreen(self.ui.settings.fullscreen),
@@ -3543,6 +3582,10 @@ impl GameState {
             loaded_chunks: self.host.world().chunk_count(),
             drawn_sections: render_stats.sections as usize,
             cached_sections: self.meshes.len(),
+            lod_batches: self.lod.batches().len(),
+            lod_sections: self.lod.represented_sections() as usize,
+            lod_skipped_sections: self.lod.skipped_sections() as usize,
+            mesh_bytes: self.mesh_bytes_estimate(),
             triangles: render_stats.vertices / 3,
             draw_calls: render_stats.draw_calls as usize,
             mesh_workers: self.mesh_scheduler.workers(),
@@ -3725,11 +3768,160 @@ impl GameState {
             .unwrap_or(BlockId::AIR)
     }
 
+    /// Chunk containing the local player.
+    fn player_chunk(&self) -> ChunkPos {
+        let pos = self.host.player().pos;
+        ChunkPos::new(
+            (pos.x.floor() as i32).div_euclid(SECTION_SIZE as i32),
+            (pos.z.floor() as i32).div_euclid(SECTION_SIZE as i32),
+        )
+    }
+
+    /// Columns generated by the next streaming call.
+    ///
+    /// The initial load spends a large budget to get the near ring playable,
+    /// then degrades gracefully: a full 65×65 field is drained over a few
+    /// seconds in the background instead of one column per frame for minutes.
+    /// Generation itself is rayon-parallel inside [`Host::ensure_streaming`].
+    fn stream_budget(&self) -> usize {
+        let radius = if self.initial_load {
+            self.initial_target_radius
+        } else {
+            self.host.render_distance_chunks()
+        };
+        let center = self.player_chunk();
+        let mut missing = 0usize;
+        for dz in -radius..=radius {
+            for dx in -radius..=radius {
+                if self
+                    .host
+                    .world()
+                    .chunk(ChunkPos::new(center.x + dx, center.z + dz))
+                    .is_none()
+                {
+                    missing += 1;
+                }
+            }
+        }
+        if self.initial_load {
+            if missing > 0 { 64 } else { 2 }
+        } else if missing > 1024 {
+            32
+        } else if missing > 256 {
+            16
+        } else if missing > 0 {
+            8
+        } else {
+            2
+        }
+    }
+
+    /// Current LOD policy derived from the render-distance setting.
+    fn lod_config_for(&self) -> LodConfig {
+        LodConfig::for_render_distance(self.host.render_distance_chunks())
+    }
+
+    /// Estimated CPU+GPU vertex-buffer bytes for the F3 overlay.
+    fn mesh_bytes_estimate(&self) -> usize {
+        let section_vertices: usize = self.meshes.values().copied().sum();
+        let section_bytes = section_vertices as u64 * std::mem::size_of::<ob_render::Vertex>() as u64;
+        (section_bytes + self.lod.vertex_bytes()) as usize * 2
+    }
+
+    /// Recomputes the initial-loading overlay percentage and finishes it when
+    /// the near ring is resident and its section backlog is drained.
+    fn update_initial_load(&mut self) {
+        if !self.initial_load {
+            return;
+        }
+        let radius = self.initial_target_radius.max(1);
+        let center = self.player_chunk();
+        let expected_columns = ((2 * radius + 1) * (2 * radius + 1)) as usize;
+        let mut loaded_columns = 0usize;
+        let mut expected_sections = 0usize;
+        let mut ready_sections = 0usize;
+        for dz in -radius..=radius {
+            for dx in -radius..=radius {
+                let chunk = ChunkPos::new(center.x + dx, center.z + dz);
+                let Some(column) = self.host.world().chunk(chunk) else {
+                    continue;
+                };
+                loaded_columns += 1;
+                for index in 0..N_SECTIONS {
+                    let pos = SectionPos::new(
+                        chunk.x,
+                        ob_math::WORLD_MIN_Y / SECTION_SIZE as i32 + index as i32,
+                        chunk.z,
+                    );
+                    if column.section(pos).is_some_and(|section| !section.is_empty()) {
+                        expected_sections += 1;
+                        if self.meshes.contains_key(&pos) {
+                            ready_sections += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let column_fraction = loaded_columns as f32 / expected_columns.max(1) as f32;
+        let mesh_fraction = if expected_sections == 0 {
+            1.0
+        } else {
+            ready_sections as f32 / expected_sections as f32
+        };
+        self.loading_progress = (0.55 * column_fraction + 0.45 * mesh_fraction).clamp(0.0, 0.99);
+        self.loading_detail = format!(
+            "{} / {} columns   {} / {} sections meshed   {:.0}%",
+            loaded_columns,
+            expected_columns,
+            ready_sections,
+            expected_sections,
+            self.loading_progress * 100.0
+        );
+        let drained = self.host.dirty_sections() == 0 && self.mesh_scheduler.in_flight_count() == 0;
+        if loaded_columns == expected_columns && drained {
+            self.finish_initial_load();
+        } else if self.loading_started.elapsed() >= INITIAL_LOAD_TIMEOUT {
+            log::warn!(
+                "initial load did not fully drain after {} s; entering play with {} columns and {} mesh jobs in flight",
+                INITIAL_LOAD_TIMEOUT.as_secs(),
+                loaded_columns,
+                self.mesh_scheduler.in_flight_count()
+            );
+            self.finish_initial_load();
+        }
+    }
+
+    fn finish_initial_load(&mut self) {
+        self.initial_load = false;
+        self.loading_progress = 1.0;
+        self.loading_detail = "world ready".to_string();
+        self.ui
+            .toasts
+            .push_success("World ready - far terrain streams in the background");
+    }
+
     fn stream_and_mesh(&mut self) {
-        self.host.ensure_streaming(GENERATE_BUDGET);
+        let budget = self.stream_budget();
+        self.host.ensure_streaming(budget);
         for chunk in self.host.take_unloaded_chunks() {
             self.unload_chunk_meshes(chunk);
         }
+
+        // Keep the near/far split current before touching the dirty set, so a
+        // section in a far group is never queued for a full 16³ mesh. A render
+        // distance change is applied inside maintain() and promotes/demotes
+        // groups at the new boundary.
+        let camera = self.player_chunk();
+        let config = self.lod_config_for();
+        self.lod.maintain(
+            self.host.world_mut(),
+            camera,
+            config,
+            &self.registry,
+            &mut self.mesh_scheduler,
+            &mut self.renderer,
+            &mut self.meshes,
+        );
 
         // Snapshot and queue dirty sections. At most 32 snapshots are captured
         // on the main thread per frame; the rest go back into the world's dirty
@@ -3743,6 +3935,13 @@ impl GameState {
             if self.host.world().section(pos).is_none() {
                 self.drop_section_mesh(pos);
                 self.mesh_scheduler.forget_section(pos);
+                continue;
+            }
+            if self.lod.is_far(pos) {
+                // A far edit invalidates the merged batch instead of producing
+                // a full section mesh; the next maintain pass rebuilds it.
+                let key = LodBatchKey::containing(pos.chunk(), self.lod.config().group_chunks);
+                self.lod.invalidate(key, &mut self.renderer, &mut self.mesh_scheduler);
                 continue;
             }
             if submitted >= MAX_MESH_SUBMISSIONS_PER_FRAME {
@@ -3761,15 +3960,22 @@ impl GameState {
         }
 
         self.drain_mesh_results();
+        self.lod
+            .drain(self.host.world(), &mut self.mesh_scheduler, &mut self.renderer);
+        self.update_initial_load();
 
         if self.mesh_stats_timer.elapsed() >= MESH_STATS_INTERVAL {
             log::debug!(
-                "mesh scheduler: submitted {} completed {} dropped {} in-flight {} backlog {}",
+                "mesh scheduler: submitted {} completed {} dropped {} in-flight {} backlog {}; lod {} batches, {} in flight, {} done, {} dropped",
                 self.mesh_scheduler.submitted_count(),
                 self.mesh_scheduler.completed_count(),
                 self.mesh_scheduler.dropped_count(),
                 self.mesh_scheduler.in_flight_count(),
                 self.host.dirty_sections(),
+                self.lod.batches().len(),
+                self.mesh_scheduler.lod_in_flight_count(),
+                self.mesh_scheduler.lod_completed_count(),
+                self.mesh_scheduler.lod_dropped_count(),
             );
             self.mesh_stats_timer = Instant::now();
         }
@@ -3790,7 +3996,7 @@ impl GameState {
             let Some(result) = self.mesh_scheduler.try_recv() else {
                 break;
             };
-            if self.host.world().section(result.pos).is_none() {
+            if self.host.world().section(result.pos).is_none() || self.lod.is_far(result.pos) {
                 self.drop_section_mesh(result.pos);
                 continue;
             }
@@ -3824,6 +4030,8 @@ impl GameState {
         // In-flight results for the unloaded column are discarded when they
         // complete because their epoch is no longer tracked.
         self.mesh_scheduler.forget_chunk(chunk);
+        // A far batch covering the unloaded column is now stale.
+        self.lod.drop_chunk(chunk, &mut self.renderer, &mut self.mesh_scheduler);
     }
 
     fn tick(&mut self) {
@@ -3892,7 +4100,7 @@ impl GameState {
         }
         self.accumulator += dt.min(Duration::from_millis(250));
         let mut ticks = 0;
-        if self.ui.screen == Screen::Playing && !self.host.is_dead() {
+        if self.ui.screen == Screen::Playing && !self.host.is_dead() && !self.initial_load {
             while self.accumulator >= TICK && ticks < 5 {
                 self.accumulator -= TICK;
                 self.tick();
@@ -3946,7 +4154,7 @@ impl GameState {
         let blend = 1.0 - (-dt.as_secs_f32() * 12.0).exp();
         self.current_fov += (target_fov - self.current_fov) * blend;
         camera.fov_y = self.current_fov.to_radians();
-        camera.far = (self.host.render_distance_chunks() as f32 * 16.0 + 48.0).max(128.0);
+        camera.far = far_plane_for_render_distance(self.host.render_distance_chunks());
         self.stream_and_mesh();
         // Keep the window title in sync with the effective render distance.
         if self.applied_render_distance != self.host.render_distance_chunks() {
@@ -4027,7 +4235,7 @@ impl GameState {
             ui: ui_frame.as_ref().or(ui),
             outline,
         };
-        if let Err(err) = renderer.render_world_scene(self.host.world(), camera, &scene) {
+        if let Err(err) = renderer.render_world_scene_lod(self.host.world(), camera, &scene, &self.lod.config()) {
             log::warn!("screenshot render failed: {err}");
             return;
         }
@@ -4072,6 +4280,7 @@ impl GameState {
             && !crafting_open
             && !container_open
             && !death_open
+            && !self.initial_load
         {
             return None;
         }
@@ -4200,6 +4409,47 @@ impl GameState {
         // --- Death screen: drawn over the HUD, below the F3 overlay ---
         if death_open {
             ui_state::draw_death_screen(&mut frame, &self.ui, screen);
+        }
+
+        // --- Initial streaming overlay: covers the HUD until the near ring is
+        // resident and meshed. Play starts then; far batches keep building in
+        // the background.
+        if self.initial_load {
+            frame.rect(0.0, 0.0, width, height, [0.02, 0.03, 0.05, 0.55]);
+            let panel_w = (width * 0.62).clamp(300.0, 560.0);
+            let panel_h = 118.0;
+            let x = (width - panel_w) * 0.5;
+            let y = (height - panel_h) * 0.5;
+            frame.rect(x, y, panel_w, panel_h, [0.05, 0.07, 0.11, 0.97]);
+            frame.rect(x, y, panel_w, 2.0, [0.98, 0.82, 0.45, 0.9]);
+            frame.text_centered(width * 0.5, y + 16.0, 2.0, [0.98, 0.82, 0.45, 1.0], "Loading world");
+            let radius = self.host.render_distance_chunks();
+            frame.text_centered(
+                width * 0.5,
+                y + 44.0,
+                1.3,
+                [0.86, 0.91, 0.98, 0.95],
+                &format!("{radius} chunks / {} blocks", radius * 16),
+            );
+            let bar_x = x + 30.0;
+            let bar_y = y + 68.0;
+            let bar_w = panel_w - 60.0;
+            let bar_h = 10.0;
+            frame.rect(bar_x, bar_y, bar_w, bar_h, [0.10, 0.12, 0.16, 1.0]);
+            frame.rect(
+                bar_x,
+                bar_y,
+                bar_w * self.loading_progress.clamp(0.0, 1.0),
+                bar_h,
+                [0.35, 0.75, 0.45, 1.0],
+            );
+            frame.text_centered(
+                width * 0.5,
+                y + 86.0,
+                1.05,
+                [0.78, 0.84, 0.92, 0.95],
+                &self.loading_detail,
+            );
         }
 
         // --- F3 debug overlay: always on top so it stays usable while dead ---
@@ -4782,6 +5032,13 @@ impl ApplicationHandler for App {
             (size.width.max(1) as f32, size.height.max(1) as f32)
         };
         let initial_fov = settings.fov_degrees;
+        // At 32 chunks the full-detail radius is capped at 10; smaller render
+        // distances keep every column at full detail. The initial load waits
+        // for two fewer chunks than that so the player can start before the
+        // merged far batches have all finished.
+        let lod_config = LodConfig::for_render_distance(settings.render_distance_chunks);
+        let initial_target_radius =
+            (lod_config.full_detail_radius_chunks - 2).clamp(2, settings.render_distance_chunks.max(2));
         let mut ui = UiState::from_settings(settings);
         ui.active_texture_pack = active_texture_pack_label(&texture_source);
         ui.active_ui_font_name = renderer.ui_font_name().to_string();
@@ -4839,6 +5096,12 @@ impl ApplicationHandler for App {
             fps: 0,
             last_save: Instant::now(),
             meshes: HashMap::new(),
+            lod: LodState::new(lod_config),
+            initial_load: true,
+            initial_target_radius,
+            loading_progress: 0.0,
+            loading_detail: String::new(),
+            loading_started: Instant::now(),
             started: Instant::now(),
             auto_exit: self
                 .options
@@ -5885,8 +6148,11 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
                 options.render_distance_chunks = value
                     .parse()
                     .map_err(|_| format!("invalid --render-distance value '{value}'"))?;
-                if !(2..=16).contains(&options.render_distance_chunks) {
-                    return Err("--render-distance must be between 2 and 16 chunks".into());
+                if !(2..=ob_core::config::MAX_RENDER_DISTANCE).contains(&options.render_distance_chunks) {
+                    return Err(format!(
+                        "--render-distance must be between 2 and {} chunks",
+                        ob_core::config::MAX_RENDER_DISTANCE
+                    ));
                 }
             }
             "fly" => options.fly = true,

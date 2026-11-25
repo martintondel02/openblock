@@ -1101,6 +1101,8 @@ dependencies = [
  "ob_sim",
  "ob_world",
  "ob_worldgen",
+ "png",
+ "rayon",
  "zstd-pure-rs",
 ]
 

@@ -300,7 +300,7 @@ fn print_help() {
     println!("  --config PATH            flat server.toml configuration (CLI overrides it)");
     println!("  --max-players N          player cap, 1..=500 (default: 8)");
     println!("  --motd TEXT              message of the day, at most 128 bytes");
-    println!("  --interest-radius N      per-client chunk radius, 1..=16 (default: 6)");
+    println!("  --interest-radius N      per-client chunk radius, 1..=32 (default: 6)");
     println!("  --save-interval SECONDS  autosave interval, 0 disables (default: 60)");
     println!("  --metrics-json PATH      write periodic JSON metrics snapshots (listener mode)");
     println!("  --metrics-interval SEC   seconds between metrics snapshots (default: 5)");

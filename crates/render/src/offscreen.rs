@@ -16,8 +16,8 @@ use crate::entities::EntitiesRenderer;
 use crate::textures::BlockTextureArray;
 use crate::ui::{UiFrame, UiRenderer};
 use crate::{
-    BlockOutline, Camera, EntityInstance, Environment, OUTLINE_VERTEX_COUNT, RenderError, RenderStats, SceneParams,
-    Vertex, mesh, pipeline, section_visible,
+    BlockOutline, Camera, EntityInstance, Environment, LodBatchKey, OUTLINE_VERTEX_COUNT, RenderError, RenderStats,
+    SceneParams, Vertex, aabb_visible, aabb_within_distance, lod, mesh, pipeline, section_bounds, section_visible,
 };
 
 /// Offscreen colour target format (sRGB, readable through `copy_texture_to_buffer`).
@@ -67,12 +67,22 @@ pub struct OffscreenRenderer {
     ui: UiRenderer,
     /// Cached section meshes (rebuilt on demand; used by the benchmark path).
     meshes: HashMap<SectionPos, CachedMesh>,
+    /// Cached merged far-LOD batches (benchmark and screenshot paths).
+    lod_batches: HashMap<LodBatchKey, CachedLodBatch>,
 }
 
 /// A cached vertex buffer for one section.
 struct CachedMesh {
     buffer: wgpu::Buffer,
     vertex_count: u32,
+}
+
+/// A cached merged far-LOD batch.
+struct CachedLodBatch {
+    buffer: wgpu::Buffer,
+    vertex_count: u32,
+    min: [f32; 3],
+    max: [f32; 3],
 }
 
 impl OffscreenRenderer {
@@ -161,6 +171,7 @@ impl OffscreenRenderer {
             stats: RenderStats::default(),
             ui,
             meshes: HashMap::new(),
+            lod_batches: HashMap::new(),
         })
     }
 
@@ -242,6 +253,67 @@ impl OffscreenRenderer {
         self.entities.set(&self.device, &self.queue, entities);
     }
 
+    /// Uploads (or replaces) one section mesh in the cached benchmark scene.
+    pub fn upload_mesh(&mut self, pos: SectionPos, section_mesh: crate::MeshData) {
+        if section_mesh.vertices.is_empty() {
+            self.meshes.remove(&pos);
+            return;
+        }
+        let vertex_count = section_mesh.vertices.len() as u32;
+        let size = (section_mesh.vertices.len() * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("offscreen-cached-section"),
+            size,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&buffer, 0, bytemuck::cast_slice(&section_mesh.vertices));
+        self.meshes.insert(pos, CachedMesh { buffer, vertex_count });
+    }
+
+    /// Uploads (or replaces) one merged far-LOD batch in the cached scene.
+    pub fn upload_lod_batch(&mut self, key: LodBatchKey, min: [f32; 3], max: [f32; 3], batch: crate::MeshData) {
+        if batch.vertices.is_empty() {
+            self.lod_batches.remove(&key);
+            return;
+        }
+        let vertex_count = batch.vertices.len() as u32;
+        let size = (batch.vertices.len() * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("offscreen-lod-batch"),
+            size,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&buffer, 0, bytemuck::cast_slice(&batch.vertices));
+        self.lod_batches.insert(
+            key,
+            CachedLodBatch {
+                buffer,
+                vertex_count,
+                min,
+                max,
+            },
+        );
+    }
+
+    /// Removes one far-LOD batch.
+    pub fn remove_lod_batch(&mut self, key: LodBatchKey) {
+        self.lod_batches.remove(&key);
+    }
+
+    /// Removes every far-LOD batch.
+    pub fn clear_lod_batches(&mut self) {
+        self.lod_batches.clear();
+    }
+
+    /// Number of cached far-LOD batches.
+    pub fn lod_batch_count(&self) -> usize {
+        self.lod_batches.len()
+    }
+
     /// Rebuilds the cached GPU meshes for every non-empty loaded section.
     ///
     /// Returns the number of cached sections and vertices. The benchmark path
@@ -249,6 +321,7 @@ impl OffscreenRenderer {
     /// dominate the measurement.
     pub fn rebuild_mesh_cache(&mut self, world: &World) -> (u32, u64) {
         self.meshes.clear();
+        self.lod_batches.clear();
         let mut sections = 0u32;
         let mut vertices = 0u64;
         let base_y = WORLD_MIN_Y / SECTION_SIZE as i32;
@@ -285,6 +358,72 @@ impl OffscreenRenderer {
             vertices += u64::from(vertex_count);
         }
         (sections, vertices)
+    }
+
+    /// Rebuilds the cached benchmark scene with the distance-LOD policy.
+    ///
+    /// Near columns are meshed per section; far 2×2-chunk groups are meshed
+    /// once as a surface-shell batch. Returns a summary for the benchmark
+    /// report. This is the exact policy the client applies through its
+    /// scheduler, implemented here without a scheduler so the offscreen tool
+    /// stays dependency-free and deterministic.
+    pub fn rebuild_lod_scene(
+        &mut self,
+        world: &World,
+        camera: &Camera,
+        config: &lod::LodConfig,
+    ) -> crate::LodCacheStats {
+        self.meshes.clear();
+        self.lod_batches.clear();
+        let config = config.normalised();
+        let camera_chunk = ob_math::BlockPos::new(
+            camera.position.x.floor() as i32,
+            camera.position.y.floor() as i32,
+            camera.position.z.floor() as i32,
+        )
+        .chunk();
+        let mut stats = crate::LodCacheStats::default();
+        let base_y = WORLD_MIN_Y / SECTION_SIZE as i32;
+        // Deterministic iteration order: chunk order is not stable in a hash
+        // map, and the benchmark's counts must be reproducible.
+        let mut columns: Vec<(ob_math::ChunkPos, &ob_world::ChunkColumn)> =
+            world.chunks().map(|(pos, c)| (*pos, c)).collect();
+        columns.sort_by_key(|(pos, _)| (pos.x, pos.z));
+        let mut far_groups = std::collections::BTreeSet::new();
+        for (chunk_pos, _) in &columns {
+            if config.chunk_tier(camera_chunk, *chunk_pos) == crate::LodTier::Shell {
+                far_groups.insert(LodBatchKey::containing(*chunk_pos, config.group_chunks));
+                continue;
+            }
+            for index in 0..ob_math::N_SECTIONS {
+                let pos = SectionPos::new(chunk_pos.x, base_y + index as i32, chunk_pos.z);
+                let Some(section) = world.section(pos) else {
+                    continue;
+                };
+                if section.is_empty() {
+                    continue;
+                }
+                let section_mesh = mesh::mesh_section(world, pos);
+                if section_mesh.is_empty() {
+                    continue;
+                }
+                stats.sections += 1;
+                stats.section_vertices += section_mesh.vertices.len() as u64;
+                self.upload_mesh(pos, section_mesh);
+            }
+        }
+        for key in far_groups {
+            let batch = lod::mesh_lod_batch(world, key, &config);
+            if batch.is_empty() {
+                continue;
+            }
+            stats.batches += 1;
+            stats.batch_sections += batch.shell_sections as u64;
+            stats.skipped_sections += batch.skipped_sections as u64;
+            stats.batch_vertices += batch.mesh.vertices.len() as u64;
+            self.upload_lod_batch(key, batch.min, batch.max, batch.mesh);
+        }
+        stats
     }
 
     /// Renders the cached meshes inside the frustum and reads the frame back.
@@ -338,6 +477,16 @@ impl OffscreenRenderer {
         }
 
         let mut stats = RenderStats::default();
+        let eye = [
+            camera.position.x as f32,
+            camera.position.y as f32,
+            camera.position.z as f32,
+        ];
+        let draw_distance = camera.far + 24.0;
+        let mut section_order: Vec<SectionPos> = self.meshes.keys().copied().collect();
+        section_order.sort_unstable();
+        let mut lod_order: Vec<LodBatchKey> = self.lod_batches.keys().copied().collect();
+        lod_order.sort_unstable();
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("offscreen-cached-frame"),
         });
@@ -391,15 +540,37 @@ impl OffscreenRenderer {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            for (pos, cached) in &self.meshes {
-                if !section_visible(&frustum, *pos) {
+            for pos in section_order {
+                let (min, max) = section_bounds(pos);
+                if !section_visible(&frustum, pos) || !aabb_within_distance(eye, min, max, draw_distance) {
+                    stats.culled_sections += 1;
                     continue;
                 }
+                let Some(cached) = self.meshes.get(&pos) else {
+                    continue;
+                };
                 pass.set_vertex_buffer(0, cached.buffer.slice(..));
                 pass.draw(0..cached.vertex_count, 0..1);
                 stats.draw_calls += 1;
                 stats.vertices += u64::from(cached.vertex_count);
                 stats.sections += 1;
+            }
+            for key in lod_order {
+                let Some(batch) = self.lod_batches.get(&key) else {
+                    continue;
+                };
+                if !aabb_visible(&frustum, batch.min, batch.max)
+                    || !aabb_within_distance(eye, batch.min, batch.max, draw_distance)
+                {
+                    stats.culled_lod_batches += 1;
+                    continue;
+                }
+                pass.set_vertex_buffer(0, batch.buffer.slice(..));
+                pass.draw(0..batch.vertex_count, 0..1);
+                stats.draw_calls += 1;
+                stats.vertices += u64::from(batch.vertex_count);
+                stats.lod_batches += 1;
+                stats.lod_vertices += u64::from(batch.vertex_count);
             }
             // Dropped items are depth-tested against the world geometry and
             // drawn before the selection outline.
@@ -426,6 +597,32 @@ impl OffscreenRenderer {
     /// Number of cached section meshes (0 before `rebuild_mesh_cache`).
     pub fn cached_mesh_count(&self) -> usize {
         self.meshes.len()
+    }
+
+    /// Renders a world using the distance-LOD policy.
+    ///
+    /// Screenshots and F2 captures use this path so a 512-block capture does not
+    /// build tens of thousands of full section meshes or exhaust GPU memory.
+    /// Render distances within the full-detail radius produce exactly the same
+    /// geometry as [`Self::render_world_scene`].
+    pub fn render_world_scene_lod(
+        &mut self,
+        world: &World,
+        camera: &Camera,
+        scene: &SceneParams<'_>,
+        config: &lod::LodConfig,
+    ) -> Result<(), RenderError> {
+        let stats = self.rebuild_lod_scene(world, camera, config);
+        log::info!(
+            "offscreen LOD frame: {} near sections + {} far batches, {} cached vertices, {} shell sections, {} skipped",
+            stats.sections,
+            stats.batches,
+            stats.section_vertices + stats.batch_vertices,
+            stats.batch_sections,
+            stats.skipped_sections
+        );
+        let _ = self.render_cached_scene(camera, scene)?;
+        Ok(())
     }
 
     /// Renders every non-empty loaded section inside the frustum into the
@@ -1988,5 +2185,70 @@ mod tests {
         );
         renderer.set_texture_style(crate::TexturePackStyle::Minimal);
         assert_eq!(renderer.texture_style(), crate::TexturePackStyle::Minimal);
+    }
+
+    #[test]
+    fn cached_mesh_beyond_the_far_plane_is_culled() {
+        if std::env::var_os("OPENBLOCK_NO_GPU_TESTS").is_some() {
+            eprintln!("skipping offscreen GPU tests: OPENBLOCK_NO_GPU_TESTS is set");
+            return;
+        }
+        let registry = Arc::new(Registry::base());
+        let world = test_world(&registry);
+        let mut renderer = match OffscreenRenderer::new(96, 54) {
+            Ok(renderer) => renderer,
+            Err(RenderError::NoAdapter(reason)) => {
+                eprintln!("skipping cached_mesh_beyond_the_far_plane_is_culled: {reason}");
+                return;
+            }
+            Err(error) => panic!("failed to create the offscreen renderer: {error}"),
+        };
+        let mesh = mesh::mesh_section(&world, SectionPos::new(0, 4, 0));
+        assert!(!mesh.is_empty(), "the test platform must produce geometry");
+        // Upload under a key far outside the 128-block far plane while the
+        // camera looks along -Z. The vertices themselves are at the origin, so
+        // any draw would be visible if distance culling failed.
+        renderer.upload_mesh(SectionPos::new(0, 4, -30), mesh);
+        let mut camera = Camera::new(WorldVec::new(8.0, 76.0, 8.0), 0.0, 0.0);
+        camera.far = 128.0;
+        let stats = renderer.render_cached(&camera).expect("cached frame");
+        assert_eq!(stats.sections, 0, "a section beyond the far plane must not draw");
+        assert_eq!(stats.draw_calls, 0);
+        assert!(stats.culled_sections >= 1);
+    }
+
+    #[test]
+    fn lod_scene_meshes_far_groups_and_draws_them() {
+        if std::env::var_os("OPENBLOCK_NO_GPU_TESTS").is_some() {
+            eprintln!("skipping offscreen GPU tests: OPENBLOCK_NO_GPU_TESTS is set");
+            return;
+        }
+        let registry = Arc::new(Registry::base());
+        let world = test_world(&registry);
+        let mut renderer = match OffscreenRenderer::new(96, 54) {
+            Ok(renderer) => renderer,
+            Err(RenderError::NoAdapter(reason)) => {
+                eprintln!("skipping lod_scene_meshes_far_groups_and_draws_them: {reason}");
+                return;
+            }
+            Err(error) => panic!("failed to create the offscreen renderer: {error}"),
+        };
+        let mut camera = Camera::new(WorldVec::new(8.0, 76.0, 8.0), 0.0, 0.0);
+        camera.far = 128.0;
+        let config = crate::LodConfig {
+            full_detail_radius_chunks: 0,
+            group_chunks: 2,
+            shell_depth_blocks: 48,
+        };
+        let cache = renderer.rebuild_lod_scene(&world, &camera, &config);
+        assert_eq!(cache.sections, 0, "full radius 0 must not mesh sections");
+        assert!(cache.batches > 0, "the test group must become a far batch");
+        assert!(cache.batch_vertices > 0);
+        assert!(cache.batch_sections > 0);
+        let stats = renderer.render_cached(&camera).expect("cached LOD frame");
+        assert!(stats.lod_batches > 0, "the far batch must be inside the frustum");
+        assert_eq!(stats.sections, 0);
+        assert_eq!(stats.vertices, stats.lod_vertices);
+        assert!(renderer.read_rgba().iter().any(|value| *value != 0));
     }
 }

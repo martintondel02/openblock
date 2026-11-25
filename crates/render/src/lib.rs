@@ -13,6 +13,7 @@
 pub mod entities;
 pub mod environment;
 pub mod frustum;
+pub mod lod;
 pub mod mesh;
 pub mod offscreen;
 pub mod outline;
@@ -31,7 +32,12 @@ use winit::window::Window;
 
 pub use entities::{EntityInstance, entity_layer, entity_layers};
 pub use environment::{DAY_LENGTH_TICKS, Environment, EnvironmentVisual};
-pub use frustum::{FRUSTUM_PLANE_COUNT, aabb_visible, section_bounds, section_visible};
+pub use frustum::{FRUSTUM_PLANE_COUNT, aabb_visible, aabb_within_distance, section_bounds, section_visible};
+pub use lod::{
+    DEFAULT_FULL_DETAIL_RADIUS_CHUNKS, DEFAULT_LOD_GROUP_CHUNKS, DEFAULT_SHELL_DEPTH_BLOCKS, LodBatchKey, LodBatchMesh,
+    LodCacheStats, LodConfig, LodTier, mesh_lod_batch, shell_section_range, skipped_sections_for_column,
+    tier_for_group,
+};
 pub use mesh::{MesherStats, SNAPSHOT_SIZE, SectionSnapshot, mesh_section, mesh_section_with_stats};
 pub use offscreen::OffscreenRenderer;
 pub use outline::{BlockOutline, DEFAULT_EDGE_COLOR, DEFAULT_INFLATION, OUTLINE_VERTEX_COUNT, OutlineVertex};
@@ -121,16 +127,28 @@ impl Camera {
 
     /// Distance-fog `(start, end)` bounds derived from the far plane.
     ///
-    /// Fog begins at 55% and reaches full strength at 95% of the far plane, so
-    /// terrain fades into the sky before the far plane culls it. The end is
-    /// clamped to at least `start + 1` so a tiny far plane cannot invert the
-    /// range. Both the windowed and offscreen renderers use this method, which
-    /// keeps their fog identical for the same camera.
+    /// Small render distances keep the historical 55%-of-far start so the
+    /// last streamed ring always dissolves into the sky. At long distances the
+    /// fog instead starts 160 blocks before the far plane (never earlier than
+    /// 55%), so a 512-block world has a crisp horizon while 200 blocks away is
+    /// still clear. The end is clamped to at least `start + 1` so a tiny far
+    /// plane cannot invert the range. Both the windowed and offscreen renderers
+    /// use this method, which keeps their fog identical for the same camera.
     pub fn fog_range(&self) -> (f32, f32) {
-        let start = self.far * 0.55;
+        let start = (self.far - 160.0).max(self.far * 0.55);
         let end = (self.far * 0.95).max(start + 1.0);
         (start, end)
     }
+}
+
+/// Far plane used for a horizontal streaming radius in chunks.
+///
+/// The margin keeps the last streamed ring inside the frustum even when the
+/// camera is close to a column boundary; 512 blocks (32 chunks) therefore maps
+/// to a 560-block far plane. The client and the offscreen benchmark share this
+/// helper so their fog and culling agree.
+pub fn far_plane_for_render_distance(chunks: i32) -> f32 {
+    (chunks.max(1) as f32 * 16.0 + 48.0).max(128.0)
 }
 
 /// Everything a frame needs besides the camera: the time of day, an optional
@@ -214,12 +232,20 @@ impl MeshData {
 /// Per-frame renderer counters.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RenderStats {
-    /// Draw calls issued for chunk geometry.
+    /// Draw calls issued for chunk geometry (sections plus far LOD batches).
     pub draw_calls: u32,
-    /// Vertices drawn.
+    /// Vertices drawn from all world geometry.
     pub vertices: u64,
-    /// Section meshes drawn after frustum culling.
+    /// Full-detail section meshes drawn after frustum and distance culling.
     pub sections: u32,
+    /// Merged far-LOD batches drawn.
+    pub lod_batches: u32,
+    /// Vertices drawn from far-LOD batches.
+    pub lod_vertices: u64,
+    /// Section meshes rejected by the frustum or distance checks.
+    pub culled_sections: u32,
+    /// Far-LOD batches rejected by the frustum or distance checks.
+    pub culled_lod_batches: u32,
 }
 
 /// Errors from renderer initialisation or presentation.
@@ -269,6 +295,19 @@ pub struct GpuMesh {
     pub vertex_count: u32,
 }
 
+/// GPU resources for one merged far-LOD batch.
+#[derive(Debug)]
+pub struct LodGpuMesh {
+    /// Vertex buffer.
+    pub buffer: wgpu::Buffer,
+    /// Number of vertices in the buffer.
+    pub vertex_count: u32,
+    /// Conservative world-space bounds for frustum and distance culling.
+    pub min: [f32; 3],
+    /// Conservative world-space bounds for frustum and distance culling.
+    pub max: [f32; 3],
+}
+
 /// The wgpu renderer.
 pub struct Renderer {
     /// wgpu instance.
@@ -309,6 +348,8 @@ pub struct Renderer {
     pub(crate) bind_group: wgpu::BindGroup,
     /// Uploaded section meshes.
     pub(crate) meshes: HashMap<SectionPos, GpuMesh>,
+    /// Uploaded merged far-LOD batches.
+    pub(crate) lod_batches: HashMap<LodBatchKey, LodGpuMesh>,
     /// Adapter description.
     pub(crate) adapter_summary: String,
     /// Statistics from the last frame.
@@ -431,6 +472,7 @@ impl Renderer {
             ui,
             bind_group,
             meshes: HashMap::new(),
+            lod_batches: HashMap::new(),
             adapter_summary,
             stats: RenderStats::default(),
             window,
@@ -532,6 +574,57 @@ impl Renderer {
         self.meshes.clear();
     }
 
+    /// Uploads (or replaces) one merged far-LOD batch.
+    ///
+    /// `min`/`max` are the world-space bounds of the emitted vertices; the
+    /// renderer uses them for frustum and distance culling. An empty mesh
+    /// removes the batch instead of allocating a zero-length buffer.
+    pub fn upload_lod_batch(&mut self, key: LodBatchKey, min: [f32; 3], max: [f32; 3], mesh: MeshData) {
+        if mesh.vertices.is_empty() {
+            self.lod_batches.remove(&key);
+            return;
+        }
+        let vertex_count = mesh.vertices.len() as u32;
+        let size = (mesh.vertices.len() * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lod-batch"),
+            size,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&buffer, 0, bytemuck::cast_slice(&mesh.vertices));
+        self.lod_batches.insert(
+            key,
+            LodGpuMesh {
+                buffer,
+                vertex_count,
+                min,
+                max,
+            },
+        );
+    }
+
+    /// Removes one merged far-LOD batch.
+    pub fn remove_lod_batch(&mut self, key: LodBatchKey) {
+        self.lod_batches.remove(&key);
+    }
+
+    /// Removes every merged far-LOD batch.
+    pub fn clear_lod_batches(&mut self) {
+        self.lod_batches.clear();
+    }
+
+    /// Number of uploaded far-LOD batches.
+    pub fn lod_batch_count(&self) -> usize {
+        self.lod_batches.len()
+    }
+
+    /// Total vertices held by uploaded far-LOD batches.
+    pub fn lod_vertex_count(&self) -> u64 {
+        self.lod_batches.values().map(|mesh| u64::from(mesh.vertex_count)).sum()
+    }
+
     /// Replaces the dropped-item entities drawn with the world.
     ///
     /// The slice is copied into the renderer and kept until the next call; an
@@ -591,6 +684,17 @@ impl Renderer {
         // and never counted in the frame statistics.
         let mut order: Vec<SectionPos> = self.meshes.keys().copied().collect();
         order.sort_unstable();
+        let mut lod_order: Vec<LodBatchKey> = self.lod_batches.keys().copied().collect();
+        lod_order.sort_unstable();
+        let eye = [
+            camera.position.x as f32,
+            camera.position.y as f32,
+            camera.position.z as f32,
+        ];
+        // A small margin keeps geometry whose AABB touches the far plane from
+        // popping a frame early. The client already evicts beyond the streaming
+        // radius; this check is the renderer's own guard against stale caches.
+        let draw_distance = camera.far + 24.0;
 
         let mut stats = RenderStats::default();
         let mut encoder = self
@@ -648,7 +752,9 @@ impl Renderer {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             for pos in order {
-                if !section_visible(&frustum, pos) {
+                let (min, max) = section_bounds(pos);
+                if !section_visible(&frustum, pos) || !aabb_within_distance(eye, min, max, draw_distance) {
+                    stats.culled_sections += 1;
                     continue;
                 }
                 let Some(mesh) = self.meshes.get(&pos) else {
@@ -662,6 +768,27 @@ impl Renderer {
                 stats.draw_calls += 1;
                 stats.vertices += u64::from(mesh.vertex_count);
                 stats.sections += 1;
+            }
+            // Far LOD batches are one draw per 2×2-chunk group. They are drawn
+            // after the near sections; depth testing makes the order visually
+            // irrelevant, and near sections win any overlap at the tier seam.
+            for key in lod_order {
+                let Some(batch) = self.lod_batches.get(&key) else {
+                    continue;
+                };
+                if batch.vertex_count == 0
+                    || !aabb_visible(&frustum, batch.min, batch.max)
+                    || !aabb_within_distance(eye, batch.min, batch.max, draw_distance)
+                {
+                    stats.culled_lod_batches += 1;
+                    continue;
+                }
+                pass.set_vertex_buffer(0, batch.buffer.slice(..));
+                pass.draw(0..batch.vertex_count, 0..1);
+                stats.draw_calls += 1;
+                stats.vertices += u64::from(batch.vertex_count);
+                stats.lod_batches += 1;
+                stats.lod_vertices += u64::from(batch.vertex_count);
             }
             // Dropped items sit in the world: depth-test them against the
             // terrain, then draw the outline over both.
@@ -797,6 +924,14 @@ mod tests {
         let (start, end) = camera.fog_range();
         assert!((start - 110.0).abs() < 1e-4, "fog start is {start}");
         assert!((end - 190.0).abs() < 1e-4, "fog end is {end}");
+
+        // At the 512-block radius the fog starts well beyond 300 blocks, so
+        // the horizon stays readable instead of dissolving into grey.
+        camera.far = far_plane_for_render_distance(32);
+        let (start, end) = camera.fog_range();
+        assert!((camera.far - 560.0).abs() < 1e-4);
+        assert!((399.0..440.0).contains(&start), "fog start is {start}");
+        assert!(end >= 530.0, "fog end is {end}");
 
         // A very short far plane keeps a usable, non-inverted range.
         camera.far = 1.0;

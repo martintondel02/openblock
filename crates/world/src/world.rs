@@ -45,6 +45,20 @@ impl World {
         }
     }
 
+    /// Builds a world from existing columns without marking them dirty.
+    ///
+    /// Used to hand a small neighbourhood to a background LOD mesher: the
+    /// caller clones the target group plus one chunk of border, and the worker
+    /// meshes against the same block data (and registry) as the live world
+    /// without producing spurious dirty sections in the main world.
+    pub fn from_columns(registry: Arc<Registry>, seed: u64, columns: impl IntoIterator<Item = ChunkColumn>) -> Self {
+        let mut world = Self::new(registry, seed);
+        for column in columns {
+            world.chunks.insert(column.pos(), column);
+        }
+        world
+    }
+
     /// The content registry used for block lookups.
     pub fn registry(&self) -> &Registry {
         &self.registry

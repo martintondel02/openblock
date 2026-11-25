@@ -18,6 +18,7 @@
 #![warn(missing_docs)]
 
 pub mod measure;
+pub mod render_distance_bench;
 
 pub mod bench {
     //! Reproducible offscreen benchmark harness behind `openblock-tools bench`.
@@ -281,7 +282,7 @@ pub mod bench {
             (player.eye(), player.yaw, player.pitch)
         };
         let mut camera = Camera::new(eye, yaw, pitch);
-        camera.far = options.render_distance as f32 * 16.0 + 64.0;
+        camera.far = ob_render::far_plane_for_render_distance(options.render_distance);
 
         let mut renderer = OffscreenRenderer::new(options.width, options.height)?;
         let adapter = renderer.adapter_summary().to_string();

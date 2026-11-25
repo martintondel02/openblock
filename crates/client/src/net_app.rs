@@ -26,8 +26,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ob_audio::{AudioEngine, Material as AudioMaterial, Sfx as AudioSfx};
 use ob_content::{BlockId, Registry};
 use ob_core::config::{Action, load_settings, save_settings};
-use ob_math::{BlockPos, SectionPos, WorldVec};
-use ob_render::{BlockOutline, Camera, Environment, Renderer, SceneParams, TextureSource, UiFrame};
+use ob_math::{BlockPos, ChunkPos, SectionPos, WorldVec};
+use ob_render::{
+    BlockOutline, Camera, Environment, LodBatchKey, LodConfig, Renderer, SceneParams, TextureSource, UiFrame,
+};
 use ob_server::ContainerState;
 use ob_sim::{Player, PlayerInput, REACH};
 use winit::application::ApplicationHandler;
@@ -39,6 +41,7 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::containers::{self, ClickButton, ContainerKind, ContainerSession, SlotId};
 use crate::inventory;
+use crate::lod_state::LodState;
 use crate::mesh_scheduler::MeshScheduler;
 use crate::mining::MiningState;
 use crate::net::{ConnectOptions, NetEvent, NetState, NetworkClient};
@@ -152,7 +155,10 @@ impl ApplicationHandler for NetApp {
         ui.active_ui_font_source = font_source.display_label();
         ui.ui_scale_percent = resolved_ui_scale_percent(ui.settings.ui_scale_percent, window_size.1);
         ui.screen = Screen::Connecting;
-        let applied_render_distance = ui.settings.render_distance_chunks.clamp(1, 16);
+        let applied_render_distance = ui.settings.render_distance_chunks.clamp(
+            ob_core::config::MIN_RENDER_DISTANCE,
+            ob_core::config::MAX_RENDER_DISTANCE,
+        );
         let audio_enabled_before_mute = if self.options.mute {
             Some(load_settings(&data_dir).audio_enabled)
         } else {
@@ -199,6 +205,7 @@ impl ApplicationHandler for NetApp {
             data_dir,
             fullscreen: false,
             applied_render_distance,
+            lod: LodState::new(LodConfig::for_render_distance(applied_render_distance)),
             rolling_frame_ms: Vec::new(),
             window_size,
             debug_stats: DebugStats::default(),
@@ -743,6 +750,9 @@ struct NetGameState {
     fps_timer: Instant,
     fps: u32,
     meshes: HashMap<SectionPos, usize>,
+    /// Distance-LOD state; multiplayer uses the same near/far policy and the
+    /// same worker pool as single-player.
+    lod: LodState,
     started: Instant,
     auto_exit: Option<Duration>,
     frame_times: Vec<f32>,
@@ -1023,7 +1033,10 @@ impl NetGameState {
         let options = ConnectOptions::new(
             self.endpoint.clone(),
             self.player_name.clone(),
-            self.ui.settings.render_distance_chunks.clamp(1, 16),
+            self.ui.settings.render_distance_chunks.clamp(
+                ob_core::config::MIN_RENDER_DISTANCE,
+                ob_core::config::MAX_RENDER_DISTANCE,
+            ),
             Arc::clone(&self.registry),
         );
         let (sender, receiver) = mpsc::channel();
@@ -1153,6 +1166,7 @@ impl NetGameState {
     }
 
     fn clear_world_render(&mut self) {
+        self.lod.reset(&mut self.renderer, &mut self.mesh_scheduler);
         self.renderer.clear_meshes();
         self.meshes.clear();
         self.mesh_scheduler = MeshScheduler::new(self.mesh_workers, Arc::clone(&self.registry));
@@ -1695,7 +1709,13 @@ impl NetGameState {
         let mut events = Vec::new();
         if let Some(client) = &mut self.client {
             events = client.poll();
-            client.maintain_chunks(2);
+            // A 512-block join is 4,225 columns. While the interest ring is
+            // incomplete, request a large batch each frame; the client's token
+            // bucket (128/s, burst 64) bounds the socket and server work. After
+            // the ring is complete, drop to the small movement-follow cadence.
+            let (loaded, target) = client.loading_progress();
+            let budget = if loaded < target { 16 } else { 4 };
+            client.maintain_chunks(budget);
             ready = client.state().is_playing();
             if let NetState::Disconnected(reason) = client.state() {
                 disconnected = Some(reason.clone());
@@ -1900,6 +1920,40 @@ impl NetGameState {
         let Some(client) = self.client.as_mut() else {
             return;
         };
+        // Bound replicated-world memory and GPU buffers while flying. The
+        // server keeps its own interest set; a returning column is requested
+        // again by the tracker.
+        for chunk in client.unload_far_chunks(2) {
+            let positions: Vec<SectionPos> = self
+                .meshes
+                .keys()
+                .filter(|pos| pos.x == chunk.x && pos.z == chunk.z)
+                .copied()
+                .collect();
+            for pos in positions {
+                self.renderer.remove_mesh(pos);
+                self.meshes.remove(&pos);
+                self.mesh_scheduler.forget_section(pos);
+            }
+            self.lod.drop_chunk(chunk, &mut self.renderer, &mut self.mesh_scheduler);
+        }
+
+        let player_pos = client.player().pos;
+        let camera = ChunkPos::new(
+            (player_pos.x.floor() as i32).div_euclid(16),
+            (player_pos.z.floor() as i32).div_euclid(16),
+        );
+        let config = LodConfig::for_render_distance(client.render_radius());
+        self.lod.maintain(
+            client.world_mut(),
+            camera,
+            config,
+            &self.registry,
+            &mut self.mesh_scheduler,
+            &mut self.renderer,
+            &mut self.meshes,
+        );
+
         let dirty = client.world_mut().take_dirty_sections();
         let mut deferred = Vec::new();
         let mut submitted = 0usize;
@@ -1908,6 +1962,11 @@ impl NetGameState {
                 self.renderer.remove_mesh(pos);
                 self.meshes.remove(&pos);
                 self.mesh_scheduler.forget_section(pos);
+                continue;
+            }
+            if self.lod.is_far(pos) {
+                let key = LodBatchKey::containing(pos.chunk(), self.lod.config().group_chunks);
+                self.lod.invalidate(key, &mut self.renderer, &mut self.mesh_scheduler);
                 continue;
             }
             if submitted >= MAX_MESH_SUBMISSIONS_PER_FRAME {
@@ -1929,16 +1988,11 @@ impl NetGameState {
         let completed_total = self.mesh_scheduler.completed_count();
         let dropped_total = self.mesh_scheduler.dropped_count();
         let in_flight = self.mesh_scheduler.in_flight_count();
-        self.drain_mesh_results();
-        if self.mesh_stats_timer.elapsed() >= MESH_STATS_INTERVAL {
-            log::debug!(
-                "net mesh scheduler: submitted {submitted_total} completed {completed_total} dropped {dropped_total} in-flight {in_flight} backlog {backlog}"
-            );
-            self.mesh_stats_timer = Instant::now();
-        }
-    }
+        // One far batch upload per frame keeps the GPU buffer-creation hitch
+        // bounded even in the join burst.
+        self.lod
+            .drain(client.world(), &mut self.mesh_scheduler, &mut self.renderer);
 
-    fn drain_mesh_results(&mut self) {
         let start = Instant::now();
         let mut uploaded = 0usize;
         loop {
@@ -1948,16 +2002,15 @@ impl NetGameState {
             let Some(result) = self.mesh_scheduler.try_recv() else {
                 break;
             };
-            let exists = self
-                .client
-                .as_ref()
-                .is_some_and(|client| client.world().section(result.pos).is_some());
-            if !exists {
-                self.drop_section_mesh(result.pos);
+            let exists = client.world().section(result.pos).is_some();
+            if !exists || self.lod.is_far(result.pos) {
+                self.renderer.remove_mesh(result.pos);
+                self.meshes.remove(&result.pos);
                 continue;
             }
             if result.mesh.vertices.is_empty() {
-                self.drop_section_mesh(result.pos);
+                self.renderer.remove_mesh(result.pos);
+                self.meshes.remove(&result.pos);
             } else {
                 let vertex_count = result.mesh.vertices.len();
                 self.renderer.upload_mesh(result.pos, result.mesh);
@@ -1965,11 +2018,16 @@ impl NetGameState {
             }
             uploaded += 1;
         }
-    }
-
-    fn drop_section_mesh(&mut self, pos: SectionPos) {
-        self.renderer.remove_mesh(pos);
-        self.meshes.remove(&pos);
+        if self.mesh_stats_timer.elapsed() >= MESH_STATS_INTERVAL {
+            log::debug!(
+                "net mesh scheduler: submitted {submitted_total} completed {completed_total} dropped {dropped_total} in-flight {in_flight} backlog {backlog}; lod {} batches, {} in flight, {} done, {} dropped",
+                self.lod.batches().len(),
+                self.mesh_scheduler.lod_in_flight_count(),
+                self.mesh_scheduler.lod_completed_count(),
+                self.mesh_scheduler.lod_dropped_count(),
+            );
+            self.mesh_stats_timer = Instant::now();
+        }
     }
 
     fn in_water(&self) -> bool {
@@ -2111,6 +2169,15 @@ impl NetGameState {
             loaded_chunks: loaded,
             drawn_sections: render_stats.sections as usize,
             cached_sections: self.meshes.len(),
+            lod_batches: self.lod.batches().len(),
+            lod_sections: self.lod.represented_sections() as usize,
+            lod_skipped_sections: self.lod.skipped_sections() as usize,
+            mesh_bytes: {
+                let section_vertices: usize = self.meshes.values().copied().sum();
+                (section_vertices as u64 * std::mem::size_of::<ob_render::Vertex>() as u64 + self.lod.vertex_bytes())
+                    as usize
+                    * 2
+            },
             triangles: render_stats.vertices / 3,
             draw_calls: render_stats.draw_calls as usize,
             mesh_workers: self.mesh_scheduler.workers(),
@@ -2492,7 +2559,10 @@ impl NetGameState {
     fn apply_settings_row(&mut self, row: SettingsRow) {
         match row {
             SettingsRow::RenderDistance => {
-                let requested = self.ui.settings.render_distance_chunks.clamp(1, 16);
+                let requested = self.ui.settings.render_distance_chunks.clamp(
+                    ob_core::config::MIN_RENDER_DISTANCE,
+                    ob_core::config::MAX_RENDER_DISTANCE,
+                );
                 if let Some(client) = &mut self.client {
                     client.set_render_radius(requested);
                 }

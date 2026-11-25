@@ -407,9 +407,13 @@ first, `world.obs` last). A target that is a directory is rejected before
 staging; on read, `world.obs` and every sidecar path is checked to be a regular
 file before it is opened, so a FIFO or device in an untrusted world directory
 cannot block startup. The v4 encoder enforces the same limits
-the loader applies (`MAX_SAVE_PAYLOAD_BYTES` 256 MiB uncompressed and
-`MAX_SAVE_FILE_BYTES` 512 MiB on disk) and refuses to commit an oversized
-snapshot, keeping the previous save intact. Individual replacements are atomic,
+the loader applies (`MAX_SAVE_PAYLOAD_BYTES` 512 MiB uncompressed and
+`MAX_SAVE_FILE_BYTES` 1 GiB on disk) and refuses to commit an oversized
+snapshot, keeping the previous save intact. The v1.1 limits cover a full
+512-block-radius world: a 65×65 generated world measured 338 MiB uncompressed,
+where the previous 256 MiB cap made every autosave of that interest set fail.
+The 2 s flush gate (REQ-SAVE-013) remains scoped to 256 MiB dirty; the 512 MiB
+case is Report only until a region-file save path lands. Individual replacements are atomic,
 but a crash between two renames can still mix one new sidecar with the previous
 world; the multi-file journal in §3.5 remains the target design for a future
 region-file save path. The interim `.tmp` files are best-effort cleaned after a
