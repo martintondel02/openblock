@@ -1831,6 +1831,7 @@ impl NetGameState {
                 environment,
                 ui: ui_frame.as_ref(),
                 outline,
+                time_seconds: 0.0,
             };
             if let Err(error) = self.renderer.render_scene(&camera, &scene) {
                 log::error!("render error: {error}");
@@ -1844,6 +1845,7 @@ impl NetGameState {
                 environment,
                 ui: ui_frame.as_ref(),
                 outline: None,
+                time_seconds: 0.0,
             };
             if let Err(error) = self.renderer.render_scene(&camera, &scene) {
                 log::error!("render error: {error}");
@@ -2008,11 +2010,11 @@ impl NetGameState {
                 self.meshes.remove(&result.pos);
                 continue;
             }
-            if result.mesh.vertices.is_empty() {
+            if result.mesh.is_empty() {
                 self.renderer.remove_mesh(result.pos);
                 self.meshes.remove(&result.pos);
             } else {
-                let vertex_count = result.mesh.vertices.len();
+                let vertex_count = result.mesh.vertex_count();
                 self.renderer.upload_mesh(result.pos, result.mesh);
                 self.meshes.insert(result.pos, vertex_count);
             }
@@ -2178,7 +2180,7 @@ impl NetGameState {
                     as usize
                     * 2
             },
-            triangles: render_stats.vertices / 3,
+            triangles: (render_stats.vertices + render_stats.water_vertices) / 3,
             draw_calls: render_stats.draw_calls as usize,
             mesh_workers: self.mesh_scheduler.workers(),
             mesh_in_flight: self.mesh_scheduler.in_flight_count(),
@@ -2219,6 +2221,8 @@ impl NetGameState {
             day_phase: self.client.as_ref().map_or(0, |client| client.server_tick() % 24_000),
             day: time_of_day > 0.25 && time_of_day < 0.75,
             defense,
+            graphics_summary: self.renderer.graphics().summary(),
+            shadow_summary: self.renderer.shadow_summary(),
         };
     }
 
@@ -2585,6 +2589,16 @@ impl NetGameState {
                 self.sync_audio_settings();
             }
             SettingsRow::UiScale => self.refresh_ui_scale(),
+            SettingsRow::GraphicsPreset
+            | SettingsRow::ShadowQuality
+            | SettingsRow::Clouds
+            | SettingsRow::WaterQuality
+            | SettingsRow::CloudCoverage
+            | SettingsRow::Bloom
+            | SettingsRow::Fxaa => {
+                self.renderer
+                    .set_graphics(crate::graphics_settings_from_settings(&self.ui.settings));
+            }
             SettingsRow::ReducedMotion
             | SettingsRow::ShowHud
             | SettingsRow::DebugOverlay

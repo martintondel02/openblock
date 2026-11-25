@@ -739,6 +739,7 @@ fn screenshot_name_tags_demo_inner(
             environment,
             ui: Some(&frame),
             outline: None,
+            time_seconds: 0.0,
         },
     )?;
     let rgba = renderer.read_rgba();
@@ -995,6 +996,7 @@ fn screenshot_network_demo_inner(
             environment,
             ui: None,
             outline: None,
+            time_seconds: 0.0,
         },
     )?;
     let render_stats = renderer.stats();
@@ -1035,8 +1037,10 @@ fn screenshot_network_demo_inner(
         lod_batches: render_stats.lod_batches as usize,
         lod_sections: 0,
         lod_skipped_sections: 0,
-        mesh_bytes: render_stats.vertices as usize * std::mem::size_of::<ob_render::Vertex>() * 2,
-        triangles: render_stats.vertices / 3,
+        mesh_bytes: (render_stats.vertices + render_stats.water_vertices) as usize
+            * std::mem::size_of::<ob_render::Vertex>()
+            * 2,
+        triangles: (render_stats.vertices + render_stats.water_vertices) / 3,
         draw_calls: render_stats.draw_calls as usize,
         mesh_workers: 0,
         mesh_in_flight: 0,
@@ -1066,6 +1070,8 @@ fn screenshot_network_demo_inner(
         day_phase: client.server_tick() % 24_000,
         day: time_of_day > 0.25 && time_of_day < 0.75,
         defense: client.armor_defense(),
+        graphics_summary: renderer.graphics().summary(),
+        shadow_summary: renderer.shadow_summary(),
     };
 
     let mut ui = UiState::from_settings(settings.clone());
@@ -1112,6 +1118,7 @@ fn screenshot_network_demo_inner(
                 environment,
                 ui: Some(frame),
                 outline: None,
+                time_seconds: 0.0,
             };
             renderer.render_world_scene(client.world(), &camera, &scene)?;
             let rgba = renderer.read_rgba();
@@ -1297,6 +1304,7 @@ fn screenshot_with_mode(
                 environment,
                 ui: None,
                 outline: None,
+                time_seconds: 0.0,
             },
             &LodConfig::for_render_distance(host.render_distance_chunks()),
         )?;
@@ -1713,6 +1721,7 @@ fn screenshot_with_mode(
         environment,
         ui: Some(&frame),
         outline: None,
+        time_seconds: 0.0,
     };
     renderer.render_world_scene_lod(
         host.world(),
@@ -1811,8 +1820,10 @@ fn screenshot_debug_stats(
         lod_batches: render_stats.lod_batches as usize,
         lod_sections: 0,
         lod_skipped_sections: 0,
-        mesh_bytes: render_stats.vertices as usize * std::mem::size_of::<ob_render::Vertex>() * 2,
-        triangles: render_stats.vertices / 3,
+        mesh_bytes: (render_stats.vertices + render_stats.water_vertices) as usize
+            * std::mem::size_of::<ob_render::Vertex>()
+            * 2,
+        triangles: (render_stats.vertices + render_stats.water_vertices) / 3,
         draw_calls: render_stats.draw_calls as usize,
         mesh_workers: options.mesh_workers,
         mesh_in_flight: 0,
@@ -1845,6 +1856,8 @@ fn screenshot_debug_stats(
         day_phase: host.day_phase(),
         day: host.is_day(),
         defense: host.armor_defense(),
+        graphics_summary: renderer.graphics().summary(),
+        shadow_summary: renderer.shadow_summary(),
     }
 }
 
@@ -3395,6 +3408,16 @@ impl GameState {
                 self.sync_audio_settings();
             }
             SettingsRow::UiScale => self.refresh_ui_scale(),
+            SettingsRow::GraphicsPreset
+            | SettingsRow::ShadowQuality
+            | SettingsRow::Clouds
+            | SettingsRow::WaterQuality
+            | SettingsRow::CloudCoverage
+            | SettingsRow::Bloom
+            | SettingsRow::Fxaa => {
+                self.renderer
+                    .set_graphics(graphics_settings_from_settings(&self.ui.settings));
+            }
             SettingsRow::ReducedMotion
             | SettingsRow::ShowHud
             | SettingsRow::DebugOverlay
@@ -3586,7 +3609,7 @@ impl GameState {
             lod_sections: self.lod.represented_sections() as usize,
             lod_skipped_sections: self.lod.skipped_sections() as usize,
             mesh_bytes: self.mesh_bytes_estimate(),
-            triangles: render_stats.vertices / 3,
+            triangles: (render_stats.vertices + render_stats.water_vertices) / 3,
             draw_calls: render_stats.draw_calls as usize,
             mesh_workers: self.mesh_scheduler.workers(),
             mesh_in_flight: self.mesh_scheduler.in_flight_count(),
@@ -3628,6 +3651,8 @@ impl GameState {
             day_phase: self.host.day_phase(),
             day: self.host.is_day(),
             defense: self.host.armor_defense(),
+            graphics_summary: self.renderer.graphics().summary(),
+            shadow_summary: self.renderer.shadow_summary(),
         };
     }
 
@@ -4000,10 +4025,10 @@ impl GameState {
                 self.drop_section_mesh(result.pos);
                 continue;
             }
-            if result.mesh.vertices.is_empty() {
+            if result.mesh.is_empty() {
                 self.drop_section_mesh(result.pos);
             } else {
-                let vertex_count = result.mesh.vertices.len();
+                let vertex_count = result.mesh.vertex_count();
                 self.renderer.upload_mesh(result.pos, result.mesh);
                 self.meshes.insert(result.pos, vertex_count);
             }
@@ -4176,6 +4201,7 @@ impl GameState {
             environment,
             ui: ui_frame.as_ref(),
             outline,
+            time_seconds: elapsed,
         };
         if let Err(err) = self.renderer.render_scene(&camera, &scene) {
             log::error!("render error: {err}");
@@ -4205,10 +4231,11 @@ impl GameState {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let path = self.data_dir.join("screenshots").join(format!("openblock-{stamp}.png"));
-        let mut renderer = match OffscreenRenderer::new_with_source(
+        let mut renderer = match OffscreenRenderer::new_with_source_and_graphics(
             SCREENSHOT_WIDTH,
             SCREENSHOT_HEIGHT,
             self.texture_source.clone(),
+            graphics_settings_from_settings(&self.ui.settings),
         ) {
             Ok(renderer) => renderer,
             Err(err) => {
@@ -4234,6 +4261,7 @@ impl GameState {
             environment: *environment,
             ui: ui_frame.as_ref().or(ui),
             outline,
+            time_seconds: elapsed,
         };
         if let Err(err) = renderer.render_world_scene_lod(self.host.world(), camera, &scene, &self.lod.config()) {
             log::warn!("screenshot render failed: {err}");
@@ -5871,6 +5899,52 @@ fn render_texture_style(style: TextureStyle) -> ob_render::TexturePackStyle {
     }
 }
 
+/// Maps persisted graphics settings to the renderer's visual configuration.
+///
+/// The two crates keep separate enums on purpose: `ob_core` owns the persisted
+/// document and `ob_render` owns the GPU feature set, so the renderer can be used
+/// (by the tools and tests) without the settings file format. Both sides use the
+/// same names and preset order, which this mapping keeps in sync.
+pub fn graphics_settings_from_settings(settings: &Settings) -> ob_render::GraphicsSettings {
+    use ob_core::config::{
+        CloudQuality as CoreCloud, GraphicsPreset as CorePreset, ShadowQuality as CoreShadow, WaterQuality as CoreWater,
+    };
+    let preset = match settings.graphics_preset {
+        CorePreset::Low => ob_render::GraphicsPreset::Low,
+        CorePreset::Medium => ob_render::GraphicsPreset::Medium,
+        CorePreset::High => ob_render::GraphicsPreset::High,
+        CorePreset::Ultra => ob_render::GraphicsPreset::Ultra,
+        CorePreset::Custom => ob_render::GraphicsPreset::Custom,
+    };
+    let shadow_quality = match settings.shadow_quality {
+        CoreShadow::Off => ob_render::ShadowQuality::Off,
+        CoreShadow::Low => ob_render::ShadowQuality::Low,
+        CoreShadow::High => ob_render::ShadowQuality::High,
+        CoreShadow::Ultra => ob_render::ShadowQuality::Ultra,
+    };
+    let clouds = match settings.clouds {
+        CoreCloud::Off => ob_render::CloudQuality::Off,
+        CoreCloud::Low => ob_render::CloudQuality::Low,
+        CoreCloud::High => ob_render::CloudQuality::High,
+    };
+    let water = match settings.water_quality {
+        CoreWater::Off => ob_render::WaterQuality::Off,
+        CoreWater::Low => ob_render::WaterQuality::Low,
+        CoreWater::High => ob_render::WaterQuality::High,
+    };
+    ob_render::GraphicsSettings {
+        preset,
+        shadow_quality,
+        clouds,
+        water,
+        bloom: settings.bloom,
+        fxaa: settings.fxaa,
+        cloud_coverage: settings.cloud_coverage,
+        exposure: ob_render::DEFAULT_EXPOSURE,
+    }
+    .normalised()
+}
+
 /// Resolves which texture source this run should use.
 ///
 /// Precedence: explicit `--texture-pack`/`--resource-pack` wins, then
@@ -6030,26 +6104,27 @@ fn create_offscreen_renderer(
 ) -> Result<(OffscreenRenderer, TextureSource, ui_font::UiFontSource), ob_render::RenderError> {
     let source = resolve_texture_source(options, settings);
     let (width, height) = screenshot_dimensions(options);
-    let (mut renderer, active_source) = match OffscreenRenderer::new_with_source(width, height, source.clone()) {
-        Ok(renderer) => (renderer, source),
-        Err(ob_render::RenderError::Texture(reason)) => {
-            if let TextureSource::ResourcePack(path) = &source {
-                log::warn!(
-                    "could not load texture pack {}: {reason}; falling back to the built-in {} style",
-                    path.display(),
-                    settings.texture_style.name()
-                );
-                let style = render_texture_style(settings.texture_style);
-                (
-                    OffscreenRenderer::new_with_style(width, height, style)?,
-                    TextureSource::Style(style),
-                )
-            } else {
-                return Err(ob_render::RenderError::Texture(reason));
+    let graphics = graphics_settings_from_settings(settings);
+    let (mut renderer, active_source) =
+        match OffscreenRenderer::new_with_source_and_graphics(width, height, source.clone(), graphics) {
+            Ok(renderer) => (renderer, source),
+            Err(ob_render::RenderError::Texture(reason)) => {
+                if let TextureSource::ResourcePack(path) = &source {
+                    log::warn!(
+                        "could not load texture pack {}: {reason}; falling back to the built-in {} style",
+                        path.display(),
+                        settings.texture_style.name()
+                    );
+                    let style = render_texture_style(settings.texture_style);
+                    let mut renderer = OffscreenRenderer::new_with_style(width, height, style)?;
+                    renderer.set_graphics(graphics);
+                    (renderer, TextureSource::Style(style))
+                } else {
+                    return Err(ob_render::RenderError::Texture(reason));
+                }
             }
-        }
-        Err(err) => return Err(err),
-    };
+            Err(err) => return Err(err),
+        };
     let resolved = font_override
         .cloned()
         .unwrap_or_else(|| ui_font::resolve_ui_font(options, settings, data_dir));
@@ -6066,23 +6141,25 @@ fn create_window_renderer(
     data_dir: &Path,
 ) -> Result<(Renderer, TextureSource, ui_font::UiFontSource), ob_render::RenderError> {
     let source = resolve_texture_source(options, settings);
-    let (mut renderer, active_source) = match Renderer::new_with_source(Arc::clone(&window), source.clone()) {
-        Ok(renderer) => (renderer, source),
-        Err(ob_render::RenderError::Texture(reason)) => {
-            if let TextureSource::ResourcePack(path) = &source {
-                log::warn!(
-                    "could not load texture pack {}: {reason}; falling back to the built-in {} style",
-                    path.display(),
-                    settings.texture_style.name()
-                );
-                let style = render_texture_style(settings.texture_style);
-                (Renderer::new_with_style(window, style)?, TextureSource::Style(style))
-            } else {
-                return Err(ob_render::RenderError::Texture(reason));
+    let graphics = graphics_settings_from_settings(settings);
+    let (mut renderer, active_source) =
+        match Renderer::new_with_source_and_graphics(Arc::clone(&window), source.clone(), graphics) {
+            Ok(renderer) => (renderer, source),
+            Err(ob_render::RenderError::Texture(reason)) => {
+                if let TextureSource::ResourcePack(path) = &source {
+                    log::warn!(
+                        "could not load texture pack {}: {reason}; falling back to the built-in {} style",
+                        path.display(),
+                        settings.texture_style.name()
+                    );
+                    let style = render_texture_style(settings.texture_style);
+                    (Renderer::new_with_style(window, style)?, TextureSource::Style(style))
+                } else {
+                    return Err(ob_render::RenderError::Texture(reason));
+                }
             }
-        }
-        Err(err) => return Err(err),
-    };
+            Err(err) => return Err(err),
+        };
     let resolved = ui_font::resolve_ui_font(options, settings, data_dir);
     let font_source = ui_font::install_ui_font(&mut renderer, &resolved);
     Ok((renderer, active_source, font_source))

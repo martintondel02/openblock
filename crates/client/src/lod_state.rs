@@ -322,7 +322,7 @@ impl LodState {
             self.built_columns.insert(key, current_columns);
             return;
         }
-        let vertex_count = result.batch.mesh.vertices.len() as u32;
+        let vertex_count = result.batch.mesh.vertex_count() as u32;
         renderer.upload_lod_batch(key, result.batch.min, result.batch.max, result.batch.mesh);
         self.batches.insert(
             key,

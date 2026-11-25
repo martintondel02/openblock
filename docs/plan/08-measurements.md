@@ -1585,3 +1585,120 @@ peak RSS.
 - `save_bench` async numbers exclude concurrent tick/copy-on-write traffic. The
   start pause is the measured tick-side cost; a sustained edit workload during a
   save pays one column copy per touched column.
+
+## 2026-11-25 — v1.1 high-quality built-in shaders (HDR, sun shadows, water, clouds, post)
+
+### Environment and method
+
+| | |
+| --- | --- |
+| OS | Fedora Linux 45 (Wayland session not used; headless Vulkan) |
+| CPU/GPU | AMD Ryzen 7 9800X3D, integrated RADV "RAPHAEL_MENDOCINO" (Vulkan) |
+| Renderer | wgpu 30.0.2, Vulkan/RADV, offscreen `Rgba8UnormSrgb`, seed 42 |
+| Build | release (thin LTO, `codegen-units = 1`), `CARGO_TARGET_DIR=/home/martintondel/Projects/openblock/target-shaders ./dev-cargo build --release -p ob_tools --bin render_distance_bench` |
+| Scene | 512-block radius (32 chunks, 4,225 columns), cached LOD scene: 2,620 near sections + 1,010 far batches, seed 42 |
+| Camera | spawn eye + 18 m, pitch −0.25, time of day 0.42, cloud/water clock 12 s |
+| Harness | `render_distance_bench --frames 120 --warmup 10 --no-png`; every measured frame copies the colour target back to the CPU, so the sample includes submission, rasterisation and the blocking readback |
+
+The harness is the same one used for the Wave 1 512-block numbers (p50 5.22 ms at
+1280×720 and 7.94 ms at 1920×1080). It has no GPU timestamp queries and includes the
+readback, so it is comparable across waves but is not a windowed present-to-present
+measurement. Percentiles are nearest-rank over 120 frames. The p50 figures below are the
+ones to compare with the earlier p50 baseline; p95/p99 are included because the visual
+features add tail work.
+
+### 512-block frame time by preset
+
+| Preset | Resolution | p50 ms | p95 ms | p99 ms | p50 FPS | Passes | Shadow draws | Water draws |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Low (shadows off, clouds off, bloom off, FXAA off, water low) | 1280×720 | 6.80 | 7.53 | 8.26 | 147.1 | 4 | 0 | 16 |
+| Low | 1920×1080 | 10.03 | 11.45 | 11.97 | 99.7 | 4 | 0 | 16 |
+| Medium (2×1024² shadows, clouds low, water low, bloom, FXAA) | 1280×720 | 9.86 | 10.79 | 11.73 | 101.4 | 9 | 411 | 16 |
+| Medium | 1920×1080 | 15.36 | 16.58 | 17.58 | 65.1 | 9 | 411 | 16 |
+| **High** (2×2048² shadows, clouds high, water high, bloom, FXAA) | 1280×720 | **11.04** | 11.86 | 12.28 | **90.6** | 9 | 303 | 16 |
+| **High** | 1920×1080 | **16.20** | 16.93 | 17.42 | **61.7** | 9 | 303 | 16 |
+| **Ultra** (High + 5×5 PCF within 16 m) | 1280×720 | **11.64** | 12.70 | 14.40 | **85.9** | 9 | 303 | 16 |
+| **Ultra** | 1920×1080 | **16.21** | 17.21 | 17.45 | **61.7** | 9 | 303 | 16 |
+
+Common frame counts: 861 opaque draws (577 sections + 284 far batches), 6,528,426 opaque
+vertices and 1,122 water vertices in the measured view. Passes: Low = main + sky + water +
+post; the other presets add two shadow cascades and three bloom passes. Shadow cascades for
+High/Ultra are two 2048² `Depth32Float` layers (32 MiB); each shadow pass culls casters to
+the cascade and replaces section geometry beyond 64 m with one instanced AABB per section.
+`RSS after build` was 452–455 MiB and peak RSS 457–463 MiB in every preset (Wave 1 baseline:
+~455 MiB). The reported `mesh estimate` of ~1,216 MiB deliberately counts the same vertex
+data twice (CPU cache + GPU buffers); it is not process memory.
+
+### Baseline comparison and targets
+
+| | Wave 1 baseline p50 | 1.1 Low p50 | 1.1 High p50 | 1.1 Ultra p50 |
+| --- | ---: | ---: | ---: | ---: |
+| 1280×720 | 5.22 ms (191.6 FPS) | 6.80 ms (147.1 FPS) | 11.04 ms (90.6 FPS) | 11.64 ms (85.9 FPS) |
+| 1920×1080 | 7.94 ms (125.9 FPS) | 10.03 ms (99.7 FPS) | 16.20 ms (61.7 FPS) | 16.21 ms (61.7 FPS) |
+
+- **Ultra 512 @1080p ≥ 60 FPS: met at p50** (61.7 FPS). It is **not met at p95**
+  (17.21 ms ≈ 58.1 FPS); the target statement should quote p50 and the p95 in the same
+  sentence.
+- **High ≥ 90 FPS**: met at 720p (90.6 FPS p50), **not** at 1080p (61.7 FPS p50). The
+  aspirational 1080p/90 target would need roughly half the current shadow-sampling cost.
+- **Low close to baseline**: +30% at 720p and +26% at 1080p. The difference is the HDR
+  `Rgba16Float` scene target, ACES/vignette post pass and the separate water pass; the
+  renderer no longer writes the 1.0 forward pass directly to the sRGB target.
+
+### Per-feature cost (1080p, diagnostic toggles)
+
+These runs start from the High preset and switch individual features off; the base row has
+shadows, clouds, water, bloom and FXAA off. GPU clock drift between runs is up to ~0.8 ms,
+so read the deltas, not the absolute values (the preset table above is the authoritative
+measurement).
+
+| Configuration | p50 ms | Approx. delta |
+| --- | ---: | ---: |
+| Base: no shadows/clouds/water/bloom/FXAA | 10.0–10.8 | — |
+| + Low shadows (2×1024², 3×3 PCF near) | 13.0–14.0 | +3.0–3.9 |
+| + High shadows (2×2048², 3×3 PCF near) | 13.8–16.9 | +3.0–3.9 |
+| + clouds high + water high (no shadows) | 10.7–11.1 | +0.2–0.8 |
+| + bloom only | 10.0–10.2 | +0.1–0.2 |
+| + FXAA only | 10.4–10.7 | +0.2–0.6 |
+
+Shadow sampling dominates the added cost. Reducing the map from 2048² to 1024² or the
+cascade count from two to one changes the shadow pass itself, but the shader still pays for
+one cascade lookup per lit fragment; the two-cascade High/Ultra sets therefore trade the
+third cascade pass for a full-resolution far cascade and still deliver 160 m coverage.
+
+### Visual verification
+
+| Capture | Path | Notes |
+| --- | --- | --- |
+| Day, 512 blocks, High | `/tmp/openblock-shaders-day.png` | tree/terrain shadows, cloud layer, ACES highlight roll-off |
+| Dusk, 512 blocks, High | `/tmp/openblock-shaders-dusk.png` | warm horizon, long soft shadows, cloud tint |
+| Night, 512 blocks, High | `/tmp/openblock-shaders-night.png` | stars, moonlit palette, dark cloud layer, no visible acne |
+| Sky/clouds, 512 blocks, High | `/tmp/openblock-shaders-sky.png` | world-space cloud layer and horizon haze |
+| Water scene, High | `/tmp/openblock-shaders-water.png` | transparent basin, Fresnel sky reflection, sun glints, pillar shadows on the water |
+| Graphics settings tab (1280×720) | `/tmp/openblock-shaders-settings.png` | preset, shadows, clouds, water, coverage, bloom and FXAA rows |
+| F3 overlay with the new counters | `/tmp/openblock-shaders-f3.png` | Graphics/Shadows lines plus the existing pass, mesh and memory counters |
+
+A GPU test (`water_receives_sun_shadows`) isolates blue water pixels and proves that
+disabling shadows changes more than 100 of them; the water screenshot difference is 5,918
+pixels across the water and tinted rim. Shadow-only A/B captures also prove that shadows
+darken more than 200 geometry pixels and that the first cascade contains over 1,000
+rasterised casters, so the visual result is not a cleared map.
+
+### 1.1 shader limitations (honest)
+
+- The far shadow cascade skips manual PCF: 3×3 (5×5 within 16 m on Ultra) is used near,
+  while 32 m and beyond use the comparison sampler's hardware 2×2 footprint. This is a
+  deliberate 4–8× reduction in per-pixel comparisons at 1080p.
+- Beyond 64 m in the shadow cascade, sections are represented by their AABBs (one instanced
+  draw). Tree silhouettes lose their crowns at that distance, but PCF/distance hides most of
+  it; the near 32 m cascade keeps full-detail tree shadows.
+- There is no screen-space water reflection/refraction, foam or underwater volume; the water
+  surface is Fresnel-blended against the sky and the underlying scene colour, with shadows.
+  Far water is carried in the far-batch water buffer and drawn in the same sorted pass.
+- Clouds are a 2.5D world-space noise layer, not a volumetric raymarch. Exposure is fixed
+  (0.8) rather than histogram-adapted. FXAA-lite, not TAA. Sample count stays 1, so block
+  edges rely on the post filter.
+- Bloom uses three mips, but the post pass samples the first two; the third is kept for the
+  documented threshold/downsample structure and future wide-glow use.
+- The offscreen numbers include a GPU→CPU readback and no present; a windowed run will
+  differ, especially in the tail percentiles.

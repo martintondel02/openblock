@@ -230,7 +230,7 @@ pub struct LodBatchMesh {
 impl LodBatchMesh {
     /// Whether the batch has no geometry and must not be uploaded.
     pub fn is_empty(&self) -> bool {
-        self.mesh.vertices.is_empty()
+        self.mesh.is_empty()
     }
 }
 
@@ -287,6 +287,7 @@ pub fn mesh_lod_batch(world: &World, key: LodBatchKey, config: &LodConfig) -> Lo
                     max[2].max(section_max[2]),
                 ];
                 batch.mesh.vertices.extend(section_mesh.vertices);
+                batch.mesh.water_vertices.extend(section_mesh.water_vertices);
                 any = true;
             }
         }
@@ -297,7 +298,7 @@ pub fn mesh_lod_batch(world: &World, key: LodBatchKey, config: &LodConfig) -> Lo
     // Tighten the vertical bounds with the emitted vertices when possible; a
     // batch may only use some sections of a group after an edit, and tighter
     // bounds make frustum rejection cheaper and more effective.
-    for vertex in &batch.mesh.vertices {
+    for vertex in batch.mesh.vertices.iter().chain(&batch.mesh.water_vertices) {
         min[0] = min[0].min(vertex.position[0]);
         min[1] = min[1].min(vertex.position[1]);
         min[2] = min[2].min(vertex.position[2]);

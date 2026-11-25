@@ -82,10 +82,15 @@ impl SectionSnapshot {
     }
 
     /// Builds the greedy mesh for this snapshot using registry block data.
+    ///
+    /// Opaque and fluid faces are emitted into separate vertex lists:
+    /// [`MeshData::vertices`] and [`MeshData::water_vertices`]. The split lets
+    /// the renderer draw water in a translucent pass after the opaque world
+    /// without changing greedy merging, AO or baked light for either list.
     pub fn mesh(&self, registry: &Registry) -> MeshData {
         let mut mesh = MeshData::default();
         for face in FACES {
-            mesh_face(&mut mesh.vertices, self, registry, face);
+            mesh_face(&mut mesh, self, registry, face);
         }
         mesh
     }
@@ -205,6 +210,8 @@ struct MergeKey {
     layer: u32,
     brightness: f32,
     ao: [f32; 4],
+    /// Fluid faces are merged among themselves and emitted into the water list.
+    water: bool,
 }
 
 /// One merged rectangle in slice coordinates.
@@ -219,10 +226,14 @@ struct Rect {
 /// Meshing statistics for one section, used by tests and profiling.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MesherStats {
-    /// Visible faces emitted after greedy merging (quads, not triangles).
+    /// Visible opaque faces emitted after greedy merging (quads, not triangles).
     pub faces: u32,
-    /// Vertices emitted (six per quad).
+    /// Opaque vertices emitted (six per quad).
     pub vertices: u32,
+    /// Visible fluid/water faces emitted after greedy merging.
+    pub water_faces: u32,
+    /// Water vertices emitted (six per quad).
+    pub water_vertices: u32,
 }
 
 /// Builds the mesh for one section, reading neighbouring sections through the world.
@@ -235,15 +246,18 @@ pub fn mesh_section_with_stats(world: &World, pos: SectionPos) -> (MeshData, Mes
     let snapshot = SectionSnapshot::capture(world, pos);
     let mesh = snapshot.mesh(world.registry());
     let vertices = mesh.vertices.len() as u32;
+    let water_vertices = mesh.water_vertices.len() as u32;
     let stats = MesherStats {
         faces: vertices / 6,
         vertices,
+        water_faces: water_vertices / 6,
+        water_vertices,
     };
     (mesh, stats)
 }
 
 /// Meshes every slice of one face direction into merged quads.
-fn mesh_face(out: &mut Vec<Vertex>, snapshot: &SectionSnapshot, registry: &Registry, face: Face) {
+fn mesh_face(out: &mut MeshData, snapshot: &SectionSnapshot, registry: &Registry, face: Face) {
     let axes = face.axes();
     for slice in 0..SECTION_EDGE {
         let mut mask: [[Option<MergeKey>; SECTION_EDGE]; SECTION_EDGE] = [[None; SECTION_EDGE]; SECTION_EDGE];
@@ -273,6 +287,7 @@ fn mesh_face(out: &mut Vec<Vertex>, snapshot: &SectionSnapshot, registry: &Regis
                     layer: u32::from(block.textures.for_face(axes.texture_face).0),
                     brightness: face.brightness,
                     ao,
+                    water: block.fluid,
                 });
             }
         }
@@ -282,7 +297,7 @@ fn mesh_face(out: &mut Vec<Vertex>, snapshot: &SectionSnapshot, registry: &Regis
 
 /// Expands equal merge keys into maximal rectangles and emits one quad each.
 fn emit_greedy(
-    out: &mut Vec<Vertex>,
+    out: &mut MeshData,
     origin: BlockPos,
     axes: &FaceAxes,
     slice: usize,
@@ -346,7 +361,7 @@ fn quad_tint(anchor: [f32; 3], layer: u32) -> f32 {
 }
 
 /// Emits the two CCW triangles of one merged rectangle.
-fn emit_quad(out: &mut Vec<Vertex>, origin: BlockPos, axes: &FaceAxes, slice: usize, rect: Rect, key: MergeKey) {
+fn emit_quad(out: &mut MeshData, origin: BlockPos, axes: &FaceAxes, slice: usize, rect: Rect, key: MergeKey) {
     // The rectangle covers the half-open block interval `rect.u..rect.u + width`
     // (and likewise in V). Walk the corners in the actual U/V direction so the
     // winding stays counter-clockwise from outside regardless of axis signs.
@@ -392,8 +407,16 @@ fn emit_quad(out: &mut Vec<Vertex>, origin: BlockPos, axes: &FaceAxes, slice: us
     let uvs = [[0.0, height], [width, height], [width, 0.0], [0.0, 0.0]];
 
     let tint = quad_tint(positions[0], key.layer);
+    // Water and other fluids go to their own list so the opaque pass never
+    // draws a translucent surface. The merge key already separates the two
+    // lists, so a rectangle can never span both.
+    let vertices = if key.water {
+        &mut out.water_vertices
+    } else {
+        &mut out.vertices
+    };
     for index in TRIANGLE_INDICES {
-        out.push(Vertex {
+        vertices.push(Vertex {
             position: positions[index],
             uv: uvs[index],
             layer: key.layer,
@@ -744,8 +767,15 @@ mod tests {
 
         assert_eq!(first_stats, second_stats);
         assert_eq!(first_mesh.vertices.len(), second_mesh.vertices.len());
+        assert_eq!(first_mesh.water_vertices.len(), second_mesh.water_vertices.len());
         assert!(!first_mesh.vertices.is_empty());
-        for (a, b) in first_mesh.vertices.iter().zip(&second_mesh.vertices) {
+        assert!(!first_mesh.water_vertices.is_empty());
+        for (a, b) in first_mesh
+            .vertices
+            .iter()
+            .chain(&first_mesh.water_vertices)
+            .zip(second_mesh.vertices.iter().chain(&second_mesh.water_vertices))
+        {
             assert_eq!(a.position, b.position);
             assert_eq!(a.uv, b.uv);
             assert_eq!(a.layer, b.layer);
@@ -789,10 +819,21 @@ mod tests {
 
         let (mesh, stats) = mesh_section_with_stats(&world, section());
         // One merged top, one merged bottom and four merged side strips; the
-        // faces between adjacent water blocks are hidden.
-        assert_eq!(stats.faces, 6);
-        assert_eq!(stats.vertices, 36);
-        let top = quads_at_y(&mesh, 1.0);
+        // faces between adjacent water blocks are hidden. Water is split out
+        // of the opaque list, so the counts live in the water fields.
+        assert_eq!(stats.faces, 0);
+        assert_eq!(stats.vertices, 0);
+        assert_eq!(stats.water_faces, 6);
+        assert_eq!(stats.water_vertices, 36);
+        assert!(mesh.vertices.is_empty());
+        let top: Vec<&[Vertex]> = mesh
+            .water_vertices
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .filter(|quad| quad.iter().all(|vertex| (vertex.position[1] - 1.0).abs() < 1e-5))
+            .map(|quad| &quad[..])
+            .collect();
         assert_eq!(top.len(), 1, "the water surface should be a single merged quad");
         let first_light = top[0][0].light;
         for vertex in top[0] {
@@ -958,6 +999,10 @@ mod tests {
         assert_eq!(
             from_snapshot.vertices, from_world.vertices,
             "snapshot meshing must reproduce the world mesher exactly",
+        );
+        assert_eq!(
+            from_snapshot.water_vertices, from_world.water_vertices,
+            "snapshot water meshing must reproduce the world mesher exactly",
         );
     }
 

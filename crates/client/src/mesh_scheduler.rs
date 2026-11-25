@@ -393,10 +393,7 @@ mod tests {
 
         let result = wait_for_result(&mut scheduler, Duration::from_secs(10)).expect("the worker should return a mesh");
         assert_eq!(result.pos, pos);
-        assert!(
-            !result.mesh.vertices.is_empty(),
-            "a surface section must produce geometry"
-        );
+        assert!(!result.mesh.is_empty(), "a surface section must produce geometry");
         assert_eq!(scheduler.in_flight_count(), 0);
         assert_eq!(scheduler.submitted_count(), 1);
         assert_eq!(scheduler.completed_count(), 1);

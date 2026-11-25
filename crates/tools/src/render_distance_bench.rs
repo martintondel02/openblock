@@ -24,9 +24,9 @@ use std::time::Instant;
 use ob_content::Registry;
 use ob_math::{BlockPos, ChunkPos, N_SECTIONS, SECTION_SIZE, SectionPos, WORLD_MIN_Y, WorldVec};
 use ob_render::{
-    Camera, DEFAULT_FULL_DETAIL_RADIUS_CHUNKS, DEFAULT_LOD_GROUP_CHUNKS, DEFAULT_SHELL_DEPTH_BLOCKS, LodBatchKey,
-    LodConfig, LodTier, OffscreenRenderer, TexturePackStyle, far_plane_for_render_distance, mesh_lod_batch,
-    mesh_section,
+    Camera, DEFAULT_FULL_DETAIL_RADIUS_CHUNKS, DEFAULT_LOD_GROUP_CHUNKS, DEFAULT_SHELL_DEPTH_BLOCKS, Environment,
+    GraphicsPreset, GraphicsSettings, LodBatchKey, LodConfig, LodTier, OffscreenRenderer, SceneParams,
+    TexturePackStyle, far_plane_for_render_distance, mesh_lod_batch, mesh_section,
 };
 use ob_server::{Host, HostConfig};
 use ob_world::World;
@@ -66,6 +66,16 @@ pub struct Options {
     pub png: Option<PathBuf>,
     /// Explicit data directory; `None` uses a self-cleaning temp directory.
     pub data_dir: Option<PathBuf>,
+    /// Visual quality preset (shadows, clouds, water, bloom, FXAA).
+    pub graphics: GraphicsSettings,
+    /// Time of day for the measured frames (`0.0` midnight, `0.5` noon).
+    pub time_of_day: f32,
+    /// Scene animation clock for clouds and water (deterministic when fixed).
+    pub time_seconds: f32,
+    /// Optional camera pitch override (radians); `None` uses the spawn pitch.
+    pub pitch: Option<f32>,
+    /// Optional camera yaw override (radians); `None` uses the spawn yaw.
+    pub yaw: Option<f32>,
 }
 
 impl Default for Options {
@@ -80,6 +90,11 @@ impl Default for Options {
             full_detail: false,
             png: Some(PathBuf::from("/tmp/openblock-512.png")),
             data_dir: None,
+            graphics: GraphicsSettings::default(),
+            time_of_day: 0.5,
+            time_seconds: 0.0,
+            pitch: None,
+            yaw: None,
         }
     }
 }
@@ -137,6 +152,22 @@ pub struct Report {
     pub peak_rss_mib: f64,
     /// Estimated CPU+GPU vertex data bytes.
     pub mesh_bytes: u64,
+    /// Graphics configuration used for the run.
+    pub graphics: String,
+    /// Shadow mode/resolution/cascades reported by the renderer.
+    pub shadow: String,
+    /// Render passes in the last frame (shadow, sky, world, water, bloom, post).
+    pub passes: u32,
+    /// Bloom passes in the last frame.
+    pub bloom_passes: u32,
+    /// Water draw calls in the last frame.
+    pub water_draw_calls: u32,
+    /// Water vertices in the last frame.
+    pub water_vertices: u64,
+    /// Shadow-cascade draw calls in the last frame.
+    pub shadow_draw_calls: u32,
+    /// Active shadow cascades in the last frame.
+    pub shadow_cascades: u32,
     /// Screenshot path, when written.
     pub png: Option<PathBuf>,
 }
@@ -144,6 +175,7 @@ pub struct Report {
 /// Parses benchmark flags on top of [`Options::default`].
 pub fn options_from_flags(flags: &[(String, String)]) -> Result<Options, String> {
     let mut options = Options::default();
+    let mut graphics_override = false;
     for (name, value) in flags {
         match name.as_str() {
             "render-distance" | "radius" => {
@@ -186,9 +218,76 @@ pub fn options_from_flags(flags: &[(String, String)]) -> Result<Options, String>
             "no-png" => options.png = None,
             "data-dir" => options.data_dir = Some(PathBuf::from(required(name, value)?)),
             "full-detail" => options.full_detail = true,
+            "graphics" | "preset" => {
+                let raw = required(name, value)?;
+                let preset = GraphicsPreset::from_name(raw)
+                    .filter(|preset| *preset != GraphicsPreset::Custom)
+                    .ok_or_else(|| format!("invalid --graphics value '{raw}' (low, medium, high, ultra)"))?;
+                options.graphics = GraphicsSettings::from_preset(preset);
+            }
+            "time" | "time-of-day" => {
+                let raw = required(name, value)?;
+                options.time_of_day = raw.parse().map_err(|_| format!("invalid --time value '{raw}'"))?;
+                if !options.time_of_day.is_finite() || !(0.0..=1.0).contains(&options.time_of_day) {
+                    return Err("--time must be between 0.0 and 1.0".to_string());
+                }
+            }
+            "scene-time" => {
+                let raw = required(name, value)?;
+                options.time_seconds = raw.parse().map_err(|_| format!("invalid --scene-time value '{raw}'"))?;
+                if !options.time_seconds.is_finite() || options.time_seconds < 0.0 {
+                    return Err("--scene-time must be a non-negative number".to_string());
+                }
+            }
+            "pitch" => {
+                let raw = required(name, value)?;
+                options.pitch = Some(raw.parse().map_err(|_| format!("invalid --pitch value '{raw}'"))?);
+            }
+            "yaw" => {
+                let raw = required(name, value)?;
+                options.yaw = Some(raw.parse().map_err(|_| format!("invalid --yaw value '{raw}'"))?);
+            }
+            "shadows" => {
+                let raw = required(name, value)?;
+                options.graphics.shadow_quality = ob_render::ShadowQuality::from_name(raw)
+                    .ok_or_else(|| format!("invalid --shadows value '{raw}' (off, low, high, ultra)"))?;
+                graphics_override = true;
+            }
+            "clouds" => {
+                let raw = required(name, value)?;
+                options.graphics.clouds = ob_render::CloudQuality::from_name(raw)
+                    .ok_or_else(|| format!("invalid --clouds value '{raw}' (off, low, high)"))?;
+                graphics_override = true;
+            }
+            "water" => {
+                let raw = required(name, value)?;
+                options.graphics.water = ob_render::WaterQuality::from_name(raw)
+                    .ok_or_else(|| format!("invalid --water value '{raw}' (off, low, high)"))?;
+                graphics_override = true;
+            }
+            "bloom" => {
+                options.graphics.bloom = true;
+                graphics_override = true;
+            }
+            "no-bloom" => {
+                options.graphics.bloom = false;
+                graphics_override = true;
+            }
+            "fxaa" => {
+                options.graphics.fxaa = true;
+                graphics_override = true;
+            }
+            "no-fxaa" => {
+                options.graphics.fxaa = false;
+                graphics_override = true;
+            }
             "help" | "version" => {}
             other => return Err(format!("unknown option --{other}")),
         }
+    }
+    if graphics_override {
+        options.graphics.preset = GraphicsPreset::Custom;
+        options.graphics = options.graphics.normalised();
     }
     Ok(options)
 }
@@ -257,7 +356,7 @@ pub fn run(options: &Options) -> Result<Report, String> {
     // world position above the spawn column, not a synthetic test box.
     let player = host.player();
     let eye = WorldVec::new(player.pos.x, player.eye().y + 18.0, player.pos.z);
-    let mut camera = Camera::new(eye, player.yaw, -0.10);
+    let mut camera = Camera::new(eye, options.yaw.unwrap_or(player.yaw), options.pitch.unwrap_or(-0.10));
     camera.far = far_plane_for_render_distance(options.radius);
     let camera_chunk = BlockPos::new(
         camera.position.x.floor() as i32,
@@ -266,9 +365,16 @@ pub fn run(options: &Options) -> Result<Report, String> {
     )
     .chunk();
 
-    let mut renderer = OffscreenRenderer::new_with_style(options.width, options.height, TexturePackStyle::Classic)
-        .map_err(|error| format!("open offscreen renderer: {error}"))?;
+    let mut renderer = OffscreenRenderer::new_with_source_and_graphics(
+        options.width,
+        options.height,
+        ob_render::TextureSource::Style(TexturePackStyle::Classic),
+        options.graphics,
+    )
+    .map_err(|error| format!("open offscreen renderer: {error}"))?;
     let adapter = renderer.adapter_summary().to_string();
+    let graphics_summary = renderer.graphics().summary();
+    let shadow_summary = renderer.shadow_summary();
 
     let mesh_start = Instant::now();
     let mut report = Report {
@@ -281,6 +387,8 @@ pub fn run(options: &Options) -> Result<Report, String> {
         stream_ms,
         streamed_columns,
         stream_calls,
+        graphics: graphics_summary,
+        shadow: shadow_summary,
         ..Report::default()
     };
     let lod = LodConfig {
@@ -298,9 +406,15 @@ pub fn run(options: &Options) -> Result<Report, String> {
     report.mesh_bytes = report.cache_vertices * std::mem::size_of::<ob_render::Vertex>() as u64 * 2;
     report.rss_after_build_mib = measure::rss_kib().map_or(0.0, |kib| kib as f64 / 1024.0);
 
+    let scene = SceneParams {
+        environment: Environment::new(options.time_of_day),
+        ui: None,
+        outline: None,
+        time_seconds: options.time_seconds,
+    };
     for _ in 0..options.warmup {
         renderer
-            .render_cached(&camera)
+            .render_cached_scene(&camera, &scene)
             .map_err(|error| format!("warm-up frame: {error}"))?;
     }
     let mut samples = Vec::with_capacity(options.frames as usize);
@@ -308,7 +422,7 @@ pub fn run(options: &Options) -> Result<Report, String> {
     for _ in 0..options.frames {
         let start = Instant::now();
         last_stats = renderer
-            .render_cached(&camera)
+            .render_cached_scene(&camera, &scene)
             .map_err(|error| format!("measured frame: {error}"))?;
         samples.push(millis(start));
     }
@@ -319,6 +433,12 @@ pub fn run(options: &Options) -> Result<Report, String> {
     report.culled_sections = last_stats.culled_sections;
     report.culled_batches = last_stats.culled_lod_batches;
     report.drawn_vertices = last_stats.vertices;
+    report.passes = last_stats.passes;
+    report.bloom_passes = last_stats.bloom_passes;
+    report.water_draw_calls = last_stats.water_draw_calls;
+    report.water_vertices = last_stats.water_vertices;
+    report.shadow_draw_calls = last_stats.shadow_draw_calls;
+    report.shadow_cascades = last_stats.shadow_cascades;
     report.peak_rss_mib = measure::peak_rss_kib().map_or(0.0, |kib| kib as f64 / 1024.0);
 
     if let Some(path) = &options.png {
@@ -363,7 +483,7 @@ fn build_lod_scene(
             .collect();
         for (pos, mesh) in meshes {
             report.cache_sections += 1;
-            report.cache_vertices += mesh.vertices.len() as u64;
+            report.cache_vertices += mesh.vertex_count() as u64;
             renderer.upload_mesh(pos, mesh);
         }
     }
@@ -380,7 +500,7 @@ fn build_lod_scene(
             report.cache_batches += 1;
             report.far_sections += u64::from(batch.shell_sections);
             report.skipped_sections += u64::from(batch.skipped_sections);
-            report.cache_vertices += batch.mesh.vertices.len() as u64;
+            report.cache_vertices += batch.mesh.vertex_count() as u64;
             renderer.upload_lod_batch(key, batch.min, batch.max, batch.mesh);
         }
     }
@@ -410,7 +530,7 @@ fn build_full_detail_scene(renderer: &mut OffscreenRenderer, world: &World, repo
             .collect();
         for (pos, mesh) in meshes {
             report.cache_sections += 1;
-            report.cache_vertices += mesh.vertices.len() as u64;
+            report.cache_vertices += mesh.vertex_count() as u64;
             renderer.upload_mesh(pos, mesh);
         }
     }
@@ -449,6 +569,8 @@ pub fn format_report(options: &Options, report: &Report) -> String {
             "distance LOD"
         }
     ));
+    out.push_str(&format!("  graphics: {}\n", report.graphics));
+    out.push_str(&format!("  shadows: {}\n", report.shadow));
     out.push_str(&format!("  adapter: {}\n", report.adapter));
     out.push_str(&format!("  CPU: {}\n", report.cpu));
     out.push_str(&format!("  OS: {}\n", report.os));
@@ -471,13 +593,22 @@ pub fn format_report(options: &Options, report: &Report) -> String {
         report.frames.per_second()
     ));
     out.push_str(&format!(
-        "  last frame: {} draws ({} sections + {} batches), {} vertices, culled {} sections + {} batches\n",
+        "  last frame: {} opaque draws ({} sections + {} batches), {} vertices, culled {} sections + {} batches\n",
         report.draw_calls,
         report.drawn_sections,
         report.drawn_batches,
         report.drawn_vertices,
         report.culled_sections,
         report.culled_batches
+    ));
+    out.push_str(&format!(
+        "  passes: {} total ({} bloom), shadow draws {} ({} cascades), water draws {} ({} vertices)\n",
+        report.passes,
+        report.bloom_passes,
+        report.shadow_draw_calls,
+        report.shadow_cascades,
+        report.water_draw_calls,
+        report.water_vertices
     ));
     out.push_str(&format!(
         "  memory: world heap {:.1} MiB, mesh estimate {:.1} MiB, RSS after build {:.0} MiB, peak {:.0} MiB\n",
@@ -503,6 +634,16 @@ pub fn usage() -> &'static str {
        --height H            target height (default 720)\n\
        --seed S              world seed (default 42)\n\
        --full-detail         disable LOD and mesh every section (baseline)\n\
+       --graphics PRESET     low, medium, high or ultra (default high)\n\
+       --shadows QUALITY     off, low, high or ultra (overrides the preset)\n\
+       --clouds QUALITY      off, low or high\n\
+       --water QUALITY       off, low or high\n\
+       --bloom / --no-bloom  enable or disable HDR bloom\n\
+       --fxaa / --no-fxaa    enable or disable FXAA-lite\n\
+       --time T              time of day 0.0..1.0 (default 0.5 noon)\n\
+       --scene-time S        cloud/water animation clock in seconds (default 0)\n\
+       --yaw RADIANS         camera yaw override\n\
+       --pitch RADIANS       camera pitch override\n\
        --png PATH            screenshot path (default /tmp/openblock-512.png)\n\
        --no-png              skip the screenshot\n\
        --data-dir DIR        keep the generated world here (default: temp dir)\n"
@@ -554,6 +695,9 @@ mod tests {
         assert_eq!(options.height, 720);
         assert!(!options.full_detail);
         assert_eq!(options.png.as_deref(), Some(Path::new("/tmp/openblock-512.png")));
+        assert_eq!(options.graphics, GraphicsSettings::default());
+        assert_eq!(options.time_of_day, 0.5);
+        assert_eq!(options.time_seconds, 0.0);
     }
 
     #[test]
@@ -568,6 +712,10 @@ mod tests {
             ("full-detail", ""),
             ("no-png", ""),
             ("data-dir", "/tmp/rd"),
+            ("graphics", "ultra"),
+            ("time", "0.25"),
+            ("scene-time", "12.5"),
+            ("pitch", "-0.4"),
         ]))
         .expect("flags parse");
         assert_eq!(options.radius, 16);
@@ -575,7 +723,31 @@ mod tests {
         assert!(options.full_detail);
         assert_eq!(options.png, None);
         assert_eq!(options.data_dir.as_deref(), Some(Path::new("/tmp/rd")));
+        assert_eq!(options.graphics.shadow_quality, ob_render::ShadowQuality::Ultra);
+        assert_eq!(options.time_of_day, 0.25);
+        assert_eq!(options.time_seconds, 12.5);
+        assert_eq!(options.pitch, Some(-0.4));
 
+        let tuned = options_from_flags(&flags(&[
+            ("graphics", "high"),
+            ("shadows", "off"),
+            ("clouds", "off"),
+            ("no-bloom", ""),
+            ("no-fxaa", ""),
+            ("water", "low"),
+        ]))
+        .expect("individual graphics overrides parse");
+        assert_eq!(tuned.graphics.shadow_quality, ob_render::ShadowQuality::Off);
+        assert_eq!(tuned.graphics.clouds, ob_render::CloudQuality::Off);
+        assert_eq!(tuned.graphics.water, ob_render::WaterQuality::Low);
+        assert!(!tuned.graphics.bloom && !tuned.graphics.fxaa);
+        assert_eq!(tuned.graphics.preset, GraphicsPreset::Custom);
+
+        assert!(options_from_flags(&flags(&[("graphics", "nope")])).is_err());
+        assert!(options_from_flags(&flags(&[("shadows", "nope")])).is_err());
+        assert!(options_from_flags(&flags(&[("graphics", "custom")])).is_err());
+        assert!(options_from_flags(&flags(&[("time", "1.5")])).is_err());
+        assert!(options_from_flags(&flags(&[("scene-time", "-1")])).is_err());
         assert!(options_from_flags(&flags(&[("render-distance", "0")])).is_err());
         assert!(options_from_flags(&flags(&[("render-distance", "33")])).is_err());
         assert!(options_from_flags(&flags(&[("frames", "0")])).is_err());
@@ -614,6 +786,8 @@ mod tests {
             "world:",
             "scene:",
             "targets:",
+            "graphics:",
+            "shadows:",
             "adapter:",
             "CPU:",
             "OS:",
@@ -621,6 +795,7 @@ mod tests {
             "mesh+upload:",
             "frame_ms:",
             "last frame:",
+            "passes:",
             "memory:",
             "png:",
         ] {
