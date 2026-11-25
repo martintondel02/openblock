@@ -1973,60 +1973,121 @@ impl Host {
     }
 
     /// Saves the world, player state, spawn point, inventory, dropped items,
-    /// block entities and equipped armor atomically (one sidecar file at a
-    /// time).
+    /// block entities and equipped armor.
     ///
     /// Stale furnace/chest records are pruned first (with a warning), so a block
     /// removed through a direct world edit does not survive in the sidecar.
+    ///
+    /// # Commit protocol
+    ///
+    /// Every payload is serialised first, then written to a `.tmp` file and
+    /// `fsync`ed, and only after **all** temporary files exist are they renamed
+    /// over the targets. Renames put the sidecars first and `world.obs` last,
+    /// so a failure while staging or a rename failure leaves the previous world
+    /// snapshot in place; the next start can still open the last committed
+    /// world. The individual replacements are atomic; the multi-file group is
+    /// not transactional (a crash between two renames can mix one new sidecar
+    /// with the previous world), which is why the format still expects the
+    /// journal from spec 17 §3.5 for a future region-file save path.
+    ///
+    /// The encoded world is checked against the loader limits
+    /// ([`ob_world::MAX_SAVE_PAYLOAD_BYTES`] / [`ob_world::MAX_SAVE_FILE_BYTES`])
+    /// before anything is written, so a long-running server cannot create a
+    /// snapshot it will refuse to open on the next start.
     pub fn save(&mut self) -> Result<(), HostError> {
         std::fs::create_dir_all(&self.world_dir)?;
         block_entities::prune_block_entities(&self.world, &self.registry, &mut self.furnaces, &mut self.chests);
-        let bytes = ob_world::to_bytes(&self.world);
-        write_atomic(&self.world_dir.join("world.obs"), &bytes)?;
-        write_atomic(
-            &self.world_dir.join("player.txt"),
-            player_state(&self.player, self.tick_count).as_bytes(),
-        )?;
-        write_atomic(&self.world_dir.join(SPAWN_FILE), spawn_state(&self.spawn).as_bytes())?;
-        write_atomic(
-            &self.world_dir.join("inventory.txt"),
-            inventory_state(&self.registry, &self.inventory).as_bytes(),
-        )?;
-        write_atomic(
-            &self.world_dir.join("items.txt"),
-            items::items_state(&self.registry, &self.items).as_bytes(),
-        )?;
-        write_atomic(
-            &self.world_dir.join(mobs::MOBS_FILE),
-            mobs::mobs_state(&self.registry, &self.mobs).as_bytes(),
-        )?;
-        write_atomic(
-            &self.world_dir.join(block_entities::BLOCK_ENTITIES_FILE),
-            block_entities::block_entities_state(&self.registry, &self.furnaces, &self.chests).as_bytes(),
-        )?;
-        write_atomic(
-            &self.world_dir.join(EQUIPMENT_FILE),
-            equipment_state(&self.registry, &self.equipment).as_bytes(),
-        )?;
-        write_atomic(
-            &self.world_dir.join(net_players::NETWORK_PLAYERS_FILE),
-            net_players::network_players_state(&self.registry, &self.network_players, &self.saved_network_players)
-                .as_bytes(),
-        )?;
+
+        // Serialise everything before touching the directory. The world is
+        // last so the renames below commit sidecars before the snapshot they
+        // describe.
+        let files: [(&str, Vec<u8>); 9] = [
+            ("player.txt", player_state(&self.player, self.tick_count).into_bytes()),
+            (SPAWN_FILE, spawn_state(&self.spawn).into_bytes()),
+            (
+                "inventory.txt",
+                inventory_state(&self.registry, &self.inventory).into_bytes(),
+            ),
+            (
+                "items.txt",
+                items::items_state(&self.registry, &self.items).into_bytes(),
+            ),
+            (
+                mobs::MOBS_FILE,
+                mobs::mobs_state(&self.registry, &self.mobs).into_bytes(),
+            ),
+            (
+                block_entities::BLOCK_ENTITIES_FILE,
+                block_entities::block_entities_state(&self.registry, &self.furnaces, &self.chests).into_bytes(),
+            ),
+            (
+                EQUIPMENT_FILE,
+                equipment_state(&self.registry, &self.equipment).into_bytes(),
+            ),
+            (
+                net_players::NETWORK_PLAYERS_FILE,
+                net_players::network_players_state(&self.registry, &self.network_players, &self.saved_network_players)
+                    .into_bytes(),
+            ),
+            ("world.obs", ob_world::to_bytes_checked(&self.world)?),
+        ];
+
+        // Reject a target path that is a directory before staging anything: a
+        // rename over a directory would otherwise leave the group half written.
+        for (name, _) in &files {
+            let target = self.world_dir.join(name);
+            if target.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("save target {} is a directory", target.display()),
+                )
+                .into());
+            }
+        }
+
+        let mut staged: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::with_capacity(files.len());
+        for (name, bytes) in &files {
+            let target = self.world_dir.join(name);
+            let temporary = target.with_extension("tmp");
+            if let Err(error) = write_staged(&temporary, bytes) {
+                let _ = std::fs::remove_file(&temporary);
+                for (temporary, _) in &staged {
+                    let _ = std::fs::remove_file(temporary);
+                }
+                return Err(error.into());
+            }
+            staged.push((temporary, target));
+        }
+
+        for (index, (temporary, target)) in staged.iter().enumerate() {
+            if let Err(error) = std::fs::rename(temporary, target) {
+                for (temporary, _) in &staged[index..] {
+                    let _ = std::fs::remove_file(temporary);
+                }
+                return Err(error.into());
+            }
+        }
+        // Best effort: make the renames durable where the platform supports
+        // syncing a directory handle. Individual files were already fsynced.
+        if let Ok(directory) = std::fs::File::open(&self.world_dir) {
+            let _ = directory.sync_all();
+        }
         self.dirty_player = false;
         Ok(())
     }
 
     /// Deterministic hash of the simulation state: world blocks in canonical
-    /// order, player position and vitals quantised, the persisted spawn point,
-    /// inventory, dropped item entities sorted by id, mobs sorted by id (id,
-    /// kind, quantised position, yaw, health and age), furnace and chest block
-    /// entities sorted by position, equipped armor in slot order, and tick
-    /// count.
+    /// order, player position, vitals, look direction and flight state
+    /// quantised, the persisted spawn point, inventory, dropped item entities
+    /// sorted by id, mobs sorted by id (id, kind, quantised position, yaw,
+    /// health and age), furnace and chest block entities sorted by position,
+    /// equipped armor in slot order, and tick count.
     ///
-    /// Everything that is persisted is hashed, so a save/reload must reproduce
-    /// the hash exactly. Used by the smoke test and cross-platform determinism
-    /// checks.
+    /// Every persisted single-player field participates, so a save/reload must
+    /// reproduce the hash exactly. Used by the smoke test and cross-platform
+    /// determinism checks. (Network-player runtime state has its own sidecar and
+    /// round-trip tests and is intentionally excluded; light is deterministic
+    /// from the block set and generation and is not mutated by 1.0 gameplay.)
     pub fn state_hash(&self) -> u64 {
         let mut hasher = StableHasher::new();
         hasher.write_u64(self.world.seed());
@@ -2034,6 +2095,11 @@ impl Host {
         hasher.write_i64((self.player.pos.x * 1000.0) as i64);
         hasher.write_i64((self.player.pos.y * 1000.0) as i64);
         hasher.write_i64((self.player.pos.z * 1000.0) as i64);
+        // Look direction and flight are persisted in player.txt and affect
+        // raycasts, attacks and placement; normalise exactly like save/load.
+        hasher.write_i64(quantize(f64::from(net_players::normalise_angle(self.player.yaw))));
+        hasher.write_i64(quantize(f64::from(net_players::clamp_pitch(self.player.pitch))));
+        hasher.write_u8(self.player.flying as u8);
         hasher.write_i32((self.player.health * 1000.0) as i32);
         hasher.write_i32((self.player.hunger * 1000.0) as i32);
         hasher.write_u8(self.player.dead as u8);
@@ -2209,11 +2275,28 @@ pub(crate) const MAX_SIDECAR_BYTES: u64 = 8 * 1024 * 1024;
 /// [`io::ErrorKind::InvalidData`] after reading at most one byte past the cap;
 /// the metadata check avoids reading a huge sparse or regular file at all.
 pub(crate) fn read_sidecar(path: &Path) -> io::Result<String> {
-    let file = std::fs::File::open(path)?;
-    if file.metadata()?.len() > MAX_SIDECAR_BYTES {
+    // A world directory is untrusted input: check that the path is a regular
+    // file before opening it, because opening a FIFO or device can block
+    // forever (and `read_to_end` on a device can stream gigabytes). The second
+    // check on the opened handle narrows the metadata/open race.
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("sidecar {} is not a regular file", path.display()),
+        ));
+    }
+    if metadata.len() > MAX_SIDECAR_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("sidecar exceeds the {MAX_SIDECAR_BYTES}-byte limit"),
+        ));
+    }
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("sidecar {} is not a regular file", path.display()),
         ));
     }
     let mut bytes = Vec::new();
@@ -2272,14 +2355,20 @@ fn load_spawn(world_dir: &Path) -> Option<WorldVec> {
 /// Serialized player state: ten whitespace-separated fields.
 ///
 /// `x y z yaw pitch flying ticks health hunger dead`
+///
+/// Look angles are stored in their canonical range (yaw `-PI..=PI`, pitch
+/// `-PI/2..=PI/2`) so `save -> load -> save` is byte-stable and the state hash
+/// can cover exactly the persisted values.
 fn player_state(player: &Player, ticks: u64) -> String {
+    let yaw = net_players::normalise_angle(player.yaw);
+    let pitch = net_players::clamp_pitch(player.pitch);
     format!(
         "{:?} {:?} {:?} {:?} {:?} {} {} {:?} {:?} {}\n",
         player.pos.x,
         player.pos.y,
         player.pos.z,
-        player.yaw,
-        player.pitch,
+        yaw,
+        pitch,
         player.flying as u8,
         ticks,
         player.health,
@@ -2329,14 +2418,8 @@ fn parse_player_state(parts: &[&str]) -> Option<(Player, u64)> {
     );
     let z = z.clamp(-30_000_000.0, 30_000_000.0);
     let mut player = Player::new(WorldVec::new(x, y, z));
-    let mut yaw = yaw % std::f32::consts::TAU;
-    if yaw > std::f32::consts::PI {
-        yaw -= std::f32::consts::TAU;
-    } else if yaw < -std::f32::consts::PI {
-        yaw += std::f32::consts::TAU;
-    }
-    player.yaw = yaw;
-    player.pitch = pitch.clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
+    player.yaw = net_players::normalise_angle(yaw);
+    player.pitch = net_players::clamp_pitch(pitch);
     player.flying = flying != 0;
     player.health = if health.is_finite() {
         health.clamp(0.0, MAX_HEALTH)
@@ -2717,11 +2800,12 @@ fn apple_drop(seed: u64, pos: BlockPos) -> bool {
     hash.is_multiple_of(APPLE_DROP_MODULUS)
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+/// Writes one staged save file and flushes it to stable storage.
+fn write_staged(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// Hashes one optional stack for the block-entity and equipment sections.
@@ -4105,6 +4189,11 @@ mod tests {
         let missing = dir.path().join("inventory.txt");
         let error = super::read_sidecar(&missing).expect_err("missing sidecar must be NotFound");
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+
+        let directory = dir.path().join("network_players.txt");
+        std::fs::create_dir(&directory).expect("create directory in place of a sidecar");
+        let error = super::read_sidecar(&directory).expect_err("a directory is not a sidecar");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -4159,6 +4248,41 @@ mod tests {
             hash_before,
             "state hash changed across save/load"
         );
+    }
+
+    #[test]
+    fn state_hash_includes_persisted_look_and_flight_and_round_trips_them() {
+        let dir = TempDir::new("hash-look");
+        let config = test_config(dir.path(), 42);
+        let registry = Arc::new(Registry::base());
+        let mut host = Host::open(Arc::clone(&registry), config.clone()).expect("host opens");
+        converge(&mut host);
+        let baseline = host.state_hash();
+
+        host.player_mut().yaw = 0.75;
+        assert_ne!(baseline, host.state_hash(), "yaw must participate in the hash");
+        host.player_mut().yaw = 0.0;
+        host.player_mut().pitch = -0.5;
+        assert_ne!(baseline, host.state_hash(), "pitch must participate in the hash");
+        host.player_mut().pitch = 0.0;
+        host.player_mut().flying = true;
+        assert_ne!(baseline, host.state_hash(), "flying must participate in the hash");
+
+        // Store out-of-range angles to prove save/load canonicalises the same
+        // values the hash covers.
+        host.player_mut().yaw = std::f32::consts::PI + 0.5;
+        host.player_mut().pitch = 2.0;
+        let hash_before = host.state_hash();
+        host.save().expect("save succeeds");
+        drop(host);
+
+        let reopened = Host::open(Arc::clone(&registry), config).expect("host reopens");
+        let yaw = reopened.player().yaw;
+        let pitch = reopened.player().pitch;
+        assert!((yaw - crate::net_players::normalise_angle(std::f32::consts::PI + 0.5)).abs() < 1e-6);
+        assert!(pitch <= std::f32::consts::FRAC_PI_2);
+        assert!(reopened.player().flying);
+        assert_eq!(reopened.state_hash(), hash_before, "look/flight hash must round-trip");
     }
 
     #[test]

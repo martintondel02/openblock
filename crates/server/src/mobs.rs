@@ -53,6 +53,7 @@ use ob_math::{BlockPos, ChunkPos, WORLD_MAX_Y, WORLD_MIN_Y, WorldVec, mix64};
 use ob_sim::{MOB_HURT_FLEE_TIME, Mob, MobAi, MobTarget, REACH, TICK_DT, aabb_collides, raycast_mob, step_mob};
 use ob_world::World;
 
+use crate::net_players::MAX_HOST_ENTITY_ID;
 use crate::{GameMode, Host, ItemStack, StableHasher, quantize};
 
 /// World-directory filename for the mob sidecar.
@@ -696,6 +697,12 @@ pub(crate) fn load_mobs(world_dir: &Path, registry: &Registry) -> Vec<MobEntity>
             log::warn!("mobs.txt:{line_number}: invalid mob id '{}'", fields[0]);
             continue;
         };
+        if id > MAX_HOST_ENTITY_ID {
+            log::warn!(
+                "mobs.txt:{line_number}: mob id {id} is outside the host id space (0..={MAX_HOST_ENTITY_ID}), dropping it"
+            );
+            continue;
+        }
         if !seen.insert(id) {
             log::warn!("mobs.txt:{line_number}: duplicate mob id {id}, dropping it");
             continue;

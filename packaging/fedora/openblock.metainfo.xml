@@ -12,23 +12,45 @@
       survive alone or with friends on servers you host yourself.
     </p>
     <p>
-      It targets the Minecraft Java feature set as a baseline, then goes further
-      with a scriptable content platform, GPU-driven rendering and a multiplayer
-      stack designed for self-hosted servers. It contains no Minecraft code or
-      assets and is not affiliated with Mojang or Microsoft.
+      The 1.0 Early Access release includes the survival loop, mobs and combat,
+      procedural audio, and self-hosted multiplayer. Minecraft parity, the
+      scriptable content/mod platform and wider platform support are post-1.0
+      work. It contains no Minecraft code or assets and is not affiliated with
+      Mojang or Microsoft.
     </p>
   </description>
-  <launchable type="desktop-id">openblock.desktop</launchable>
+  <launchable type="desktop-id">io.github.martintondel02.OpenBlock.desktop</launchable>
+  <screenshots>
+    <screenshot type="default">
+      <caption>The title screen</caption>
+      <image>https://raw.githubusercontent.com/martintondel02/openblock/v1.0.0/docs/img/v1.0.0-title.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Survival HUD with the starting world</caption>
+      <image>https://raw.githubusercontent.com/martintondel02/openblock/v1.0.0/docs/img/v1.0.0-survival.png</image>
+    </screenshot>
+  </screenshots>
   <url type="homepage">https://github.com/martintondel02/openblock</url>
   <url type="bugtracker">https://github.com/martintondel02/openblock/issues</url>
   <developer id="io.github.martintondel02">
     <name>OpenBlock contributors</name>
   </developer>
+  <categories>
+    <category>Game</category>
+  </categories>
   <content_rating type="oars-1.1">
     <content_attribute id="violence-fantasy">moderate</content_attribute>
     <content_attribute id="social-chat">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="1.0.1" date="2026-11-25" type="stable">
+      <description>
+        <p>Post-release audit and polish: GUI scale and compact layouts,
+        connect/loading polish, server persistence/autosave/save-size fixes,
+        complete state hash, docs/security/packaging corrections and a
+        performance/reliability re-baseline.</p>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-11-25" type="stable">
       <description>
         <p>OpenBlock 1.0.0 Early Access: survival core (worldgen, mobs, combat,

@@ -1690,10 +1690,16 @@ pub fn layout(screen: [f32; 2], item_count: usize, scroll: usize) -> InventoryLa
     let grid_width = column_count * slot_size + gap * (column_count - 1.0);
     let panel_width = grid_width + 2.0 * INVENTORY_PADDING;
 
-    // Fit as many rows as possible; panel height follows the visible rows.
-    let max_panel_height = (height - 2.0 * INVENTORY_MARGIN).max(1.0);
-    let available_grid_height =
-        (max_panel_height - INVENTORY_TITLE_HEIGHT - INVENTORY_FOOTER_HEIGHT - INVENTORY_GRID_GAP).max(0.0);
+    // Below the 720p/540p baseline (for example 960x540 at 150% GUI scale,
+    // which is 640x360 logical) leave the gameplay hotbar its band, tighten the
+    // title/footer and centre the palette in the remaining space. The survival
+    // inventory has its own hotbar row and does not need this reserve.
+    let hud_reserve = if height < 480.0 { 56.0 } else { 0.0 };
+    let compact = height < 480.0;
+    let title_height = if compact { 40.0 } else { INVENTORY_TITLE_HEIGHT };
+    let footer_height = if compact { 92.0 } else { INVENTORY_FOOTER_HEIGHT };
+    let max_panel_height = (height - 2.0 * INVENTORY_MARGIN - hud_reserve).max(1.0);
+    let available_grid_height = (max_panel_height - title_height - footer_height - INVENTORY_GRID_GAP).max(0.0);
     let row_pitch = slot_size + gap;
     let rows_fit = (((available_grid_height + gap) / row_pitch).floor() as usize).max(1);
 
@@ -1703,15 +1709,15 @@ pub fn layout(screen: [f32; 2], item_count: usize, scroll: usize) -> InventoryLa
     let scroll = scroll.min(max_scroll);
 
     let visible_height = visible_rows as f32 * slot_size + visible_rows.saturating_sub(1) as f32 * gap;
-    let panel_height = INVENTORY_TITLE_HEIGHT + visible_height + INVENTORY_GRID_GAP + INVENTORY_FOOTER_HEIGHT;
+    let panel_height = title_height + visible_height + INVENTORY_GRID_GAP + footer_height;
     let panel = UiRect::new(
         (width - panel_width) / 2.0,
-        (height - panel_height) / 2.0,
+        ((height - hud_reserve - panel_height) / 2.0).max(INVENTORY_MARGIN.min(height / 2.0)),
         panel_width,
         panel_height,
     );
     let grid_x = panel.x + INVENTORY_PADDING;
-    let grid_y = panel.y + INVENTORY_TITLE_HEIGHT;
+    let grid_y = panel.y + title_height;
 
     let mut slots = Vec::new();
     for row in 0..visible_rows {
@@ -1739,7 +1745,7 @@ pub fn layout(screen: [f32; 2], item_count: usize, scroll: usize) -> InventoryLa
         visible_rows,
         total_rows,
         slot_size,
-        footer_top: panel.y + panel.h - INVENTORY_FOOTER_HEIGHT,
+        footer_top: panel.y + panel.h - footer_height,
         grid_bottom: grid_y + visible_height,
     }
 }

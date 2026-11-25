@@ -972,9 +972,84 @@ Rust quick benchmarks still run as before.
   `spawn.txt` sidecar and is covered by the state hash.
 - Headless smoke (seed 42, save format 4): `1dba6105028ba6e5` across fresh runs
   (the previous `33875a6597c2ce7b` predates the spawn sidecar/hash change).
+  1.0.1 completes the state hash over persisted yaw/pitch/flying and canonical
+  angles, so the current seed-42 hash is `7a4532e2ee387d5f` (still deterministic
+  across fresh runs and save/reload).
 - Multiplayer load gate (8 clients / 60 s): tick p50/p95/p99
   0.061/0.124/0.163 ms, 20.0 TPS, 0 overruns >35 ms, RSS 22.3 MiB; 10-minute
   soak plateaued with stable hash and no fd/thread leaks. Known gaps:
   synchronous save spikes, reference-hardware capacity, 16/50-player rows.
 - UI workload at 1280x720: 243–1335 quads and ≤3 texture draw calls per screen;
   full 960x540 audit passes.
+
+## 2026-11-25 — 1.0.1 performance/reliability audit (v1.0.0 re-measurement)
+
+Post-release audit of the **v1.0.0** tag (`19e489e`) from a pristine worktree,
+plus extended reliability and CI checks for the 1.0.1 line. Full detail and the
+save-pause design proposal are in
+[the 1.0.1 performance audit](1.0.1-performance.md). The machine was shared
+with other agents/builds; every row below is a repeat median or a stated range,
+not a quiet-box claim.
+
+### Baseline re-measurement
+
+| Metric | 1.0.0 published | 1.0.1 audit | Verdict |
+| --- | ---: | ---: | :---: |
+| `worldgen_bench --full` mean | 0.921 ms/chunk | **0.918** (p99 1.123) | PASS |
+| `worldgen_bench --quick` mean, 3 runs | 0.940 | **0.947** (0.936–0.952) | PASS |
+| `server_bench` player/mobs/items/containers p99 | 0.0091 / 0.0190 / 0.0261 / 0.0242 ms | **0.0090 / 0.0191 / 0.0245 / 0.0257** | PASS |
+| 289-column save / reload | 21.24 / 73.5 ms | **21.39 / 72.20 ms** | PASS |
+| 2,025-column save / reload | 155.97 / 539.6 ms | **154.48 / 542.03 ms** | PASS |
+| Host world heap at 2,025 columns | 162.54 MB | **162.54 MB** | marginal PERF-MEM-013 miss |
+| `soak --ticks 60000` save mean | 15.92 ms | **16.42 ms** (16.36–16.60) | PASS |
+| 60k soak hash | `b907560a3c528183` | **`c828635abf0645df`** (3/3) | deterministic; old value stale |
+| 60k soak RSS end | 71.5 MiB | **88.1 MiB** (84.4–100.5) | allocator spread, plateau |
+| load gate quick p99 | 5.418 ms | **5.041 ms** (4.944–5.165) | PASS |
+| load gate 8×60 p99 / overruns | 0.163 ms / 0 | **0.892 ms** (0.225–1.288) / 0,0,1 | PASS; cold tail |
+
+The four quick tools, quick load gate and backup/restore test ran repeatedly
+with no functional flake. The 8-client full gate's higher p99/max is consistent
+with the shared host and with the join/streaming tail already recorded for
+1.0.0 (one run's 26.3 ms maximum and one cumulative >50 ms tick came from the
+cold phase; the steady-state p99 stayed ≤1.3 ms).
+
+### Save pause (PERF-IO-004)
+
+Pristine v1.0.0 decomposition at 2,025 columns: `Host::save` = 154–166 ms;
+~57% zstd-3 compression, ~39% serialization/allocation/CRC, <1% write+rename,
+~1.5% fsync probes. An IO thread alone cannot meet the 30 ms budget.
+
+End-to-end autosave impact, measured window started after interest sets:
+
+| Server load | Autosave | Tick p99 | Max | Overruns | RSS end |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8 clients, 169 cols | off | 0.154 ms | 0.259 ms | 0 | 21.3 MiB |
+| 8 clients, 169 cols | 1 Hz | **11.066 ms** | 20.717 ms | 0 (>50 ms) | 87.1 MiB |
+| 1 client, 1,089 cols | off | 0.203 ms | 1.729 ms | 0 | 92.9 MiB |
+| 1 client, 1,089 cols | 1 Hz | **85.007 ms** | 151.289 ms | 44 | 125.3 MiB |
+
+At 1,089 columns all 45 logged overrun warnings landed on the line immediately
+after an autosave; the 1 Hz run correctly fails the 35 ms p99 target. At the
+2,025-column reference size the network server cannot load enough columns
+(interest radius is capped at 16), so the 154–156 ms `save_bench` value is the
+applicable one. `--save-interval 0` disables the timer but not the pause: the
+console `save` and shutdown save call the same synchronous path.
+
+### Reliability and CI (summary)
+
+The new `scripts/reliability-audit.py` exercised 20 network start/stop/reload
+cycles, 60 s of 8-client connect/disconnect churn, a 300 s persistent-bot soak
+with `/proc` RSS/fd/thread sampling, truncated `mobs.txt`/`spawn.txt` and
+`world.obs`, SIGTERM under save, a console save+stop race and read-only /
+file-size-limit disk proxies. Every lane passed; the notable gaps are (1) a
+truncated `world.obs` is refused with exit 1 but there is no last-good
+fallback, and (2) `--ticks 0` is not read-only: `Host::open` streams the
+two-column ring and the headless path saves it, so repeated opens of the same
+directory grow the resident set and change the hash. The reliability harness
+therefore compares two independent copies.
+
+CI now uploads benchmark and load-gate artifacts, has per-job timeouts, runs
+`save_bench --quick --phases`, uses `--wait-interest` in the quick gate, and
+has a manual `reliability` job (20 cycles, 60 s churn, 300 s soak). No
+repository-setting or GitHub-permission change is required beyond the
+read-only `contents` token already added during the 1.0.1 audit.

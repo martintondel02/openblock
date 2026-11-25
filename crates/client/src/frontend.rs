@@ -403,36 +403,52 @@ pub fn draw_new_world_screen(frame: &mut UiFrame, form: &NewWorldForm, cursor: (
     draw_panel(frame, panel, "New World");
     let fields = new_world_field_rects(screen);
     let labels = ["World name", "Seed (optional, 0 = default)"];
+    let compact = menu_compact(screen);
     for (index, field) in fields.iter().enumerate() {
         let active = (index == 0) == (form.field == NewWorldField::Name);
         let label = labels[index];
-        frame.text(field.x, field.y - 20.0, 1.2, [0.74, 0.81, 0.91, 1.0], label);
+        let label_scale = if compact { 1.0 } else { 1.2 };
+        let label_gap = if compact { 14.0 } else { 20.0 };
+        frame.text(
+            field.x,
+            field.y - label_gap,
+            label_scale,
+            [0.74, 0.81, 0.91, 1.0],
+            label,
+        );
         let text = if index == 0 { &form.name } else { &form.seed };
         let placeholder = if index == 0 { "" } else { "0" };
         draw_text_field(frame, *field, text, placeholder, active, cursor);
     }
-    let hint_y = fields[1].y + fields[1].h + 12.0;
-    frame.text(
-        fields[0].x,
-        hint_y,
-        1.0,
-        [0.60, 0.68, 0.79, 1.0],
-        "ASCII letters, digits, spaces, underscore, hyphen and dot; max 32 characters.",
-    );
-    frame.text(
-        fields[0].x,
-        hint_y + 16.0,
-        1.0,
-        [0.60, 0.68, 0.79, 1.0],
-        "A new world directory is created under <data>/worlds/.",
-    );
+    let hint_y = fields[1].y + fields[1].h + if compact { 10.0 } else { 12.0 };
+    let hint_lines: [&str; 2] = if compact {
+        [
+            "Name: letters, digits, spaces, _ - .; max 32 chars.",
+            "Worlds are created under <data>/worlds/.",
+        ]
+    } else {
+        [
+            "ASCII letters, digits, spaces, underscore, hyphen and dot; max 32 characters.",
+            "A new world directory is created under <data>/worlds/.",
+        ]
+    };
+    let max_chars = ((fields[0].w) / ob_render::glyph_advance(1.0)).max(20.0) as usize;
+    for (index, line) in hint_lines.iter().enumerate() {
+        frame.text(
+            fields[0].x,
+            hint_y + index as f32 * 14.0,
+            1.0,
+            [0.60, 0.68, 0.79, 1.0],
+            &shorten_text(line, max_chars),
+        );
+    }
     if let Some(error) = &form.error {
         frame.text(
             fields[0].x,
-            hint_y + 40.0,
-            1.15,
+            hint_y + 32.0,
+            1.05,
             [1.0, 0.68, 0.58, 1.0],
-            &shorten_text(error, 86),
+            &shorten_text(error, max_chars),
         );
     }
     let [create, back] = form_button_rects(screen);
@@ -599,7 +615,7 @@ pub fn draw_world_list_screen(frame: &mut UiFrame, list: &WorldList, cursor: (f3
         let last = (list.scroll + visible_rows).min(list.worlds.len());
         frame.text(
             panel.x + panel.w - 110.0,
-            panel.y + 50.0,
+            panel.y + 64.0,
             0.95,
             [0.55, 0.63, 0.75, 1.0],
             &format!("{first}-{last} of {}", list.worlds.len()),
@@ -896,11 +912,18 @@ pub fn draw_multiplayer_screen(
     let panel = menu_panel_rect(screen);
     draw_panel(frame, panel, "Multiplayer");
     let fields = multiplayer_field_rects(screen);
+    let compact = menu_compact(screen);
     let labels = ["Server address (host:port)", "Player name"];
     for (index, field) in fields.iter().enumerate() {
         let active = (index == 0 && form.field == MultiplayerField::Address)
             || (index == 1 && form.field == MultiplayerField::Name);
-        frame.text(field.x, field.y - 20.0, 1.2, [0.74, 0.81, 0.91, 1.0], labels[index]);
+        frame.text(
+            field.x,
+            field.y - if compact { 14.0 } else { 20.0 },
+            if compact { 1.0 } else { 1.2 },
+            [0.74, 0.81, 0.91, 1.0],
+            labels[index],
+        );
         let (text, placeholder) = if index == 0 {
             (&form.address, DEFAULT_SERVER_ADDRESS)
         } else {
@@ -908,20 +931,26 @@ pub fn draw_multiplayer_screen(
         };
         draw_text_field(frame, *field, text, placeholder, active, cursor);
     }
-    frame.text(
-        fields[0].x,
-        fields[1].y + fields[1].h + 10.0,
-        1.0,
-        [0.60, 0.68, 0.79, 1.0],
-        "The server must run the same protocol version. Survival is server-authoritative.",
-    );
-    let list_label_y = fields[1].y + fields[1].h + 36.0;
+    if !compact {
+        frame.text(
+            fields[0].x,
+            fields[1].y + fields[1].h + 10.0,
+            1.0,
+            [0.60, 0.68, 0.79, 1.0],
+            "The server must run the same protocol version. Survival is server-authoritative.",
+        );
+    }
+    let list_label_y = fields[1].y + fields[1].h + if compact { 16.0 } else { 36.0 };
     frame.text(
         fields[0].x,
         list_label_y,
-        1.2,
+        if compact { 1.05 } else { 1.2 },
         [0.86, 0.91, 0.99, 1.0],
-        "Recent servers",
+        if compact {
+            "Recent servers (protocol v2 required)"
+        } else {
+            "Recent servers"
+        },
     );
     let rows = recent_server_rects(screen);
     if recents.is_empty() {
@@ -950,22 +979,35 @@ pub fn draw_multiplayer_screen(
         if selected {
             frame.outline(rect.x, rect.y, rect.w, rect.h, 1.0, [0.95, 0.79, 0.35, 0.95]);
         }
+        let row_scale = if rect.h < 24.0 { 1.0 } else { 1.15 };
+        let text_y = rect.y + (rect.h - ob_render::line_height(row_scale)) / 2.0;
+        let name_text = if recent.name.is_empty() {
+            String::new()
+        } else {
+            format!("as {}", shorten_text(&recent.name, 24))
+        };
+        let name_width = if name_text.is_empty() {
+            0.0
+        } else {
+            frame.text_width(0.95, &name_text) + 12.0
+        };
+        let address_chars = (((rect.w - 24.0 - name_width) / ob_render::glyph_advance(row_scale)).max(8.0)) as usize;
         frame.text(
             rect.x + 12.0,
-            rect.y + 6.0,
-            1.15,
+            text_y,
+            row_scale,
             [0.88, 0.93, 0.99, 1.0],
-            &shorten_text(&recent.address, 52),
+            &shorten_text(&recent.address, address_chars),
         );
-        if !recent.name.is_empty() {
-            let text = format!("as {}", shorten_text(&recent.name, 28));
-            let width = frame.text_width(0.95, &text);
+        if !name_text.is_empty() {
+            let width = frame.text_width(0.95, &name_text);
+            let name_y = rect.y + (rect.h - ob_render::line_height(0.95)) / 2.0;
             frame.text(
                 rect.x + rect.w - width - 12.0,
-                rect.y + 7.0,
+                name_y,
                 0.95,
                 [0.62, 0.70, 0.80, 1.0],
-                &text,
+                &name_text,
             );
         }
     }
@@ -1001,15 +1043,27 @@ pub fn draw_multiplayer_screen(
     );
 }
 
+/// Whether the front-end uses its compact vertical layout.
+///
+/// 480 logical pixels is the 1280x720 baseline. Below it (for example
+/// 960x540 at 150% GUI scale, which is 640x360 logical) fields, labels and
+/// buttons are tightened so the footer hint stays outside the panel.
+fn menu_compact(screen: [f32; 2]) -> bool {
+    screen[1] < 480.0
+}
+
 /// Shared menu panel bounds.
 pub fn menu_panel_rect(screen: [f32; 2]) -> UiRect {
     let width = (screen[0] - 48.0).clamp(1.0, 760.0);
-    // Leave the bottom 48 px free for the footer band and hint text; at 960x540
-    // the old `screen - 48` panel reached into the footer and the hint clipped.
-    // Very short diagnostic windows (below 480 px) keep the old, taller panel:
-    // shrinking both the panel and the footer gap would push the form fields
-    // into the buttons.
-    let reserved = if screen[1] >= 480.0 { 96.0 } else { 48.0 };
+    // Keep the footer band and hint text clear of the panel. At 960x540 the
+    // old `screen - 48` panel reached into the footer and the hint clipped.
+    let reserved = if screen[1] >= 480.0 {
+        96.0
+    } else if screen[1] >= 320.0 {
+        72.0
+    } else {
+        48.0
+    };
     let height = (screen[1] - reserved).clamp(1.0, 560.0);
     UiRect::new((screen[0] - width) / 2.0, (screen[1] - height) / 2.0, width, height)
 }
@@ -1017,43 +1071,62 @@ pub fn menu_panel_rect(screen: [f32; 2]) -> UiRect {
 /// Bounds of the two text fields on the new-world form.
 pub fn new_world_field_rects(screen: [f32; 2]) -> [UiRect; 2] {
     let panel = menu_panel_rect(screen);
+    let compact = menu_compact(screen);
     let width = panel.w - 72.0;
     let x = panel.x + 36.0;
-    let top = panel.y + (panel.h * 0.22).max(72.0);
-    let gap = if screen[1] >= 480.0 {
-        (panel.h * 0.14).clamp(68.0, 76.0)
+    let top = panel.y + if compact { 60.0 } else { (panel.h * 0.22).max(72.0) };
+    let gap = if compact {
+        (panel.h * 0.16).clamp(52.0, 58.0)
     } else {
-        (panel.h * 0.14).clamp(44.0, 54.0)
+        (panel.h * 0.14).clamp(68.0, 76.0)
     };
-    [UiRect::new(x, top, width, 40.0), UiRect::new(x, top + gap, width, 40.0)]
+    let height = if compact { 32.0 } else { 40.0 };
+    [
+        UiRect::new(x, top, width, height),
+        UiRect::new(x, top + gap, width, height),
+    ]
 }
 
 /// Bounds of the two text fields on the multiplayer form.
 pub fn multiplayer_field_rects(screen: [f32; 2]) -> [UiRect; 2] {
     let panel = menu_panel_rect(screen);
+    let compact = menu_compact(screen);
     let width = panel.w - 72.0;
     let x = panel.x + 36.0;
-    let top = panel.y + (panel.h * 0.20).max(72.0);
-    let gap = if screen[1] >= 480.0 {
-        (panel.h * 0.13).clamp(68.0, 74.0)
+    let top = panel.y + if compact { 60.0 } else { (panel.h * 0.20).max(72.0) };
+    let gap = if compact {
+        (panel.h * 0.14).clamp(52.0, 58.0)
     } else {
-        (panel.h * 0.13).clamp(44.0, 54.0)
+        (panel.h * 0.13).clamp(68.0, 74.0)
     };
-    [UiRect::new(x, top, width, 40.0), UiRect::new(x, top + gap, width, 40.0)]
+    let height = if compact { 32.0 } else { 40.0 };
+    [
+        UiRect::new(x, top, width, height),
+        UiRect::new(x, top + gap, width, height),
+    ]
 }
 
 /// Bounds of the recent-server rows on the multiplayer form.
 pub fn recent_server_rects(screen: [f32; 2]) -> Vec<UiRect> {
     let panel = menu_panel_rect(screen);
+    let compact = menu_compact(screen);
     let x = panel.x + 36.0;
     let width = panel.w - 72.0;
     let fields = multiplayer_field_rects(screen);
     let buttons = form_button_rects(screen);
-    let top = (panel.y + panel.h * 0.54).max(fields[1].y + fields[1].h + 44.0);
+    let (top, pitch, height) = if compact {
+        (fields[1].y + fields[1].h + 28.0, 26.0, 22.0)
+    } else {
+        (
+            (panel.y + panel.h * 0.54).max(fields[1].y + fields[1].h + 44.0),
+            30.0,
+            26.0,
+        )
+    };
     let available = (buttons[0].y - 12.0 - top).max(0.0);
-    let capacity = ((available / 30.0).floor() as usize).min(RECENT_SERVER_ROWS);
+    let capacity = ((available / pitch).floor() as usize).min(RECENT_SERVER_ROWS);
     (0..capacity)
-        .map(|index| UiRect::new(x, top + index as f32 * 30.0, width, 26.0))
+        .map(|index| UiRect::new(x, top + index as f32 * pitch, width, height))
         .collect()
 }
 
@@ -1065,7 +1138,7 @@ pub fn form_button_rects(screen: [f32; 2]) -> [UiRect; 2] {
     let gap = 20.0;
     let total = width * 2.0 + gap;
     let x = panel.x + (panel.w - total) / 2.0;
-    let y = panel.y + panel.h - height - 46.0;
+    let y = panel.y + panel.h - height - if menu_compact(screen) { 18.0 } else { 46.0 };
     [
         UiRect::new(x, y, width, height),
         UiRect::new(x + width + gap, y, width, height),
@@ -1090,7 +1163,7 @@ pub fn world_list_button_rects(screen: [f32; 2]) -> [UiRect; 3] {
     let gap = 14.0;
     let total = width * 3.0 + gap * 2.0;
     let x = panel.x + (panel.w - total) / 2.0;
-    let y = panel.y + panel.h - height - 42.0;
+    let y = panel.y + panel.h - height - if menu_compact(screen) { 18.0 } else { 42.0 };
     [
         UiRect::new(x, y, width, height),
         UiRect::new(x + width + gap, y, width, height),
@@ -1533,6 +1606,7 @@ fn draw_world_row(frame: &mut UiFrame, rect: UiRect, world: &WorldSummary, selec
         frame.outline(rect.x, rect.y, rect.w, rect.h, 1.0, [0.95, 0.79, 0.35, 0.95]);
         frame.rect(rect.x, rect.y + 4.0, 3.0, rect.h - 8.0, [0.96, 0.76, 0.32, 1.0]);
     }
+    let name_chars = (((rect.w - 14.0 - 74.0 - 8.0) / ob_render::glyph_advance(1.45)).max(8.0)) as usize;
     frame.text(
         rect.x + 14.0,
         rect.y + 4.0,
@@ -1542,7 +1616,7 @@ fn draw_world_row(frame: &mut UiFrame, rect: UiRect, world: &WorldSummary, selec
         } else {
             [0.90, 0.94, 0.99, 1.0]
         },
-        &shorten_text(&world.name, 42),
+        &shorten_text(&world.name, name_chars),
     );
     let now = SystemTime::now();
     let meta = format!("{}    modified {}", world.size_label(), world.modified_label(now));
@@ -1998,5 +2072,37 @@ mod tests {
             now,
             2
         ));
+    }
+
+    #[test]
+    fn scaled_pointer_mapping_hits_title_and_form_buttons() {
+        use crate::ui_scale::{physical_to_ui_point, ui_scale_factor, ui_screen, ui_to_physical_point};
+        for physical in [[1280.0_f32, 720.0], [960.0, 540.0]] {
+            for percent in [75_u16, 100, 125, 150] {
+                let screen = ui_screen(physical, percent);
+                let factor = ui_scale_factor(percent, physical[1]);
+                let mut title = TitleMenu::new(Some("harbor".to_string()));
+                for (index, rect) in title_button_rects(screen).iter().enumerate() {
+                    let point = physical_to_ui_point(ui_to_physical_point(rect.center(), factor), factor);
+                    assert_eq!(
+                        title.update_hover(screen, point),
+                        TitleButton::ALL.get(index).copied(),
+                        "{physical:?} at {percent}%"
+                    );
+                }
+                for rect in form_button_rects(screen) {
+                    let point = physical_to_ui_point(ui_to_physical_point(rect.center(), factor), factor);
+                    assert!(rect.contains(point.0, point.1));
+                }
+                // New-world and multiplayer field clicks use the same mapping.
+                for rect in new_world_field_rects(screen)
+                    .into_iter()
+                    .chain(multiplayer_field_rects(screen))
+                {
+                    let point = physical_to_ui_point(ui_to_physical_point(rect.center(), factor), factor);
+                    assert!(rect.contains(point.0, point.1));
+                }
+            }
+        }
     }
 }

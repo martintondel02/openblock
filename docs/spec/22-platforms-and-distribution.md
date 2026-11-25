@@ -6,6 +6,17 @@
 
 ## 1. Purpose and scope
 
+> **Implementation note (1.0 Early Access).** The 1.0 release ships a Linux
+> x86_64 client built from source (Fedora-first), a headless server binary, and
+> staged RPM/Flatpak/container recipes under `packaging/`. Windows and macOS are
+> CI build/test targets with the silent audio stub, not signed installers;
+> Flathub/COPR publication, AppImage/`.tar.zst` artifacts, notarisation, the
+> self-updater, crash reporting and telemetry are **post-1.0**. The release
+> assets for v1.0.0 were screenshots only. Treat this chapter as the target
+> distribution design and check [packaging/README.md](../../packaging/README.md)
+> plus the [1.0.1 audit](../plan/1.0.1-audit.md) for what is actually shipped
+> and published.
+
 This chapter defines where OpenBlock runs at 1.0, on what hardware, how builds are produced and
 signed, how they are packaged and distributed, how the game updates itself without bricking an
 install, what crash reporting and telemetry are permitted, and how platform conventions shape input

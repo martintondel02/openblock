@@ -29,11 +29,12 @@ sudo scripts/server-backup.sh \
 sudo cp -a /usr/bin/openblock-server /usr/bin/openblock-server.previous
 ```
 
-Also read the release notes/CHANGELOG for the target version. Pre-1.0 releases
-may change the save format, protocol version, CLI, config keys or content
-fingerprint; the changelog says which. Do not mix a new server with an old
-client if the protocol version changed; the server rejects mismatched clients
-with `protocol_mismatch`.
+Also read the release notes/CHANGELOG for the target version. Within 1.0.x a
+patch release keeps save format 4 and protocol 2; a later minor may add a save
+migration or protocol revision, and the changelog says which. Do not mix a new
+server with an old client if the protocol version changed; the server rejects
+mismatched clients with `protocol_mismatch`. Pre-1.0 builds are unsupported and
+may not read a 1.0 world.
 
 ## Upgrade from source
 
@@ -83,8 +84,9 @@ the two before merging:
 sudo diff -u /etc/openblock/server.toml /etc/openblock/server.toml.rpmnew
 ```
 
-RPM scriptlets stop/restart the unit on upgrade (the spec uses
-`%systemd_postun_with_restart`). The world lives under `/var/lib/openblock`, not
+RPM scriptlets reload/restart the unit on upgrade (the spec uses
+`%systemd_post`, `%systemd_preun` and `%systemd_postun_with_restart`; the unit
+must be stopped cleanly first). The world lives under `/var/lib/openblock`, not
 in the package, so an RPM upgrade does not replace it.
 
 ### Container

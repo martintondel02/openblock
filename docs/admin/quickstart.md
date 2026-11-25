@@ -82,9 +82,13 @@ Expected tail (the hash depends on the exact build and seed):
 
 ```text
 [INFO ] openblock_server: smoke test: generating, ticking, saving, reloading
-[INFO ] openblock_server: smoke OK: state hash 33875a6597c2ce7b
-smoke OK hash=33875a6597c2ce7b
+[INFO ] openblock_server: smoke OK: state hash 7a4532e2ee387d5f
+smoke OK hash=7a4532e2ee387d5f
 ```
+
+That hash is the 1.0.0 reference (seed 42, save format 4); the value changes
+when a release changes persisted state, so treat it as a determinism check
+(two fresh runs must match) rather than a fixed constant.
 
 The world is now at `./data/worlds/world/` with `world.obs` and its sidecars.
 
@@ -161,7 +165,7 @@ ss -ltnp | grep ':25565'
 ## 5. Join with the client
 
 The client needs a Vulkan-capable GPU and a Wayland/X11 session (see the
-[README](../../README.md#platforms)). On the same machine:
+[README quick start](../../README.md#quick-start)). On the same machine:
 
 ```sh
 cargo run --release -p ob_client --bin openblock -- \

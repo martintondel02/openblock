@@ -44,7 +44,7 @@
 //! flags override the file.
 
 use std::collections::{BTreeMap, HashSet};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -63,7 +63,9 @@ use ob_protocol::{
 };
 use ob_sim::REACH;
 
-use crate::net_players::{ENTITY_INTEREST_RADIUS, NetworkWindowRef, ServerPlayer, stack_dto, wire_entity_id};
+use crate::net_players::{
+    ENTITY_INTEREST_RADIUS, MAX_CONTAINER_DISTANCE, NetworkWindowRef, ServerPlayer, stack_dto, wire_entity_id,
+};
 use crate::{GameMode, Host, HostError, ItemStack};
 
 /// Default TCP port of the interim server.
@@ -105,8 +107,6 @@ const MIN_PLAYER_Y: f64 = WORLD_MIN_Y as f64 - 32.0;
 const MAX_PLAYER_Y: f64 = WORLD_MAX_Y as f64 + 256.0;
 /// Maximum accepted block-edit distance from the sender's last position.
 const MAX_EDIT_DISTANCE: f64 = REACH + 2.0;
-/// Maximum distance from a player to a furnace/chest they open or keep open.
-const MAX_CONTAINER_DISTANCE: f64 = 6.0;
 /// Inbound frame rate cap applied before the tick loop sees messages.
 const INBOUND_FRAMES_PER_SECOND: f64 = 120.0;
 /// Inbound burst allowance.
@@ -921,6 +921,38 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// A reader that enforces one absolute deadline for the whole handshake.
+///
+/// `TcpStream::set_read_timeout` only bounds one blocking read, so a client
+/// that trickles one byte per timeout interval can hold a handshake slot (and
+/// one of the 32 admission slots) forever. This wrapper recomputes the
+/// remaining time before every read and returns `TimedOut` once the handshake
+/// deadline has passed.
+struct DeadlineReader {
+    stream: TcpStream,
+    deadline: Instant,
+}
+
+impl DeadlineReader {
+    fn new(stream: TcpStream, timeout: Duration) -> Self {
+        Self {
+            stream,
+            deadline: Instant::now() + timeout,
+        }
+    }
+}
+
+impl Read for DeadlineReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "handshake deadline exceeded"));
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(buffer)
+    }
+}
+
 /// Accept loop: non-blocking accept with a short poll interval so shutdown is
 /// prompt. Each accepted socket gets a dedicated handshake thread.
 fn run_accept_loop(shared: Arc<Shared>, listener: TcpListener) {
@@ -968,13 +1000,14 @@ fn handshake(shared: Arc<Shared>, stream: TcpStream) {
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
-    let mut reader = match stream.try_clone() {
+    let reader = match stream.try_clone() {
         Ok(reader) => reader,
         Err(error) => {
             log::warn!("handshake failed: {error}");
             return;
         }
     };
+    let mut reader = DeadlineReader::new(reader, HANDSHAKE_TIMEOUT);
     let payload = match read_frame(&mut reader, MAX_FRAME_LEN) {
         Ok(payload) => payload,
         Err(error) => {
@@ -1821,7 +1854,12 @@ impl Core {
         }
         let window_ref = window.map(OpenWindow::window_ref);
         let involved_window = window_ref.is_some_and(|_| from >= SLOT_WINDOW_START || to >= SLOT_WINDOW_START);
-        match self.host.network_inventory_move(id, from, to, count, window_ref) {
+        // The window is revalidated per transaction (distance, block and
+        // container record), not only by the once-per-tick close loop.
+        match self
+            .host
+            .network_inventory_move_checked(id, from, to, count, window_ref)
+        {
             Ok(changed) if changed => {
                 self.dirty = true;
                 if involved_window {
@@ -1929,7 +1967,12 @@ impl Core {
                         killed: outcome.killed,
                     },
                 );
-                if outcome.tool_broke.is_some() {
+                if outcome.hit {
+                    // A hit wears the selected tool by one point (and can
+                    // break it). Treat every landed hit as a survival
+                    // mutation so the authoritative durability reaches the
+                    // client immediately instead of waiting for the 1 Hz
+                    // resync.
                     self.send_action_sync(id);
                 }
                 if outcome.killed {
@@ -2265,6 +2308,13 @@ impl Core {
         // and dropped items.
         self.host.tick_network();
         self.tick_count += 1;
+        // The host tick advances persisted state even when no intent arrives:
+        // the world clock (tick count/day phase), network-player hunger/regen,
+        // furnaces, mob AI/age and dropped-item physics. Autosave therefore has
+        // to consider every tick dirty; otherwise a server with a connected
+        // idle player could run for hours and be killed without ever writing
+        // the player's position/vitals or the current tick.
+        self.dirty = true;
         self.relay_damage_events();
         self.relay_entity_removals();
         self.stream_chunks();
@@ -3021,6 +3071,46 @@ mod tests {
         assert_eq!(sanitise_reason(" hello\nworld "), "hello world");
         assert_eq!(sanitise_reason(""), "disconnected");
         assert!(sanitise_reason(&"x".repeat(MAX_REASON_LEN + 10)).len() <= MAX_REASON_LEN);
+    }
+
+    #[test]
+    fn handshake_deadline_is_absolute_against_trickled_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            // A valid four-byte header for a 16-byte payload, then one payload
+            // byte every 10 ms: each individual read succeeds, but the whole
+            // frame takes far longer than the 80 ms handshake deadline.
+            let _ = stream.write_all(&[0, 0, 0, 16]);
+            for _ in 0..30 {
+                if stream.write_all(b"{").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let (stream, _) = listener.accept().expect("accept");
+        let started = Instant::now();
+        let mut reader = DeadlineReader::new(stream, Duration::from_millis(80));
+        let error = read_frame(&mut reader, MAX_FRAME_LEN).expect_err("the trickle must time out");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the absolute deadline was not enforced: {:?}",
+            started.elapsed()
+        );
+        // A blocking socket read timeout is surfaced as `WouldBlock` on
+        // Linux/Unix and `TimedOut` on some platforms; both mean the absolute
+        // deadline fired.
+        assert!(
+            matches!(
+                &error,
+                ob_protocol::ProtocolError::Io(error)
+                    if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+            ),
+            "{error}"
+        );
+        let _ = client.join();
     }
 
     #[test]

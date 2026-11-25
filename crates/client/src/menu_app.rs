@@ -26,6 +26,7 @@ use crate::frontend::{
     self, MenuScreen, MultiplayerField, MultiplayerForm, NewWorldField, NewWorldForm, TitleButton, TitleMenu,
     WorldList, continue_target, discover_worlds, is_double_click,
 };
+use crate::ui_scale::{physical_to_ui_point, rescale_cursor, resolved_ui_scale_percent, ui_scale_factor, ui_screen};
 use crate::ui_state::{SettingsAction, SettingsInfo, SettingsRow, SettingsTab, UiState};
 
 /// Result of running the front-end.
@@ -141,6 +142,7 @@ impl ApplicationHandler for MenuApp {
             let size = window.inner_size();
             (size.width.max(1) as f32, size.height.max(1) as f32)
         };
+        ui.ui_scale_percent = resolved_ui_scale_percent(ui.settings.ui_scale_percent, window_size.1);
         let auto_exit = self
             .options
             .seconds
@@ -195,6 +197,7 @@ impl ApplicationHandler for MenuApp {
             WindowEvent::Resized(size) => {
                 state.renderer.resize(size.width.max(1), size.height.max(1));
                 state.window_size = (size.width.max(1) as f32, size.height.max(1) as f32);
+                state.refresh_ui_scale();
             }
             WindowEvent::RedrawRequested => state.frame(),
             WindowEvent::KeyboardInput { event, .. } => {
@@ -220,7 +223,7 @@ impl ApplicationHandler for MenuApp {
                 state.handle_click(button);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                state.ui.cursor = (position.x as f32, position.y as f32);
+                state.ui.cursor = state.ui_point((position.x as f32, position.y as f32));
                 if state.screen == MenuScreen::Settings {
                     let screen = state.window_screen();
                     state.ui.settings_hover(screen);
@@ -307,8 +310,32 @@ struct MenuRuntime {
 }
 
 impl MenuRuntime {
+    /// Effective GUI-scale percentage for the current physical window.
+    fn resolved_ui_percent(&self) -> u16 {
+        resolved_ui_scale_percent(self.ui.settings.ui_scale_percent, self.window_size.1)
+    }
+
+    fn ui_point(&self, point: (f32, f32)) -> (f32, f32) {
+        physical_to_ui_point(
+            point,
+            ui_scale_factor(self.ui.settings.ui_scale_percent, self.window_size.1),
+        )
+    }
+
+    fn refresh_ui_scale(&mut self) {
+        let old = self.ui.ui_scale_percent;
+        let new = self.resolved_ui_percent();
+        if new != old {
+            self.ui.cursor = rescale_cursor(self.ui.cursor, old, new);
+            self.ui.ui_scale_percent = new;
+        }
+    }
+
     fn window_screen(&self) -> [f32; 2] {
-        [self.window_size.0.max(1.0), self.window_size.1.max(1.0)]
+        ui_screen(
+            [self.window_size.0.max(1.0), self.window_size.1.max(1.0)],
+            self.ui.settings.ui_scale_percent,
+        )
     }
 
     fn update_title(&mut self) {
@@ -655,6 +682,7 @@ impl MenuRuntime {
             SettingsRow::MasterVolume | SettingsRow::SfxVolume | SettingsRow::MusicVolume => {
                 self.sync_audio_settings();
             }
+            SettingsRow::UiScale => self.refresh_ui_scale(),
             SettingsRow::RenderDistance
             | SettingsRow::Fov
             | SettingsRow::MouseSensitivity
@@ -862,6 +890,7 @@ impl MenuRuntime {
                     texture_source: self.texture_source.label(),
                     texture_resolution: self.renderer.texture_resolution(),
                     mesh_workers: self.mesh_workers,
+                    ui_scale_percent: resolved_ui_scale_percent(self.ui.settings.ui_scale_percent, self.window_size.1),
                     audio_status: self.audio_status.clone(),
                     ..SettingsInfo::default()
                 };
@@ -913,11 +942,17 @@ fn screenshot_menu_inner(
     // Menu screenshots are captured with the classic procedural textures unless
     // the caller explicitly selected another style.
     settings.texture_style = options.texture_style.unwrap_or(TextureStyle::Classic);
+    if let Some(percent) = options.ui_scale {
+        settings.ui_scale_percent = percent;
+    }
     settings.clamp();
     let (width, height) = crate::screenshot_dimensions(options);
-    let screen = [width as f32, height as f32];
+    let physical = [width as f32, height as f32];
+    let screen = ui_screen(physical, settings.ui_scale_percent);
+    let effective_ui_scale = resolved_ui_scale_percent(settings.ui_scale_percent, physical[1]);
     let mut ui = UiState::from_settings(settings.clone());
     ui.host_optional = true;
+    ui.ui_scale_percent = effective_ui_scale;
     let worlds = discover_worlds(data_dir);
     let mut frame = UiFrame::new(screen[0], screen[1]);
     let mut camera = Camera::new(WorldVec::new(0.5, 74.0, 6.0), 0.0, -0.12);
@@ -950,7 +985,10 @@ fn screenshot_menu_inner(
             ui.host_optional = true;
             ui.settings_tab = SettingsTab::Game;
             ui.settings_selected_row = 0;
-            let info = SettingsInfo::default();
+            let info = SettingsInfo {
+                ui_scale_percent: effective_ui_scale,
+                ..SettingsInfo::default()
+            };
             crate::ui_state::draw_settings_screen(&mut frame, &ui, &info, screen);
             detail = "host-optional settings".to_string();
         }

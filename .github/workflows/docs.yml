@@ -8,6 +8,10 @@ on:
     paths: ["docs/**", "README.md", "CONTRIBUTING.md", ".github/scripts/**"]
   workflow_dispatch:
 
+# Read-only workflow token; this workflow only checks out and validates docs.
+permissions:
+  contents: read
+
 jobs:
   consistency:
     name: Documentation consistency

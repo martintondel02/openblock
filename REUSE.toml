@@ -4,10 +4,11 @@ version = 1
 
 [[annotations]]
 path = [
-  "README.md", "CONTRIBUTING.md", "SECURITY.md", "CODE_OF_CONDUCT.md",
-  "MAINTAINERS.md", "docs/**", "crates/**", "xtask/**", "perf/**", "packs/**", "justfile",
+  "README.md", "CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md",
+  "CODE_OF_CONDUCT.md", "MAINTAINERS.md", "Cargo.lock", "dev-cargo",
+  "docs/**", "crates/**", "xtask/**", "perf/**", "packs/**", "justfile",
   "Cargo.toml", "rust-toolchain.toml", "rustfmt.toml", "deny.toml",
-  "architecture.toml", "REUSE.toml", "perf/**",
+  "architecture.toml", "REUSE.toml",
   ".github/**", ".editorconfig", ".markdownlint.jsonc", ".gitignore",
   ".dockerignore", "scripts/**",
 ]
@@ -21,8 +22,21 @@ path = ["DCO", "LICENSES/LicenseRef-DCO-1.1.txt"]
 SPDX-FileCopyrightText = "2004, 2006 The Linux Foundation and its contributors"
 SPDX-License-Identifier = "LicenseRef-DCO-1.1"
 
+# Packaging is MIT OR Apache-2.0 except the project icon, which is CC0-1.0.
+# The icon is listed separately because a broad "packaging/**" annotation would
+# give the same file two licenses.
 [[annotations]]
-path = ["packaging/**"]
+path = [
+  "packaging/README.md",
+  "packaging/container/**",
+  "packaging/fedora/io.github.martintondel02.OpenBlock.desktop",
+  "packaging/fedora/openblock.mime.xml",
+  "packaging/fedora/openblock.metainfo.xml",
+  "packaging/fedora/openblock-server.firewalld.xml",
+  "packaging/fedora/openblock.spec",
+  "packaging/flatpak/**",
+  "packaging/systemd/**",
+]
 SPDX-FileCopyrightText = "2026 OpenBlock contributors"
 SPDX-License-Identifier = "MIT OR Apache-2.0"
 

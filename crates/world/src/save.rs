@@ -83,6 +83,13 @@ const ZSTD_LEVEL: i32 = 3;
 /// Upper bound on a decompressed payload, to keep malformed headers from
 /// requesting an unbounded allocation before the payload is parsed.
 const MAX_PAYLOAD_LEN: usize = 256 * 1024 * 1024;
+/// Largest world payload this build can read back.
+///
+/// This is the public half of the private loader cap. Writers must not
+/// produce a snapshot whose uncompressed payload exceeds it: the loader
+/// rejects such a file before allocating, so a save that crossed this limit
+/// would be silently unloadable on the next start.
+pub const MAX_SAVE_PAYLOAD_BYTES: usize = MAX_PAYLOAD_LEN;
 /// Upper bound on the on-disk size of `world.obs` accepted by
 /// [`read_save_file`].
 ///
@@ -151,6 +158,20 @@ pub enum SaveError {
     UnknownBlock(u16),
     /// The save was written with a different content pack (block order/content).
     RegistryMismatch { saved: u64, current: u64 },
+    /// A world payload would exceed the loader's uncompressed-size limit.
+    PayloadTooLarge {
+        /// Encoded payload length in bytes.
+        len: usize,
+        /// Configured maximum.
+        max: usize,
+    },
+    /// An encoded snapshot would exceed the on-disk loader limit.
+    SaveFileTooLarge {
+        /// Encoded file length in bytes.
+        len: u64,
+        /// Configured maximum.
+        max: u64,
+    },
 }
 
 impl std::fmt::Display for SaveError {
@@ -164,6 +185,13 @@ impl std::fmt::Display for SaveError {
                 "world was saved with a different content pack (registry fingerprint {saved:016x}, current {current:016x}); \
                  reordering or changing block types invalidates existing saves"
             ),
+            SaveError::PayloadTooLarge { len, max } => write!(
+                f,
+                "world snapshot payload of {len} bytes exceeds the {max}-byte load limit"
+            ),
+            SaveError::SaveFileTooLarge { len, max } => {
+                write!(f, "world snapshot of {len} bytes exceeds the {max}-byte file limit")
+            }
         }
     }
 }
@@ -183,11 +211,51 @@ pub struct WorldSave;
 /// same world produce identical bytes. The payload is compressed with zstd
 /// level 3. The trailing CRC32C covers the header and compressed payload, and
 /// is written last (not included in its own checksum).
+///
+/// This convenience wrapper is for callers that already know the world fits.
+/// Use [`to_bytes_checked`] in a save path: it enforces the same payload and
+/// file limits the loader applies, so a successful save is always reloadable by
+/// this build. It panics only when those limits are exceeded.
 pub fn to_bytes(world: &World) -> Vec<u8> {
+    to_bytes_checked(world).unwrap_or_else(|error| panic!("world snapshot cannot be encoded: {error}"))
+}
+
+/// Serializes a world and enforces the loader's payload and on-disk limits.
+///
+/// Returns [`SaveError::PayloadTooLarge`] when the uncompressed chunk payload
+/// exceeds [`MAX_SAVE_PAYLOAD_BYTES`] and [`SaveError::SaveFileTooLarge`] when
+/// the compressed snapshot exceeds [`MAX_SAVE_FILE_BYTES`]. This is what keeps a
+/// long-running server with resident chunks from writing a `world.obs` that the
+/// next start (or the next version) cannot open.
+pub fn to_bytes_checked(world: &World) -> Result<Vec<u8>, SaveError> {
+    encode_v4(world, MAX_SAVE_PAYLOAD_BYTES, MAX_SAVE_FILE_BYTES)
+}
+
+/// Encodes a v4 snapshot with explicit limits (unit-testable).
+fn encode_v4(world: &World, max_payload: usize, max_file: u64) -> Result<Vec<u8>, SaveError> {
     let payload = encode_payload(world, write_section);
-    let payload_len = u32::try_from(payload.len()).expect("world snapshot payload exceeds 4 GiB");
+    if payload.len() > max_payload {
+        return Err(SaveError::PayloadTooLarge {
+            len: payload.len(),
+            max: max_payload,
+        });
+    }
+    let payload_len = u32::try_from(payload.len()).map_err(|_| SaveError::PayloadTooLarge {
+        len: payload.len(),
+        max: max_payload,
+    })?;
     let (compression, body) = compress_payload(&payload);
-    let body_len = u32::try_from(body.len()).expect("compressed world snapshot exceeds 4 GiB");
+    let body_len = u32::try_from(body.len()).map_err(|_| SaveError::SaveFileTooLarge {
+        len: u64::try_from(body.len()).unwrap_or(u64::MAX),
+        max: max_file,
+    })?;
+    let file_len = (V4_HEADER_LEN + body.len() + CRC_LEN) as u64;
+    if file_len > max_file {
+        return Err(SaveError::SaveFileTooLarge {
+            len: file_len,
+            max: max_file,
+        });
+    }
 
     let mut out = Vec::with_capacity(V4_HEADER_LEN + body.len() + CRC_LEN);
     out.extend_from_slice(MAGIC);
@@ -201,7 +269,7 @@ pub fn to_bytes(world: &World) -> Vec<u8> {
 
     let checksum = crc32c(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
-    out
+    Ok(out)
 }
 
 /// Loads a world from a v1, v2, v3 or v4 snapshot.
@@ -246,11 +314,28 @@ pub fn from_bytes(registry: Arc<Registry>, bytes: &[u8]) -> Result<World, SaveEr
 /// [`io::ErrorKind::InvalidData`]; callers can then keep the previous world or
 /// refuse to start without allocating attacker-chosen memory.
 pub fn read_save_file(path: &Path) -> Result<Vec<u8>, io::Error> {
-    let file = std::fs::File::open(path)?;
-    if file.metadata()?.len() > MAX_SAVE_FILE_BYTES {
+    // Check the path *before* opening it: opening a FIFO or device can block
+    // indefinitely, and a downloaded world directory is untrusted input. A
+    // second check on the opened handle narrows the metadata/open race.
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("world save {} is not a regular file", path.display()),
+        ));
+    }
+    if metadata.len() > MAX_SAVE_FILE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("world save file exceeds the {MAX_SAVE_FILE_BYTES}-byte limit"),
+        ));
+    }
+    let file = std::fs::File::open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("world save {} is not a regular file", path.display()),
         ));
     }
     let mut bytes = Vec::new();
@@ -1116,6 +1201,23 @@ mod tests {
     }
 
     #[test]
+    fn checked_encoder_enforces_the_loader_limits() {
+        let (_registry, world) = sample_world();
+        let bytes = to_bytes_checked(&world).expect("a normal sample world fits");
+        assert_eq!(bytes, to_bytes(&world));
+
+        let error = encode_v4(&world, 1, u64::MAX).expect_err("a tiny payload cap must be enforced");
+        assert!(matches!(error, SaveError::PayloadTooLarge { max: 1, .. }), "{error}");
+        assert!(
+            error.to_string().contains("load limit"),
+            "the error should name the limit: {error}"
+        );
+
+        let error = encode_v4(&world, MAX_SAVE_PAYLOAD_BYTES, 1).expect_err("a tiny file cap must be enforced");
+        assert!(matches!(error, SaveError::SaveFileTooLarge { max: 1, .. }), "{error}");
+    }
+
+    #[test]
     fn save_is_deterministic_and_stable_after_load() {
         let (registry, world) = sample_world();
         let first = to_bytes(&world);
@@ -1510,6 +1612,22 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("limit"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_regular_save_paths_are_rejected_before_opening() {
+        let dir = std::env::temp_dir().join(format!(
+            "openblock-save-non-regular-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(dir.join("world.obs")).expect("create directory in place of the save");
+        let error = read_save_file(&dir.join("world.obs")).expect_err("a directory is not a save file");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -39,8 +39,9 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    # The interim server handles SIGINT gracefully (SIGTERM support is pending);
-    # do not remove this or `docker compose stop` may kill without a final save.
+    # The server handles both SIGINT and SIGTERM gracefully; SIGINT is explicit
+    # so Ctrl-C, systemd and Compose share one stop path. Either signal saves;
+    # SIGKILL cannot. Keep the grace period above the server's shutdown budget.
     stop_signal: SIGINT
     stop_grace_period: 40s
 

@@ -41,3 +41,4 @@ ob_worldgen.workspace = true
 ob_sim.workspace = true
 ob_server.workspace = true
 ob_render.workspace = true
+zstd.workspace = true

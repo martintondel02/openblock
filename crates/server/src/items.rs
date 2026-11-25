@@ -22,6 +22,7 @@ use ob_math::{BlockPos, WORLD_MAX_Y, WORLD_MIN_Y, WorldVec};
 use ob_sim::{GRAVITY, Player};
 use ob_world::World;
 
+use crate::net_players::MAX_HOST_ENTITY_ID;
 use crate::{ItemStack, MAX_STACK_SIZE, StableHasher};
 
 /// Seconds after spawn before an item can be picked up (10 ticks at 20 Hz).
@@ -315,6 +316,12 @@ pub(crate) fn load_items(world_dir: &Path, registry: &Registry) -> Vec<ItemEntit
             log::warn!("items.txt:{line_number}: invalid entity id '{}'", fields[0]);
             continue;
         };
+        if id > MAX_HOST_ENTITY_ID {
+            log::warn!(
+                "items.txt:{line_number}: entity id {id} is outside the host id space (0..={MAX_HOST_ENTITY_ID}), dropping it"
+            );
+            continue;
+        }
         if !seen.insert(id) {
             log::warn!("items.txt:{line_number}: duplicate entity id {id}, dropping it");
             continue;
@@ -357,10 +364,25 @@ pub(crate) fn load_items(world_dir: &Path, registry: &Registry) -> Vec<ItemEntit
         let max_stack = item_type.max_stack.clamp(1, MAX_STACK_SIZE);
         let count = count.clamp(1, u32::from(max_stack)) as u8;
         let mut stack = ItemStack::for_item(item, item_type, count);
-        stack.durability = durability.map(|value| match item_type.tool {
-            Some(spec) => value.clamp(1, u32::from(spec.durability)) as u16,
-            None => value.min(u32::from(u16::MAX)) as u16,
-        });
+        let durability_limit = item_type
+            .tool
+            .map(|spec| spec.durability)
+            .or_else(|| item_type.armor.map(|spec| spec.durability));
+        stack.durability = match (durability, durability_limit) {
+            (Some(value), Some(max)) => Some(value.clamp(1, u32::from(max)) as u16),
+            // A tool/armor line without the optional field starts undamaged.
+            (None, Some(max)) => Some(max),
+            // Non-durable items carry no durability component, matching
+            // `sanitize_stack`; a hostile sidecar cannot attach one here.
+            (Some(_), None) => {
+                log::warn!(
+                    "items.txt:{line_number}: item '{}' has no durability, ignoring it",
+                    fields[7]
+                );
+                None
+            }
+            (None, None) => None,
+        };
 
         let pos = WorldVec::new(
             pos_x.clamp(-LOAD_HORIZONTAL_LIMIT, LOAD_HORIZONTAL_LIMIT),

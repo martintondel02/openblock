@@ -85,11 +85,12 @@ no capabilities.
 * The server's admin console reads **stdin**. Under systemd stdin is
   `/dev/null`, so `help`/`list`/`say`/`kick`/`save`/`tps` are only available when
   you run the binary in a terminal or tmux. This build has no remote console.
-* `systemctl stop openblock-server` sends `SIGINT` because the unit sets
-  `KillSignal=SIGINT`; this interim binary's graceful handler is Ctrl-C/SIGINT,
-  while SIGTERM support is pending. The server disconnects clients, saves the
-  world and exits. `TimeoutStopSec=40` bounds the wait. Do not override
-  `KillSignal=SIGTERM` until the server handles it.
+* `systemctl stop openblock-server` sends `SIGINT` because the unit explicitly
+  sets `KillSignal=SIGINT`. The binary is built with `ctrlc`'s `termination`
+  feature, so **`SIGINT` and `SIGTERM` both** take the graceful path; the unit
+  keeps `SIGINT` so Ctrl-C and `systemctl stop` exercise the same code. The
+  server disconnects clients, saves the world and exits. `TimeoutStopSec=40`
+  bounds the wait. A `SIGKILL` cannot save.
 * Config changes always require a restart; there is no live reload.
 
 ## Validation
@@ -106,4 +107,6 @@ systemd-analyze security --offline=yes openblock-server.service  # optional scor
 
 `systemd-analyze verify` may report warnings for features unavailable on the
 host (for example `ProtectProc` on very old systemd); the Fedora CI job uses a
-Fedora 44/45 container where all directives are supported.
+Fedora 44/45 container where all directives are supported. On a workstation it
+will also report `/usr/bin/openblock-server` missing until the binary is
+installed; that is not a unit bug.

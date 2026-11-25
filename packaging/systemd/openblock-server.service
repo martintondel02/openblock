@@ -18,10 +18,10 @@
 #   - Config changes require `systemctl restart openblock-server`.
 #   - Open the port only for trusted networks, e.g.:
 #       firewall-cmd --permanent --add-service=openblock-server && firewall-cmd --reload
-#   - This interim binary handles SIGINT (Ctrl-C) as its graceful shutdown
-#     signal. SIGTERM support is pending a server-side `ctrlc` feature, so the
-#     unit deliberately sends SIGINT on stop. Once SIGTERM is handled, this can
-#     return to the systemd default without changing operator commands.
+#   - This binary handles both SIGINT (Ctrl-C) and SIGTERM as graceful
+#     shutdown signals (`ctrlc` with the `termination` feature). The unit
+#     explicitly sends SIGINT so Ctrl-C and `systemctl stop` share one path;
+#     either signal saves, and SIGKILL cannot.
 
 [Unit]
 Description=OpenBlock dedicated server
@@ -56,9 +56,8 @@ Restart=on-failure
 RestartSec=5
 TimeoutStartSec=120
 TimeoutStopSec=40
-# SIGINT is the graceful save path in this interim build; SIGTERM is not
-# handled (see the note above). Keep this until the server installs a SIGTERM
-# handler, otherwise `systemctl stop` kills without a final save.
+# SIGINT is the explicit graceful stop signal (SIGTERM is handled too; see the
+# note above). Keeping one signal makes Ctrl-C and `systemctl stop` identical.
 KillSignal=SIGINT
 SuccessExitStatus=130 143
 

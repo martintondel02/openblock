@@ -1,8 +1,7 @@
 # Security policy
 
-OpenBlock ships a networked game with a dedicated server, a content-pack and
-modding system, and a future account service. Security reports are taken
-seriously.
+OpenBlock 1.0 is a networked game: a desktop client, a headless dedicated server
+and a runtime resource-pack loader. Security reports are taken seriously.
 
 ## Reporting a vulnerability
 
@@ -11,8 +10,8 @@ seriously.
 project lead listed in [MAINTAINERS.md](MAINTAINERS.md).
 
 Include, as far as you can: affected version or commit, component
-(client / server / protocol / mod runtime / content pack loader / updater),
-reproduction steps, and impact.
+(client / server / protocol / resource-pack loader / packaging), reproduction
+steps, and impact.
 
 The project is currently maintained by one person. Reports are handled on a
 best-effort basis: we aim to acknowledge within 72 hours when possible, but we
@@ -22,31 +21,60 @@ details before a fix or an agreed disclosure date.
 
 ## Supported versions
 
-Until 1.0, only the latest released version of the client and the dedicated
-server receives security fixes. Save and network format compatibility follows
+The supported line is **OpenBlock 1.0.x**. Only the latest 1.0.x release of the
+client and dedicated server receives security fixes; pre-1.0 (`0.x`) builds are
+unsupported. Patch releases keep save format 4 and protocol 2; a later 1.0.x
+minor may add a save migration or a protocol revision, which the release notes
+will call out. Save and network format compatibility follows
 [Persistence](docs/spec/17-persistence.md).
 
-## Scope highlights
+## Scope: what 1.0 actually ships
 
-- Dedicated server: authentication bypass, remote crash, resource exhaustion,
-  save corruption.
-- Protocol: memory-safety bugs reachable from network input, packet amplification,
-  replay, identity spoofing.
-- Mod runtime: WASM sandbox escape, capability bypass, content-pack path
-  traversal, native plugin loading of unsigned libraries.
-- Mod and content-pack supply chain: a pack or mod that escapes the sandbox,
-  bypasses a capability, traverses paths, exhausts memory or disk, mismatches a
-  signature or hash, or is installed or updated from an untrusted source,
-  including a typosquatted or dependency-confused package. 1.0 clients run no
-  client-side mod or WASM code ([DEC-049](docs/decisions.md)); server and
-  host-side mod execution is in scope.
-- Updates and auto-updates: a forged, replayed or downgraded update manifest,
-  a compromised update channel or signing key, TLS or signature-verification
-  bypass, and updater/installer privilege issues on any supported platform.
-- Asset/content loading: zipped pack exploits, malformed model/shader input.
-- Client: browser/OS-level issues in the update mechanism.
+The current attack surface is deliberately small. In scope:
 
-Out of scope: cheating in unranked multiplayer without server-side impact,
+- **Dedicated server:** remote crash, resource exhaustion, save corruption,
+  unexpected file access from operator-supplied paths, and a bypass of a
+  documented limit (`max_players`, frame size, per-op rate limits, handshake
+  cap) that grants more access than the protocol intends. Player names are
+  explicitly *not* authentication, so claiming an unauthenticated name or
+  defeating a spoofable whitelist is a documented design limitation, not a
+  vulnerability by itself.
+- **Protocol:** malformed, truncated or oversized frames, decode-time memory
+  amplification, frame amplification, rate-limit bypass, and identity spoofing
+  that defeats a control the documentation claims is enforced.
+- **Resource packs:** path traversal or symlink escape from a user-selected pack
+  directory, malformed PNG/tRNS/animation input, memory exhaustion, or a
+  panic/UB reachable from pack data. Packs are directories read at runtime; no
+  archive/ZIP import exists in 1.0.
+- **Client:** local file handling for screenshots, data directories, config and
+  pack paths; windowing/GPU input handling. The game protocol client side is in
+  scope.
+- **Packaging and CI:** leaked credentials in the repository or artifacts,
+  release-asset substitution, and workflow-token over-permission.
+
+**Not present in 1.0:** there is no WASM/native mod runtime, account service,
+updater/auto-update, telemetry or remote console/RCON. The mod-runtime,
+updater, identity and account scope in earlier drafts of this policy describes
+the post-1.0 plan; report an unexpected implementation as a security issue.
+
+Out of scope: cheating in unranked multiplayer that has no server-side impact,
 self-hosted server misconfiguration that does not affect the software,
-vulnerabilities in third-party mods (report to that mod's author), and anything
-requiring physical access.
+vulnerabilities in third-party resource packs (report to that pack's author),
+and anything requiring physical access.
+
+## 1.0 hardening and operator guidance
+
+- The dedicated server has **no TLS, authentication or encryption**. Bind it to
+  loopback, a trusted LAN or a VPN/Tailscale network, or reach it over an SSH
+  tunnel; do not port-forward 25565 to the public internet. See the
+  [operator security guide](docs/admin/security.md) for the supported
+  deployment patterns and the full limits table.
+- Player names are display labels and save-file keys, not identities. The
+  whitelist reduces accidental joins but is spoofable.
+- At the default `info` level the server does not log remote IP addresses or
+  chat content; a `debug` line records only the chat sender and character
+  count. See [Data handling](docs/admin/security.md#data-handling) before
+  sharing logs or the optional `--metrics-json` file.
+- No credentials, tokens or private keys are created by the 1.0 build. The
+  tracked repository files were reviewed for committed secrets as part of the
+  [1.0.1 audit](docs/plan/1.0.1-audit.md).

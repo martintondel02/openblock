@@ -1,7 +1,7 @@
 # Security
 
 **The interim 1.0 server is not safe to expose to the public internet.** It has
-no TLS, no authentication, no encryption at rest on the wire, and no remote
+no TLS, no authentication, no encryption in transit, and no remote
 console authentication because there is no remote console at all. This page
 explains the model, the supported private deployments, and the hardening that is
 already in place.
@@ -20,9 +20,12 @@ implemented in this build.
 | No authentication | Anyone who can connect may claim any name, including a whitelisted name |
 | No account/identity | A name is a display label and a save-file key, not proof of identity |
 | Client-authoritative movement | Clients report positions; the server validates finite values, world bounds, per-message distance and rate, but does not simulate anti-cheat physics |
-| Chat rate-limited only | No moderation, mute or ban command in this build; logs record what is said |
+| Chat rate-limited only | No moderation, mute or ban command in this build; player chat content is never logged by default (a debug line records the sender and message length only) |
 | Chunk/edit validation limited | Server checks reach, world bounds, block validity, limits and support rules, but this is not an anti-cheat boundary |
-| IP addresses logged | Join/leave lines include the peer address; chat is logged with the sender |
+
+**Privacy default.** Join/leave lines log the player name/id and reason only; the
+build does not log or persist peer addresses. Debug logs add the sender and
+length of a chat line, never its text (see [Data handling](#data-handling)).
 
 A whitelist is useful to prevent accidental joins on a trusted LAN. It is **not**
 a security boundary: an attacker who knows `alice` can join as `alice` and resume
@@ -157,12 +160,43 @@ socket, host `/etc`, or the whole host filesystem into the container. See the
   inventories and chat-adjacent activity. Protect them like any game save.
 * Backups can contain the same data. Keep them mode 0600, restrict the backup
   directory, and delete expired copies according to your retention policy.
-* Logs go to journald/Docker; they include IP addresses and chat. Apply the
-  host's normal log retention and access controls. There is no built-in audit or
-  redaction layer.
+* Logs go to journald/Docker; at the default `info` level they include player
+  names, the world name/seed, the bound listen address, join/leave/kick events,
+  edit counts and errors. They do **not** include remote IP addresses or chat
+  content. `OPENBLOCK_LOG=debug` adds the chat sender and message length (still
+  not the text) and move-rejection diagnostics; treat debug logs as more
+  sensitive and keep them short-lived. Apply the host's normal log retention and
+  access controls. There is no built-in audit or redaction layer.
+* The optional `--metrics-json PATH` snapshot is not an HTTP endpoint: it is a
+  file created with the process umask containing the world name/seed, listen
+  address, player counts and performance counters. Store it with mode
+  `0600`/`0640` (the systemd unit sets `UMask=0027`; the container does not) and
+  do not publish it.
 * No credentials, tokens or private keys are created by this build. Do not put
   secrets in `server.toml`; it has no secret fields and is readable by the
   service account.
+
+### Limits and rate limits
+
+These bounds are the whole resource-exhaustion story in 1.0; they are not a
+substitute for a firewall, but they limit what one connection can consume:
+
+| Bound | 1.0 value |
+| --- | --- |
+| Players | `max_players` default **8** (1–500) |
+| Frame size | **2 MiB** decoded cap; larger declared lengths are rejected before allocation |
+| Handshakes | **32** concurrent, 10 s handshake timeout, 120 s idle read timeout |
+| Outbound queue | **256** frames per client; a full queue drops rather than grows |
+| Movement | 30 moves/s; finite/bounds/per-message distance checks only (client-authoritative) |
+| Edits | 20/s, **7 m** server reach, loaded-column/block/support validation |
+| Chat | 5 lines per 10 s, 256 characters; 32-character player names |
+| Chunks | 16 requests/s, 16-chunk request radius, 6-chunk default interest, 4 chunks/tick/client |
+| Persistence | 60 s autosave (configurable; `0` disables); shutdown always saves |
+| Unit caps | `MemoryMax=8G`, `TasksMax=4096`, `LimitNOFILE=65536` |
+
+The whitelist only filters accidental joins: because names are not
+authenticated, anyone who knows an allowed name can claim it. Use the SSH
+tunnel/VPN patterns above when the network is not fully trusted.
 
 ## Threat-model notes for operators
 
@@ -200,5 +234,6 @@ example WireGuard/SSH), which is what the patterns above use.
 - [ ] Backups scheduled and one restore tested ([backup](backup.md)).
 - [ ] Host patched; SSH key-only; no unrelated services on the machine.
 - [ ] World/backup directories readable only by the service account and admins.
-- [ ] Players told that names are not accounts and chat is logged.
+- [ ] Players told that names are not accounts and that chat is not logged by
+      default (debug records only the sender and message length).
 - [ ] Server stopped before upgrades and backed up first ([upgrade](upgrade.md)).

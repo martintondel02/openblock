@@ -627,7 +627,7 @@ wherever it can be mechanised.
   [feature inventory](../research/05-minecraft-feature-inventory.md) §3.7–3.8;
   [modding and content](../research/06-modding-and-content-system.md) §4.2.
 - Milestones: [MS-08](../plan/01-milestones.md#ms-08--worldgen),
-  [MS-13](../plan/01-milestones.md#ms-13--persistence-maturity-030beta-with-ms-08ms-10).
+  [MS-13](../plan/01-milestones.md#ms-13--persistence-maturity-030-beta-with-ms-08ms-10).
 - External: Perlin, *An Image Synthesizer*, SIGGRAPH 1985
   <https://doi.org/10.1145/325165.325247>; Fritsch & Carlson, *Monotone Piecewise
   Cubic Interpolation*, SIAM J. Numer. Anal. 1980 <https://doi.org/10.1137/0717021>;

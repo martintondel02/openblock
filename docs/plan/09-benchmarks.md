@@ -15,9 +15,10 @@ This page is the map for the CPU-only benchmark and soak tools added for the
 | --- | --- | --- | --- | --- |
 | `worldgen_bench` | [worldgen_bench.rs](../../crates/tools/src/bin/worldgen_bench.rs) | Per-chunk generation latency, chunks/s, block/cave/ore densities, determinism | `--quick` (6×6 chunks × 3 seeds) | default 12×12; `--full` 40×40 |
 | `server_bench` | [server_bench.rs](../../crates/tools/src/bin/server_bench.rs) | `Host::tick` p50/p95/p99/max for idle, moving player, mobs, items, containers; streaming; RSS; save/reload | `--quick` (300 ticks, radius 5) | `--ticks 1000`, reference `--radius 22` (2,025 columns) |
-| `save_bench` | [save_bench.rs](../../crates/tools/src/bin/save_bench.rs) | Save/sidecar size, save and reload latency, state-hash round-trip, v1–v4 migration smoke | `--quick` | `--radius 8` / `--radius 22` |
+| `save_bench` | [save_bench.rs](../../crates/tools/src/bin/save_bench.rs) | Save/sidecar size, save and reload latency, state-hash round-trip, v1–v4 migration smoke; `--phases` adds the serialize/compress/write/fsync breakdown | `--quick` (and `--quick --phases` in CI) | `--radius 8` / `--radius 22`, `--phases` |
 | `soak` | [soak.rs](../../crates/tools/src/bin/soak.rs) | 60,000-tick scripted survival session, invariant/cap checks, save-size and RSS series, final save/reload hash | `--quick` (4,000 ticks) | `--ticks 60000` |
-| `load-gate.py` | [load-gate.py](../../scripts/load-gate.py) | Spawns the real `openblock-server`, drives protocol-v2 bots, waits for the interest set, exercises Move/edit/chat/ping and reports server tick percentiles, TPS, RSS, bandwidth, chunks, edits and a save/reload soak check | `--quick` (4 bots, 12 s; target advisory) | 8 bots / 60 s at radius 6; `--soak` 8 bots / 600 s |
+| `load-gate.py` | [load-gate.py](../../scripts/load-gate.py) | Spawns the real `openblock-server`, drives protocol-v2 bots, waits for the interest set, exercises Move/edit/chat/ping and reports server tick percentiles, TPS, RSS, bandwidth, chunks, edits, a save/reload soak check and autosave/overrun correlation from the server log | `--quick` (4 bots, 12 s; target advisory) | 8 bots / 60 s at radius 6; `--soak` 8 bots / 600 s; `--wait-interest`, `--save-interval 0` diagnostics |
+| `reliability-audit.py` | [reliability-audit.py](../../scripts/reliability-audit.py) | Restart/save/reload cycles, 8-client churn, persistent-bot soak with `/proc` RSS/fd/thread sampling, truncated sidecars/`world.obs`, SIGTERM under save, save+stop race and read-only/file-size-limit disk proxies | n/a (20 cycles, 60 s churn, 300 s soak) | `--soak-seconds 1800` / 24 h soak for the long gate |
 
 The four Rust tools are CPU-only and headless: they never initialize a GPU
 adapter or open a window, never touch `crates/client`, and live in the
@@ -47,6 +48,8 @@ cargo run --release -p ob_tools --bin server_bench -- \
 cargo run --release -p ob_tools --bin save_bench -- --quick
 cargo run --release -p ob_tools --bin save_bench -- \
   --radius 8 --items 256 --mobs 18 --furnaces 32 --chests 16 --saves 5
+cargo run --release -p ob_tools --bin save_bench -- \
+  --radius 22 --saves 5 --no-migration --phases
 
 cargo run --release -p ob_tools --bin soak -- --quick
 cargo run --release -p ob_tools --bin soak -- --ticks 60000
@@ -62,7 +65,28 @@ python3 scripts/load-gate.py --clients 8 --seconds 60 \
 python3 scripts/load-gate.py --soak \
   --binary target/release/openblock-server \
   --json target/soak.json --markdown target/soak.md
+
+# Save-pause diagnostics: steady-state window after interest sets complete,
+# 1 Hz autosave; the report correlates overrun warnings with autosave ticks.
+python3 scripts/load-gate.py --clients 8 --seconds 60 --save-interval 1 \
+  --wait-interest --no-gate --binary target/release/openblock-server \
+  --json target/save-pause.json --markdown target/save-pause.md
+
+# Reliability lane: restart/churn/soak/corruption/SIGTERM/disk proxies.
+python3 scripts/reliability-audit.py \
+  --binary target/release/openblock-server \
+  --cycles 20 --churn-seconds 60 --soak-seconds 300 \
+  --sigterm-iterations 10 \
+  --json target/reliability.json --markdown target/reliability.md
 ```
+
+`save_bench --phases` measures `Host::save` as serialize+compress+CRC, pure
+zstd compression, write+rename, fsync probes and a residual term; it is a
+diagnostic, not a new gate. `load-gate.py --wait-interest` starts the measured
+window only after every bot has its full interest set, and `--save-interval 0`
+is accepted so an operator can reproduce the no-autosave control. Neither flag
+changes the default gate: the published 1.0 numbers still use the original
+join-aligned window.
 
 Each tool prints a human-readable report and the Rust tools can additionally
 write CSV and Markdown tables; the load gate writes JSON and Markdown. The Rust
@@ -100,15 +124,22 @@ The reference profile in [Measurements](08-measurements.md) records:
 ## 4. CI
 
 The `bench` job in `.github/workflows/ci.yml` builds the release tools and runs
-the four `--quick` profiles on Ubuntu. A separate `load-gate` job builds the
-headless server and runs `scripts/load-gate.py --quick` (4 bots, 12 s, temp data
+the four `--quick` profiles on Ubuntu, now with CSV/Markdown output and an
+artifact upload; `save_bench --quick --phases` also exercises the phase probe.
+A separate `load-gate` job builds the headless server and runs
+`scripts/load-gate.py --quick --wait-interest` (4 bots, 12 s, temp data
 directory, ephemeral loopback port, no GPU) and uploads the JSON/Markdown
-report. The quick profiles assert correctness (determinism, invariants,
-save/reload hash, joins, interest sets, chunks and edits), not wall-clock
-thresholds; a shared hosted runner is not a bench box, so the 35 ms target is
-advisory in the quick gate. The local quick gate took about 14 s of run time
-(0.05 s startup + 2.2 s streaming + 12 s load + shutdown). Measured local
-numbers are recorded in [Measurements](08-measurements.md).
+report. An opt-in `reliability` job (`workflow_dispatch` with
+`run_reliability=true`) runs the 20-cycle/churn/300 s-soak audit and uploads its
+report; it is manual because the full lane costs ~15 minutes.
+
+The quick profiles assert correctness (determinism, invariants, save/reload
+hash, joins, interest sets, chunks and edits), not wall-clock thresholds; a
+shared hosted runner is not a bench box, so the 35 ms target is advisory in the
+quick gate. The local quick gate took about 14 s of run time (0.05 s startup +
+2.2 s streaming + 12 s load + shutdown) before `--wait-interest`; the wait adds
+~2.1 s of pre-measurement streaming. Measured local numbers are recorded in
+[Measurements](08-measurements.md).
 
 The pre-existing offscreen render gate, save-size guard and Fedora/Windows/macOS
 matrix are unchanged.
@@ -158,9 +189,22 @@ matrix are unchanged.
   50-minute wall-clock leak test. The 2 h/24 h bot soak in spec/24 §3.13 remains
   the long-running gate.
 - **Whole-world save pause is over budget at scale.** The measured 2,025-column
-  save takes ≈156 ms, against the 30 ms PERF-IO-004 tick-impact budget; the
-  current snapshot writer is synchronous. The measurement and the 289-column
-  (21–24 ms) result are in [Measurements](08-measurements.md).
+  save takes 154–156 ms, against the 30 ms PERF-IO-004 tick-impact budget; the
+  current snapshot writer is synchronous. At 1,089 columns an end-to-end 1 Hz
+  autosave moves tick p99 to 85 ms and every logged overrun lands on an
+  autosave tick. The 289-column 21–24 ms result is tmpfs-only; on a btrfs data
+  directory the same save is slower and the 169-column point is the currently
+  demonstrated safe size. The phase breakdown and design proposal are in
+  [the 1.0.1 performance audit](1.0.1-performance.md).
+- **`--ticks 0` is not a read-only verification.** `Host::open` streams the
+  two-column ring and the headless path saves it, so reopening the same world
+  directory can grow the resident set and change the state hash. Reliability
+  checks compare two independent copies instead; a read-only hash mode is an
+  open item.
+- **No last-good snapshot fallback.** A truncated `world.obs` is rejected with
+  a non-zero exit (good: no silent partial load), but there is no previous-
+  generation recovery. Sidecar truncation degrades to warnings and missing
+  records.
 
 ## Open questions
 
@@ -191,4 +235,7 @@ matrix are unchanged.
 - [World generation](../spec/06-worldgen.md) — generation determinism and
   density contracts
 - [Tools crate](../../crates/tools/Cargo.toml) — binaries and dependencies
-- [CI workflow](../../.github/workflows/ci.yml) — quick benchmark job
+- [CI workflow](../../.github/workflows/ci.yml) — quick benchmark, load-gate
+  and manual reliability jobs
+- [1.0.1 performance audit](1.0.1-performance.md) — save-pause decomposition,
+  reliability results and the design proposal

@@ -97,11 +97,17 @@ impl ChunkColumn {
     }
 
     /// Writes a block by world position, updating the column heightmap.
+    ///
+    /// A position outside this column is ignored. The heightmap only changes
+    /// when the write actually changes the topmost non-air block; in particular
+    /// writing air (or re-writing the same id) above the current top must not
+    /// raise it.
     pub fn set_block(&mut self, pos: BlockPos, value: BlockId) {
         let local = pos.local();
-        if let Some(section) = self.section_mut(pos.section()) {
-            section.set(local, value);
-        }
+        let Some(section) = self.section_mut(pos.section()) else {
+            return;
+        };
+        section.set(local, value);
         self.update_heightmap(local, pos.y);
     }
 
@@ -112,10 +118,21 @@ impl ChunkColumn {
             return;
         }
         let current = self.heightmap[column];
+        let world = BlockPos::new(
+            self.pos.x * SECTION_SIZE as i32 + local.x as i32,
+            world_y,
+            self.pos.z * SECTION_SIZE as i32 + local.z as i32,
+        );
         if relative > current {
-            self.heightmap[column] = relative;
-        } else if relative == current {
-            // The top block was removed; rescan this column downwards.
+            // Only a non-air block above the current top raises the heightmap.
+            // A no-op/air write must not create a phantom surface that spawn
+            // and mob-placement checks would trust.
+            if self.get_block(world) != BlockId::AIR {
+                self.heightmap[column] = relative;
+            }
+        } else if relative == current && self.get_block(world) == BlockId::AIR {
+            // The top block was removed; rescan this column downwards. A
+            // no-op or a replacement at the same height leaves it unchanged.
             let mut y = relative - 1;
             while y >= 0 {
                 let block_pos = BlockPos::new(
@@ -152,5 +169,52 @@ impl ChunkColumn {
             .iter()
             .map(|s| s.block_bytes() + s.light().heap_bytes())
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ob_math::{ChunkPos, SectionPos, WORLD_MIN_Y};
+
+    #[test]
+    fn air_and_noop_writes_above_the_top_do_not_raise_the_heightmap() {
+        let pos = ChunkPos::new(1, -2);
+        let mut column = ChunkColumn::new(pos);
+        let (origin_x, origin_z) = pos.origin();
+        let top = BlockPos::new(origin_x + 3, WORLD_MIN_Y + 10, origin_z + 4);
+        column.set_block(top, BlockId(1));
+        assert_eq!(column.height_at(3, 4), Some(WORLD_MIN_Y + 10));
+
+        let above = BlockPos::new(origin_x + 3, WORLD_MIN_Y + 15, origin_z + 4);
+        column.set_block(above, BlockId(2));
+        assert_eq!(column.height_at(3, 4), Some(WORLD_MIN_Y + 15));
+
+        // A no-op non-air write above the top stays put.
+        column.set_block(above, BlockId(2));
+        assert_eq!(column.height_at(3, 4), Some(WORLD_MIN_Y + 15));
+
+        // Writing air above the top must not invent a surface.
+        column.set_block(above, BlockId::AIR);
+        assert_eq!(column.height_at(3, 4), Some(WORLD_MIN_Y + 10));
+        column.set_block(
+            BlockPos::new(origin_x + 3, WORLD_MIN_Y + 20, origin_z + 4),
+            BlockId::AIR,
+        );
+        assert_eq!(column.height_at(3, 4), Some(WORLD_MIN_Y + 10));
+
+        // Removing the actual top rescans downwards.
+        column.set_block(top, BlockId::AIR);
+        assert_eq!(column.height_at(3, 4), None);
+    }
+
+    #[test]
+    fn set_block_ignores_positions_outside_the_column() {
+        let pos = ChunkPos::new(0, 0);
+        let mut column = ChunkColumn::new(pos);
+        let other = BlockPos::new(16, WORLD_MIN_Y + 3, 0);
+        column.set_block(other, BlockId(1));
+        assert_eq!(column.height_at(0, 0), None);
+        assert!(column.section(SectionPos::new(1, WORLD_MIN_Y / 16, 0)).is_none());
     }
 }

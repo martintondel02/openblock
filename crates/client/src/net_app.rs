@@ -44,6 +44,7 @@ use crate::mining::MiningState;
 use crate::net::{ConnectOptions, NetEvent, NetState, NetworkClient};
 use crate::net_state;
 use crate::net_ui::{self, ConnectPanel};
+use crate::ui_scale::{physical_to_ui_point, rescale_cursor, resolved_ui_scale_percent, ui_scale_factor, ui_screen};
 use crate::ui_state::{
     BLOCK_NAME_SECONDS, DamageFlash, DeathAction, DebugStats, HOTBAR_SLOTS as UI_HOTBAR_SLOTS, Screen, SettingsAction,
     SettingsInfo, SettingsRow, UiState, facing_label,
@@ -146,6 +147,7 @@ impl ApplicationHandler for NetApp {
         let initial_fov = settings.fov_degrees;
         let mut ui = UiState::from_settings(settings);
         ui.active_texture_pack = crate::active_texture_pack_label(&texture_source);
+        ui.ui_scale_percent = resolved_ui_scale_percent(ui.settings.ui_scale_percent, window_size.1);
         ui.screen = Screen::Connecting;
         let applied_render_distance = ui.settings.render_distance_chunks.clamp(1, 16);
         let audio_enabled_before_mute = if self.options.mute {
@@ -211,6 +213,8 @@ impl ApplicationHandler for NetApp {
             endpoint,
             player_name,
             auto_player_name,
+            connect_selected: 0,
+            connect_hovered: None,
             connect_started: Instant::now(),
             notice_seconds: NOTICE_SECONDS,
             tab_held: false,
@@ -247,6 +251,7 @@ impl ApplicationHandler for NetApp {
             WindowEvent::Resized(size) => {
                 state.renderer.resize(size.width.max(1), size.height.max(1));
                 state.window_size = (size.width.max(1) as f32, size.height.max(1) as f32);
+                state.refresh_ui_scale();
             }
             WindowEvent::RedrawRequested => state.frame(),
             WindowEvent::KeyboardInput { event, .. } => {
@@ -438,10 +443,24 @@ impl ApplicationHandler for NetApp {
                         }
                         state.handle_escape();
                     }
-                    KeyCode::KeyR | KeyCode::Enter
-                        if pressed && !event.repeat && state.ui.screen == Screen::Connecting =>
-                    {
+                    KeyCode::KeyR if pressed && !event.repeat && state.ui.screen == Screen::Connecting => {
                         state.retry();
+                    }
+                    KeyCode::Enter if pressed && !event.repeat && state.ui.screen == Screen::Connecting => {
+                        if state.connect_selected == 0 {
+                            state.retry();
+                        } else {
+                            state.shutdown();
+                            state.persist_settings();
+                            event_loop.exit();
+                            return;
+                        }
+                    }
+                    KeyCode::ArrowUp | KeyCode::ArrowDown if pressed && state.ui.screen == Screen::Connecting => {
+                        let step = if code == KeyCode::ArrowUp { -1 } else { 1 };
+                        state.connect_selected = (state.connect_selected as i32 + step)
+                            .rem_euclid(net_ui::CONNECT_ACTIONS.len() as i32)
+                            as usize;
                     }
                     KeyCode::Tab => {
                         state.tab_held = pressed;
@@ -527,9 +546,19 @@ impl ApplicationHandler for NetApp {
                             return;
                         }
                         let screen = state.window_screen();
-                        match net_ui::connect_action_at(screen, state.ui.cursor.0, state.ui.cursor.1) {
-                            Some(net_ui::ConnectAction::Retry) => state.retry(),
+                        match net_ui::connect_action_at_for_state(
+                            screen,
+                            state.failure.is_some(),
+                            state.client.is_some(),
+                            state.ui.cursor.0,
+                            state.ui.cursor.1,
+                        ) {
+                            Some(net_ui::ConnectAction::Retry) => {
+                                state.connect_selected = 0;
+                                state.retry();
+                            }
                             Some(net_ui::ConnectAction::Quit) => {
+                                state.connect_selected = 1;
                                 state.shutdown();
                                 state.persist_settings();
                                 event_loop.exit();
@@ -601,8 +630,19 @@ impl ApplicationHandler for NetApp {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                state.ui.cursor = (position.x as f32, position.y as f32);
+                state.ui.cursor = state.ui_point((position.x as f32, position.y as f32));
                 match state.ui.screen {
+                    Screen::Connecting => {
+                        let screen = state.window_screen();
+                        let cursor = state.ui.cursor;
+                        state.connect_hovered = net_ui::connect_button_rects_for_state(
+                            screen,
+                            state.failure.is_some(),
+                            state.client.is_some(),
+                        )
+                        .iter()
+                        .position(|rect| rect.contains(cursor.0, cursor.1));
+                    }
                     Screen::Settings => {
                         let screen = state.window_screen();
                         state.ui.settings_hover(screen);
@@ -612,7 +652,7 @@ impl ApplicationHandler for NetApp {
                         let screen = state.window_screen();
                         state.ui.update_death_hover(screen);
                     }
-                    Screen::Playing | Screen::Furnace | Screen::Chest | Screen::Crafting | Screen::Connecting => {}
+                    Screen::Playing | Screen::Furnace | Screen::Chest | Screen::Crafting => {}
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -727,6 +767,10 @@ struct NetGameState {
     player_name: String,
     /// Whether the name was generated (and may be regenerated on retry).
     auto_player_name: bool,
+    /// Keyboard focus on the connect overlay (0 reconnect/restart, 1 quit).
+    connect_selected: usize,
+    /// Hovered connect-overlay button, if any.
+    connect_hovered: Option<usize>,
     connect_started: Instant,
     notice_seconds: f32,
     tab_held: bool,
@@ -764,8 +808,32 @@ impl NetGameState {
             .is_some_and(|client| client.chat_input().is_active())
     }
 
+    /// Effective GUI-scale percentage for the current physical window.
+    fn resolved_ui_percent(&self) -> u16 {
+        resolved_ui_scale_percent(self.ui.settings.ui_scale_percent, self.window_size.1)
+    }
+
+    fn ui_point(&self, point: (f32, f32)) -> (f32, f32) {
+        physical_to_ui_point(
+            point,
+            ui_scale_factor(self.ui.settings.ui_scale_percent, self.window_size.1),
+        )
+    }
+
+    fn refresh_ui_scale(&mut self) {
+        let old = self.ui.ui_scale_percent;
+        let new = self.resolved_ui_percent();
+        if new != old {
+            self.ui.cursor = rescale_cursor(self.ui.cursor, old, new);
+            self.ui.ui_scale_percent = new;
+        }
+    }
+
     fn window_screen(&self) -> [f32; 2] {
-        [self.window_size.0.max(1.0), self.window_size.1.max(1.0)]
+        ui_screen(
+            [self.window_size.0.max(1.0), self.window_size.1.max(1.0)],
+            self.ui.settings.ui_scale_percent,
+        )
     }
 
     fn persist_settings(&self) {
@@ -936,6 +1004,8 @@ impl NetGameState {
         self.shutdown_client();
         self.pending_connect = None;
         self.failure = None;
+        self.connect_selected = 0;
+        self.connect_hovered = None;
         self.ui.clear_death();
         self.damage_flash.reset();
         self.cancel_mining();
@@ -2049,6 +2119,10 @@ impl NetGameState {
             adapter: self.renderer.adapter_summary().to_string(),
             window: [self.window_size.0 as u32, self.window_size.1 as u32],
             fov_degrees: self.ui.settings.fov_degrees,
+            ui_scale: crate::ui_scale::debug_line(
+                self.ui.settings.ui_scale_percent,
+                [self.window_size.0, self.window_size.1],
+            ),
             time_of_day,
             texture_source: crate::describe_texture_source(&self.texture_source, self.renderer.texture_resolution()),
             game_mode: "survival",
@@ -2266,6 +2340,7 @@ impl NetGameState {
                 texture_source: self.texture_source.label(),
                 texture_resolution: self.renderer.texture_resolution(),
                 mesh_workers: self.mesh_scheduler.workers(),
+                ui_scale_percent: resolved_ui_scale_percent(self.ui.settings.ui_scale_percent, self.window_size.1),
                 audio_status: self.audio_status.clone(),
             };
             crate::ui_state::draw_settings_screen(&mut frame, &self.ui, &info, screen);
@@ -2325,6 +2400,8 @@ impl NetGameState {
                 players: connection.map(|client| (client.player_count(), client.server_info().max_players)),
                 progress: connection.map(NetworkClient::loading_progress),
                 failure: self.failure.as_deref(),
+                selected: self.connect_selected.min(1),
+                hovered: self.connect_hovered,
             };
             net_ui::draw_connect_panel(&mut frame, &panel, screen);
         }
@@ -2433,6 +2510,7 @@ impl NetGameState {
             SettingsRow::MasterVolume | SettingsRow::SfxVolume | SettingsRow::MusicVolume => {
                 self.sync_audio_settings();
             }
+            SettingsRow::UiScale => self.refresh_ui_scale(),
             SettingsRow::ReducedMotion
             | SettingsRow::ShowHud
             | SettingsRow::DebugOverlay

@@ -14,7 +14,7 @@ none of those libraries.
 | Port | `25565/tcp` |
 | Volume | `/data` (worlds live in `/data/worlds/<name>/`) |
 | Healthcheck | `nc -z 127.0.0.1 25565` (TCP liveness; no HTTP endpoint in this build) |
-| Signals | `SIGTERM`/`SIGINT` save and exit; image `STOPSIGNAL SIGTERM`, compose `stop_signal: SIGTERM`, 40 s grace |
+| Signals | `SIGTERM` and `SIGINT` save and exit; image `STOPSIGNAL SIGTERM`, compose `stop_signal: SIGINT` (both handled), 40 s grace |
 
 There is no shell in the runtime image beyond Alpine's busybox `sh` (kept for
 `nc`/troubleshooting); `cap_drop: ALL`, `no-new-privileges` and
@@ -75,9 +75,16 @@ docker logs -f openblock-server
 
 `--read-only` works because all mutable state is below `/data`; the image's
 `/data` is pre-owned by 10001, so empty named volumes inherit the ownership.
+
+The TCP healthcheck probes the listener without sending a `hello`, so the
+server logs a `handshake failed`/timeout warning for each probe (every 30 s).
+That line is expected liveness noise, not a client failure; use the `tps` line
+and a real client join as readiness evidence.
+
 Podman builds OCI images by default and drops Docker's `HEALTHCHECK` unless you
 pass `--format docker`; the Compose example defines its own healthcheck, so
 `docker compose ps` still reports health for both runtimes.
+
 With a host bind mount, create it explicitly:
 
 ```sh
@@ -101,7 +108,7 @@ cd packaging/container
 docker compose up -d --build
 docker compose logs -f openblock
 docker compose ps                 # healthy once the listener accepts TCP
-docker compose down               # sends SIGTERM and waits up to 40 s
+docker compose down               # sends SIGINT and waits up to 40 s
 ```
 
 The compose file deliberately publishes `127.0.0.1:25565:25565/tcp`. The server

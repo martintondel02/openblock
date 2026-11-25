@@ -62,7 +62,8 @@ world and exits.
 | Persistent network-player records | Yes | `network_players.txt`; the same name resumes the record, so names are not authentication |
 | Whitelist by player name | Yes | Empty list means everyone; restart required |
 | TLS, login/auth, encryption | **No** | Firewall/VPN/SSH tunnel only |
-| Remote console/RCON, metrics/HTTP health, server browser | **No** | Console is stdin-only; the container healthcheck is a TCP connect |
+| Remote console/RCON, HTTP health/status endpoint, server browser | **No** | Console is stdin-only; the container healthcheck is a TCP connect |
+| Metrics snapshots | **Yes, file-based** | `--metrics-json PATH` writes JSON snapshots (world/seed, listen address, tick/network counters); there is no HTTP/Prometheus endpoint |
 | Built-in backup scheduler/world management | **No** | Use the shell scripts and systemd timer/cron |
 | World-directory lock | **No** | Run exactly one server process per world |
 | Live config reload | **No** | Every config change requires a restart |
@@ -80,5 +81,6 @@ build. The interim sections of specs 18 and 19 are the contract for today.
   musl.
 * The server is a foreground process. systemd, the container image, or your own
   supervisor provides restart-on-failure and log collection.
-* No telemetry and no outbound connections are made by the server.
+* No telemetry and no outbound connections are made by the server. Logs and
+  metrics stay local; see [security § Data handling](security.md#data-handling).
 * World data is the operator's responsibility: schedule and test backups.

@@ -1,10 +1,15 @@
-# RPM spec for OpenBlock — draft, built from milestone MS-16 onward.
+# RPM spec for OpenBlock — COPR staging recipe for the 1.0.x line.
+#
+# STATUS: not published and not yet buildable from a release asset. v1.0.0
+# attached only screenshots to GitHub; Source0 (the vendor tarball described
+# below) and the COPR project do not exist yet. See packaging/README.md
+# "Publication status" and docs/plan/1.0.1-audit.md before relying on this file.
 #
 # This is a COPR package: it bundles the Rust crate graph in the source archive
 # (see packaging/README.md). An official Fedora repository package requires
 # unbundling via cargo2rpm and is tracked as OPEN-021.
 #
-# Build locally from a release tarball:
+# Build locally from a release tarball placed in the rpmbuild SOURCES directory:
 #   rpmbuild -ba packaging/fedora/openblock.spec
 #
 # The archive must contain Cargo.lock and the full workspace. `%cargo_*` macros
@@ -13,15 +18,18 @@
 %global debug_package %{nil}
 
 Name:           openblock
-Version:        1.0.0
+Version:        1.0.1
 Release:        1%{?dist}
-Summary:        Fast, deeply moddable, server-first voxel sandbox
+Summary:        Fast, self-hostable voxel sandbox with survival and multiplayer
 
 License:        MIT OR Apache-2.0
 URL:            https://github.com/martintondel02/openblock
 Source0:        %{url}/releases/download/v%{version}/openblock-%{version}.tar.gz
-# Bundled Rust crates; see packaging/README.md and OPEN-021.
-Provides:       bundled(crate(openblock)) = %{version}
+# TODO(release/COPR): replace with one `Provides: bundled(crate(NAME)) = VERSION`
+# per vendored crate generated from Cargo.lock, as Fedora review requires. The
+# previous single `bundled(crate(openblock))` line was not a valid bundled
+# provide list, so it is deliberately omitted rather than claiming a capability.
+# See packaging/README.md and OPEN-021.
 
 BuildRequires:  gcc gcc-c++ make
 BuildRequires:  rust cargo
@@ -38,9 +46,11 @@ Recommends:     pulseaudio-libs
 
 %description
 OpenBlock is an open-source voxel sandbox game. Mine, build, explore and
-survive alone or with friends on servers you host yourself. It targets the
-Minecraft Java feature set as a baseline and goes further with a scriptable
-content platform, GPU-driven rendering and server-first multiplayer.
+survive alone or with friends on servers you host yourself. The 1.0 Early
+Access release ships the survival loop, mobs/combat, procedural audio and
+self-hosted multiplayer. Minecraft parity, the mod/content platform and the
+wider distribution channels are post-1.0 work, not capabilities of this
+package.
 
 This package installs the client with desktop integration. Audio is synthesised
 in memory and played through PipeWire's PulseAudio compatibility service (or
@@ -81,8 +91,9 @@ install -Dpm 0644 packaging/fedora/openblock.metainfo.xml \
   %{buildroot}%{_metainfodir}/io.github.martintondel02.OpenBlock.metainfo.xml
 install -Dpm 0644 packaging/fedora/io.github.martintondel02.OpenBlock.svg \
   %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/io.github.martintondel02.OpenBlock.svg
-install -Dpm 0644 packaging/fedora/openblock.mime.xml \
-  %{buildroot}%{_datadir}/mime/packages/openblock.xml
+# The .obworld MIME definition is intentionally not installed: archive import
+# is not implemented in 1.0, so the desktop file does not claim the type. Ship
+# both together when the format lands.
 
 install -Dpm 0644 packaging/systemd/openblock-server.service \
   %{buildroot}%{_unitdir}/openblock-server.service
@@ -134,7 +145,6 @@ update-desktop-database &>/dev/null || :
 %{_datadir}/applications/io.github.martintondel02.OpenBlock.desktop
 %{_metainfodir}/io.github.martintondel02.OpenBlock.metainfo.xml
 %{_datadir}/icons/hicolor/scalable/apps/io.github.martintondel02.OpenBlock.svg
-%{_datadir}/mime/packages/openblock.xml
 
 %files server
 %doc packaging/systemd/README.md docs/admin
@@ -151,7 +161,7 @@ update-desktop-database &>/dev/null || :
 %config(noreplace) %{_sysconfdir}/openblock/server.env.example
 
 %changelog
-* Sat Nov 25 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 1.0.0-1
+* Wed Nov 25 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 1.0.0-1
 - OpenBlock 1.0.0 Early Access: survival core (worldgen caves/ores, mobs and
   combat, crafting/recipe book, furnace smelting, iron tools and armor, chests,
   item drops/pickup, death/respawn, persistence), self-hosted multiplayer alpha
@@ -162,7 +172,7 @@ update-desktop-database &>/dev/null || :
   action guard, UI/UX audit fixes, macOS/Windows CI fixes, 8-player load gate
   and 10-minute soak.
 
-* Sat Nov 25 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.2.0-1
+* Wed Nov 25 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.2.0-1
 - Front-end: title screen with Continue/New World/Load World/Multiplayer/
   Settings/Quit, world creation and world browser with safe delete, direct-
   connect screen with recent servers, host-optional settings from the menu.
@@ -175,7 +185,7 @@ update-desktop-database &>/dev/null || :
 - Cross-platform fix: accepted sockets are forced blocking on Darwin (macOS
   loopback/network failures) and Windows-only clippy test imports fixed.
 
-* Sat Nov 25 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.1.0-1
+* Wed Nov 25 2026 OpenBlock contributors <openblock@users.noreply.github.com> - 0.1.0-1
 - Multiplayer alpha: dedicated server (TCP/JSON protocol v2) with
   server-authoritative survival (inventories, vitals, equipment, actions,
   furnace/chest windows, death/respawn, persistence), client connect mode with

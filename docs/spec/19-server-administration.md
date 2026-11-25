@@ -121,6 +121,13 @@ The systemd unit uses `Restart=on-failure`, `RestartSec=5`, `LimitNOFILE=65536`,
 
 #### 3.1.1 Fedora Server (primary deployment)
 
+> **Target design, not the 1.0 package.** The COPR repository, `/etc/openblock-server`
+> and `/var/lib/openblock-server` paths, and the UDP/QUIC port below describe the
+> post-1.0 Fedora deployment. The 1.0 recipe in [`packaging/fedora`](../../packaging/fedora/openblock.spec)
+> installs `/etc/openblock/server.toml`, keeps worlds in `/var/lib/openblock`,
+> opens **TCP/25565**, and is staged rather than published; the operator-facing
+> truth for this build is [docs/admin](../../docs/admin/README.md).
+
 The reference deployment is **Fedora Server 44/45 x86_64**:
 
 1. `dnf copr enable openblock/openblock && dnf install openblock-server` (COPR; the
@@ -443,6 +450,12 @@ Logs are JSON lines on stdout and in `<data>/logs/server.jsonl`, rotated at
 are omitted unless `log_player_ips` is true; tokens, keys and chat content are never logged by
 default. `RUST_LOG`-style per-target filters are allowed but the resolved filter is logged at start.
 
+> **Interim note (1.0).** The shipped build logs plain text through
+> `OPENBLOCK_LOG`, not JSON, and has no `log_player_ips` key or rotation
+> settings. It never logs peer IP addresses or chat text (a `debug` line
+> records only the chat sender and character count). The JSON-lines,
+> hash-chained audit and rotation design above remains the post-1.0 target.
+
 Metrics are exposed in Prometheus text format. Naming follows
 `openblock_<area>_<name>_<unit>` ([01](01-technical-architecture.md) §4.4); a rename breaks dashboards
 and is a breaking change.
@@ -488,7 +501,7 @@ series only for the top N by bandwidth unless `per_player_series = "all"`. `/hea
 `/ready` is readiness:
 
 ```json
-{"status":"ok","version":"0.2.0","protocol":1,"uptime_seconds":86400,
+{"status":"ok","version":"1.0.0","protocol":2,"uptime_seconds":86400,
  "world":{"name":"main","uuid":"018f…","loaded_chunks":2048,"save_age_seconds":3},
  "tick":{"rate_hz":20,"snapshot_hz":20,"tps_1m":20.0,"p99_ms":12.4,"overruns_total":0},
  "players":{"online":12,"max":20},
@@ -748,9 +761,9 @@ fail with a line number and exit `2`.
 `SIGINT`/`SIGTERM` take the same graceful path as `stop`. On shutdown every
 client receives `Disconnect { reason: "server_shutdown" }`, the host save runs
 once, and the process exits. Join, leave, edits, client errors and periodic
-TPS/tick timing are logged through the existing `OPENBLOCK_LOG` logger; IP
-addresses and chat are not treated as secrets, but no credentials exist in
-this build.
+TPS/tick timing are logged through the existing `OPENBLOCK_LOG` logger. Peer IP
+addresses are not logged, and chat content is never logged (a debug line records
+the sender and length only); no credentials exist in this build.
 
 **Metrics snapshots (interim observability).** `--metrics-json PATH` writes an
 atomic JSON object (`"schema": "openblock.server-metrics/1"`) immediately after
@@ -781,7 +794,11 @@ authoritative for world blocks, network-player vitals/inventory/equipment,
 containers, mobs and item pickups; movement is client-authoritative (bounds,
 speed/teleport and fall-damage tracking only) and network players do not
 collide. The host's internal single-player `Player` is not a network
-participant and does not appear in `list`.
+participant and does not appear in `list`. `--save-interval` is a maximum loss
+window: the advancing tick clock (and player/mob/furnace/item simulation)
+dirties the world, so the server saves at that cadence even when no client
+intent arrives (1.0.1 autosave fix). Autosave remains synchronous on the tick
+thread.
 
 **Network-player persistence.** `network_players.txt` in the world directory
 stores one line per known player (online first, then offline), containing
@@ -941,9 +958,9 @@ one measurement path.
   backups, capacity); [persistence](../research/09-persistence-assets-packaging.md) §6.7 (container
   image, reproducibility) and §3.7–§3.8 (compaction, backups); [Weft teardown](../research/01-weft-teardown.md)
   §4.4 (append-only regions and the format-gate lesson).
-- Milestones: [MS-07](../plan/01-milestones.md#ms-07--dedicated-server-020alpha),
-  [MS-15](../plan/01-milestones.md#ms-15--scale--anticheat-100rc),
-  [MS-16](../plan/01-milestones.md#ms-16--10-launch-100).
+- Milestones: [MS-07](../plan/01-milestones.md#ms-07--dedicated-server-020-alpha),
+  [MS-15](../plan/01-milestones.md#ms-15--scale--anti-cheat-100-rc),
+  [MS-16](../plan/01-milestones.md#ms-16--10-early-access-launch-100).
 - External: Prometheus exposition format <https://prometheus.io/docs/instrumenting/exposition_formats/>;
   systemd.exec hardening directives
   <https://www.freedesktop.org/software/systemd/man/systemd.exec.html>; Docker Compose file

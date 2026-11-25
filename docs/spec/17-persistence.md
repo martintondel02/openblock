@@ -394,7 +394,26 @@ non-finite or out-of-range line is ignored with a warning.
 The host state hash covers player state, inventory, item entities sorted by id,
 the persisted world spawn, furnaces and chests sorted by position (all slots,
 empty markers included), equipment in slot order and world blocks; save/reload
-must therefore reproduce the hash exactly.
+must therefore reproduce the hash exactly. "Player state" includes the
+persisted look direction (yaw/pitch, canonicalised) and the flight flag; the
+1.0.1 audit added those fields explicitly and `player.txt` now writes canonical
+angles so save/load/save is byte-stable. Light remains a deterministic function
+of the resident blocks and generation and is not hashed.
+
+**1.0.1 save-path clarifications (implemented).** Sidecar and world files are
+first serialised in memory, then written to `*.tmp` and `fsync`ed, and only
+after every temporary file exists are they renamed over the targets (sidecars
+first, `world.obs` last). A target that is a directory is rejected before
+staging; on read, `world.obs` and every sidecar path is checked to be a regular
+file before it is opened, so a FIFO or device in an untrusted world directory
+cannot block startup. The v4 encoder enforces the same limits
+the loader applies (`MAX_SAVE_PAYLOAD_BYTES` 256 MiB uncompressed and
+`MAX_SAVE_FILE_BYTES` 512 MiB on disk) and refuses to commit an oversized
+snapshot, keeping the previous save intact. Individual replacements are atomic,
+but a crash between two renames can still mix one new sidecar with the previous
+world; the multi-file journal in §3.5 remains the target design for a future
+region-file save path. The interim `.tmp` files are best-effort cleaned after a
+failed staging/rename.
 
 ### 3.5 Write path
 
@@ -825,8 +844,8 @@ growth beyond the compaction threshold.
   [feature inventory](../research/05-minecraft-feature-inventory.md) §3.12
   (Anvil as prior art only, explicitly not imported); research 09 was not present
   at the time of writing (see the note above).
-- Milestones: [MS-13](../plan/01-milestones.md#ms-13--persistence-maturity-030beta-with-ms-08ms-10),
-  [MS-03](../plan/01-milestones.md#ms-03--first-playable-0001),
+- Milestones: [MS-13](../plan/01-milestones.md#ms-13--persistence-maturity-030-beta-with-ms-08ms-10),
+  [MS-03](../plan/01-milestones.md#ms-03--first-playable-001),
   [MS-16](../plan/01-milestones.md) (format freeze).
 - External: RFC 8878 (Zstandard) <https://www.rfc-editor.org/rfc/rfc8878>; RFC 3720
   §12.1 (CRC32C) <https://www.rfc-editor.org/rfc/rfc3720>; BLAKE3

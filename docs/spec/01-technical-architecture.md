@@ -70,6 +70,13 @@ terrain cannot create or extend a world. The client lists the same generator bec
 host is linked into the client binary; client gameplay code MUST NOT call the generator directly
 ([DEC-008](../decisions.md)).
 
+> **1.0 interim note.** `ob_net`, `ob_ui` and `ob_modding` are empty scaffold
+> crates declared in `architecture.toml`; the shipped client and server do not
+> link them yet. Their `allowed_deps` entries are permitted future edges, not
+> current dependencies, so the implemented graph is the table above minus
+> those three crates. The networking and UI behaviour in 1.0 lives in
+> `ob_protocol`, `ob_server::net` and `ob_client` (see [18 §3.13](18-networking-multiplayer.md#313-interim-jsontcp-protocol-implemented-for-10)).
+
 ### 3.2 Crate topology
 
 Arrows point from dependent to dependency; the diagram omits the `ob_math` and `ob_core` base edges

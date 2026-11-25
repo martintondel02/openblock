@@ -720,6 +720,61 @@ def delta(end, start, key):
     return int(end.get(key, 0) or 0) - int(start.get(key, 0) or 0)
 
 
+def parse_duration_ms(text):
+    """Parses a Rust `Duration` debug string into milliseconds."""
+    match = re.match(r"([0-9]+(?:\.[0-9]+)?)\s*(ns|µs|us|ms|s)", text.strip())
+    if match is None:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2)
+    if unit == "ns":
+        return value / 1_000_000.0
+    if unit in ("µs", "us"):
+        return value / 1000.0
+    if unit == "s":
+        return value * 1000.0
+    return value
+
+
+def analyze_server_log(path):
+    """Extracts autosave ticks and overrun warnings from the server log.
+
+    The server logs an overrun immediately after the tick that produced it, and
+    an autosave logs at the end of the same tick. A warning on the line right
+    after an autosave line therefore attributes the pause to that save without
+    instrumenting the server.
+    """
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {"autosaves": 0, "overrun_warnings": 0, "autosave_overruns": 0, "overrun_ms": []}
+    autosave_ticks = []
+    overruns = []
+    autosave_overruns = 0
+    last_autosave_line = -10
+    for index, line in enumerate(lines):
+        autosave = re.search(r"autosaved world .* at tick (\d+)", line)
+        if autosave:
+            autosave_ticks.append(int(autosave.group(1)))
+            last_autosave_line = index
+        overrun = re.search(r"tick overran the 50 ms budget: (.+)$", line)
+        if overrun:
+            milliseconds = parse_duration_ms(overrun.group(1))
+            if milliseconds is not None:
+                overruns.append(milliseconds)
+                if index - last_autosave_line <= 1:
+                    autosave_overruns += 1
+    return {
+        "autosaves": len(autosave_ticks),
+        "first_autosave_tick": autosave_ticks[0] if autosave_ticks else None,
+        "last_autosave_tick": autosave_ticks[-1] if autosave_ticks else None,
+        "overrun_warnings": len(overruns),
+        "autosave_overruns": autosave_overruns,
+        "overrun_max_ms": max(overruns) if overruns else None,
+        "overrun_ms": [round(value, 3) for value in overruns],
+    }
+
+
 def run_gate(args):
     binary = Path(args.binary).resolve()
     if not binary.is_file() or not os.access(binary, os.X_OK):
@@ -773,6 +828,24 @@ def run_gate(args):
         if stats.joins < args.clients:
             failure_detail = "only %d/%d clients joined before measurement" % (stats.joins, args.clients)
 
+        # Optionally let the cold interest-set streaming finish before the
+        # measured window starts, so the tick percentiles describe steady-state
+        # play rather than the join burst. Off by default to keep the 1.0
+        # profile comparable with the published numbers.
+        interest_wait_seconds = 0.0
+        if args.wait_interest:
+            interest_started = time.monotonic()
+            interest_deadline = interest_started + min(30.0, max(10.0, args.seconds + 5.0))
+            while time.monotonic() < interest_deadline:
+                if all(bot.interest_loaded_seconds is not None for bot in bots):
+                    break
+                if server.proc.poll() is not None:
+                    break
+                time.sleep(0.1)
+            interest_wait_seconds = time.monotonic() - interest_started
+            if not all(bot.interest_loaded_seconds is not None for bot in bots):
+                print("load-gate: warning: interest sets did not complete within %.1f s" % interest_wait_seconds)
+
         # Align the measurement window with a snapshot taken after the joins,
         # so the rate deltas cover load rather than server start-up.
         start_snapshot = server.wait_for_snapshot(
@@ -809,6 +882,7 @@ def run_gate(args):
         if end_snapshot is None or int(end_snapshot.get("players_connected", 0)) != 0:
             end_snapshot = server.read_metrics() or start_snapshot
         server.stop()
+        server_log = analyze_server_log(server.log_path)
         if server.exit_code != 0:
             failure_detail = "server exited with code %s" % server.exit_code
         print(
@@ -1001,6 +1075,7 @@ def run_gate(args):
             "run": {
                 "measured_seconds": round(measurement_wall, 3),
                 "rate_window_seconds": round(rates_elapsed, 3),
+                "interest_wait_seconds": round(interest_wait_seconds, 3),
                 "run_id": run_id,
             },
             "clients": {
@@ -1082,6 +1157,7 @@ def run_gate(args):
                     for uptime, value in rss_history
                 ],
             },
+            "server_log": server_log,
             "checks": checks,
             "gate_checks": gate_checks,
             "warnings": warnings,
@@ -1275,7 +1351,26 @@ def render_markdown(result):
         clients["action_rejections"], len(clients["errors"]), clients["disconnects"],
     ))
     lines.append("| Loaded columns at end | %s |" % metrics["loaded_columns"])
+    lines.append("| Interest-set wait before measurement | %.2f s |" % result["run"].get("interest_wait_seconds", 0.0))
     lines.append("")
+    server_log = result.get("server_log") or {}
+    if server_log:
+        lines.append("## Autosave / overrun correlation")
+        lines.append("")
+        lines.append("| Metric | Value |")
+        lines.append("| --- | --- |")
+        lines.append("| Autosaves logged | %d |" % server_log.get("autosaves", 0))
+        lines.append("| Autosave ticks (first / last) | %s / %s |" % (
+            server_log.get("first_autosave_tick") if server_log.get("first_autosave_tick") is not None else "n/a",
+            server_log.get("last_autosave_tick") if server_log.get("last_autosave_tick") is not None else "n/a",
+        ))
+        lines.append("| Tick overrun warnings (>45 ms) | %d |" % server_log.get("overrun_warnings", 0))
+        lines.append("| Overruns on the autosave tick | %d |" % server_log.get("autosave_overruns", 0))
+        lines.append("| Longest logged tick | %s ms |" % fmt_ms(server_log.get("overrun_max_ms")))
+        lines.append("")
+        if server_log.get("overrun_ms"):
+            lines.append("Logged overrun samples (ms): %s" % ", ".join("%.1f" % value for value in server_log["overrun_ms"]))
+            lines.append("")
     lines.append("## Checks")
     lines.append("")
     lines.append("| Check | Result | Detail |")
@@ -1338,7 +1433,8 @@ def parse_args(argv):
     parser.add_argument("--seed", type=int, default=42, help="world seed (default: 42)")
     parser.add_argument("--world", default="load-gate", help="world directory name (default: load-gate)")
     parser.add_argument("--game-mode", choices=("creative", "survival"), default="creative", help="server default game mode (default: creative, so edits are deterministic)")
-    parser.add_argument("--save-interval", type=int, default=60, help="server autosave interval in seconds (soak forces 10 unless set)")
+    parser.add_argument("--save-interval", type=int, default=60, help="server autosave interval in seconds, 0 disables (soak forces 10 unless set)")
+    parser.add_argument("--wait-interest", action="store_true", help="start the measured window only after every bot has its full interest set")
     parser.add_argument("--metrics-interval", type=int, default=2, help="server metrics snapshot interval in seconds (default: 2)")
     parser.add_argument("--max-p99-ms", type=float, default=DEFAULT_TARGET_P99_MS, help="tick p99 target (default: 35 ms)")
     parser.add_argument("--connect-timeout", type=float, default=5.0, help="per-bot connect/handshake timeout (default: 5 s)")
@@ -1384,8 +1480,8 @@ def parse_args(argv):
         parser.error("--seconds must be at least 1")
     if not 1 <= args.interest_radius <= 16:
         parser.error("--interest-radius must be in 1..=16")
-    if not 1 <= args.save_interval <= 86_400:
-        parser.error("--save-interval must be in 1..=86400")
+    if not 0 <= args.save_interval <= 86_400:
+        parser.error("--save-interval must be in 0..=86400")
     if not 1 <= args.metrics_interval <= 3600:
         parser.error("--metrics-interval must be in 1..=3600")
     if args.max_p99_ms <= 0:

@@ -61,6 +61,12 @@ use crate::{ARMOR_SLOTS, ActionOutcome, AttackOutcome, GameMode, HOTBAR_SLOTS, H
 pub const NETWORK_PLAYERS_FILE: &str = "network_players.txt";
 /// Distance at which mobs and dropped items are replicated to a player.
 pub const ENTITY_INTEREST_RADIUS: f64 = 64.0;
+/// Maximum distance from a player to a furnace/chest they may transact with.
+///
+/// Opening a window checks this, and the network transaction path re-checks it
+/// on every move so a client cannot use a window it opened before teleporting
+/// away (movement is client-authoritative in 1.0).
+pub const MAX_CONTAINER_DISTANCE: f64 = 6.0;
 /// Maximum accumulated fall distance tracked from reported moves, in metres.
 const MAX_TRACKED_FALL: f64 = 512.0;
 /// Reported vertical delta below which a move counts as descending.
@@ -193,6 +199,15 @@ pub struct RemovedEntity {
 /// protocol uses one entity id space, so item ids carry the high bit. Clients
 /// treat entity ids as opaque.
 pub const ITEM_ENTITY_ID_BIT: u64 = 1 << 63;
+
+/// Largest host-local mob or item entity id accepted from a sidecar.
+///
+/// Host ids must stay below [`ITEM_ENTITY_ID_BIT`] so the two namespaces remain
+/// disjoint on the wire. The bound leaves one more id available for the
+/// `max + 1` next-id allocation, so loading the largest accepted id still
+/// produces a valid next id instead of overflowing into the item bit or
+/// saturating at `u64::MAX`.
+pub const MAX_HOST_ENTITY_ID: u64 = ITEM_ENTITY_ID_BIT - 2;
 
 /// Maps a host entity id to the protocol entity id.
 pub fn wire_entity_id(item: bool, id: u64) -> u64 {
@@ -913,8 +928,14 @@ fn attract(entity: &mut crate::ItemEntity, target: WorldVec) {
     }
 }
 
-/// Normalises an angle to `-PI..=PI`.
-fn normalise_angle(angle: f32) -> f32 {
+/// Normalises an angle to `-PI..=PI`; non-finite input becomes zero.
+///
+/// Save/load and the state hash call this, so a debug-built non-finite look
+/// angle cannot produce a `player.txt` that the loader later rejects.
+pub(crate) fn normalise_angle(angle: f32) -> f32 {
+    if !angle.is_finite() {
+        return 0.0;
+    }
     let mut angle = angle % std::f32::consts::TAU;
     if angle > std::f32::consts::PI {
         angle -= std::f32::consts::TAU;
@@ -922,6 +943,16 @@ fn normalise_angle(angle: f32) -> f32 {
         angle += std::f32::consts::TAU;
     }
     angle
+}
+
+/// Clamps a look pitch to the camera's `-PI/2..=PI/2` range; non-finite input
+/// becomes zero.
+pub(crate) fn clamp_pitch(pitch: f32) -> f32 {
+    if pitch.is_finite() {
+        pitch.clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2)
+    } else {
+        0.0
+    }
 }
 
 /// Serializes online and offline network players to deterministic
@@ -1143,6 +1174,10 @@ fn parse_stack_token(token: &str, registry: &Registry, line_number: usize, equip
         };
         (count.clamp(1, u32::from(max_stack)) as u8, parts.next())
     };
+    if parts.next().is_some() {
+        log::warn!("network_players.txt:{line_number}: malformed stack token");
+        return None;
+    }
     let mut stack = ItemStack::for_item(item, item_type, count);
     if let Some(text) = durability_text {
         match text.parse::<u32>() {
@@ -1150,9 +1185,15 @@ fn parse_stack_token(token: &str, registry: &Registry, line_number: usize, equip
                 let max = item_type
                     .tool
                     .map(|spec| spec.durability)
-                    .or_else(|| item_type.armor.map(|spec| spec.durability))
-                    .unwrap_or(u16::MAX);
-                stack.durability = Some(value.clamp(1, u32::from(max)) as u16);
+                    .or_else(|| item_type.armor.map(|spec| spec.durability));
+                match max {
+                    Some(max) => stack.durability = Some(value.clamp(1, u32::from(max)) as u16),
+                    // Matches `sanitize_stack`: non-tool/non-armor items carry
+                    // no durability component even if a hostile sidecar says so.
+                    None => {
+                        log::warn!("network_players.txt:{line_number}: item '{name}' has no durability, ignoring it")
+                    }
+                }
             }
             Err(_) => {
                 log::warn!("network_players.txt:{line_number}: invalid durability '{text}'");
@@ -1195,7 +1236,7 @@ pub fn equipment_armor_slot(index: usize) -> Option<ArmorSlot> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ContainerState, FurnaceState, HostConfig};
+    use crate::{CHEST_SLOTS, ContainerState, FurnaceState, HostConfig};
     use std::sync::Arc;
 
     fn temp_host(label: &str) -> (std::path::PathBuf, Host) {
@@ -1230,6 +1271,10 @@ mod tests {
         player.yaw = 40.0;
         player.pitch = 4.0;
         assert!(normalise_angle(player.yaw).abs() <= std::f32::consts::PI);
+        assert_eq!(normalise_angle(f32::NAN), 0.0);
+        assert_eq!(normalise_angle(f32::INFINITY), 0.0);
+        assert_eq!(clamp_pitch(f32::NEG_INFINITY), 0.0);
+        assert_eq!(clamp_pitch(2.0), std::f32::consts::FRAC_PI_2);
         player.dead = true;
         assert_eq!(player.armor_defense(&Registry::base()), 0);
     }
@@ -1441,6 +1486,104 @@ mod tests {
     }
 
     #[test]
+    fn network_player_stack_tokens_reject_extra_fields_and_invalid_durability() {
+        let registry = Registry::base();
+        let stone = parse_stack_token("openblock:stone,1,5", &registry, 1, false).expect("stone parses");
+        assert!(
+            stone.durability.is_none(),
+            "non-durable sidecar stacks must not carry durability"
+        );
+        assert!(
+            parse_stack_token("openblock:stone,1,5,extra", &registry, 1, false).is_none(),
+            "extra comma fields must reject the token"
+        );
+        let pickaxe =
+            parse_stack_token("openblock:wooden_pickaxe,1,9999", &registry, 1, false).expect("pickaxe parses");
+        assert!(
+            pickaxe
+                .durability
+                .is_some_and(|durability| (1..=59).contains(&durability))
+        );
+        let helmet = parse_stack_token("openblock:iron_helmet,9999", &registry, 1, true).expect("armor parses");
+        assert_eq!(helmet.count, 1);
+        assert!(
+            helmet
+                .durability
+                .is_some_and(|durability| (1..=165).contains(&durability))
+        );
+    }
+
+    #[test]
+    fn checked_window_moves_enforce_distance_block_and_record() {
+        let (dir, mut host) = temp_host("window-checked");
+        host.join_network_player(1, "alice", GameMode::Survival).expect("join");
+        let pos = BlockPos::new(0, 70, 0);
+        let chest_block = host.registry().id("openblock:chest").expect("chest block");
+        host.ensure_streaming_around(WorldVec::new(0.5, 71.0, 0.5), 0, 4);
+        assert!(
+            host.world_mut().set_block(pos, chest_block),
+            "the test chest column must be loaded"
+        );
+        let dirt = host.registry().item_id("openblock:dirt").expect("dirt");
+        let mut chest = ContainerState::default();
+        chest.slots[0] = Some(host.make_stack(dirt, 2).expect("dirt stack"));
+        host.chests.insert(pos, chest);
+        let window = NetworkWindowRef {
+            pos,
+            slots: CHEST_SLOTS,
+            furnace: false,
+        };
+        host.network_player_mut(1).expect("online").pos = WorldVec::new(20.5, 71.0, 0.5);
+        assert_eq!(
+            host.network_inventory_move_checked(1, 100, 0, 1, Some(window)),
+            Err("out_of_range"),
+            "a window transaction from 20 m away must be rejected"
+        );
+        assert_eq!(
+            host.chest_at(pos).expect("chest").slots[0].expect("dirt").count,
+            2,
+            "the rejected move must not consume container contents"
+        );
+        assert!(host.network_player(1).expect("online").inventory[0].is_none());
+
+        host.network_player_mut(1).expect("online").pos = WorldVec::new(0.5, 71.0, 0.5);
+        assert_eq!(
+            host.network_inventory_move_checked(1, 100, 0, 1, Some(window)),
+            Ok(true),
+            "a nearby move must still succeed"
+        );
+        assert_eq!(
+            host.network_player(1).expect("online").inventory[0]
+                .expect("dirt")
+                .count,
+            1
+        );
+
+        // A stale window whose block was replaced is rejected before any slot
+        // is written, even if the block-entity record still exists.
+        let stone_block = host.registry().id("openblock:stone").expect("stone block");
+        assert!(host.world_mut().set_block(pos, stone_block));
+        assert_eq!(
+            host.network_inventory_move_checked(1, 0, 100, 1, Some(window)),
+            Err("block_removed")
+        );
+        assert!(host.world_mut().set_block(pos, chest_block));
+        host.chests.remove(&pos);
+        assert_eq!(
+            host.network_inventory_move_checked(1, 0, 100, 1, Some(window)),
+            Err("container_missing")
+        );
+        assert_eq!(
+            host.network_player(1).expect("online").inventory[0]
+                .expect("dirt")
+                .count,
+            1,
+            "no rejected path may remove the source stack"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn randomized_moves_conserve_stacks_across_inventory_equipment_and_container() {
         let (dir, mut host) = temp_host("inventory-fuzz");
         host.join_network_player(1, "alice", GameMode::Survival).expect("join");
@@ -1613,6 +1756,60 @@ impl SlotAddress {
 }
 
 impl Host {
+    /// Applies one network slot move after revalidating the open window.
+    ///
+    /// This is the entry point the network layer uses. Window transactions are
+    /// only accepted while the player is within [`MAX_CONTAINER_DISTANCE`] of
+    /// the container, the container's block is still the expected furnace/chest
+    /// and its block-entity record still exists. The per-tick window close in
+    /// `net` is not sufficient on its own: a client can report a teleport and
+    /// send a container move in the same tick before that check runs.
+    ///
+    /// Non-window moves (hotbar/equipment only) do not require an open window or
+    /// a nearby container and behave exactly like
+    /// [`Host::network_inventory_move`].
+    pub(crate) fn network_inventory_move_checked(
+        &mut self,
+        id: u64,
+        from: u16,
+        to: u16,
+        count: u8,
+        window: Option<NetworkWindowRef>,
+    ) -> Result<bool, &'static str> {
+        let window_involved = from >= ob_protocol::SLOT_WINDOW_START || to >= ob_protocol::SLOT_WINDOW_START;
+        if window_involved {
+            let Some(window) = window else {
+                return Err("no_window");
+            };
+            let Some(player) = self.network_players.get(&id) else {
+                return Err("not_connected");
+            };
+            if !window.pos.in_world() || self.world.chunk(window.pos.chunk()).is_none() {
+                return Err("block_removed");
+            }
+            let expected = if window.furnace {
+                self.registry.id_or_air("openblock:furnace")
+            } else {
+                self.registry.id_or_air("openblock:chest")
+            };
+            if self.world.get_block(window.pos) != expected {
+                return Err("block_removed");
+            }
+            let exists = if window.furnace {
+                self.furnace_at(window.pos).is_some()
+            } else {
+                self.chest_at(window.pos).is_some()
+            };
+            if !exists {
+                return Err("container_missing");
+            }
+            if window.pos.center().distance(player.pos) > MAX_CONTAINER_DISTANCE {
+                return Err("out_of_range");
+            }
+        }
+        self.network_inventory_move(id, from, to, count, window)
+    }
+
     /// Applies one validated slot move for a network player.
     ///
     /// Slot addresses use the protocol layout: hotbar `0..9`, equipment `9..13`
@@ -1621,6 +1818,10 @@ impl Host {
     /// are bounded by the source stack; merges respect content max stacks;
     /// incompatible destinations need a full-stack swap. All writes are
     /// rollback-safe and the function never creates or destroys items.
+    ///
+    /// This lower-level helper intentionally trusts `window`, because the host
+    /// unit tests exercise transactions without a live connection. Network
+    /// callers must use [`Host::network_inventory_move_checked`].
     ///
     /// Returns `Ok(true)` when anything changed. Errors are short
     /// machine-readable reasons (`empty_source`, `destination_full`,

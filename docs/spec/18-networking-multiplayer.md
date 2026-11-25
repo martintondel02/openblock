@@ -841,6 +841,23 @@ before decoding.
   handshakes. The tick loop is the sole writer of the host; reader/writer
   threads never hold the host lock while doing socket I/O.
 
+**1.0.1 correctness clarifications (implemented).** Autosave treats every
+completed tick as dirty, not only explicit intents: the world clock/day phase,
+network-player hunger/regen, mob ages/AI, furnaces and item physics all advance
+in `tick_network`, so an idle connected player is now persisted on the normal
+interval and a crash no longer loses hours of elapsed state. Every landed
+attack pushes the immediate inventory/vitals/selection sync because it wears the
+tool; previously only a tool break did. `inventory_move` revalidates the open
+window on every transaction (distance ≤6 m, expected furnace/chest block and a
+live block-entity record), not only in the once-per-tick window close loop, so
+a teleport and a container move in the same tick cannot use a stale window.
+The 10 s handshake limit is an absolute deadline for the whole hello frame, not
+a per-read inactivity timeout, so a trickled frame cannot hold one of the 32
+handshake slots indefinitely. Entity ids in `items.txt`/`mobs.txt` are rejected
+outside the host id space (`0..=2^63-2`) so bit 63 stays reserved for item
+entities on the wire and `max + 1` cannot saturate; non-durable stacks in
+sidecars cannot carry a durability component.
+
 #### 3.13.6 Non-goals for this milestone
 
 No QUIC, TLS, key authentication, 0-RTT, datagrams, bit-packed catalog,
@@ -865,20 +882,22 @@ into the client-owned `World`; a `block_edit` for a column that has not arrived
 yet is buffered and replayed when the column is inserted. `move` is sent at
 20 Hz only when the local player actually moved or turned, `ping` runs about
 once a second, and `disconnect.reason` is treated as a machine-readable prefix.
-Movement has no prediction/reconciliation in v1 (the server relays the
-client's last accepted position), while block edits are predicted locally and
-corrected by the server broadcast (see §3.13.8).
+In the shipped 1.0 v2 client, movement still has no prediction/reconciliation
+(the server relays the client's last accepted position), while block edits are
+predicted locally and corrected by the server broadcast (see §3.13.8/§3.13.9).
 
-#### 3.13.8 Client connect mode (interim v1)
+#### 3.13.8 Client connect mode (historical v1; superseded by §3.13.9)
 
-**Status.** Implemented in `ob_client::net` (headless, loopback-tested) and
-`ob_client::net_app` (winit/wgpu). This subsection describes the **v1**
-connect mode: it builds against protocol v2 constants but still treats
-survival state, entities and containers as unavailable. A v2 client must add
-the handlers and HUD/inventory/container/entity rendering in §3.13.9; until it
-does, the server refuses its `hello` and the client cannot play on a v2
-server. The single-player runtime is unchanged; the network runtime does not
-open, tick, save or autosave a local `Host`.
+**Status.** The shipped 1.0 client implements the **v2** connect mode in
+`ob_client::net` (headless, loopback-tested) and `ob_client::net_app`
+(winit/wgpu): protocol-v2 handshake, server-authoritative survival/vitals/
+inventory/containers, item and mob replication, and the title/world/connect
+front-end. This subsection is retained as the historical **v1** baseline that
+the v2 client grew from (and as the design-seam record); statements below such
+as "not synced", "creative-only" or "no title screen" describe `v0.1`/`v0.2`,
+not the 1.0 build. §3.13.9 is the authoritative v2 survival contract. The
+single-player runtime is unchanged; the network runtime does not open, tick,
+save or autosave a local `Host`.
 
 ##### State machine
 
@@ -917,10 +936,11 @@ The connection/loading overlay shows the server world name, MOTD, player count,
 closed connection shows the server's reason (with friendly text for
 `server_full`, `name_taken`, `not_whitelisted`, `server_shutdown`,
 `protocol_mismatch`, `invalid_name`, `rate_limited` and `protocol_error`).
-There is no title screen in this milestone, so the failure actions are
-Reconnect and Quit. `--survival`/`--creative` are accepted for launcher
-compatibility but the network runtime always uses creative building and does
-not persist a game-mode change.
+In v1 there was no title screen, so the failure actions were Reconnect and
+Quit. `--survival`/`--creative` were accepted for launcher compatibility but
+the v1 network runtime always used creative building and did not persist a
+game-mode change; the v2 client uses the server-selected survival/creative
+mode.
 
 ##### Chunk loading
 
@@ -944,8 +964,9 @@ predicted by applying `world.set_block` immediately, remeshing the affected
 sections and sending `BlockEdit`; the server's broadcast is authoritative and
 replaces the predicted value. An unconfirmed prediction is reverted after 2 s,
 which covers rate-limit drops and out-of-reach rejections without a rollback
-protocol. Survival vitals, inventory, crafting and item entities are not
-simulated in network mode; the hotbar is the existing creative palette.
+protocol. In v1, survival vitals, inventory, crafting and item entities were
+not simulated in network mode and the hotbar was the creative palette;
+§3.13.9 replaces that with server-authoritative state.
 
 ##### Avatars, chat, player list and diagnostics
 
@@ -987,17 +1008,19 @@ but movement is client-authoritative and can be teleported within the server's
 per-move distance limit. The client never trusts server-provided chunk payloads
 without registry validation, caps every inbound frame at 2 MiB and every
 decoded column at the protocol limit, and never panics on a malformed or
-truncated stream. Offscreen `--screenshot` remains local-world only; there is
-no title screen, reconnect token, encryption, inventory or server browser. The
-settings footer's "Save & quit" only persists settings and exits because there
-is no local world in network mode.
+truncated stream. In v1, offscreen `--screenshot` was local-world only and
+there was no title screen, reconnect token, encryption, inventory or server
+browser; 1.0 adds the front-end and v2 state but still has no encryption,
+reconnect token or server browser. The settings footer's "Save & quit" only
+persists settings and exits because there is no local world in network mode.
 
-The next wave (authoritative survival/inventory and mob replication) should
-add messages for vitals, inventory slots, container transactions, item-entity
-spawn/despawn and mob transforms, keep the existing `NetworkClient` chunk/edit
-core, and replace the creative HUD gating in `net_app` with a server-driven
-survival HUD. Movement prediction/reconciliation and entity interpolation
-state already have clean seams (`tick_player`, `RemotePlayer`) for that work.
+The next wave (authoritative survival/inventory and mob replication) added the
+messages for vitals, inventory slots, container transactions, item-entity
+spawn/despawn and mob transforms described in §3.13.9, kept the existing
+`NetworkClient` chunk/edit core, and replaced the creative HUD gating in
+`net_app` with a server-driven survival HUD. Movement
+prediction/reconciliation and entity interpolation state already have clean
+seams (`tick_player`, `RemotePlayer`) for post-1.0 work.
 
 #### 3.13.9 Server-authoritative survival (protocol v2)
 

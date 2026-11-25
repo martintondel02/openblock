@@ -1,8 +1,10 @@
 # Contributing to OpenBlock
 
 Thanks for wanting to help build an open, fast, deeply moddable block game.
-OpenBlock is early: the specification is being written before the engine. That
-makes **design contributions as valuable as code** right now.
+OpenBlock 1.0 has shipped as an Early Access release: the specs are the
+normative contract for the code that exists, and the post-1.0 tracks (modding,
+full parity, distribution) still need design work. **Design contributions are
+as valuable as code**, especially for the unimplemented chapters.
 
 ## Read this first
 
@@ -23,12 +25,13 @@ makes **design contributions as valuable as code** right now.
   Reading code to understand a technique is fine; reproducing it is not.
   Describe the idea in your own words in the PR, then write your own
   implementation.
-- **Clean-room naming (DEC-053).** Shipped base-pack identifiers use original
-  names: `openblock:underworld` for the nether-like dimension,
-  `openblock:terminus` for the end-like dimension, and original mob names (for
-  example the Blaster). Minecraft-specific proper nouns may appear only in
-  cited research prose; they must not appear in content identifiers, item or
-  mob names, save fields, protocol strings, or base-pack data.
+- **Clean-room naming (DEC-053).** Base-pack identifiers use original names.
+  The 1.0 pack ships only the base blocks, items, mobs and recipes; planned
+  post-1.0 content reserved the names `openblock:underworld` for the nether-like
+  dimension, `openblock:terminus` for the end-like dimension, and original mob
+  names (for example the Blaster). Minecraft-specific proper nouns may appear
+  only in cited research prose; they must not appear in content identifiers,
+  item or mob names, save fields, protocol strings, or base-pack data.
 - Do not commit Minecraft assets, sounds, textures, or names. Every asset in
   the repository must have a recorded license and source.
 - AI-assisted contributions are welcome under the same rules: you are
@@ -114,12 +117,14 @@ missing trailer is a blocking review defect.
 
 ## Continuous integration
 
-CI runs formatting, clippy, tests, docs, the architecture guard
-(`.github/scripts/check-arch.sh`), `cargo deny`, and markdown/link checks. The
-DCO requirement covers the whole commit range of the pull request: **every
-commit must carry a `Signed-off-by` trailer**; a PR with an unsigned commit is
-not merged until the history is amended. Only a human contributor can sign off;
-an AI agent cannot sign on your behalf.
+CI runs formatting, clippy, workspace tests, rustdoc, the architecture guard
+(`.github/scripts/check-arch.sh`), the documentation/link checker
+(`.github/scripts/check-docs.py`), `cargo deny`, the Fedora packaging validation,
+the container-manifest checks, the benchmark quick profiles and the multiplayer
+load gate. The DCO requirement covers the whole commit range of the pull
+request: **every commit must carry a `Signed-off-by` trailer**; a PR with an
+unsigned commit is not merged until the history is amended. Only a human
+contributor can sign off; an AI agent cannot sign on your behalf.
 
 ## Code of conduct
 

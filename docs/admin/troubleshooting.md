@@ -324,12 +324,17 @@ docker exec openblock nc -z 127.0.0.1 25565 && echo listen-ok
 * The compose file publishes `127.0.0.1:25565` deliberately. Do not change it to
   a public bind without a VPN/firewall; see [security](security.md).
 * The container has no shell-based console. Use `docker compose logs`, stop with
-  `docker compose stop` (SIGTERM via `stop_signal`; the save path), and replace the image to upgrade.
+  `docker compose stop` (SIGINT via `stop_signal`; the graceful save path; the
+  image's own `STOPSIGNAL SIGTERM` is handled too), and replace the image to
+  upgrade.
 
 ## Collect a support report
 
 There is no `diagnose`/support-bundle command in this build. Collect
-deliberately, and review for IP addresses/player names before sharing:
+deliberately, and review for player names, world names/seeds and filesystem
+paths before sharing. The server does not log remote IP addresses or chat
+content at the default level, but a `debug` log can still contain operational
+detail; keep support reports short-lived.
 
 ```sh
 {
@@ -345,4 +350,6 @@ deliberately, and review for IP addresses/player names before sharing:
 ```
 
 Do not include `world.obs` or backups in a report; they are large and contain
-player state. Redact IP addresses and chat as needed.
+player state. Redact player names, world names/seeds and filesystem paths as
+needed. The default logs contain no remote IP addresses or chat text, but a
+debug log and the metrics file can contain more operational detail.

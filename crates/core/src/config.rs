@@ -1022,6 +1022,37 @@ pub const MIN_AUDIO_VOLUME: f32 = 0.0;
 /// Highest volume accepted by the audio settings, as a linear gain.
 pub const MAX_AUDIO_VOLUME: f32 = 1.0;
 
+/// `ui_scale_percent` value that selects automatic GUI scaling.
+pub const UI_SCALE_AUTO: u16 = 0;
+/// Smallest manual GUI scale offered by the settings screen.
+pub const MIN_UI_SCALE_PERCENT: u16 = 75;
+/// Largest manual GUI scale offered by the settings screen.
+pub const MAX_UI_SCALE_PERCENT: u16 = 150;
+/// Manual GUI scale choices, from smallest to largest.
+pub const UI_SCALE_CHOICES: [u16; 4] = [75, 100, 125, 150];
+/// Normalises a persisted GUI-scale percentage to the nearest supported choice.
+///
+/// `UI_SCALE_AUTO` is preserved; every other value is clamped to
+/// [`MIN_UI_SCALE_PERCENT`]..=[`MAX_UI_SCALE_PERCENT`] and rounded to the
+/// nearest of [`UI_SCALE_CHOICES`]. The discrete choices keep bitmap glyph
+/// edges and panel borders predictable instead of accepting arbitrary ratios.
+pub fn normalise_ui_scale_percent(value: u16) -> u16 {
+    if value == UI_SCALE_AUTO {
+        return UI_SCALE_AUTO;
+    }
+    let clamped = value.clamp(MIN_UI_SCALE_PERCENT, MAX_UI_SCALE_PERCENT);
+    let mut best = UI_SCALE_CHOICES[0];
+    let mut best_distance = u16::MAX;
+    for choice in UI_SCALE_CHOICES {
+        let distance = clamped.abs_diff(choice);
+        if distance < best_distance {
+            best = choice;
+            best_distance = distance;
+        }
+    }
+    best
+}
+
 /// Persistent user settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -1032,6 +1063,11 @@ pub struct Settings {
     pub fov_degrees: f32,
     /// Mouse look multiplier (1.0 = default).
     pub mouse_sensitivity: f32,
+    /// GUI scale percentage, or [`UI_SCALE_AUTO`] to follow the display.
+    ///
+    /// Persisted as an integer percentage; values other than the supported
+    /// discrete choices are normalised on load by [`normalise_ui_scale_percent`].
+    pub ui_scale_percent: u16,
     /// Whether the window starts fullscreen.
     pub fullscreen: bool,
     /// Whether the F3 debug overlay is visible.
@@ -1074,6 +1110,7 @@ impl Default for Settings {
             render_distance_chunks: 6,
             fov_degrees: 70.0,
             mouse_sensitivity: 1.0,
+            ui_scale_percent: UI_SCALE_AUTO,
             fullscreen: false,
             show_debug_overlay: false,
             show_hud: true,
@@ -1110,6 +1147,7 @@ impl Settings {
         self.mouse_sensitivity = self
             .mouse_sensitivity
             .clamp(MIN_MOUSE_SENSITIVITY, MAX_MOUSE_SENSITIVITY);
+        self.ui_scale_percent = normalise_ui_scale_percent(self.ui_scale_percent);
         if let Some(workers) = self.mesh_workers {
             self.mesh_workers = Some(workers.clamp(1, 16));
         }
@@ -1787,6 +1825,56 @@ mod tests {
         assert!(load_settings(&dir).reduced_motion);
         fs::write(settings_path(&dir), br#"{"render_distance_chunks": 8}"#).expect("write");
         assert!(!load_settings(&dir).reduced_motion);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ui_scale_defaults_to_auto_and_round_trips() {
+        assert_eq!(Settings::default().ui_scale_percent, UI_SCALE_AUTO);
+        let dir = temp_dir("ui-scale-roundtrip");
+        let settings = Settings {
+            ui_scale_percent: 125,
+            ..Settings::default()
+        };
+        save_settings(&dir, &settings).expect("save");
+        let text = fs::read_to_string(settings_path(&dir)).expect("read");
+        assert!(text.contains("\"ui_scale_percent\": 125"), "{text}");
+        assert_eq!(load_settings(&dir).ui_scale_percent, 125);
+
+        // Old documents without the field keep the automatic default.
+        fs::write(settings_path(&dir), br#"{"render_distance_chunks": 8}"#).expect("write");
+        assert_eq!(load_settings(&dir).ui_scale_percent, UI_SCALE_AUTO);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ui_scale_is_clamped_to_supported_choices() {
+        let dir = temp_dir("ui-scale-clamp");
+        for (persisted, expected) in [
+            (1_u16, MIN_UI_SCALE_PERCENT),
+            (75, 75),
+            (100, 100),
+            (110, 100),
+            (113, 125),
+            (125, 125),
+            (140, 150),
+            (150, 150),
+            (999, MAX_UI_SCALE_PERCENT),
+        ] {
+            fs::write(settings_path(&dir), format!(r#"{{"ui_scale_percent": {persisted}}}"#)).expect("write");
+            let settings = load_settings(&dir);
+            assert_eq!(
+                settings.ui_scale_percent, expected,
+                "persisted {persisted} should normalise to {expected}"
+            );
+        }
+        assert_eq!(normalise_ui_scale_percent(UI_SCALE_AUTO), UI_SCALE_AUTO);
+        let mut settings = Settings {
+            ui_scale_percent: 999,
+            ..Settings::default()
+        };
+        assert!(settings.clamp());
+        assert_eq!(settings.ui_scale_percent, MAX_UI_SCALE_PERCENT);
         let _ = fs::remove_dir_all(dir);
     }
 

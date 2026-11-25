@@ -9,11 +9,11 @@ disagree, that is a bug in one of them, and the PR must fix it.
 | Document | What it answers |
 | --- | --- |
 | [Vision](vision.md) | What game are we making, for whom, and what is deliberately out of scope? |
-| [Decision register](decisions.md) | The binding technical decisions (`DEC-001 … DEC-053`), with rationale and reversal cost. |
+| [Decision register](decisions.md) | The binding technical decisions (`DEC-001 … DEC-054`), with rationale and reversal cost. |
 | [Spec conventions](spec/00-conventions.md) | Terminology, coordinate systems, identifiers and how to write a spec chapter. |
 | [Architecture](spec/01-technical-architecture.md) | How the crates, processes and data flows fit together. |
 | [Roadmap](plan/00-roadmap.md) | The two-track path from an empty repo to 1.0 Early Access and 2.0, and what each milestone proves. |
-| [Milestones](plan/01-milestones.md) | Concrete, testable exit criteria per milestone (`MS-00 … MS-16`, then `MS-17` for 2.0). |
+| [Milestones](plan/01-milestones.md) | Concrete, testable exit criteria per milestone (`MS-00 … MS-16` for 1.0, then the post-1.0 tracks `MS-17 … MS-24`). |
 | [Server operations](admin/README.md) | Build, configure, secure, back up and upgrade a dedicated server (interim 1.0 build). |
 
 ## Map of the specification
@@ -64,7 +64,9 @@ self-contained once you know the terminology from chapter 00.
 | [Review findings](plan/07-review-findings.md) | The review board that re-baselined the plan, and dispositions |
 | [Measurements](plan/08-measurements.md) | Living log of measured performance, storage and determinism results |
 | [Benchmarks and soak](plan/09-benchmarks.md) | The 1.0 CPU benchmark/soak tools, commands and known gaps |
-| [Review findings](plan/07-review-findings.md) | The 2026-11-24 review board's findings and the re-baseline they triggered |
+| [1.0 scope and delivery plan](plan/1.0-scope.md) | The 1.0.0 checklist, released status and accepted limitations |
+| [1.0 acceptance sweep](plan/1.0-acceptance.md) | The end-to-end gameplay-loop acceptance and bug-bash record |
+| [1.0.1 audit](plan/1.0.1-audit.md) | Post-release documentation, security, metadata and packaging findings |
 
 ## Research
 

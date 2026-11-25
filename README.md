@@ -6,20 +6,20 @@
 <p align="center">
   <a href=".github/workflows/ci.yml"><img alt="CI" src="https://github.com/martintondel02/openblock/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE-MIT"><img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-1.0.0%20early%20access-orange.svg">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.0.1%20early%20access-orange.svg">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.100%2B-B7410E.svg?logo=rust">
   <img alt="Primary platform" src="https://img.shields.io/badge/platform-Fedora%2044%2F45%20%7C%20Linux-51A2DA.svg?logo=fedora">
 </p>
 
 OpenBlock is an open-source voxel sandbox: mine, build, explore and survive alone
-or with friends on servers you host yourself. **1.0.0 is an Early Access
+or with friends on servers you host yourself. **1.0.1 is an Early Access
 release**: the core survival game and self-hosted multiplayer are playable and
 tested end-to-end, while crafting-grid, lighting, farming, weather and the
 modding track are explicitly post-1.0 (see [Known limitations](#known-limitations)).
 
 ![OpenBlock 1.0 title screen](docs/img/v1.0.0-title.png)
 
-## What's in 1.0.0
+## What's in 1.0
 
 - **Survival core** — procedural world with five biomes, caves/ravines and
   coal/iron/copper ore veins; health/hunger, fall damage, starvation and
@@ -37,20 +37,23 @@ modding track are explicitly post-1.0 (see [Known limitations](#known-limitation
   (inventories, vitals, equipment, actions, containers, death/respawn,
   persistence); protocol v2 over TCP with strict limits. No TLS yet: use it on a
   LAN, VPN or SSH tunnel.
-- **Audio** — 79 procedurally synthesized clips (material footsteps, break/place,
-  pickup, hurt/death, eat, craft, tool break, splash, UI) plus wind/music loops;
-  master/SFX/music volumes and mute in the Audio tab. Real output on Linux via
-  PulseAudio loaded at runtime; Windows/macOS build with a silent stub in 1.0.
+- **Audio** — 79 procedurally synthesized clips total: 77 SFX (material
+  footsteps, break/place, pickup, hurt/death, eat, craft, tool break, splash,
+  UI) plus two loops (wind/forest ambience and a music pad); master/SFX/music
+  volumes and mute in the Audio tab. Real output on Linux via PulseAudio loaded
+  at runtime; Windows/macOS build with a silent stub in 1.0.
 - **Front-end and accessibility** — title screen (Continue/New World/Load World/
   Multiplayer/Settings/Quit), world browser, direct connect with recent servers,
   interactive key rebinding for 17 actions, reduced motion, persisted HUD
-  visibility and readable spaced UI at 1280×720 and 960×540.
+  visibility, **GUI scale (Auto/75/100/125/150)** and readable spaced UI at
+  1280×720 and 960×540.
 - **Resource packs** — load Minecraft-format pack directories at runtime
   (`--texture-pack PATH`), with biome tinting, animated first frames and
   per-layer fallback. No third-party assets are bundled or redistributed.
 - **Server operations** — hardened systemd unit, dependency-free container image
-  + compose file, backup/restore scripts, load-test bots, metrics endpoint,
-  admin handbook and graceful SIGINT/SIGTERM saves.
+  + compose file, backup/restore scripts, load-test bots, periodic JSON metrics
+  snapshots (`--metrics-json`), admin handbook and graceful SIGINT/SIGTERM
+  saves.
 
 | Survival | Crafting | Mobs | Multiplayer |
 | --- | --- | --- | --- |
@@ -79,9 +82,13 @@ cargo run --release -p ob_client --bin openblock -- \
   --connect 127.0.0.1:25565 --name alice
 ```
 
-Pre-built packages: see [packaging/](packaging/) (Flatpak for the client, COPR
-RPM for Fedora, systemd/container for servers) and
-[docs/admin/](docs/admin/README.md) for hosting, backups, upgrades and security.
+Packaging recipes: [packaging/](packaging/README.md) holds the Flatpak manifest,
+COPR RPM spec, systemd units and container files; [docs/admin/](docs/admin/README.md)
+covers hosting, backups, upgrades and security. **No RPM, Flatpak or container
+artifacts were published for v1.0.0** (the GitHub release carries only the four
+screenshots below), so build from source or from a reviewed tag until the 1.0.x
+packaging wave publishes binaries (tracked in the
+[1.0.1 audit](docs/plan/1.0.1-audit.md)).
 
 ## Controls
 
@@ -113,8 +120,9 @@ TLS or authentication**, and movement is client-authoritative within server
 bounds/reach/rate checks — do not expose it directly to the public internet.
 Full guidance: [docs/admin/security.md](docs/admin/security.md).
 
-The load gate in CI runs four bot clients on every push; the full 8-client load
-gate and a 10-minute soak are available locally:
+The load gate in CI runs four bot clients on every push to `main` and on every
+pull request; the full 8-client load gate and a 10-minute soak are available
+locally:
 
 ```sh
 python3 scripts/load-gate.py --quick     # CI profile
@@ -134,10 +142,15 @@ runs quick profiles in CI; measured reference numbers live in
   gate tick p99 **0.163 ms**, 20.0 TPS, RSS 22.3 MiB, 0 overruns >35 ms.
 - Saves: 21 ms at 289 columns, 156 ms at 2,025 columns (synchronous save is the
   known pause gap below); v1–v4 migrations verified.
-- Test suite: 733+ tests (including adversarial protocol/save/pack tests,
-  network loopback survival tests, a full acceptance scenario and GPU probes).
+- Test suite: 753 passing tests (764 test functions; 11 intentionally ignored
+  GPU, measurement and local-pack probes), including adversarial
+  protocol/save/pack tests, network loopback survival tests, a full acceptance
+  scenario and GPU probes.
 
-## Known limitations (1.0.0)
+## Known limitations
+
+These are the accepted 1.0.0/1.0.x limitations; items marked 1.0.1 or post-1.0
+are not shipped in the initial release.
 
 - Crafting is **recipe-book based**; a spatial 3×3 grid is post-1.0.
 - No torches/block lighting, farming, weather, beds, dimensions or redstone;
@@ -155,7 +168,8 @@ runs quick profiles in CI; measured reference numbers live in
 
 The full 1.0 checklist, accepted limitations and audit results:
 [docs/plan/1.0-scope.md](docs/plan/1.0-scope.md),
-[docs/plan/1.0-acceptance.md](docs/plan/1.0-acceptance.md).
+[docs/plan/1.0-acceptance.md](docs/plan/1.0-acceptance.md),
+[docs/plan/1.0.1-audit.md](docs/plan/1.0.1-audit.md).
 
 ## Documentation
 
@@ -163,6 +177,7 @@ The full 1.0 checklist, accepted limitations and audit results:
 - [docs/spec/01-technical-architecture.md](docs/spec/01-technical-architecture.md) — crate graph and architecture.
 - [docs/spec/18-networking-multiplayer.md](docs/spec/18-networking-multiplayer.md) — protocol v2 and multiplayer design.
 - [docs/admin/](docs/admin/README.md) — server quickstart, configuration, admin, security, backup, upgrade, troubleshooting.
+- [docs/plan/1.0.1-audit.md](docs/plan/1.0.1-audit.md) — post-release docs/security/metadata audit findings and accepted risks.
 - [CONTRIBUTING.md](CONTRIBUTING.md) — build, test and review workflow.
 
 ## Architecture at a glance
@@ -170,7 +185,10 @@ The full 1.0 checklist, accepted limitations and audit results:
 A Cargo workspace of 16 crates: `ob_math`/`ob_core` (foundation),
 `ob_content`/`ob_world`/`ob_worldgen`/`ob_sim`/`ob_protocol` (headless data and
 simulation), `ob_render`/`ob_audio` (presentation), `ob_server`/`ob_client`
-(hosts), `ob_tools` (benchmarks/soak), plus `xtask`. The dedicated server is
+(hosts), `ob_tools` (benchmarks/soak), plus `xtask`. Three further crates —
+`ob_net`, `ob_ui` and `ob_modding` — are post-1.0 scaffolds: they are empty
+placeholders declared in `architecture.toml` so the planned edges stay explicit,
+and nothing in the shipped binaries links them yet. The dedicated server is
 GPU-free (enforced by the architecture guard and a CI dependency check); the
 client and renderer never run on the server.
 

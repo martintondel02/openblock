@@ -1,17 +1,24 @@
-# Flatpak manifest for OpenBlock — draft, built from milestone MS-16 onward.
+# Flatpak manifest for OpenBlock — staged for the first Flathub submission.
+#
+# STATUS (1.0.1): NOT BUILDABLE/PUBLISHED YET. The git source is pinned to the
+# v1.0.0 commit, but `cargo-sources.json` is still missing and the build runs
+# with CARGO_NET_OFFLINE=true, so flatpak-builder will fail until the generated
+# sources file is committed and uncommented below. See
+# packaging/flatpak/README.md and docs/plan/1.0.1-audit.md.
 #
 # Client-only: the dedicated server is packaged separately as an RPM and a
 # container image (see packaging/systemd and packaging/container). Do not add a
 # server build or headless variant to this Flatpak.
 #
-# Flathub is the recommended install for Fedora and other Linux players
+# Flathub is the intended install for Fedora and other Linux players
 # (DEC-054). Cargo dependencies are bundled as vendored sources, which is the
 # standard Flatpak model and avoids the Fedora Rust unbundling problem.
 #
 # Before submitting:
-#   1. Generate the cargo sources file:
+#   1. Generate the cargo sources file from the release Cargo.lock:
 #        flatpak-cargo-generator.py Cargo.lock -o cargo-sources.json
-#   2. Uncomment the cargo-sources.json source below and pin the git tag/commit.
+#   2. Commit cargo-sources.json next to this manifest, uncomment its source
+#      below, and keep the git tag/commit pinned to the release commit.
 #   3. Run: flatpak-builder --user --install --force-clean build-dir \
 #             packaging/flatpak/io.github.martintondel02.OpenBlock.yml
 #   4. Validate with: flatpak run io.github.martintondel02.OpenBlock
@@ -43,7 +50,7 @@ modules:
   - name: openblock
     buildsystem: simple
     build-commands:
-      - cargo build --release --locked --offline
+      - cargo build --release --locked --offline -p ob_client --bin openblock
       - install -Dm755 target/release/openblock /app/bin/openblock
       - install -Dm644 packaging/fedora/io.github.martintondel02.OpenBlock.desktop
         /app/share/applications/io.github.martintondel02.OpenBlock.desktop
@@ -51,11 +58,13 @@ modules:
         /app/share/metainfo/io.github.martintondel02.OpenBlock.metainfo.xml
       - install -Dm644 packaging/fedora/io.github.martintondel02.OpenBlock.svg
         /app/share/icons/hicolor/scalable/apps/io.github.martintondel02.OpenBlock.svg
-      - install -Dm644 packaging/fedora/openblock.mime.xml /app/share/mime/packages/openblock.xml
+      # .obworld MIME is not installed: archive import is not implemented in 1.0.
     sources:
       - type: git
         url: https://github.com/martintondel02/openblock.git
-        tag: v1.0.0
-        commit: 0000000000000000000000000000000000000000   # pin at release time
+        tag: v1.0.1
+        commit: 19e489e63b6aa656f6569f81c1c8b4fb8ed3c74a   # v1.0.0 release commit
+      # BLOCKED: uncomment after generating and committing the file.
+      # Without this source the offline Cargo build cannot resolve crates.
       # - type: file
       #   path: cargo-sources.json

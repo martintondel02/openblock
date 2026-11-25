@@ -6,6 +6,81 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [1.0.1] — 2026-11-25
+
+Strict post-release polish update; no save-format or protocol change.
+
+### Added
+- **GUI scale**: Auto/75/100/125/150 in the Display tab, persisted as
+  `ui_scale_percent` (Auto keeps 1280x720 and 960x540 at the 100% baseline;
+  `--ui-scale` overrides one run for audits). Applies live to menus, HUD,
+  containers, F3, chat, name tags and the connect overlay; F3 now reports the
+  effective scale and logical size.
+- Compact responsive layouts for 960x540 at 125/150% (logical 640x360): settings,
+  death, front-end forms, creative inventory and the F3 overlay reflow instead
+  of clipping.
+- Connect/loading/failure panels are content-sized, with endpoint/player lines,
+  progress percentage, keyboard focus on Reconnect/Restart and Quit, and no
+  stale world/roster fields in error mode.
+- 1.0.1 screenshots in `docs/img/v1.0.1-*` and implementation notes in
+  `docs/client-gui-scale.md`.
+
+### Fixed — server, persistence and networking audit
+- **Save-size guard**: `Host::save` now refuses (and keeps the previous save)
+  when the v4 payload/file would exceed the loader's limits, instead of writing
+  an unopenable world.
+- **Autosave actually runs**: tick-advanced state (idle connected players,
+  furnaces, mobs, item physics, ticks/day) now marks the world dirty, so
+  autosave no longer loses hours of progress.
+- **Handshake absolute deadline**: trickled handshake frames can no longer hold
+  handshake slots indefinitely.
+- **Container windows revalidated per transaction**: teleport-plus-move in one
+  tick can no longer use a stale/distant chest; distance, expected block and
+  live record are checked.
+- **Crash-safe multi-file save**: all files staged and fsynced, sidecars renamed
+  before `world.obs`, directory fsync; non-regular/device/FIFO paths are
+  rejected before opening.
+- **Entity-id and sidecar hardening**: item/mob ids stay inside the host space
+  (bit-63/u64::MAX rejected), durability only on durable items, stricter
+  `network_players.txt` tokens, heightmap no-op/air fixes.
+- **State hash completeness**: persisted yaw/pitch/flying (canonical angles) are
+  now hashed and round-trip exactly; seed-42 smoke hash is
+  `7a4532e2ee387d5f` (deterministic across fresh runs and save/reload).
+- Landed attacks push an immediate inventory/vitals/selection sync (tool-wear
+  latency removed).
+
+### Fixed — docs, security and packaging audit
+- Corrected release reality (sources/binaries/checksums are staged, not
+  published), stale SIGTERM claims, privacy/logging claims, test/screenshot
+  counts, broken anchors and stale 1.0 scope notes.
+- Rewrote `SECURITY.md` for the real 1.0 surface; REUSE now covers every tracked
+  file with exactly one license; CI workflows are read-only by default.
+- Fixed AppStream launchable/screenshots/category, RPM metadata, Flatpak commit
+  pin and packaging blocker docs; added release-asset/checksum/SBOM checklist.
+
+### Performance/reliability audit (1.0.1)
+- Re-measured v1.0.0 vs 1.0.1 with 3+ runs: worldgen 0.918 ms/chunk, host tick
+  p99 0.0002–0.0257 ms, save/reload and 8-client load gate unchanged; no
+  regression.
+- Autosave impact now measured end to end (1 Hz autosave: p99 11.1 ms at 169
+  columns, 85 ms at 1,089 columns) and the synchronous-save gap is decomposed
+  (~55–58% zstd, ~39–40% serialize/CRC, <3% IO/fsync) with an async/compressed
+  cache proposal for the 1.0.x line.
+- 20/20 start/stop/reload cycles, 8-client churn, 300 s soak, SIGTERM-under-save
+  and corrupted-sidecar/world tests pass; `--ticks 0` is not read-only
+  (documented); CI benchmark/load-gate lanes stable with artifacts/timeouts.
+- Remaining known gaps unchanged: network chunk unloading, transactional
+  multi-file crash window, client-authoritative movement, save pause, reference
+  hardware capacity.
+
+### Fixed — UX
+- Survival inventory no longer draws the gameplay hotbar/vitals over its footer
+  at small logical heights; creative inventory reserves the hotbar band.
+- Long chat/player-list/world-name/toast/reason text is width-clamped instead of
+  crossing the panel edge.
+- Front-end labels, pager and footer hints no longer overlap fields or panel
+  borders at 640x360 logical.
+
 ## [1.0.0] — 2026-11-25 (Early Access)
 
 The first Early Access release: a complete single-player survival loop, a
@@ -126,10 +201,11 @@ audio, a real front-end and measured performance/operations tooling.
   iron tools, leather and iron armor; chest block entity with 27 slots; armor
   equipping/defense/durability and equipment persistence; container and furnace
   UIs with click-to-cursor transfer, revisions and output-only slots.
-- **Audio**: dependency-free `ob_audio` with 79 procedurally synthesized clips
-  (material footsteps, break/place, pickup, hurt/death, eat, craft, tool break,
-  splash, UI) plus wind/music loops, 48 kHz stereo mixer with 16 voices and soft
-  limiter; Linux PulseAudio backend loaded at runtime (no ALSA/cpal build deps),
+- **Audio**: dependency-free `ob_audio` with 77 procedurally synthesized SFX
+  clips plus two loops (79 total; material footsteps, break/place, pickup,
+  hurt/death, eat, craft, tool break, splash, UI, wind and music), 48 kHz stereo
+  mixer with 16 voices and a soft limiter; Linux PulseAudio backend loaded at
+  runtime (no ALSA/cpal build deps),
   silent stub on other platforms; Audio settings tab with master/SFX/music
   volumes and mute, persisted; event hooks across gameplay.
 - **Worldgen**: deterministic cave/ravine systems and ore veins; spawn-safe
@@ -478,7 +554,10 @@ host, wired to the first implementation of the engine core.
   later milestones (MS-06 and onward); this build is a single-player tech
   preview.
 
-## [Unreleased]
+## [0.0.0] — 2026-11-24 (specification stage, pre-first-build)
+
+This section is the pre-build snapshot from before the first playable release;
+it is kept for history and is superseded by [0.0.1] above.
 
 ### Added
 
@@ -528,4 +607,5 @@ host, wired to the first implementation of the engine core.
 - Documentation index now lists `research/10-custom-content-and-differentiation.md`
   and `plan/07-review-findings.md`; ADR and milestone counts are corrected.
 
-No playable build exists yet; the first one is milestone `MS-03` (`0.0.1`).
+The first playable build is 0.0.1, described above; this 0.0.0 section records
+only the specification-stage snapshot.

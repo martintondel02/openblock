@@ -205,7 +205,11 @@ fn hostile_sidecars_are_sanitized_or_skipped() {
          2 5 70 5 1 2 3 openblock:not_a_real_item 1 - 0\n\
          3 5 70 5 0 0 0 openblock:dirt 0 - 0\n\
          3 6 70 6 0 0 0 openblock:dirt 1 - 0\n\
-         4 1e308 1e308 -1e308 0 0 0 openblock:stone 300 - -5\n",
+         4 1e308 1e308 -1e308 0 0 0 openblock:stone 300 - -5\n\
+         9223372036854775808 5 70 5 0 0 0 openblock:stone 1 - 0\n\
+         18446744073709551615 6 70 6 0 0 0 openblock:dirt 1 - 0\n\
+         5 7 70 7 0 0 0 openblock:iron_helmet 1 99999 0\n\
+         6 8 70 8 0 0 0 openblock:stone 1 5 0\n",
     )
     .expect("write items sidecar");
     std::fs::write(
@@ -214,7 +218,9 @@ fn hostile_sidecars_are_sanitized_or_skipped() {
          2 openblock:not_a_mob 1 70 1 0 20 0\n\
          3 openblock:cow 5 70 5 0 100 -5\n\
          3 openblock:cow 6 70 6 0 20 0\n\
-         4 openblock:zombie 1e308 1e308 1e308 1e30 1e30 -1e30\n",
+         4 openblock:zombie 1e308 1e308 1e308 1e30 1e30 -1e30\n\
+         9223372036854775808 openblock:cow 7 70 7 0 20 0\n\
+         18446744073709551615 openblock:cow 8 70 8 0 20 0\n",
     )
     .expect("write mobs sidecar");
     std::fs::write(
@@ -236,7 +242,7 @@ fn hostile_sidecars_are_sanitized_or_skipped() {
     std::fs::write(world.join("unexpected.bin"), [0xffu8; 64]).expect("write unexpected file");
     std::fs::write(world.join("world.tmp"), b"stale temp file").expect("write stale temp file");
 
-    let host = open(&registry, config(&dir, world_name)).expect("hostile sidecars must not prevent opening");
+    let mut host = open(&registry, config(&dir, world_name)).expect("hostile sidecars must not prevent opening");
 
     let player = host.player();
     assert!(player.pos.is_finite());
@@ -284,6 +290,36 @@ fn hostile_sidecars_are_sanitized_or_skipped() {
     item_ids.sort_unstable();
     item_ids.dedup();
     assert_eq!(item_ids.len(), item_count, "duplicate item ids must be dropped");
+    let host_id_max = (1u64 << 63) - 1;
+    assert!(
+        item_ids.iter().all(|id| *id <= host_id_max),
+        "item ids must leave bit 63 for the wire namespace: {item_ids:?}"
+    );
+    let stone = registry.item_id("openblock:stone").expect("stone item");
+    let helmet = registry.item_id("openblock:iron_helmet").expect("helmet item");
+    let helmet_max = registry.item(helmet).armor.expect("helmet armor").durability;
+    for entity in host.item_entities() {
+        if entity.stack.item == stone {
+            assert!(
+                entity.stack.durability.is_none(),
+                "a non-durable item entity must not load a durability"
+            );
+        }
+        if entity.stack.item == helmet {
+            let durability = entity.stack.durability.unwrap_or(0);
+            assert!(
+                (1..=helmet_max).contains(&durability),
+                "armor durability {durability} is outside 1..={helmet_max}"
+            );
+        }
+    }
+    let spawn_pos = host.spawn();
+    let stone_stack = host.make_stack(stone, 1).expect("stone stack");
+    let spawned = host.spawn_item_entity(spawn_pos, stone_stack);
+    assert!(
+        !item_ids.contains(&spawned) && spawned <= host_id_max,
+        "a new item entity id {spawned} must not collide with a loaded hostile id"
+    );
 
     for mob in host.mobs() {
         assert!(mob.mob.pos.is_finite());
@@ -295,6 +331,10 @@ fn hostile_sidecars_are_sanitized_or_skipped() {
     mob_ids.sort_unstable();
     mob_ids.dedup();
     assert_eq!(mob_ids.len(), mob_count, "duplicate mob ids must be dropped");
+    assert!(
+        mob_ids.iter().all(|id| *id <= host_id_max),
+        "mob ids must stay below the item wire namespace: {mob_ids:?}"
+    );
 
     for (_, furnace) in host.furnaces() {
         assert!(furnace.burn_remaining <= furnace.burn_total);
@@ -348,6 +388,71 @@ fn oversized_sidecar_is_ignored_without_failing_the_open() {
         host.inventory().iter().all(Option::is_none),
         "the too-large inventory must be ignored, not partially parsed"
     );
+}
+
+#[test]
+fn save_target_directory_leaves_previous_files_and_world_intact() {
+    let dir = TempDir::new("save-target-directory");
+    let registry = Arc::new(Registry::base());
+    let world_name = "target-directory";
+    let mut host = open(&registry, config(&dir, world_name)).expect("create world");
+    host.save().expect("initial save");
+    let world = world_dir(&dir, world_name);
+    let read = |name: &str| std::fs::read(world.join(name)).expect("read save file");
+    let before_world = read("world.obs");
+    let before_inventory = read("inventory.txt");
+
+    // Change persisted state, so a committed save must produce different bytes.
+    let chunk = host.world().chunks().next().expect("a loaded chunk").0;
+    let pos = ob_math::BlockPos::new(chunk.x * 16 + 1, ob_math::WORLD_MAX_Y - 1, chunk.z * 16 + 1);
+    let stone = host.registry().id_or_air("openblock:stone");
+    assert!(host.world_mut().set_block(pos, stone));
+    let dirt = host.registry().item_id("openblock:dirt").expect("dirt");
+    assert_eq!(host.give_item(dirt, 3), 0);
+    host.player_mut().pos.x += 0.5;
+
+    // A directory where a sidecar target belongs: the save must fail before
+    // any target (especially world.obs) is replaced.
+    std::fs::remove_file(world.join("player.txt")).expect("remove player sidecar");
+    std::fs::create_dir(world.join("player.txt")).expect("replace player sidecar with a directory");
+    let error = match host.save() {
+        Ok(()) => panic!("saving over a directory target must fail"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("directory"), "{error}");
+    assert_eq!(
+        read("world.obs"),
+        before_world,
+        "the world snapshot must stay at the last commit"
+    );
+    assert_eq!(
+        read("inventory.txt"),
+        before_inventory,
+        "other sidecars must stay at the last commit"
+    );
+    assert!(
+        world.join("player.txt").is_dir(),
+        "the failing target must be untouched"
+    );
+
+    // Once the path is usable again the staged protocol commits everything.
+    std::fs::remove_dir(world.join("player.txt")).expect("remove directory target");
+    host.save().expect("save after the target is repaired");
+    assert!(world.join("player.txt").is_file());
+    assert_ne!(read("world.obs"), before_world, "the changed world must be committed");
+    assert_ne!(
+        read("inventory.txt"),
+        before_inventory,
+        "the changed inventory must be committed"
+    );
+    for entry in std::fs::read_dir(&world).expect("list world directory") {
+        let entry = entry.expect("directory entry");
+        assert!(
+            !entry.file_name().to_string_lossy().ends_with(".tmp"),
+            "a successful save must not leave a temporary file: {:?}",
+            entry.path()
+        );
+    }
 }
 
 #[cfg(unix)]

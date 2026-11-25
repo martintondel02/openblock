@@ -302,6 +302,8 @@ pub enum SettingsRow {
     MouseSensitivity,
     /// Fullscreen window toggle.
     Fullscreen,
+    /// GUI scale percentage or Auto.
+    UiScale,
     /// Read-only worker-thread count.
     MeshWorkers,
     /// Procedural texture style.
@@ -335,6 +337,7 @@ impl SettingsRow {
             SettingsRow::Fov => "Field of view",
             SettingsRow::MouseSensitivity => "Mouse sensitivity",
             SettingsRow::Fullscreen => "Fullscreen",
+            SettingsRow::UiScale => "GUI scale",
             SettingsRow::MeshWorkers => "Mesh workers",
             SettingsRow::TextureStyle => "Texture style",
             SettingsRow::TexturePack => "Texture pack",
@@ -351,7 +354,7 @@ impl SettingsRow {
     /// How the row reacts to adjustment and drawing.
     pub fn kind(self) -> SettingsRowKind {
         match self {
-            SettingsRow::GameMode | SettingsRow::TextureStyle => SettingsRowKind::Choice,
+            SettingsRow::GameMode | SettingsRow::TextureStyle | SettingsRow::UiScale => SettingsRowKind::Choice,
             SettingsRow::ShowHud
             | SettingsRow::DebugOverlay
             | SettingsRow::Fullscreen
@@ -498,6 +501,8 @@ pub struct SettingsInfo {
     pub texture_resolution: u32,
     /// Mesh worker-thread count.
     pub mesh_workers: usize,
+    /// Effective GUI-scale percentage for the current window/target.
+    pub ui_scale_percent: u16,
     /// One-line audio output description, or `off` when unavailable.
     pub audio_status: String,
 }
@@ -510,6 +515,7 @@ impl Default for SettingsInfo {
             texture_source: "classic".to_string(),
             texture_resolution: 16,
             mesh_workers: 1,
+            ui_scale_percent: 100,
             audio_status: "off (headless)".to_string(),
         }
     }
@@ -797,6 +803,8 @@ pub struct DebugStats {
     pub window: [u32; 2],
     /// Vertical field of view in degrees.
     pub fov_degrees: f32,
+    /// Effective GUI scale line, e.g. `UI 125% (1024x576 logical)`.
+    pub ui_scale: String,
     /// Normalised time of day (0 midnight, 0.5 noon).
     pub time_of_day: f32,
     /// Active texture source label, e.g. `painterly 32px` or a pack folder name.
@@ -887,7 +895,15 @@ impl DebugStats {
                     &self.texture_source
                 }
             ),
-            format!("Seed {}", self.seed),
+            format!(
+                "Seed {}   {}",
+                self.seed,
+                if self.ui_scale.is_empty() {
+                    "UI scale ?"
+                } else {
+                    &self.ui_scale
+                }
+            ),
             format!(
                 "Chunks {}   Sections drawn {}/{}   Draws {}",
                 self.loaded_chunks, self.drawn_sections, self.cached_sections, self.draw_calls
@@ -950,6 +966,88 @@ impl DebugStats {
             lines.extend(wrap_words(&text, DEBUG_RIGHT_WRAP_COLUMNS));
         }
         lines
+    }
+}
+
+impl DebugStats {
+    /// Reduced left-column set used when the logical target is short.
+    ///
+    /// At 960x540 with 150% GUI scale the logical target is 640x360. The full
+    /// 16-line F3 column cannot fit above the hotbar there, so the overlay
+    /// keeps identity, performance, position, vitals, world, UI scale and
+    /// target information readable instead of spilling over the HUD.
+    pub fn compact_left_lines(&self) -> Vec<String> {
+        vec![
+            format!(
+                "OpenBlock {} (save format {})",
+                self.version,
+                ob_core::SAVE_FORMAT_VERSION
+            ),
+            format!(
+                "{} FPS  p50 {:.2} ms  p95 {:.2} ms",
+                self.fps, self.frame_p50_ms, self.frame_p95_ms
+            ),
+            format!(
+                "Game: {}   Move: {}",
+                if self.game_mode.is_empty() {
+                    "survival"
+                } else {
+                    self.game_mode
+                },
+                if self.movement.is_empty() {
+                    "walk"
+                } else {
+                    self.movement
+                }
+            ),
+            format!(
+                "XYZ {:.3} / {:.3} / {:.3}   Chunk {} {} {}",
+                self.position[0], self.position[1], self.position[2], self.chunk[0], self.chunk[1], self.chunk[2]
+            ),
+            format!(
+                "Vitals: {:.1} / 20 HP, {:.1} / 20 hunger, {} def",
+                self.health, self.hunger, self.defense
+            ),
+            format!(
+                "FOV {:.0}   Render distance {} chunks   Facing {}",
+                self.fov_degrees, self.render_distance, self.facing
+            ),
+            format!(
+                "Seed {}   {}",
+                self.seed,
+                if self.ui_scale.is_empty() {
+                    "UI scale ?"
+                } else {
+                    &self.ui_scale
+                }
+            ),
+            format!(
+                "Chunks {}  Sec {}/{}  Draws {}  Tri {}",
+                self.loaded_chunks, self.drawn_sections, self.cached_sections, self.draw_calls, self.triangles
+            ),
+            format!(
+                "Mesh {}w {}in {}done   Mobs {}   Heap {:.1} MiB",
+                self.mesh_workers,
+                self.mesh_in_flight,
+                self.mesh_completed,
+                self.mobs_total,
+                self.heap_bytes as f64 / (1024.0 * 1024.0)
+            ),
+            match &self.target {
+                Some((id, pos)) => format!(
+                    "Held: {}   Target {} at {} {} {}",
+                    if self.held.is_empty() { "empty" } else { &self.held },
+                    id,
+                    pos[0],
+                    pos[1],
+                    pos[2]
+                ),
+                None => format!(
+                    "Held: {}   Target none",
+                    if self.held.is_empty() { "empty" } else { &self.held }
+                ),
+            },
+        ]
     }
 }
 
@@ -1033,6 +1131,12 @@ pub const DEBUG_FOOTER_SCALE: f32 = 1.2;
 pub const DEBUG_SCALES: [f32; 9] = [1.8, 1.7, 1.6, 1.5, 1.4, 1.3, 1.2, 1.1, 1.0];
 /// Section index of every line returned by [`DebugStats::left_lines`].
 pub const DEBUG_LEFT_SECTIONS: [usize; 16] = [0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3];
+/// Section index of every line returned by [`DebugStats::compact_left_lines`].
+pub const DEBUG_COMPACT_SECTIONS: [usize; 10] = [0, 0, 1, 1, 1, 1, 2, 2, 2, 3];
+/// Maximum glyph scales tried for the compact F3 overlay, largest first.
+pub const DEBUG_COMPACT_SCALES: [f32; 6] = [1.4, 1.3, 1.2, 1.1, 1.0, 0.9];
+/// Logical height below which the F3 overlay uses its reduced line set.
+pub const DEBUG_COMPACT_MAX_HEIGHT: f32 = 420.0;
 
 /// How the two F3 columns are arranged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1084,6 +1188,8 @@ pub struct DebugOverlayLayout {
     pub header_separator_y: f32,
     /// Y of the footer hint.
     pub footer_y: f32,
+    /// Whether the reduced compact line set is in use (small logical targets).
+    pub compact: bool,
 }
 
 /// Line step of the F3 overlay at `scale`, including the breathing gap.
@@ -1175,6 +1281,7 @@ fn debug_layout_at(
         let hotbar_top = screen[1] - HOTBAR_SLOT_SIZE - 18.0;
         (panel_bottom <= available_height + DEBUG_MARGIN && footer_bottom <= hotbar_top - 4.0).then_some(
             DebugOverlayLayout {
+                compact: false,
                 columns,
                 header_separator_y: left
                     .lines
@@ -1242,6 +1349,63 @@ fn debug_section_count(sections: &[usize]) -> usize {
     count
 }
 
+/// Builds the reduced F3 layout used on short logical targets.
+fn debug_compact_layout(screen: [f32; 2], stats: &DebugStats) -> DebugOverlayLayout {
+    let lines = stats.compact_left_lines();
+    let measure = UiFrame::new(screen[0], screen[1]);
+    let available_width = (screen[0] - DEBUG_MARGIN * 2.0).max(1.0);
+    let hotbar_top = screen[1] - HOTBAR_SLOT_SIZE - 18.0;
+    let mut layout = None;
+    for scale in DEBUG_COMPACT_SCALES {
+        let left = debug_column(
+            &measure,
+            &lines,
+            &DEBUG_COMPACT_SECTIONS,
+            scale,
+            (DEBUG_MARGIN, DEBUG_MARGIN),
+            available_width,
+        );
+        let footer_y = left.panel.y + left.panel.h + 6.0;
+        let footer_bottom = footer_y + ob_render::line_height(DEBUG_FOOTER_SCALE);
+        if left.panel.y + left.panel.h <= screen[1] - DEBUG_MARGIN && footer_bottom <= hotbar_top - 4.0 {
+            layout = Some(DebugOverlayLayout {
+                compact: true,
+                columns: DebugColumns::LeftOnly,
+                header_separator_y: left
+                    .lines
+                    .first()
+                    .map_or(DEBUG_MARGIN, |line| line.y + ob_render::line_height(scale) + 2.0),
+                left,
+                right: None,
+                footer_y,
+            });
+            break;
+        }
+    }
+    layout.unwrap_or_else(|| {
+        let scale = *DEBUG_COMPACT_SCALES.last().unwrap_or(&1.0);
+        let left = debug_column(
+            &measure,
+            &lines,
+            &DEBUG_COMPACT_SECTIONS,
+            scale,
+            (DEBUG_MARGIN, DEBUG_MARGIN),
+            available_width,
+        );
+        DebugOverlayLayout {
+            compact: true,
+            columns: DebugColumns::LeftOnly,
+            header_separator_y: left
+                .lines
+                .first()
+                .map_or(DEBUG_MARGIN, |line| line.y + ob_render::line_height(scale) + 2.0),
+            footer_y: left.panel.y + left.panel.h + 6.0,
+            left,
+            right: None,
+        }
+    })
+}
+
 /// Computes the F3 overlay geometry for a deterministic stats snapshot.
 ///
 /// The largest scale that keeps both columns (and the footer) on screen is
@@ -1249,6 +1413,9 @@ fn debug_section_count(sections: &[usize]) -> usize {
 /// stacked below the stats column; on very small targets it is omitted so the
 /// remaining text stays readable.
 pub fn debug_overlay_layout(screen: [f32; 2], stats: &DebugStats) -> DebugOverlayLayout {
+    if screen[1] < DEBUG_COMPACT_MAX_HEIGHT {
+        return debug_compact_layout(screen, stats);
+    }
     let left_lines = stats.left_lines();
     let right_lines = stats.right_lines();
     for scale in DEBUG_SCALES {
@@ -1270,6 +1437,7 @@ pub fn debug_overlay_layout(screen: [f32; 2], stats: &DebugStats) -> DebugOverla
         available_width,
     );
     DebugOverlayLayout {
+        compact: false,
         columns: DebugColumns::LeftOnly,
         header_separator_y: left
             .lines
@@ -1292,6 +1460,11 @@ pub struct UiState {
     pub hud_visible: bool,
     /// Current persisted settings.
     pub settings: Settings,
+    /// Effective GUI-scale percentage for the current physical target.
+    ///
+    /// Persisted [`Settings::ui_scale_percent`] may be `Auto`; the runtimes
+    /// update this resolved value whenever the window size or setting changes.
+    pub ui_scale_percent: u16,
     /// Active tab of the settings screen.
     pub settings_tab: SettingsTab,
     /// Flat keyboard focus on the settings screen: tab rows first, then the
@@ -1354,6 +1527,7 @@ impl Default for UiState {
             debug_overlay: false,
             hud_visible: true,
             settings: Settings::default(),
+            ui_scale_percent: 100,
             settings_tab: SettingsTab::Game,
             settings_selected_row: 0,
             settings_hovered_tab: None,
@@ -1390,6 +1564,7 @@ impl UiState {
         Self {
             debug_overlay: settings.show_debug_overlay,
             hud_visible: settings.show_hud,
+            ui_scale_percent: 100,
             settings,
             ..Self::default()
         }
@@ -1592,6 +1767,7 @@ impl UiState {
                 SettingsRow::Fov,
                 SettingsRow::MouseSensitivity,
                 SettingsRow::Fullscreen,
+                SettingsRow::UiScale,
                 SettingsRow::ReducedMotion,
                 SettingsRow::MeshWorkers,
             ],
@@ -1722,7 +1898,7 @@ impl UiState {
             SettingsRow::MusicVolume => {
                 volume_can_adjust(self.settings.music_volume, delta, Settings::default().music_volume)
             }
-            SettingsRow::GameMode | SettingsRow::TextureStyle => true,
+            SettingsRow::GameMode | SettingsRow::TextureStyle | SettingsRow::UiScale => true,
             SettingsRow::ShowHud
             | SettingsRow::DebugOverlay
             | SettingsRow::Fullscreen
@@ -1747,7 +1923,7 @@ impl UiState {
             .map(|(row, rect)| {
                 let shows_arrows = matches!(row.kind(), SettingsRowKind::Range | SettingsRowKind::Choice)
                     && self.settings_row_enabled(row);
-                shows_arrows.then(|| settings_arrow_rects_for(rect))
+                shows_arrows.then(|| settings_arrow_rects_for_metrics(rect, settings_metrics(screen)))
             })
             .collect()
     }
@@ -1777,6 +1953,9 @@ impl UiState {
             SettingsRow::Fov => format!("{:.0} deg", self.settings.fov_degrees),
             SettingsRow::MouseSensitivity => format!("{:.2}x", self.settings.mouse_sensitivity),
             SettingsRow::Fullscreen => checkbox(self.settings.fullscreen),
+            SettingsRow::UiScale => {
+                crate::ui_scale::ui_scale_label(self.settings.ui_scale_percent, info.ui_scale_percent)
+            }
             SettingsRow::MeshWorkers => format!("{} threads (launch)", info.mesh_workers.max(1)),
             SettingsRow::TextureStyle => texture_style_label(self.settings.texture_style).to_string(),
             SettingsRow::TexturePack => {
@@ -1957,6 +2136,16 @@ impl UiState {
             SettingsRow::Fullscreen => {
                 self.settings.fullscreen = !self.settings.fullscreen;
                 true
+            }
+            SettingsRow::UiScale => {
+                let next =
+                    crate::ui_scale::cycle_ui_scale(self.settings.ui_scale_percent, delta, self.ui_scale_percent);
+                if next == self.settings.ui_scale_percent {
+                    false
+                } else {
+                    self.settings.ui_scale_percent = next;
+                    true
+                }
             }
             SettingsRow::AudioEnabled => {
                 self.settings.audio_enabled = !self.settings.audio_enabled;
@@ -2168,33 +2357,67 @@ impl UiState {
     /// fits above the footer buttons; other tabs use the single-column list.
     pub fn settings_row_rects(&self, screen: [f32; 2]) -> Vec<UiRect> {
         let panel = settings_panel_rect(screen);
-        let start_y = panel.y + SETTINGS_CONTENT_TOP;
+        let metrics = settings_metrics(screen);
+        let buttons = settings_button_rects(screen);
+        let start_y = panel.y + metrics.content_top;
         let rows = self.settings_rows();
-        if self.settings_tab == SettingsTab::Controls && !rows.is_empty() {
-            let count = rows.len();
+        let count = rows.len();
+        if count == 0 {
+            return Vec::new();
+        }
+        if self.settings_tab == SettingsTab::Controls {
+            // The Controls tab lays its entries out in two columns and keeps a
+            // line free between the last hit box and the footer buttons for the
+            // capture/conflict message.
             let per_column = count.div_ceil(2);
-            let column_width = (panel.w - SETTINGS_MARGIN * 2.0 - SETTINGS_CONTROLS_COLUMN_GAP) / 2.0;
+            let note_space = 16.0;
+            let available = (buttons[0].y - note_space - start_y).max(1.0);
+            let gap = 4.0;
+            let height = (metrics
+                .controls_row_height
+                .min((available - gap * (per_column.saturating_sub(1)) as f32) / per_column as f32))
+            .max(8.0);
+            let step = if per_column > 1 {
+                ((available - height) / (per_column - 1) as f32).min(metrics.controls_row_step)
+            } else {
+                0.0
+            };
+            let column_width = (panel.w - metrics.margin * 2.0 - metrics.controls_column_gap) / 2.0;
             return (0..count)
                 .map(|index| {
                     let column = index / per_column;
                     let row = index % per_column;
                     UiRect::new(
-                        panel.x + SETTINGS_MARGIN + column as f32 * (column_width + SETTINGS_CONTROLS_COLUMN_GAP),
-                        start_y + row as f32 * SETTINGS_CONTROLS_ROW_STEP,
+                        panel.x + metrics.margin + column as f32 * (column_width + metrics.controls_column_gap),
+                        start_y + row as f32 * step,
                         column_width,
-                        SETTINGS_CONTROLS_ROW_HEIGHT,
+                        height,
                     )
                 })
                 .collect();
         }
+        // Fit every single-column row between the content top and the footer
+        // buttons. At 100% the old 44 px pitch is kept; the extra Display row
+        // (GUI scale) compresses the pitch slightly rather than overlapping.
+        let gap = 6.0;
+        let available = (buttons[0].y - 6.0 - start_y).max(1.0);
+        let height = metrics
+            .row_height
+            .min((available - gap * (count.saturating_sub(1)) as f32) / count as f32)
+            .max(8.0);
+        let step = if count > 1 {
+            ((available - height) / (count - 1) as f32).min(metrics.row_step)
+        } else {
+            0.0
+        };
         rows.iter()
             .enumerate()
             .map(|(index, _)| {
                 UiRect::new(
-                    panel.x + SETTINGS_MARGIN,
-                    start_y + index as f32 * SETTINGS_ROW_STEP,
-                    panel.w - SETTINGS_MARGIN * 2.0,
-                    SETTINGS_ROW_HEIGHT,
+                    panel.x + metrics.margin,
+                    start_y + index as f32 * step,
+                    panel.w - metrics.margin * 2.0,
+                    height,
                 )
             })
             .collect()
@@ -2361,6 +2584,193 @@ fn vital_value(value: f32) -> f32 {
     }
 }
 
+/// Responsive settings-screen metrics.
+///
+/// The release layouts are the 100% baseline. When the logical height drops
+/// below 500 px (for example 960x540 at 150% GUI scale, which is 640x360
+/// logical), a compact metric set keeps the tab strip, seven Display rows and
+/// the footer buttons inside the panel instead of clipping them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SettingsMetrics {
+    /// Whether the compact metric set is active.
+    pub compact: bool,
+    /// Horizontal inner margin.
+    pub margin: f32,
+    /// Y offset of the title.
+    pub title_y: f32,
+    /// Glyph scale of the title.
+    pub title_scale: f32,
+    /// Y offset of the version label.
+    pub version_y: f32,
+    /// Glyph scale of the version label.
+    pub version_scale: f32,
+    /// Y offset of the rule under the header.
+    pub separator_y: f32,
+    /// Y offset of the tab strip.
+    pub tab_top: f32,
+    /// Height of the tab strip.
+    pub tab_height: f32,
+    /// Gap between tabs.
+    pub tab_gap: f32,
+    /// Glyph scale of a tab label.
+    pub tab_scale: f32,
+    /// Y offset of the first row.
+    pub content_top: f32,
+    /// Preferred height of a row.
+    pub row_height: f32,
+    /// Preferred vertical pitch between rows.
+    pub row_step: f32,
+    /// Glyph scale of a row label.
+    pub row_scale: f32,
+    /// Width of one adjustment arrow.
+    pub arrow_width: f32,
+    /// Height of one adjustment arrow.
+    pub arrow_height: f32,
+    /// Gap between the two adjustment arrows.
+    pub arrow_gap: f32,
+    /// Right margin of the increment arrow.
+    pub arrow_right_margin: f32,
+    /// Gap between the value and the decrement arrow.
+    pub value_gap: f32,
+    /// Width of the range progress track.
+    pub slider_width: f32,
+    /// Gap between the slider track and the decrement arrow.
+    pub slider_gap: f32,
+    /// Glyph scale of a row value.
+    pub value_scale: f32,
+    /// Glyph scale of an arrow glyph.
+    pub arrow_scale: f32,
+    /// Width of a footer button.
+    pub button_width: f32,
+    /// Height of a footer button.
+    pub button_height: f32,
+    /// Gap between the footer buttons.
+    pub button_gap: f32,
+    /// Button top, measured from the panel bottom.
+    pub button_y_from_bottom: f32,
+    /// Glyph scale of a footer button label.
+    pub button_scale: f32,
+    /// Separator Y, measured from the panel bottom.
+    pub footer_y_from_bottom: f32,
+    /// First hint-line Y, measured from the panel bottom.
+    pub hint_y_from_bottom: f32,
+    /// Distance between hint lines.
+    pub hint_step: f32,
+    /// Glyph scale of a hint line.
+    pub hint_scale: f32,
+    /// Gap between the last row and a summary/source box.
+    pub summary_gap: f32,
+    /// Height of the summary box.
+    pub summary_height: f32,
+    /// Glyph scale of summary/source text.
+    pub small_scale: f32,
+    /// Height of one interactive Controls row.
+    pub controls_row_height: f32,
+    /// Preferred pitch of the Controls rows.
+    pub controls_row_step: f32,
+    /// Gap between the Controls columns.
+    pub controls_column_gap: f32,
+    /// Glyph scale of Controls key/action labels.
+    pub controls_text_scale: f32,
+}
+
+/// Baseline (100%) settings metrics.
+const SETTINGS_METRICS_BASE: SettingsMetrics = SettingsMetrics {
+    compact: false,
+    margin: SETTINGS_MARGIN,
+    title_y: 18.0,
+    title_scale: 2.6,
+    version_y: 27.0,
+    version_scale: 1.2,
+    separator_y: 58.0,
+    tab_top: SETTINGS_TAB_TOP,
+    tab_height: SETTINGS_TAB_HEIGHT,
+    tab_gap: SETTINGS_TAB_GAP,
+    tab_scale: 1.45,
+    content_top: SETTINGS_CONTENT_TOP,
+    row_height: 30.0,
+    row_step: SETTINGS_ROW_STEP,
+    row_scale: 1.35,
+    arrow_width: SETTINGS_ARROW_WIDTH,
+    arrow_height: SETTINGS_ARROW_HEIGHT,
+    arrow_gap: SETTINGS_ARROW_GAP,
+    arrow_right_margin: SETTINGS_ARROW_RIGHT_MARGIN,
+    value_gap: SETTINGS_VALUE_GAP,
+    slider_width: SETTINGS_SLIDER_WIDTH,
+    slider_gap: SETTINGS_SLIDER_GAP,
+    value_scale: 1.25,
+    arrow_scale: 1.4,
+    button_width: SETTINGS_BUTTON_WIDTH,
+    button_height: SETTINGS_BUTTON_HEIGHT,
+    button_gap: SETTINGS_BUTTON_GAP,
+    button_y_from_bottom: SETTINGS_BUTTON_Y_FROM_BOTTOM,
+    button_scale: 1.5,
+    footer_y_from_bottom: SETTINGS_FOOTER_Y_FROM_BOTTOM,
+    hint_y_from_bottom: SETTINGS_HINT_Y_FROM_BOTTOM,
+    hint_step: SETTINGS_HINT_STEP,
+    hint_scale: 1.0,
+    summary_gap: SETTINGS_SUMMARY_GAP,
+    summary_height: SETTINGS_SUMMARY_HEIGHT,
+    small_scale: 1.2,
+    controls_row_height: SETTINGS_CONTROLS_ROW_HEIGHT,
+    controls_row_step: SETTINGS_CONTROLS_ROW_STEP,
+    controls_column_gap: SETTINGS_CONTROLS_COLUMN_GAP,
+    controls_text_scale: 1.0,
+};
+
+/// Compact metrics used when the logical panel is shorter than 500 px.
+const SETTINGS_METRICS_COMPACT: SettingsMetrics = SettingsMetrics {
+    compact: true,
+    margin: 16.0,
+    title_y: 12.0,
+    title_scale: 2.0,
+    version_y: 16.0,
+    version_scale: 1.0,
+    separator_y: 40.0,
+    tab_top: 46.0,
+    tab_height: 26.0,
+    tab_gap: 6.0,
+    tab_scale: 1.15,
+    content_top: 76.0,
+    row_height: 20.0,
+    row_step: 34.0,
+    row_scale: 1.15,
+    arrow_width: 20.0,
+    arrow_height: 18.0,
+    arrow_gap: 6.0,
+    arrow_right_margin: 8.0,
+    value_gap: 10.0,
+    slider_width: 70.0,
+    slider_gap: 10.0,
+    value_scale: 1.1,
+    arrow_scale: 1.15,
+    button_width: 140.0,
+    button_height: 28.0,
+    button_gap: 16.0,
+    button_y_from_bottom: 80.0,
+    button_scale: 1.25,
+    footer_y_from_bottom: 44.0,
+    hint_y_from_bottom: 30.0,
+    hint_step: 12.0,
+    hint_scale: 0.95,
+    summary_gap: 8.0,
+    summary_height: 30.0,
+    small_scale: 1.0,
+    controls_row_height: 16.0,
+    controls_row_step: 18.0,
+    controls_column_gap: 8.0,
+    controls_text_scale: 1.0,
+};
+
+/// Metrics for the current target: the 100% baseline or compact mode.
+pub fn settings_metrics(screen: [f32; 2]) -> SettingsMetrics {
+    if settings_panel_rect(screen).h < 420.0 {
+        SETTINGS_METRICS_COMPACT
+    } else {
+        SETTINGS_METRICS_BASE
+    }
+}
+
 /// Full bounds of the modal settings panel for a target size.
 pub fn settings_panel_rect(screen: [f32; 2]) -> UiRect {
     let width = SETTINGS_PANEL_WIDTH.min((screen[0] - 24.0).max(1.0));
@@ -2371,34 +2781,42 @@ pub fn settings_panel_rect(screen: [f32; 2]) -> UiRect {
 /// Bounds of the settings tab buttons.
 pub fn settings_tab_rects(screen: [f32; 2]) -> [UiRect; 5] {
     let panel = settings_panel_rect(screen);
+    let metrics = settings_metrics(screen);
     let count = SettingsTab::ALL.len() as f32;
-    let width = (panel.w - SETTINGS_MARGIN * 2.0 - SETTINGS_TAB_GAP * (count - 1.0)) / count;
+    let width = (panel.w - metrics.margin * 2.0 - metrics.tab_gap * (count - 1.0)) / count;
     std::array::from_fn(|index| {
         UiRect::new(
-            panel.x + SETTINGS_MARGIN + index as f32 * (width + SETTINGS_TAB_GAP),
-            panel.y + SETTINGS_TAB_TOP,
+            panel.x + metrics.margin + index as f32 * (width + metrics.tab_gap),
+            panel.y + metrics.tab_top,
             width,
-            SETTINGS_TAB_HEIGHT,
+            metrics.tab_height,
         )
     })
 }
 
-/// Left (`<`) and right (`>`) adjustment-arrow rectangles inside a row.
+/// Left (`<`) and right (`>`) adjustment-arrow rectangles inside a row,
+/// using the 100% metric set.
 ///
 /// The returned rectangles sit at the right edge of the row, with the value
 /// right-aligned before the decrement arrow so the two never overlap.
 pub fn settings_arrow_rects_for(row: UiRect) -> (UiRect, UiRect) {
+    settings_arrow_rects_for_metrics(row, SETTINGS_METRICS_BASE)
+}
+
+/// Left and right adjustment arrows for one row and metric set.
+pub fn settings_arrow_rects_for_metrics(row: UiRect, metrics: SettingsMetrics) -> (UiRect, UiRect) {
+    let arrow_height = metrics.arrow_height.min(row.h);
     let right = UiRect::new(
-        row.x + row.w - SETTINGS_ARROW_RIGHT_MARGIN - SETTINGS_ARROW_WIDTH,
-        row.y + (row.h - SETTINGS_ARROW_HEIGHT) / 2.0,
-        SETTINGS_ARROW_WIDTH,
-        SETTINGS_ARROW_HEIGHT,
+        row.x + row.w - metrics.arrow_right_margin - metrics.arrow_width,
+        row.y + (row.h - arrow_height) / 2.0,
+        metrics.arrow_width,
+        arrow_height,
     );
     let left = UiRect::new(
-        right.x - SETTINGS_ARROW_GAP - SETTINGS_ARROW_WIDTH,
+        right.x - metrics.arrow_gap - metrics.arrow_width,
         right.y,
-        SETTINGS_ARROW_WIDTH,
-        SETTINGS_ARROW_HEIGHT,
+        metrics.arrow_width,
+        arrow_height,
     );
     (left, right)
 }
@@ -2406,16 +2824,17 @@ pub fn settings_arrow_rects_for(row: UiRect) -> (UiRect, UiRect) {
 /// Bounds of the Resume and Save & quit buttons.
 pub fn settings_button_rects(screen: [f32; 2]) -> [UiRect; 2] {
     let panel = settings_panel_rect(screen);
-    let total = SETTINGS_BUTTON_WIDTH * 2.0 + SETTINGS_BUTTON_GAP;
+    let metrics = settings_metrics(screen);
+    let total = metrics.button_width * 2.0 + metrics.button_gap;
     let x = panel.x + (panel.w - total) / 2.0;
-    let y = panel.y + panel.h - SETTINGS_BUTTON_Y_FROM_BOTTOM;
+    let y = panel.y + panel.h - metrics.button_y_from_bottom;
     [
-        UiRect::new(x, y, SETTINGS_BUTTON_WIDTH, SETTINGS_BUTTON_HEIGHT),
+        UiRect::new(x, y, metrics.button_width, metrics.button_height),
         UiRect::new(
-            x + SETTINGS_BUTTON_WIDTH + SETTINGS_BUTTON_GAP,
+            x + metrics.button_width + metrics.button_gap,
             y,
-            SETTINGS_BUTTON_WIDTH,
-            SETTINGS_BUTTON_HEIGHT,
+            metrics.button_width,
+            metrics.button_height,
         ),
     ]
 }
@@ -2426,36 +2845,40 @@ pub fn settings_button_rects(screen: [f32; 2]) -> [UiRect; 2] {
 /// client screens should add their own `draw_*` function alongside it instead
 /// of growing this one.
 pub fn draw_settings_screen(frame: &mut UiFrame, ui: &UiState, info: &SettingsInfo, screen: [f32; 2]) {
+    let metrics = settings_metrics(screen);
     let [width, height] = screen;
     frame.rect(0.0, 0.0, width, height, [0.0, 0.0, 0.0, 0.55]);
     frame.rect(0.0, 0.0, width, height, [0.02, 0.03, 0.06, 0.18]);
     let panel = settings_panel_rect(screen);
     draw_settings_panel(frame, panel);
-    draw_settings_header(frame, panel);
-    draw_settings_tabs(frame, ui, screen);
+    draw_settings_header(frame, panel, metrics);
+    draw_settings_tabs(frame, ui, screen, metrics);
     let rows = ui.settings_row_infos(info);
     let row_rects = ui.settings_row_rects(screen);
+    let content_bottom = row_rects
+        .last()
+        .map_or(panel.y + metrics.content_top, |rect| rect.y + rect.h);
     match ui.settings_tab {
         SettingsTab::Game => {
             draw_settings_rows(frame, ui, &rows, &row_rects, screen);
-            draw_game_summary(frame, ui, info, panel, rows.len());
+            draw_game_summary(frame, ui, info, panel, content_bottom, metrics);
         }
         SettingsTab::Display => draw_settings_rows(frame, ui, &rows, &row_rects, screen),
         SettingsTab::Audio => {
             draw_settings_rows(frame, ui, &rows, &row_rects, screen);
-            draw_audio_status(frame, info, panel, rows.len());
+            draw_audio_status(frame, info, panel, content_bottom, metrics);
         }
         SettingsTab::Controls => {
             draw_settings_rows(frame, ui, &rows, &row_rects, screen);
-            draw_controls_help(frame, ui, panel, &row_rects);
+            draw_controls_help(frame, ui, panel, &row_rects, screen);
         }
         SettingsTab::Textures => {
             draw_settings_rows(frame, ui, &rows, &row_rects, screen);
-            draw_texture_source(frame, info, panel, rows.len());
+            draw_texture_source(frame, info, panel, content_bottom, metrics);
         }
     }
-    draw_settings_buttons(frame, ui, screen);
-    draw_settings_footer(frame, panel, ui.settings_tab);
+    draw_settings_buttons(frame, ui, screen, metrics);
+    draw_settings_footer(frame, panel, ui, metrics);
 }
 
 fn draw_settings_panel(frame: &mut UiFrame, panel: UiRect) {
@@ -2472,34 +2895,35 @@ fn draw_settings_panel(frame: &mut UiFrame, panel: UiRect) {
     );
 }
 
-fn draw_settings_header(frame: &mut UiFrame, panel: UiRect) {
+fn draw_settings_header(frame: &mut UiFrame, panel: UiRect, metrics: SettingsMetrics) {
     frame.text(
-        panel.x + SETTINGS_MARGIN,
-        panel.y + 18.0,
-        2.6,
+        panel.x + metrics.margin,
+        panel.y + metrics.title_y,
+        metrics.title_scale,
         [0.98, 0.99, 1.0, 1.0],
         "Settings",
     );
     let version = format!("OpenBlock v{}", ob_core::VERSION);
-    let version_width = frame.text_width(1.2, &version);
+    let version_width = frame.text_width(metrics.version_scale, &version);
     frame.text(
-        panel.x + panel.w - SETTINGS_MARGIN - version_width,
-        panel.y + 27.0,
-        1.2,
+        panel.x + panel.w - metrics.margin - version_width,
+        panel.y + metrics.version_y,
+        metrics.version_scale,
         [0.64, 0.70, 0.79, 1.0],
         &version,
     );
     frame.rect(
-        panel.x + SETTINGS_MARGIN,
-        panel.y + 58.0,
-        panel.w - SETTINGS_MARGIN * 2.0,
+        panel.x + metrics.margin,
+        panel.y + metrics.separator_y,
+        panel.w - metrics.margin * 2.0,
         1.0,
         [0.24, 0.28, 0.35, 1.0],
     );
 }
 
-fn draw_settings_tabs(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2]) {
+fn draw_settings_tabs(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2], metrics: SettingsMetrics) {
     let rects = settings_tab_rects(screen);
+    let label_y = |rect: UiRect| rect.y + (rect.h - ob_render::line_height(metrics.tab_scale)) / 2.0;
     for (index, tab) in SettingsTab::ALL.iter().enumerate() {
         let rect = rects[index];
         let active = *tab == ui.settings_tab;
@@ -2524,44 +2948,80 @@ fn draw_settings_tabs(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2]) {
         } else {
             [0.62, 0.68, 0.76, 1.0]
         };
-        frame.text_centered(rect.center().0, rect.y + 11.0, 1.45, color, tab.name());
+        frame.text_centered(rect.center().0, label_y(rect), metrics.tab_scale, color, tab.name());
     }
 }
 
 fn draw_settings_rows(frame: &mut UiFrame, ui: &UiState, rows: &[SettingsRowInfo], rects: &[UiRect], screen: [f32; 2]) {
+    let metrics = settings_metrics(screen);
     let arrows = ui.settings_arrow_rects(screen);
     let hovered_arrow = ui.settings_arrow_at(screen, ui.cursor);
+    let inset = if metrics.compact { 10.0 } else { 16.0 };
     for (index, (info, rect)) in rows.iter().zip(rects.iter()).enumerate() {
         if info.row == SettingsRow::MeshWorkers {
             frame.rect(rect.x, rect.y - 9.0, rect.w, 1.0, [0.19, 0.23, 0.29, 0.9]);
         }
-        if index == ui.settings_selected_row {
+        let focused = index == ui.settings_selected_row;
+        let hovered = ui.settings_hovered_row == Some(index);
+        if focused || hovered {
             frame.rect(rect.x, rect.y, rect.w, rect.h, [0.16, 0.21, 0.29, 0.96]);
-            frame.outline(rect.x, rect.y, rect.w, rect.h, 1.0, [0.95, 0.79, 0.35, 0.95]);
-            frame.rect(rect.x, rect.y + 4.0, 3.0, rect.h - 8.0, [0.96, 0.76, 0.32, 1.0]);
+            frame.outline(
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                1.0,
+                if focused {
+                    [0.95, 0.79, 0.35, 0.95]
+                } else {
+                    [0.42, 0.49, 0.59, 0.85]
+                },
+            );
+            frame.rect(
+                rect.x,
+                rect.y + 4.0,
+                3.0,
+                (rect.h - 8.0).max(1.0),
+                [0.96, 0.76, 0.32, 1.0],
+            );
         }
         let label_color = if info.enabled {
             [0.92, 0.95, 0.99, 1.0]
         } else {
             [0.50, 0.55, 0.63, 1.0]
         };
-        let label_y = rect.y + (rect.h - ob_render::line_height(1.35)) / 2.0;
-        frame.text(rect.x + 16.0, label_y, 1.35, label_color, info.label);
+        let label_y = rect.y + (rect.h - ob_render::line_height(metrics.row_scale)) / 2.0;
+        frame.text(rect.x + inset, label_y, metrics.row_scale, label_color, info.label);
         let row_arrows = arrows.get(index).copied().flatten();
-        let value_right = row_arrows.map_or(rect.x + rect.w - 14.0, |(left, _)| left.x - SETTINGS_VALUE_GAP);
+        let value_right = row_arrows.map_or(rect.x + rect.w - inset, |(left, _)| left.x - metrics.value_gap);
         let value_color = settings_value_color(info);
-        let value_width = frame.text_width(1.25, &info.value);
-        frame.text(value_right - value_width, label_y, 1.25, value_color, &info.value);
+        let value_width = frame.text_width(metrics.value_scale, &info.value);
+        let value_x = (value_right - value_width).max(rect.x + inset);
+        frame.text(value_x, label_y, metrics.value_scale, value_color, &info.value);
         if let Some((left, right)) = row_arrows {
             let left_active = ui.settings_can_adjust(info.row, -1);
             let right_active = ui.settings_can_adjust(info.row, 1);
-            draw_settings_arrow(frame, left, "<", left_active, hovered_arrow == Some((index, -1)));
-            draw_settings_arrow(frame, right, ">", right_active, hovered_arrow == Some((index, 1)));
+            draw_settings_arrow(
+                frame,
+                left,
+                "<",
+                left_active,
+                hovered_arrow == Some((index, -1)),
+                metrics,
+            );
+            draw_settings_arrow(
+                frame,
+                right,
+                ">",
+                right_active,
+                hovered_arrow == Some((index, 1)),
+                metrics,
+            );
         }
         if let Some(fraction) = ui.settings_row_fraction(info.row) {
-            let track_width = SETTINGS_SLIDER_WIDTH;
-            let track_x = row_arrows.map_or(rect.x + rect.w - track_width - 14.0, |(left, _)| {
-                left.x - SETTINGS_SLIDER_GAP - track_width
+            let track_width = metrics.slider_width.min((rect.w * 0.28).max(1.0));
+            let track_x = row_arrows.map_or(rect.x + rect.w - track_width - inset, |(left, _)| {
+                left.x - metrics.slider_gap - track_width
             });
             let track_y = rect.y + rect.h - 7.0;
             frame.rect(track_x, track_y, track_width, 3.0, [0.10, 0.12, 0.16, 1.0]);
@@ -2574,7 +3034,14 @@ fn draw_settings_rows(frame: &mut UiFrame, ui: &UiState, rows: &[SettingsRowInfo
     }
 }
 
-fn draw_settings_arrow(frame: &mut UiFrame, rect: UiRect, glyph: &str, enabled: bool, hovered: bool) {
+fn draw_settings_arrow(
+    frame: &mut UiFrame,
+    rect: UiRect,
+    glyph: &str,
+    enabled: bool,
+    hovered: bool,
+    metrics: SettingsMetrics,
+) {
     let background = if hovered && enabled {
         [0.28, 0.34, 0.44, 0.98]
     } else if enabled {
@@ -2596,11 +3063,11 @@ fn draw_settings_arrow(frame: &mut UiFrame, rect: UiRect, glyph: &str, enabled: 
     } else {
         [0.45, 0.50, 0.57, 0.9]
     };
-    let text_height = ob_render::line_height(1.4);
+    let text_height = ob_render::line_height(metrics.arrow_scale);
     frame.text_centered(
         rect.center().0,
         rect.y + (rect.h - text_height) / 2.0,
-        1.4,
+        metrics.arrow_scale,
         color,
         glyph,
     );
@@ -2624,37 +3091,50 @@ fn settings_value_color(info: &SettingsRowInfo) -> [f32; 4] {
     }
 }
 
-fn draw_game_summary(frame: &mut UiFrame, ui: &UiState, info: &SettingsInfo, panel: UiRect, row_count: usize) {
-    let x = panel.x + SETTINGS_MARGIN;
-    let y = panel.y + SETTINGS_CONTENT_TOP + row_count as f32 * SETTINGS_ROW_STEP + SETTINGS_SUMMARY_GAP;
-    let width = panel.w - SETTINGS_MARGIN * 2.0;
-    frame.rect(x, y, width, SETTINGS_SUMMARY_HEIGHT, [0.09, 0.11, 0.15, 0.96]);
-    frame.outline(x, y, width, SETTINGS_SUMMARY_HEIGHT, 1.0, [0.20, 0.24, 0.31, 1.0]);
+fn draw_game_summary(
+    frame: &mut UiFrame,
+    ui: &UiState,
+    info: &SettingsInfo,
+    panel: UiRect,
+    content_bottom: f32,
+    metrics: SettingsMetrics,
+) {
+    let x = panel.x + metrics.margin;
+    let y = content_bottom + metrics.summary_gap;
+    let width = panel.w - metrics.margin * 2.0;
+    frame.rect(x, y, width, metrics.summary_height, [0.09, 0.11, 0.15, 0.96]);
+    frame.outline(x, y, width, metrics.summary_height, 1.0, [0.20, 0.24, 0.31, 1.0]);
     let mode = game_mode_label(ui.settings.game_mode);
     let health = vital_value(info.health);
     let hunger = vital_value(info.hunger);
     let text = format!("{mode}   Health {health:.0} / 20   Hunger {hunger:.0} / 20");
     frame.text(
         x + 14.0,
-        y + (SETTINGS_SUMMARY_HEIGHT - ob_render::line_height(1.2)) / 2.0,
-        1.2,
+        y + (metrics.summary_height - ob_render::line_height(metrics.small_scale)) / 2.0,
+        metrics.small_scale,
         [0.90, 0.94, 0.99, 1.0],
         &text,
     );
     if ui.host_optional {
         frame.text(
             x,
-            y + SETTINGS_SUMMARY_HEIGHT + 12.0,
-            1.05,
+            y + metrics.summary_height + 8.0,
+            0.95,
             [0.96, 0.80, 0.42, 1.0],
             "No world loaded: game mode is chosen when you start a world.",
         );
     }
 }
 
-fn draw_texture_source(frame: &mut UiFrame, info: &SettingsInfo, panel: UiRect, row_count: usize) {
-    let x = panel.x + SETTINGS_MARGIN;
-    let y = panel.y + SETTINGS_CONTENT_TOP + row_count as f32 * SETTINGS_ROW_STEP + SETTINGS_SUMMARY_GAP;
+fn draw_texture_source(
+    frame: &mut UiFrame,
+    info: &SettingsInfo,
+    panel: UiRect,
+    content_bottom: f32,
+    metrics: SettingsMetrics,
+) {
+    let x = panel.x + metrics.margin;
+    let y = content_bottom + metrics.summary_gap;
     let source = if info.texture_source.is_empty() {
         "built-in"
     } else {
@@ -2670,16 +3150,22 @@ fn draw_texture_source(frame: &mut UiFrame, info: &SettingsInfo, panel: UiRect, 
     frame.rect(
         x,
         y - 10.0,
-        panel.w - SETTINGS_MARGIN * 2.0,
+        panel.w - metrics.margin * 2.0,
         1.0,
         [0.19, 0.23, 0.29, 0.9],
     );
-    frame.text(x, y, 1.2, [0.80, 0.86, 0.94, 1.0], &text);
+    frame.text(x, y, metrics.small_scale, [0.80, 0.86, 0.94, 1.0], &text);
 }
 
-fn draw_audio_status(frame: &mut UiFrame, info: &SettingsInfo, panel: UiRect, row_count: usize) {
-    let x = panel.x + SETTINGS_MARGIN;
-    let y = panel.y + SETTINGS_CONTENT_TOP + row_count as f32 * SETTINGS_ROW_STEP + SETTINGS_SUMMARY_GAP;
+fn draw_audio_status(
+    frame: &mut UiFrame,
+    info: &SettingsInfo,
+    panel: UiRect,
+    content_bottom: f32,
+    metrics: SettingsMetrics,
+) {
+    let x = panel.x + metrics.margin;
+    let y = content_bottom + metrics.summary_gap;
     let status = if info.audio_status.is_empty() {
         "off"
     } else {
@@ -2688,35 +3174,38 @@ fn draw_audio_status(frame: &mut UiFrame, info: &SettingsInfo, panel: UiRect, ro
     frame.rect(
         x,
         y - 10.0,
-        panel.w - SETTINGS_MARGIN * 2.0,
+        panel.w - metrics.margin * 2.0,
         1.0,
         [0.19, 0.23, 0.29, 0.9],
     );
     frame.text(
         x,
         y,
-        1.2,
+        metrics.small_scale,
         [0.80, 0.86, 0.94, 1.0],
         &format!("Output: {}", shorten(status, 66)),
     );
     frame.text(
         x,
         y + 18.0,
-        1.1,
+        0.95,
         [0.62, 0.68, 0.76, 1.0],
         "Volumes apply immediately; 5% steps with Left/Right or the wheel.",
     );
 }
 
-fn draw_controls_help(frame: &mut UiFrame, ui: &UiState, panel: UiRect, rects: &[UiRect]) {
-    let top = rects
+fn draw_controls_help(frame: &mut UiFrame, ui: &UiState, panel: UiRect, rects: &[UiRect], screen: [f32; 2]) {
+    let metrics = settings_metrics(screen);
+    let buttons = settings_button_rects(screen);
+    let top = (rects
         .last()
-        .map_or(panel.y + SETTINGS_CONTENT_TOP, |rect| rect.y + rect.h)
-        + 8.0;
-    let x = panel.x + SETTINGS_MARGIN;
+        .map_or(panel.y + metrics.content_top, |rect| rect.y + rect.h)
+        + 6.0)
+        .min(buttons[0].y - ob_render::line_height(0.95) - 4.0);
+    let x = panel.x + metrics.margin;
     // Only one note line fits between the last keybind row and the footer
-    // buttons at 960x540. Duplicate-bind errors already name the conflict in
-    // `binding_message`, so a second line would cover the buttons.
+    // buttons at small logical sizes. The message names the conflict or the
+    // action waiting for capture, so no information is lost.
     let conflicts = ui.settings.keybinds.conflict_lines();
     let (message, color) = if let Some(action) = ui.binding_action() {
         (
@@ -2743,14 +3232,15 @@ fn draw_controls_help(frame: &mut UiFrame, ui: &UiState, panel: UiRect, rects: &
     frame.rect(
         x,
         top - 6.0,
-        panel.w - SETTINGS_MARGIN * 2.0,
+        panel.w - metrics.margin * 2.0,
         1.0,
         [0.19, 0.23, 0.29, 0.9],
     );
-    frame.text(x, top, 1.0, color, &message);
+    let max_chars = (((panel.w - metrics.margin * 2.0) / ob_render::glyph_advance(0.95)).max(24.0)) as usize;
+    frame.text(x, top, 0.95, color, &shorten(&message, max_chars));
 }
 
-fn draw_settings_buttons(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2]) {
+fn draw_settings_buttons(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2], metrics: SettingsMetrics) {
     let rects = settings_button_rects(screen);
     let row_count = ui.settings_rows().len();
     for (index, button) in SETTINGS_BUTTONS.iter().enumerate() {
@@ -2781,32 +3271,51 @@ fn draw_settings_buttons(frame: &mut UiFrame, ui: &UiState, screen: [f32; 2]) {
         } else {
             [0.84, 0.88, 0.93, 1.0]
         };
-        frame.text_centered(rect.center().0, rect.y + 13.0, 1.5, label_color, button.label());
+        let text_height = ob_render::line_height(metrics.button_scale);
+        frame.text_centered(
+            rect.center().0,
+            rect.y + (rect.h - text_height) / 2.0,
+            metrics.button_scale,
+            label_color,
+            button.label(),
+        );
     }
 }
 
-fn draw_settings_footer(frame: &mut UiFrame, panel: UiRect, tab: SettingsTab) {
-    let separator_y = panel.y + panel.h - SETTINGS_FOOTER_Y_FROM_BOTTOM;
+fn draw_settings_footer(frame: &mut UiFrame, panel: UiRect, ui: &UiState, metrics: SettingsMetrics) {
+    let separator_y = panel.y + panel.h - metrics.footer_y_from_bottom;
     frame.rect(
-        panel.x + SETTINGS_MARGIN,
+        panel.x + metrics.margin,
         separator_y,
-        panel.w - SETTINGS_MARGIN * 2.0,
+        panel.w - metrics.margin * 2.0,
         1.0,
         [0.24, 0.28, 0.35, 1.0],
     );
-    let hint_y = panel.y + panel.h - SETTINGS_HINT_Y_FROM_BOTTOM;
-    let lines = if tab == SettingsTab::Controls {
-        SETTINGS_CONTROLS_HINT_LINES
+    let hint_y = panel.y + panel.h - metrics.hint_y_from_bottom;
+    // Contextual help: the GUI-scale row is the one setting whose visual
+    // effect is not obvious from its label alone.
+    let ui_scale_help = (ui.settings_tab == SettingsTab::Display
+        && ui.settings_focused_row() == Some(SettingsRow::UiScale))
+    .then_some([
+        "GUI scale applies immediately; Auto grows with the window.",
+        "Panels reflow to stay on screen. Esc: back",
+    ]);
+    let lines: &[&str] = if let Some(lines) = ui_scale_help.as_ref() {
+        lines
+    } else if ui.settings_tab == SettingsTab::Controls {
+        &SETTINGS_CONTROLS_HINT_LINES
     } else {
-        SETTINGS_HINT_LINES
+        &SETTINGS_HINT_LINES
     };
     for (index, line) in lines.iter().enumerate() {
+        let max_chars =
+            (((panel.w - metrics.margin * 2.0) / ob_render::glyph_advance(metrics.hint_scale)).max(24.0)) as usize;
         frame.text_centered(
             panel.x + panel.w / 2.0,
-            hint_y + index as f32 * SETTINGS_HINT_STEP,
-            1.0,
+            hint_y + index as f32 * metrics.hint_step,
+            metrics.hint_scale,
             [0.62, 0.68, 0.76, 1.0],
-            line,
+            &shorten(line, max_chars),
         );
     }
 }
@@ -3075,7 +3584,10 @@ pub fn draw_toasts(frame: &mut UiFrame, toasts: &ToastQueue, screen: [f32; 2]) {
         let fade = (toast.remaining / 0.5).clamp(0.0, 1.0);
         let alpha = fade * 0.95;
         let y = first.y - 22.0 - index as f32 * line_step;
-        let width = frame.text_width(scale, &toast.text);
+        let max_chars =
+            (((screen[0] - VITAL_MARGIN_X * 2.0 - 12.0) / ob_render::glyph_advance(scale)).max(8.0)) as usize;
+        let text = shorten(&toast.text, max_chars);
+        let width = frame.text_width(scale, &text);
         frame.rect(
             VITAL_MARGIN_X,
             y - 2.0,
@@ -3088,12 +3600,27 @@ pub fn draw_toasts(frame: &mut UiFrame, toasts: &ToastQueue, screen: [f32; 2]) {
             ToastKind::Success => [0.62, 0.94, 0.56, alpha],
             ToastKind::Warning => [1.0, 0.62, 0.55, alpha],
         };
-        frame.text(VITAL_MARGIN_X + 4.0, y, scale, color, &toast.text);
+        frame.text(VITAL_MARGIN_X + 4.0, y, scale, color, &text);
     }
 }
 
 /// Positions of the two death-screen buttons.
+///
+/// Below 500 logical pixels the buttons use a compact 34 px height and sit
+/// higher so the "You died" block, both buttons and the key hint stay clear of
+/// the vitals row (e.g. 960x540 at 150% GUI scale is 640x360 logical).
 pub fn death_button_rects(screen: [f32; 2]) -> [UiRect; 2] {
+    if screen[1] < 500.0 {
+        let width = DEATH_BUTTON_WIDTH.min((screen[0] - 32.0).max(1.0));
+        let height = 34.0;
+        let gap = 8.0;
+        let x = (screen[0] - width) / 2.0;
+        let first_y = screen[1] / 2.0 - 18.0;
+        return [
+            UiRect::new(x, first_y, width, height),
+            UiRect::new(x, first_y + height + gap, width, height),
+        ];
+    }
     let x = (screen[0] - DEATH_BUTTON_WIDTH) / 2.0;
     let first_y = screen[1] / 2.0 + 34.0;
     [
@@ -3139,11 +3666,24 @@ pub fn draw_death_screen_custom(
     frame.rect(0.0, 0.0, width, height, [0.35, 0.02, 0.03, 0.20]);
     let centre_x = width / 2.0;
     let centre_y = height / 2.0;
-    frame.text_centered(centre_x, centre_y - 142.0, 4.0, [1.0, 0.88, 0.86, 1.0], "You died");
+    let compact = height < 500.0;
+    let (title_y, title_scale, cause_y, cause_scale, note_y, note_scale) = if compact {
+        (centre_y - 112.0, 3.2, centre_y - 76.0, 1.1, centre_y - 56.0, 1.3)
+    } else {
+        (centre_y - 142.0, 4.0, centre_y - 104.0, 1.2, centre_y - 84.0, 1.5)
+    };
+    frame.text_centered(centre_x, title_y, title_scale, [1.0, 0.88, 0.86, 1.0], "You died");
     if let Some(cause) = cause {
-        frame.text_centered(centre_x, centre_y - 104.0, 1.2, [0.98, 0.74, 0.66, 1.0], cause);
+        let max_chars = ((width - 32.0) / ob_render::glyph_advance(cause_scale)).max(8.0) as usize;
+        frame.text_centered(
+            centre_x,
+            cause_y,
+            cause_scale,
+            [0.98, 0.74, 0.66, 1.0],
+            &shorten(cause, max_chars),
+        );
     }
-    frame.text_centered(centre_x, centre_y - 84.0, 1.5, [0.95, 0.82, 0.80, 1.0], note);
+    frame.text_centered(centre_x, note_y, note_scale, [0.95, 0.82, 0.80, 1.0], note);
     let rects = death_button_rects(screen);
     for (index, (rect, label)) in rects.iter().zip(labels).enumerate() {
         let active = index == ui.death_selected || ui.death_hovered == Some(index);
@@ -3159,18 +3699,36 @@ pub fn draw_death_screen_custom(
             [0.50, 0.22, 0.22, 1.0]
         };
         frame.outline(rect.x, rect.y, rect.w, rect.h, if active { 2.0 } else { 1.0 }, border);
-        frame.text_centered(rect.center().0, rect.y + 14.0, 2.0, [0.96, 0.92, 0.90, 1.0], label);
+        let label_scale = if compact { 1.6 } else { 2.0 };
+        let label_height = ob_render::line_height(label_scale);
+        frame.text_centered(
+            rect.center().0,
+            rect.y + (rect.h - label_height) / 2.0,
+            label_scale,
+            [0.96, 0.92, 0.90, 1.0],
+            label,
+        );
     }
-    frame.text_centered(centre_x, death_hint_y(screen), 1.2, [0.86, 0.72, 0.72, 1.0], hint);
+    let hint_scale = if compact { 1.0 } else { 1.2 };
+    let max_chars = ((width - 32.0) / ob_render::glyph_advance(hint_scale)).max(8.0) as usize;
+    frame.text_centered(
+        centre_x,
+        death_hint_y(screen),
+        hint_scale,
+        [0.86, 0.72, 0.72, 1.0],
+        &shorten(hint, max_chars),
+    );
 }
 
-/// Y of the death-screen key hint, clamped above the health row at 960x540.
+/// Y of the death-screen key hint, clamped above the health row at small sizes.
 pub fn death_hint_y(screen: [f32; 2]) -> f32 {
     let rects = death_button_rects(screen);
-    let mut y = rects[1].y + rects[1].h + 26.0;
+    let compact = screen[1] < 500.0;
+    let mut y = rects[1].y + rects[1].h + if compact { 6.0 } else { 26.0 };
     let (hearts, _) = vitals_layout(screen);
     if let Some(first) = hearts.first() {
-        y = y.min(first.y - ob_render::line_height(1.2) - 4.0);
+        let hint_scale = if compact { 1.0 } else { 1.2 };
+        y = y.min(first.y - ob_render::line_height(hint_scale) - 4.0);
     }
     y
 }
@@ -3224,6 +3782,7 @@ mod tests {
             adapter: "Test GPU (vulkan, radv)".into(),
             window: [1280, 720],
             fov_degrees: 70.0,
+            ui_scale: "UI 100% (1280x720 logical)".to_string(),
             time_of_day: 0.5,
             texture_source: "classic 16px".into(),
             game_mode: "survival",
@@ -3445,8 +4004,8 @@ mod tests {
         assert_eq!(state.settings_focused_button(), None);
 
         state.settings_select_tab(SettingsTab::Display);
-        assert_eq!(state.settings_focus_count(), 8);
-        state.settings_selected_row = 7;
+        assert_eq!(state.settings_focus_count(), 9);
+        state.settings_selected_row = 8;
         assert_eq!(state.settings_focused_button(), Some(SettingsButton::SaveAndQuit));
         state.settings_row_down();
         assert_eq!(state.settings_selected_row, 0);
@@ -3640,11 +4199,15 @@ mod tests {
         assert_eq!(state.settings_adjust(1), Some(SettingsRow::Fullscreen));
         assert!(state.settings.fullscreen);
         state.settings_selected_row = 4;
+        assert_eq!(state.settings_focused_row(), Some(SettingsRow::UiScale));
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::UiScale));
+        assert_eq!(state.settings.ui_scale_percent, 125);
+        state.settings_selected_row = 5;
         assert_eq!(state.settings_focused_row(), Some(SettingsRow::ReducedMotion));
         assert!(!state.settings.reduced_motion);
         assert_eq!(state.settings_adjust(1), Some(SettingsRow::ReducedMotion));
         assert!(state.settings.reduced_motion);
-        state.settings_selected_row = 5;
+        state.settings_selected_row = 6;
         assert_eq!(state.settings_focused_row(), Some(SettingsRow::MeshWorkers));
         assert_eq!(state.settings_adjust(1), None);
         assert_eq!(state.settings_activate(), None);
@@ -3698,7 +4261,7 @@ mod tests {
         assert_eq!(state.settings_tab, SettingsTab::Display);
 
         let rows = state.settings_row_rects(screen);
-        assert_eq!(rows.len(), 6);
+        assert_eq!(rows.len(), 7);
         state.cursor = rows[3].center();
         assert_eq!(
             state.settings_click(screen),
@@ -3843,13 +4406,14 @@ mod tests {
         let screen = [1280.0, 720.0];
         let rows = state.settings_row_rects(screen);
         let arrows = state.settings_arrow_rects(screen);
-        assert_eq!(rows.len(), 6);
+        assert_eq!(rows.len(), 7);
         assert!(arrows[0].is_some(), "render distance is a range");
         assert!(arrows[1].is_some(), "FOV is a range");
         assert!(arrows[2].is_some(), "sensitivity is a range");
         assert!(arrows[3].is_none(), "fullscreen is a toggle");
-        assert!(arrows[4].is_none(), "reduced motion is a toggle");
-        assert!(arrows[5].is_none(), "mesh workers is read-only");
+        assert!(arrows[4].is_some(), "GUI scale is a choice");
+        assert!(arrows[5].is_none(), "reduced motion is a toggle");
+        assert!(arrows[6].is_none(), "mesh workers is read-only");
         let (left, right) = arrows[0].expect("render distance arrows");
         assert!(left.x + left.w < right.x, "arrows must not touch");
         assert!(right.x + right.w <= rows[0].x + rows[0].w);
@@ -3889,7 +4453,7 @@ mod tests {
             Some(SettingsAction::Adjust(SettingsRow::RenderDistance))
         );
         assert_eq!(state.settings.render_distance_chunks, 6, "right arrow increments");
-        state.cursor = rows[5].center();
+        state.cursor = rows[6].center();
         assert_eq!(
             state.settings_click(screen),
             None,
@@ -3939,6 +4503,58 @@ mod tests {
         state.settings.mouse_sensitivity = SETTINGS_MIN_MOUSE_SENSITIVITY;
         assert_eq!(state.settings_adjust(-1), None);
         assert!(!state.settings_can_adjust(SettingsRow::MouseSensitivity, -1));
+    }
+
+    #[test]
+    fn debug_overlay_fits_every_scaled_release_target() {
+        for physical in [[1280.0_f32, 720.0], [960.0, 540.0]] {
+            for percent in [75_u16, 100, 125, 150] {
+                let screen = crate::ui_scale::ui_screen(physical, percent);
+                let mut stats = sample_debug_stats();
+                stats.ui_scale = crate::ui_scale::debug_line(percent, physical);
+                let layout = debug_overlay_layout(screen, &stats);
+                let label = format!("{physical:?} at {percent}%");
+                assert!(layout.left.panel.x >= 0.0 && layout.left.panel.y >= 0.0);
+                assert!(layout.left.panel.x + layout.left.panel.w <= screen[0] + 0.01, "{label}");
+                assert!(layout.left.panel.y + layout.left.panel.h <= screen[1] + 0.01, "{label}");
+                if let Some(right) = &layout.right {
+                    assert!(right.panel.x + right.panel.w <= screen[0] + 0.01, "{label}");
+                    assert!(right.panel.y + right.panel.h <= screen[1] + 0.01, "{label}");
+                }
+                let hotbar_top = screen[1] - HOTBAR_SLOT_SIZE - 18.0;
+                assert!(
+                    layout.footer_y + ob_render::line_height(DEBUG_FOOTER_SCALE) <= hotbar_top,
+                    "{label} F3 footer overlaps the hotbar"
+                );
+                let expected = if layout.compact { 10 } else { 16 };
+                assert_eq!(layout.left.lines.len(), expected, "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn debug_overlay_switches_to_the_compact_set_on_short_logical_targets() {
+        let mut stats = sample_debug_stats();
+        stats.ui_scale = crate::ui_scale::debug_line(150, [960.0, 540.0]);
+        let screen = crate::ui_scale::ui_screen([960.0, 540.0], 150);
+        let layout = debug_overlay_layout(screen, &stats);
+        assert!(layout.compact, "640x360 logical needs the compact F3 set");
+        assert_eq!(layout.columns, DebugColumns::LeftOnly);
+        assert_eq!(layout.left.lines.len(), 10);
+        let hotbar_top = screen[1] - HOTBAR_SLOT_SIZE - 18.0;
+        assert!(
+            layout.left.panel.y + layout.left.panel.h < hotbar_top,
+            "the compact overlay must clear the hotbar"
+        );
+        assert!(
+            layout.footer_y + ob_render::line_height(DEBUG_FOOTER_SCALE) < hotbar_top,
+            "the compact footer must clear the hotbar"
+        );
+        let lines = stats.compact_left_lines();
+        assert!(lines.iter().any(|line| line.contains("UI 150% (640x360 logical)")));
+        assert!(lines.iter().any(|line| line.contains("XYZ")));
+        assert!(lines.iter().any(|line| line.contains("FPS")));
+        assert!(lines.iter().any(|line| line.contains("Vitals")));
     }
 
     #[test]
@@ -4250,6 +4866,7 @@ mod tests {
             adapter: "Test GPU".into(),
             window: [1280, 720],
             fov_degrees: 70.0,
+            ui_scale: "UI 100% (1280x720 logical)".to_string(),
             time_of_day: 0.5,
             texture_source: "painterly 32px".into(),
             game_mode: "survival",
@@ -4281,6 +4898,7 @@ mod tests {
             "Facing north",
             "Textures: painterly 32px",
             "Seed 42",
+            "UI 100% (1280x720 logical)",
             "Target openblock:grass",
             "Mesh workers 7",
             "Heap 2.0 MiB",
@@ -4676,7 +5294,7 @@ mod tests {
         let mut state = UiState::default();
         state.open_settings();
         state.settings_select_tab(SettingsTab::Display);
-        state.settings_selected_row = 4;
+        state.settings_selected_row = 5;
         assert_eq!(state.settings_focused_row(), Some(SettingsRow::ReducedMotion));
         assert_eq!(
             state.settings_activate(),
@@ -4701,5 +5319,191 @@ mod tests {
         assert!(actions.contains(&"Place / eat / use"));
         assert_eq!(CONTROLS_REFERENCE.len(), 14);
         assert_eq!(controls_reference_columns().iter().map(Vec::len).sum::<usize>(), 14);
+    }
+
+    fn assert_inside(label: &str, rect: UiRect, screen: [f32; 2]) {
+        assert!(
+            rect.x >= -0.01
+                && rect.y >= -0.01
+                && rect.x + rect.w <= screen[0] + 0.01
+                && rect.y + rect.h <= screen[1] + 0.01,
+            "{label} {rect:?} must fit inside {screen:?}"
+        );
+    }
+
+    #[test]
+    fn gui_scale_matrix_keeps_every_screen_inside_the_logical_target() {
+        use crate::{containers, crafting, frontend, inventory, net_ui};
+        let mut state = UiState::default();
+        state.open_settings();
+        for physical in [[1280.0_f32, 720.0], [960.0, 540.0]] {
+            for percent in [75_u16, 100, 125, 150] {
+                let screen = crate::ui_scale::ui_screen(physical, percent);
+                let label = format!("{physical:?} at {percent}% -> {screen:?}");
+                state.ui_scale_percent = crate::ui_scale::resolved_ui_scale_percent(percent, physical[1]);
+
+                // Title, world forms and the shared menu panel.
+                for rect in frontend::title_button_rects(screen) {
+                    assert_inside(&format!("{label} title button"), rect, screen);
+                }
+                assert_inside(
+                    &format!("{label} menu panel"),
+                    frontend::menu_panel_rect(screen),
+                    screen,
+                );
+                for rect in frontend::form_button_rects(screen) {
+                    assert_inside(&format!("{label} form button"), rect, screen);
+                }
+                for rect in frontend::multiplayer_field_rects(screen) {
+                    assert_inside(&format!("{label} multiplayer field"), rect, screen);
+                }
+
+                // Every settings tab, including the seven-row Display tab.
+                for tab in SettingsTab::ALL {
+                    state.settings_select_tab(tab);
+                    let panel = settings_panel_rect(screen);
+                    assert_inside(&format!("{label} settings panel {tab:?}"), panel, screen);
+                    for rect in settings_tab_rects(screen) {
+                        assert_inside(&format!("{label} settings tab {tab:?}"), rect, screen);
+                    }
+                    let buttons = settings_button_rects(screen);
+                    for rect in buttons {
+                        assert_inside(&format!("{label} settings button {tab:?}"), rect, screen);
+                        assert!(
+                            rect.x >= panel.x - 0.01 && rect.x + rect.w <= panel.x + panel.w + 0.01,
+                            "{label} settings button {tab:?} must stay in the panel"
+                        );
+                    }
+                    let rows = state.settings_row_rects(screen);
+                    for rect in &rows {
+                        assert!(rect.x >= panel.x - 0.01 && rect.x + rect.w <= panel.x + panel.w + 0.01);
+                        assert!(
+                            rect.y >= panel.y - 0.01 && rect.y + rect.h <= panel.y + panel.h + 0.01,
+                            "{label} settings row {tab:?} {rect:?} escapes the panel"
+                        );
+                        assert!(
+                            rect.y + rect.h <= buttons[0].y + 0.01,
+                            "{label} settings row {tab:?} overlaps the footer buttons"
+                        );
+                    }
+                    for arrows in state.settings_arrow_rects(screen).into_iter().flatten() {
+                        assert_inside(&format!("{label} settings arrow {tab:?}"), arrows.0, screen);
+                        assert_inside(&format!("{label} settings arrow {tab:?}"), arrows.1, screen);
+                    }
+                }
+
+                // HUD: crosshair band, hotbar, vitals and armor share the same
+                // logical target as the menus.
+                for rect in state.hotbar_rects(screen) {
+                    assert_inside(&format!("{label} hotbar slot"), rect, screen);
+                }
+                let (hearts, hunger) = vitals_layout(screen);
+                for rect in hearts.iter().chain(hunger.iter()) {
+                    assert_inside(&format!("{label} vitals row"), *rect, screen);
+                }
+                for rect in armor_layout(screen) {
+                    assert_inside(&format!("{label} armor row"), rect, screen);
+                }
+
+                // Death screen: buttons, hint and vitals must not collide.
+                let death_buttons = death_button_rects(screen);
+                for rect in death_buttons {
+                    assert_inside(&format!("{label} death button"), rect, screen);
+                }
+                let hint_y = death_hint_y(screen);
+                let hint_scale = if screen[1] < 500.0 { 1.0 } else { 1.2 };
+                assert!(
+                    hint_y + ob_render::line_height(hint_scale) <= hearts[0].y + 0.01,
+                    "{label} death hint overlaps the hearts row"
+                );
+                assert!(
+                    death_buttons[1].y + death_buttons[1].h <= hint_y + 0.01,
+                    "{label} death hint overlaps the second button"
+                );
+
+                // Connect/loading/failure panels in both states.
+                for (failed, has_info) in [(false, false), (false, true), (true, false)] {
+                    let panel = net_ui::connect_panel_rect_for_state(screen, failed, has_info);
+                    assert_inside(&format!("{label} connect panel"), panel, screen);
+                    for rect in net_ui::connect_button_rects_for_state(screen, failed, has_info) {
+                        assert_inside(&format!("{label} connect button"), rect, screen);
+                        assert!(
+                            rect.x >= panel.x - 0.01 && rect.x + rect.w <= panel.x + panel.w + 0.01,
+                            "{label} connect button must stay in the panel"
+                        );
+                    }
+                }
+
+                // Inventory, crafting and both container screens.
+                let survival = inventory::survival_layout(screen);
+                assert_inside(&format!("{label} survival inventory"), survival.panel, screen);
+                for rect in survival.slots.iter().chain(survival.armor_slots.iter()) {
+                    assert_inside(&format!("{label} survival slot"), *rect, screen);
+                }
+                let creative = inventory::layout(screen, 100, 0);
+                assert_inside(&format!("{label} creative inventory"), creative.panel, screen);
+                let craft = crafting::crafting_panel_rect(screen);
+                assert_inside(&format!("{label} crafting panel"), craft, screen);
+                let furnace = containers::furnace_layout(screen);
+                assert_inside(&format!("{label} furnace panel"), furnace.panel, screen);
+                let chest = containers::chest_layout(screen);
+                assert_inside(&format!("{label} chest panel"), chest.panel, screen);
+            }
+        }
+    }
+
+    #[test]
+    fn gui_scale_clicks_convert_physical_pointer_to_the_same_logical_rect() {
+        use crate::ui_scale::{physical_to_ui_point, ui_to_physical_point};
+        let mut state = UiState::default();
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Display);
+        for physical in [[1280.0_f32, 720.0], [960.0, 540.0]] {
+            for percent in [75_u16, 100, 125, 150] {
+                let screen = crate::ui_scale::ui_screen(physical, percent);
+                let factor = crate::ui_scale::ui_scale_factor(percent, physical[1]);
+                state.ui_scale_percent = crate::ui_scale::resolved_ui_scale_percent(percent, physical[1]);
+                state.settings.render_distance_chunks = 6;
+                state.settings_selected_row = 0;
+                let (left, _) = state.settings_arrow_rects(screen)[0].expect("range arrows");
+                // The window hands us physical pixels; convert exactly as the
+                // input loop does before the logical hit test.
+                let physical_point = ui_to_physical_point(left.center(), factor);
+                state.cursor = physical_to_ui_point(physical_point, factor);
+                assert_eq!(
+                    state.settings_click(screen),
+                    Some(SettingsAction::Adjust(SettingsRow::RenderDistance)),
+                    "{physical:?} at {percent}%"
+                );
+                assert_eq!(state.settings.render_distance_chunks, 5);
+            }
+        }
+    }
+
+    #[test]
+    fn gui_scale_row_shows_auto_and_cycles_from_the_resolved_value() {
+        let mut state = UiState::default();
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Display);
+        state.settings_selected_row = 4;
+        let info = SettingsInfo {
+            ui_scale_percent: 100,
+            ..SettingsInfo::default()
+        };
+        assert_eq!(state.settings_row_value(SettingsRow::UiScale, &info), "Auto (100%)");
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::UiScale));
+        assert_eq!(state.settings.ui_scale_percent, 125);
+        assert_eq!(state.settings_row_value(SettingsRow::UiScale, &info), "125%");
+
+        // Auto follows the display: at 4K the resolved 150% is the base, so
+        // Left selects the next concrete choice below it.
+        state.settings.ui_scale_percent = 0;
+        state.ui_scale_percent = 150;
+        assert_eq!(state.settings_adjust(-1), Some(SettingsRow::UiScale));
+        assert_eq!(state.settings.ui_scale_percent, 125);
+        state.settings.ui_scale_percent = 0;
+        state.ui_scale_percent = 125;
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::UiScale));
+        assert_eq!(state.settings.ui_scale_percent, 150);
     }
 }

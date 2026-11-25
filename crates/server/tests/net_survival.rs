@@ -66,6 +66,10 @@ impl TestServer {
     }
 
     fn start_with_mode(label: &str, game_mode: GameMode) -> Self {
+        Self::start_with_interval(label, game_mode, 3_600)
+    }
+
+    fn start_with_interval(label: &str, game_mode: GameMode, save_interval_seconds: u64) -> Self {
         let dir = TempDir::new(label);
         let registry = Arc::new(Registry::base());
         let host_config = HostConfig {
@@ -83,7 +87,7 @@ impl TestServer {
             motd: "survival integration test".to_string(),
             interest_radius_chunks: 2,
             chunks_per_tick: 16,
-            save_interval_seconds: 3_600,
+            save_interval_seconds,
             whitelist: Vec::new(),
             game_mode,
         };
@@ -109,6 +113,10 @@ impl TestServer {
         if let Some(server) = self.handle.take() {
             server.stop().expect("stop saves the world");
         }
+    }
+
+    fn world_dir(&self) -> std::path::PathBuf {
+        self.dir.path().join("worlds").join(&self.host_config.world_name)
     }
 
     fn reopen(&self) -> Host {
@@ -1166,6 +1174,37 @@ fn second_client_sees_entity_spawn_state_and_despawn() {
         matches!(message, ServerMessage::EntityState { entities } if entities.iter().any(|state| state.id == cow))
     });
     server.stop();
+}
+
+#[test]
+fn idle_connected_player_is_autosaved_on_the_configured_interval() {
+    // Regression: the tick advances persisted state (tick count, hunger/regen,
+    // player position after Move, mobs/furnaces/items) but only explicit intents
+    // used to set the net layer's dirty flag, so an idle connection was never
+    // autosaved and a crash lost everything since the previous action.
+    let mut server = TestServer::start_with_interval("autosave", GameMode::Survival, 1);
+    let mut alice = TestClient::connect(server.addr());
+    let _id = join(&server, &mut alice, "autosave-alice").id;
+    let path = server.world_dir().join("network_players.txt");
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        if text.contains("autosave-alice") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the connected player was never autosaved; network_players.txt = {text:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    server.stop();
+    let saved = server
+        .reopen()
+        .saved_network_player("autosave-alice")
+        .cloned()
+        .expect("the autosaved record loads");
+    assert!(saved.pos.is_finite());
 }
 
 #[test]

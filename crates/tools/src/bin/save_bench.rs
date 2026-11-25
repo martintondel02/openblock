@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -31,6 +32,7 @@ use ob_tools::measure::{self, Stats};
 use ob_world::ChunkColumn;
 use ob_world::section::SectionStorage;
 use ob_world::{World, from_bytes, registry_fingerprint, to_bytes};
+use zstd::prelude::{ZSTD_compress, ZSTD_compressBound, ZSTD_decompress, ZSTD_isError};
 
 /// World directory name used under the benchmark data root.
 const WORLD_NAME: &str = "save-bench";
@@ -42,6 +44,8 @@ const SECTION_BLOCKS: u64 = 16 * 16 * 16;
 const MAGIC: &[u8; 4] = b"OBSV";
 /// Compressed snapshot format written by this build.
 const V4_VERSION: u16 = 4;
+/// zstd level used by the v4 writer (`ob_world::save`).
+const ZSTD_LEVEL: i32 = 3;
 
 const USAGE: &str = "\
 usage: save_bench [options]
@@ -54,6 +58,7 @@ usage: save_bench [options]
   --chests N           full chests (default 16, quick 4)
   --saves N            measured save repetitions (default 5, quick 3)
   --loads N            measured reload repetitions (default 3, quick 2)
+  --phases             add a Host::save phase breakdown (encode/compress/write/fsync)
   --no-migration       skip the synthesized v1/v2/v3 migration smoke
   --data-dir DIR       benchmark data root instead of a temporary directory
   --clean              remove an existing <DIR>/worlds/save-bench before opening
@@ -73,6 +78,7 @@ struct Options {
     chests: usize,
     saves: usize,
     loads: usize,
+    phases: bool,
     migration: bool,
     data_dir: Option<PathBuf>,
     clean: bool,
@@ -92,6 +98,7 @@ impl Default for Options {
             chests: 16,
             saves: 5,
             loads: 3,
+            phases: false,
             migration: true,
             data_dir: None,
             clean: false,
@@ -134,6 +141,29 @@ struct SaveResult {
     sidecars: Vec<(String, u64)>,
     world_bytes: u64,
     uncompressed_payload: Option<u64>,
+    phases: Option<SavePhases>,
+}
+
+/// Phase breakdown of the synchronous `Host::save()` path.
+///
+/// The first phase is a second `ob_world::to_bytes` call on the same world
+/// after the timed save, so it is cache-warm relative to the encode inside the
+/// save; the write/fsync probes write the same bytes to a scratch directory on
+/// the same filesystem. `residual` is `Host::save` minus the encode and write
+/// probes: block-entity pruning, sidecar serialization, directory creation and
+/// scheduling noise.
+#[derive(Default)]
+struct SavePhases {
+    encode: Stats,
+    compress: Stats,
+    world_write: Stats,
+    sidecar_write: Stats,
+    fsync_world: Stats,
+    fsync_dir: Stats,
+    residual: Stats,
+    payload_bytes: u64,
+    compressed_bytes: u64,
+    sidecar_bytes: u64,
 }
 
 /// Runs the benchmark and returns a process exit code.
@@ -202,6 +232,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Options, String> 
                 options.loads = parse_usize(&name, &value, 1, 20)?;
                 explicit[6] = true;
             }
+            "phases" => options.phases = true,
             "no-migration" => options.migration = false,
             "data-dir" => {
                 if value.is_empty() {
@@ -331,7 +362,7 @@ fn run(options: &Options) -> Result<bool, String> {
     // Warm-up save: prunes stale block entities and writes the first full snapshot.
     host.save().map_err(|error| format!("warm-up save failed: {error}"))?;
     let rss_after_setup = measure::rss_kib();
-    let save = measure_saves(&mut host, options.saves)?;
+    let save = measure_saves(&mut host, options.saves, options.phases)?;
     let rss_after_save = measure::rss_kib();
     let hash_before = host.state_hash();
     let chunks_before = host.world().chunk_count();
@@ -402,6 +433,9 @@ fn run(options: &Options) -> Result<bool, String> {
     println!("| --- | ---: |");
     for (name, bytes) in &save.sidecars {
         println!("| {name} | {} |", measure::bytes_label(*bytes));
+    }
+    if let Some(phases) = &save.phases {
+        print_save_phases(phases, save.stats.mean_ms);
     }
     println!();
     println!("## Load and round-trip");
@@ -761,14 +795,93 @@ fn grid_offset(center: WorldVec, offset: &mut i32) -> (i32, i32) {
 }
 
 /// Measures repeated saves and sums the on-disk footprint.
-fn measure_saves(host: &mut Host, runs: usize) -> Result<SaveResult, String> {
+///
+/// With `phases`, each timed save is followed by an encode/compress/write/fsync
+/// probe on the same world; the probes are not part of the save sample.
+fn measure_saves(host: &mut Host, runs: usize, phases: bool) -> Result<SaveResult, String> {
     let mut samples = Vec::with_capacity(runs);
+    let mut phase_series = SavePhases::default();
+    let dir = world_dir_from_host(host);
+    let scratch = dir.join("phase-scratch");
+    if phases {
+        std::fs::create_dir_all(&scratch).map_err(|error| format!("cannot create {}: {error}", scratch.display()))?;
+    }
+    let mut encode_samples = Vec::with_capacity(runs);
+    let mut compress_samples = Vec::with_capacity(runs);
+    let mut world_write_samples = Vec::with_capacity(runs);
+    let mut sidecar_write_samples = Vec::with_capacity(runs);
+    let mut fsync_world_samples = Vec::with_capacity(runs);
+    let mut fsync_dir_samples = Vec::with_capacity(runs);
+    let mut residual_samples = Vec::with_capacity(runs);
     for _ in 0..runs {
         let started = Instant::now();
         host.save().map_err(|error| format!("save failed: {error}"))?;
-        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+        samples.push(total_ms);
+        if phases {
+            let encode_started = Instant::now();
+            let bytes = to_bytes(host.world());
+            let encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
+            let (payload_len, compressed_len) =
+                v4_lengths(&bytes).ok_or_else(|| "phase probe produced a non-v4 snapshot".to_string())?;
+            phase_series.payload_bytes = payload_len as u64;
+            phase_series.compressed_bytes = compressed_len as u64;
+
+            let write_started = Instant::now();
+            write_atomic_probe(&scratch.join("world.obs"), &bytes)?;
+            let world_write_ms = write_started.elapsed().as_secs_f64() * 1000.0;
+
+            let fsync_started = Instant::now();
+            let file = File::open(scratch.join("world.obs"))
+                .map_err(|error| format!("cannot reopen phase snapshot: {error}"))?;
+            file.sync_data()
+                .map_err(|error| format!("cannot fsync phase snapshot: {error}"))?;
+            let fsync_world_ms = fsync_started.elapsed().as_secs_f64() * 1000.0;
+
+            let dir_fsync_started = Instant::now();
+            let dir_handle =
+                File::open(&scratch).map_err(|error| format!("cannot open {}: {error}", scratch.display()))?;
+            dir_handle
+                .sync_all()
+                .map_err(|error| format!("cannot fsync phase directory: {error}"))?;
+            let fsync_dir_ms = dir_fsync_started.elapsed().as_secs_f64() * 1000.0;
+
+            let sidecars = read_sidecar_bytes(&dir)?;
+            let sidecar_started = Instant::now();
+            for (name, data) in &sidecars {
+                write_atomic_probe(&scratch.join(name), data)?;
+            }
+            let sidecar_write_ms = sidecar_started.elapsed().as_secs_f64() * 1000.0;
+            phase_series.sidecar_bytes = sidecars.iter().map(|(_, data)| data.len() as u64).sum();
+
+            let payload = decode_v4_payload(&bytes)?;
+            let mut compressed = vec![0u8; ZSTD_compressBound(payload.len())];
+            let compress_started = Instant::now();
+            let written = ZSTD_compress(&mut compressed, &payload, ZSTD_LEVEL);
+            let compress_ms = compress_started.elapsed().as_secs_f64() * 1000.0;
+            if ZSTD_isError(written) || written > compressed.len() {
+                return Err("phase probe: zstd compression failed".to_string());
+            }
+
+            let residual_ms = total_ms - encode_ms - world_write_ms - sidecar_write_ms;
+            encode_samples.push(encode_ms);
+            compress_samples.push(compress_ms);
+            world_write_samples.push(world_write_ms);
+            sidecar_write_samples.push(sidecar_write_ms);
+            fsync_world_samples.push(fsync_world_ms);
+            fsync_dir_samples.push(fsync_dir_ms);
+            residual_samples.push(residual_ms);
+        }
     }
-    let dir = world_dir_from_host(host);
+    if phases {
+        phase_series.encode = Stats::from_samples(&encode_samples);
+        phase_series.compress = Stats::from_samples(&compress_samples);
+        phase_series.world_write = Stats::from_samples(&world_write_samples);
+        phase_series.sidecar_write = Stats::from_samples(&sidecar_write_samples);
+        phase_series.fsync_world = Stats::from_samples(&fsync_world_samples);
+        phase_series.fsync_dir = Stats::from_samples(&fsync_dir_samples);
+        phase_series.residual = Stats::from_samples(&residual_samples);
+    }
     let (total_bytes, sidecars) = directory_files(&dir)?;
     let world_bytes = sidecars
         .iter()
@@ -783,6 +896,7 @@ fn measure_saves(host: &mut Host, runs: usize) -> Result<SaveResult, String> {
         sidecars,
         world_bytes,
         uncompressed_payload,
+        phases: if phases { Some(phase_series) } else { None },
     })
 }
 
@@ -813,6 +927,120 @@ fn directory_files(dir: &Path) -> Result<(u64, Vec<(String, u64)>), String> {
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
     Ok((total, files))
+}
+
+/// Reads the declared uncompressed and compressed payload lengths from a v4
+/// snapshot header.
+fn v4_lengths(bytes: &[u8]) -> Option<(usize, usize)> {
+    if bytes.len() < 31 || &bytes[..4] != MAGIC {
+        return None;
+    }
+    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+    if version != V4_VERSION || bytes[22] != 1 {
+        return None;
+    }
+    let uncompressed = u32::from_le_bytes([bytes[23], bytes[24], bytes[25], bytes[26]]) as usize;
+    let compressed = u32::from_le_bytes([bytes[27], bytes[28], bytes[29], bytes[30]]) as usize;
+    if bytes.len() != 31 + compressed + 4 {
+        return None;
+    }
+    Some((uncompressed, compressed))
+}
+
+/// Decompresses the zstd body of a v4 snapshot (phase probe only).
+fn decode_v4_payload(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let (uncompressed, compressed) = v4_lengths(bytes).ok_or_else(|| "invalid v4 snapshot header".to_string())?;
+    let body = &bytes[31..31 + compressed];
+    let mut payload = vec![0u8; uncompressed];
+    let written = ZSTD_decompress(&mut payload, body);
+    if ZSTD_isError(written) || written != uncompressed {
+        return Err("phase probe: zstd decompression failed".to_string());
+    }
+    Ok(payload)
+}
+
+/// Writes bytes with the same temporary-file + rename shape as
+/// `ob_server`'s private `write_atomic` helper (which does not fsync).
+fn write_atomic_probe(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes).map_err(|error| format!("cannot write {}: {error}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|error| format!("cannot rename {}: {error}", tmp.display()))
+}
+
+/// Reads every sidecar file (everything except `world.obs`) into memory.
+fn read_sidecar_bytes(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut names = Vec::new();
+    let entries = std::fs::read_dir(dir).map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let metadata = entry.metadata().map_err(|error| error.to_string())?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name != "world.obs" {
+            names.push(name);
+        }
+    }
+    names.sort();
+    let mut sidecars = Vec::with_capacity(names.len());
+    for name in names {
+        let data = std::fs::read(dir.join(&name)).map_err(|error| format!("cannot read {name}: {error}"))?;
+        sidecars.push((name, data));
+    }
+    Ok(sidecars)
+}
+
+/// Prints the optional `--phases` breakdown.
+fn print_save_phases(phases: &SavePhases, total_mean_ms: f64) {
+    let share = |mean_ms: f64| {
+        if total_mean_ms > 0.0 {
+            mean_ms / total_mean_ms * 100.0
+        } else {
+            0.0
+        }
+    };
+    println!();
+    println!("## Save phase breakdown (--phases)");
+    println!();
+    println!(
+        "snapshot payload / compressed / sidecars: {} / {} / {}",
+        measure::bytes_label(phases.payload_bytes),
+        measure::bytes_label(phases.compressed_bytes),
+        measure::bytes_label(phases.sidecar_bytes)
+    );
+    println!();
+    println!("| Phase | Mean ms | p50 | p95 | Max | Share of save |");
+    println!("| --- | ---: | ---: | ---: | ---: | ---: |");
+    let rows = [
+        ("to_bytes: serialize + compress + CRC", &phases.encode),
+        ("zstd level-3 compress only (probe)", &phases.compress),
+        ("write world.obs (write + rename, no fsync)", &phases.world_write),
+        ("write sidecars (write + rename, no fsync)", &phases.sidecar_write),
+        ("residual: prune + sidecar serialize + dir create", &phases.residual),
+        ("fsync world.obs (not in current save)", &phases.fsync_world),
+        ("fsync world dir (not in current save)", &phases.fsync_dir),
+    ];
+    for (name, stats) in rows {
+        println!(
+            "| {name} | {:.3} | {:.3} | {:.3} | {:.3} | {:.1}% |",
+            stats.mean_ms,
+            stats.p50_ms,
+            stats.p95_ms,
+            stats.max_ms,
+            share(stats.mean_ms)
+        );
+    }
+    let serialize_mean = phases.encode.mean_ms - phases.compress.mean_ms;
+    println!(
+        "| derived serialize + allocation + CRC (mean) | {:.3} | — | — | — | {:.1}% |",
+        serialize_mean,
+        share(serialize_mean)
+    );
+    println!();
+    println!(
+        "  fsync rows are probes of the durability cost a future atomic writer would need; the current `Host::save` does not fsync."
+    );
 }
 
 /// Reads the declared uncompressed payload length from a v4 snapshot header.
@@ -1206,6 +1434,23 @@ fn build_report(
     csv.push_str(&format!("save_p99_ms,{:.4}\n", save.stats.p99_ms));
     csv.push_str(&format!("save_max_ms,{:.4}\n", save.stats.max_ms));
     csv.push_str(&format!("save_total_bytes,{}\n", save.total_bytes));
+    if let Some(phases) = &save.phases {
+        for (name, stats) in [
+            ("encode", &phases.encode),
+            ("compress", &phases.compress),
+            ("world_write", &phases.world_write),
+            ("sidecar_write", &phases.sidecar_write),
+            ("fsync_world", &phases.fsync_world),
+            ("fsync_dir", &phases.fsync_dir),
+            ("residual", &phases.residual),
+        ] {
+            csv.push_str(&format!("save_phase_{name}_mean_ms,{:.4}\n", stats.mean_ms));
+            csv.push_str(&format!("save_phase_{name}_p95_ms,{:.4}\n", stats.p95_ms));
+        }
+        csv.push_str(&format!("save_phase_payload_bytes,{}\n", phases.payload_bytes));
+        csv.push_str(&format!("save_phase_compressed_bytes,{}\n", phases.compressed_bytes));
+        csv.push_str(&format!("save_phase_sidecar_bytes,{}\n", phases.sidecar_bytes));
+    }
     csv.push_str(&format!("load_runs,{}\n", options.loads));
     csv.push_str(&format!("load_mean_ms,{:.4}\n", load.stats.mean_ms));
     csv.push_str(&format!("load_p50_ms,{:.4}\n", load.stats.p50_ms));
@@ -1261,6 +1506,47 @@ fn build_report(
         load.hash,
         if load.hash == hash_before { "PASS" } else { "FAIL" }
     ));
+    if let Some(phases) = &save.phases {
+        markdown.push_str("\n## Save phase breakdown (--phases)\n\n");
+        markdown.push_str(&format!(
+            "Snapshot payload {} / compressed {} / sidecars {}.\n\n",
+            measure::bytes_label(phases.payload_bytes),
+            measure::bytes_label(phases.compressed_bytes),
+            measure::bytes_label(phases.sidecar_bytes)
+        ));
+        markdown.push_str("| Phase | Mean ms | p50 | p95 | Max | Share of save |\n");
+        markdown.push_str("| --- | ---: | ---: | ---: | ---: | ---: |\n");
+        for (name, stats) in [
+            ("to_bytes: serialize + compress + CRC", &phases.encode),
+            ("zstd level-3 compress only (probe)", &phases.compress),
+            ("write world.obs (write + rename, no fsync)", &phases.world_write),
+            ("write sidecars (write + rename, no fsync)", &phases.sidecar_write),
+            ("residual: prune + sidecar serialize + dir create", &phases.residual),
+            ("fsync world.obs (not in current save)", &phases.fsync_world),
+            ("fsync world dir (not in current save)", &phases.fsync_dir),
+        ] {
+            let share = if save.stats.mean_ms > 0.0 {
+                stats.mean_ms / save.stats.mean_ms * 100.0
+            } else {
+                0.0
+            };
+            markdown.push_str(&format!(
+                "| {name} | {:.3} | {:.3} | {:.3} | {:.3} | {:.1}% |\n",
+                stats.mean_ms, stats.p50_ms, stats.p95_ms, stats.max_ms, share
+            ));
+        }
+        let serialize_mean = phases.encode.mean_ms - phases.compress.mean_ms;
+        markdown.push_str(&format!(
+            "| derived serialize + allocation + CRC (mean) | {:.3} | — | — | — | {:.1}% |\n",
+            serialize_mean,
+            if save.stats.mean_ms > 0.0 {
+                serialize_mean / save.stats.mean_ms * 100.0
+            } else {
+                0.0
+            }
+        ));
+        markdown.push_str("\nThe fsync rows are probes of the durability cost a future atomic writer would need; the current `Host::save` does not fsync.\n");
+    }
     markdown.push_str("\n## Migration smoke\n\n");
     markdown.push_str("| Version | Bytes | Encode ms | Load ms | Chunks | Hash |\n");
     markdown.push_str("| --- | ---: | ---: | ---: | ---: | :---: |\n");

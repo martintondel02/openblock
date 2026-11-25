@@ -1,6 +1,6 @@
 //! The `openblock` game client binary.
 
-const USAGE: &str = "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--mesh-workers N] [--survival|--creative] [--fly] [--x11] [--no-audio] [--mute] [--connect HOST:PORT] [--name NAME] [--screenshot PATH] [--screenshot-inventory PATH] [--screenshot-dead] [--screenshot-settings[=TAB]] [--screenshot-settings-tab TAB] [--screenshot-crafting] [--screenshot-title] [--screenshot-new-world] [--screenshot-worlds] [--screenshot-connect] [--screenshot-debug] [--screenshot-mobs] [--screenshot-furnace] [--screenshot-chest] [--screenshot-items] [--screenshot-network] [--screenshot-name-tags] [--screenshot-net-ui=KIND] [--screenshot-size WxH] [--seconds N] [--texture-style NAME] [--texture-pack PATH] [--no-texture-pack] [--time-of-day F] [--title|--menu] [--version]";
+const USAGE: &str = "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--mesh-workers N] [--survival|--creative] [--fly] [--x11] [--no-audio] [--mute] [--connect HOST:PORT] [--name NAME] [--screenshot PATH] [--screenshot-inventory PATH] [--screenshot-dead] [--screenshot-settings[=TAB]] [--screenshot-settings-tab TAB] [--screenshot-crafting] [--screenshot-title] [--screenshot-new-world] [--screenshot-worlds] [--screenshot-connect] [--screenshot-debug] [--screenshot-mobs] [--screenshot-furnace] [--screenshot-chest] [--screenshot-items] [--screenshot-network] [--screenshot-name-tags] [--screenshot-net-ui=KIND] [--screenshot-size WxH] [--ui-scale PERCENT|auto] [--seconds N] [--texture-style NAME] [--texture-pack PATH] [--no-texture-pack] [--time-of-day F] [--title|--menu] [--version]";
 
 fn main() {
     ob_core::init_logging();
@@ -30,6 +30,7 @@ fn main() {
         println!("          --screenshot-name-tags renders synthetic remote-player name tags over a world");
         println!("          --screenshot-net-ui=loading|failed|disconnected|roster  multiplayer overlay audit frame");
         println!("          --screenshot-size WxH  offscreen target size (default 1280x720; e.g. 960x540)");
+        println!("          --ui-scale auto|75|100|125|150  override GUI scale for this run (audits)");
         println!("front-end: a plain launch opens the title/world-selection screens;");
         println!("          --world/--seed/--data-dir/--connect and screenshot flags bypass it");
         println!("          --title or --menu forces the title screen (useful for screenshots)");
@@ -69,6 +70,7 @@ fn main() {
         println!("  --screenshot-name-tags  render synthetic remote-player name tags over a world");
         println!("  --screenshot-net-ui=KIND  render loading, failed, disconnected or roster overlay");
         println!("  --screenshot-size WxH  offscreen target size (default 1280x720)");
+        println!("  --ui-scale PERCENT|auto  override the persistent GUI scale (auto, 75, 100, 125 or 150)");
         println!("  --screenshot-title  render the title screen (requires --screenshot PATH)");
         println!("  --screenshot-new-world  render the new-world form (requires --screenshot PATH)");
         println!("  --screenshot-worlds  render the world list with temporary worlds");

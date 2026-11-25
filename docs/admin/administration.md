@@ -25,7 +25,8 @@ journalctl -u openblock-server -f
 journalctl -u openblock-server --since '1 hour ago' --no-pager
 ```
 
-`stop` sends `SIGTERM`, which takes the graceful save path.
+`systemctl stop` sends the unit's `KillSignal`, which is `SIGINT` (both `SIGINT`
+and `SIGTERM` take the graceful save path), so normal stops save.
 The server disconnects every client, writes a final save, logs `world saved;
 shutdown complete`, and exits. `TimeoutStopSec=40` in the unit bounds the wait. Check that the world timestamp actually advanced:
 
@@ -40,16 +41,18 @@ ls -l --time-style=full-iso /var/lib/openblock/worlds/world/world.obs
 openblock-server --config /etc/openblock/server.toml --data-dir /var/lib/openblock
 ```
 
-`Ctrl-C` sends `SIGINT` and takes the same graceful path as `stop`/SIGTERM.
-terminal attached if you need the console; use `tmux`/`screen` for a long-lived
-interactive run. Do not run a second process against the same world.
+`Ctrl-C` sends `SIGINT` and takes the same graceful path as `systemctl stop`.
+Run the binary in a terminal with stdin attached if you need the console; use
+`tmux`/`screen` for a long-lived interactive run. Do not run a second process
+against the same world.
 
-> **Signal note.** This binary installs SIGINT and SIGTERM handlers through the
-> `ctrlc` does not yet enable SIGTERM termination. A direct `kill -TERM` ends the
-> process without a final save. The packaged systemd unit and container use
-> SIGINT on stop so normal operations save correctly. Once the server installs a
-> SIGTERM handler they can return to the systemd/Docker defaults; operator
-> commands do not change.
+> **Signal note.** `ctrlc` is built with its `termination` feature, so this
+> binary installs handlers for **both `SIGINT` and `SIGTERM`**; either signal
+> requests the graceful save path (and `SIGTERM` is no longer a data-loss
+> hazard). The systemd unit uses `KillSignal=SIGINT` and the Compose example
+> repeats `stop_signal: SIGINT` so Ctrl-C, `systemctl stop` and `docker compose
+> stop` exercise the same path; the container image itself keeps
+> `STOPSIGNAL SIGTERM`, which is also handled. Operator commands do not change.
 
 ### Container
 
@@ -60,10 +63,10 @@ docker compose logs -f openblock
 ```
 
 The process is PID 1 in the container; the entrypoint is `exec`-form, so Docker's
-stop signal reaches the server directly. The image sets `STOPSIGNAL SIGINT` and
-the Compose example repeats `stop_signal: SIGINT` because this interim build's
-graceful handler is SIGINT, not SIGTERM. There is no `docker exec ... console`
-command in this build.
+stop signal reaches the server directly. The image sets `STOPSIGNAL SIGTERM` and
+the Compose example overrides it with `stop_signal: SIGINT`; both signals take
+the graceful save path. There is no `docker exec ... console` command in this
+build.
 
 ## Console commands
 
@@ -74,7 +77,7 @@ The network-mode console is:
 | --- | --- | --- |
 | `help` | List commands | `commands: help, list, say, kick, save, tps, stop` |
 | `list` | Online ids, names and positions | `  1 'alice' at 12.3,68.0,-4.1` |
-| `say <msg>` | Broadcast a `server` chat line | `[INFO ] ob_server::net: <server> restarting in 5 minutes` |
+| `say <msg>` | Broadcast a `server` chat line | no console echo; players see `<server> <msg>` in chat |
 | `kick <id-or-name> [reason]` | Disconnect one client; reason is sanitised | `kicked alice` |
 | `save` | Save immediately | `saved` |
 | `tps` | Current TPS, player count, tick count | `tps 20.0, players 1, ticks 12345` |
@@ -130,9 +133,9 @@ guarantee.
   or inventory change, join/leave, or another persisted action) and the interval
   has elapsed. A player who only walks around may not trigger an autosave until
   another persisted change occurs; shutdown always saves the latest pose.
-* `save` in the foreground and `SIGINT` (Ctrl-C, unit/container stop) request a
-  full save. Do not send a bare `SIGTERM` to this build: it has no handler and
-  will not save.
+* `save` in the foreground and `SIGINT`/`SIGTERM` (Ctrl-C, `systemctl stop`,
+  `docker compose stop`) request a full save. Both signals are handled; a
+  `SIGKILL` (or `systemctl kill -s KILL`) still cannot save.
 * The host writes each file with a temporary name and an atomic rename; a crash
   during one file leaves the previous complete file and a stale `.tmp` (ignored
   by the loader). The sidecar set is **not** a multi-file transaction, so a
@@ -179,8 +182,10 @@ A TPS line is emitted every five seconds while the network server runs:
   separate threads and is not included.
 * In the foreground, `tps` prints the current one-second measurement plus player
   and tick counts.
-* Player joins/leaves and chat are logged at info. IP addresses are included in
-  join/leave lines; chat text is logged with the sender.
+* Player joins/leaves are logged at info with the player name/id and a
+  disconnect reason. Remote IP addresses are **not** logged or stored. Player
+  chat text is never logged; at `debug` level the server records only the sender
+  and character count, so enabling debug does not expose conversation content.
 
 Common tuning, cheapest first:
 
@@ -259,7 +264,9 @@ WantedBy=timers.target
 ```
 
 Enable with `systemctl enable --now openblock-backup.timer`. The RPM installs
-the script as `/usr/bin/openblock-server-backup`; change `ExecStart` if you use
-that copy. Stop the service for a fully consistent snapshot, or accept that a
+the script as `/usr/bin/openblock-server-backup` (and
+`openblock-server-restore`) but **does not ship the timer or service units**;
+install the two example units yourself and adjust `ExecStart` if you use the
+packaged script path. Stop the service for a fully consistent snapshot, or accept that a
 live archive can pair `world.obs` with slightly older sidecars. See
 [backup](backup.md) for retention, verification and restore drills.

@@ -10,6 +10,18 @@ on:
         description: Build the full server container image (slow, manual only)
         type: boolean
         default: false
+      run_reliability:
+        description: Run the 15-minute reliability audit (restart/churn/soak/SIGTERM)
+        type: boolean
+        default: false
+
+# Least privilege: no job writes repository contents, so the workflow token is
+# read-only. This also limits fork pull requests; this workflow deliberately
+# does not use pull_request_target. Action refs are major tags kept current by
+# Dependabot; SHA-pinning third-party actions is a tracked 1.0.1 hardening item
+# (docs/plan/1.0.1-audit.md) before accepting untrusted contributions at scale.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,6 +34,7 @@ concurrency:
 jobs:
   rust:
     name: Rust (${{ matrix.os }})
+    timeout-minutes: 45
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -125,6 +138,7 @@ jobs:
 
   server-deps:
     name: Server dependency and ops-script policy
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -137,10 +151,11 @@ jobs:
           bash -n scripts/server-restore.sh
           bash -n scripts/check-server-deps.sh
           bash -n scripts/tests/test-backup-restore.sh
-          python3 -m py_compile scripts/load-test.py scripts/load-gate.py
+          python3 -m py_compile scripts/load-test.py scripts/load-gate.py scripts/reliability-audit.py
 
   container:
     name: Container manifests
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -184,13 +199,28 @@ jobs:
       # total; they assert determinism, invariants and the save/reload hash,
       # never wall-clock thresholds on a shared CI runner.
       - name: Worldgen benchmark (quick)
-        run: cargo run --release --locked -p ob_tools --bin worldgen_bench -- --quick
+        run: cargo run --release --locked -p ob_tools --bin worldgen_bench -- --quick --csv target/bench-worldgen.csv --markdown target/bench-worldgen.md
       - name: Server simulation benchmark (quick)
-        run: cargo run --release --locked -p ob_tools --bin server_bench -- --quick
+        run: cargo run --release --locked -p ob_tools --bin server_bench -- --quick --csv target/bench-server.csv --markdown target/bench-server.md
       - name: Save/persistence benchmark (quick)
-        run: cargo run --release --locked -p ob_tools --bin save_bench -- --quick
+        run: cargo run --release --locked -p ob_tools --bin save_bench -- --quick --phases --csv target/bench-save.csv --markdown target/bench-save.md
       - name: Soak smoke (quick)
-        run: cargo run --release --locked -p ob_tools --bin soak -- --quick
+        run: cargo run --release --locked -p ob_tools --bin soak -- --quick --csv target/bench-soak.csv --markdown target/bench-soak.md
+      - name: Upload benchmark reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-benchmark-reports
+          path: |
+            target/bench-worldgen.csv
+            target/bench-worldgen.md
+            target/bench-server.csv
+            target/bench-server.md
+            target/bench-save.csv
+            target/bench-save.md
+            target/bench-soak.csv
+            target/bench-soak.md
+          if-no-files-found: ignore
 
   load-gate:
     name: Multiplayer load gate (quick)
@@ -207,7 +237,7 @@ jobs:
       # passed. No GPU, no window, temp data dir and ephemeral port.
       - name: Quick load gate
         run: |
-          python3 scripts/load-gate.py --quick \
+          python3 scripts/load-gate.py --quick --wait-interest \
             --binary target/release/openblock-server \
             --json target/load-gate.json --markdown target/load-gate.md
       - name: Upload load-gate report
@@ -220,8 +250,40 @@ jobs:
             target/load-gate.md
           if-no-files-found: ignore
 
+  reliability:
+    # Manual pre-release lane: the full audit takes ~15 minutes (300 s soak,
+    # 60 s churn, 20 restart cycles, SIGTERM/corruption/disk probes), so it is
+    # opt-in rather than a per-PR cost. Functional failures exit non-zero.
+    name: Reliability audit (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_reliability
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Build headless server
+        run: cargo build --release --locked -p ob_server --bin openblock-server
+      - name: Reliability audit
+        run: |
+          python3 scripts/reliability-audit.py \
+            --binary target/release/openblock-server \
+            --cycles 20 --churn-seconds 60 --soak-seconds 300 \
+            --sigterm-iterations 10 \
+            --json target/reliability.json \
+            --markdown target/reliability.md
+      - name: Upload reliability report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reliability-report
+          path: |
+            target/reliability.json
+            target/reliability.md
+          if-no-files-found: ignore
+
   arch:
     name: Architecture guard
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -231,6 +293,7 @@ jobs:
 
   deny:
     name: Dependency policy
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -240,6 +303,7 @@ jobs:
 
   docs:
     name: Documentation
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -248,6 +312,7 @@ jobs:
 
   dco:
     # Pull requests only: the project's own history predates the DCO requirement.
+    timeout-minutes: 10
     name: DCO sign-off
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest

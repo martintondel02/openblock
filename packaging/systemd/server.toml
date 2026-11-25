@@ -13,6 +13,10 @@ world = "world"
 # Omit seed to generate one on first start. An existing world keeps its seed.
 # seed = 42
 data_dir = "/var/lib/openblock"
+# SECURITY: 0.0.0.0 binds every interface and the interim protocol has no TLS or
+# authentication. Keep TCP/25565 closed to the internet (firewalld service
+# `openblock-server` is installed but not opened) or bind 127.0.0.1 and use an
+# SSH tunnel/VPN. See docs/admin/security.md.
 listen = "0.0.0.0:25565"
 max_players = 8
 motd = "A self-hosted OpenBlock world"

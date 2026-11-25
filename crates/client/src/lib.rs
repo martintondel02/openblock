@@ -52,6 +52,7 @@ pub mod net;
 mod net_app;
 pub mod net_state;
 mod net_ui;
+pub mod ui_scale;
 pub mod ui_state;
 
 use containers::{ClickButton, ContainerAction, ContainerKind, ContainerSession, ContainerSnapshot};
@@ -60,6 +61,7 @@ use inventory::inventory_blocks;
 use mesh_scheduler::MeshScheduler;
 use mining::MiningState;
 use mobs::MobRenderCache;
+use ui_scale::{physical_to_ui_point, rescale_cursor, resolved_ui_scale_percent, ui_scale_factor, ui_screen};
 use ui_state::{
     DamageFlash, DeathAction, DebugColumns, DebugStats, Screen, SettingsAction, SettingsInfo, SettingsRow, SettingsTab,
     UiState, facing_label,
@@ -128,6 +130,11 @@ pub struct ClientOptions {
     pub time_of_day: Option<f32>,
     /// Explicit gameplay-mode override for this run (persisted when given).
     pub game_mode: Option<SettingsGameMode>,
+    /// GUI-scale override in percent (`0` = Auto) for this run.
+    ///
+    /// Normalised to the supported choices. Used by `--screenshot` audits and
+    /// diagnostics; the settings screen persists its own choice.
+    pub ui_scale: Option<u16>,
     /// Render the death screen in the offscreen screenshot frame.
     pub screenshot_dead: bool,
     /// Use the network death wording (server keep-inventory, Disconnect).
@@ -215,6 +222,7 @@ impl Default for ClientOptions {
             no_texture_pack: false,
             time_of_day: None,
             game_mode: None,
+            ui_scale: None,
             screenshot_dead: false,
             screenshot_dead_network: false,
             screenshot_settings: false,
@@ -299,7 +307,7 @@ pub fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .ok_or("--screenshot-network requires --screenshot PATH")?;
         let (width, height) = screenshot_dimensions(&options);
-        return screenshot_network_demo_at(path, None, options.seed, width, height);
+        return screenshot_network_demo_at_scaled(path, None, options.seed, width, height, options.ui_scale);
     }
     if options.screenshot_name_tags {
         let path = options
@@ -307,7 +315,7 @@ pub fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .ok_or("--screenshot-name-tags requires --screenshot PATH")?;
         let (width, height) = screenshot_dimensions(&options);
-        return screenshot_name_tags_demo_at(path, options.seed, width, height);
+        return screenshot_name_tags_demo_at_scaled(path, options.seed, width, height, options.ui_scale);
     }
     if let Some(path) = &options.screenshot {
         let mode = if let Some(kind) = options.screenshot_net_ui {
@@ -522,6 +530,18 @@ pub fn screenshot_network_demo_at(
     width: u32,
     height: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    screenshot_network_demo_at_scaled(path, debug_path, seed, width, height, None)
+}
+
+/// Like [`screenshot_network_demo_at`] but applies a GUI-scale override.
+pub(crate) fn screenshot_network_demo_at_scaled(
+    path: &Path,
+    debug_path: Option<&Path>,
+    seed: u64,
+    width: u32,
+    height: u32,
+    ui_scale: Option<u16>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let registry = Arc::new(Registry::base());
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -529,7 +549,7 @@ pub fn screenshot_network_demo_at(
         .unwrap_or_default();
     let data_dir = std::env::temp_dir().join(format!("openblock-net-shot-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&data_dir)?;
-    let result = screenshot_network_demo_inner(path, debug_path, seed, &registry, &data_dir, width, height);
+    let result = screenshot_network_demo_inner(path, debug_path, seed, &registry, &data_dir, width, height, ui_scale);
     let _ = std::fs::remove_dir_all(&data_dir);
     result
 }
@@ -551,6 +571,17 @@ pub fn screenshot_name_tags_demo_at(
     width: u32,
     height: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    screenshot_name_tags_demo_at_scaled(path, seed, width, height, None)
+}
+
+/// Like [`screenshot_name_tags_demo_at`] but applies a GUI-scale override.
+pub(crate) fn screenshot_name_tags_demo_at_scaled(
+    path: &Path,
+    seed: u64,
+    width: u32,
+    height: u32,
+    ui_scale: Option<u16>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let registry = Arc::new(Registry::base());
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -558,11 +589,12 @@ pub fn screenshot_name_tags_demo_at(
         .unwrap_or_default();
     let data_dir = std::env::temp_dir().join(format!("openblock-name-tags-shot-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&data_dir)?;
-    let result = screenshot_name_tags_demo_inner(path, seed, &registry, &data_dir, width, height);
+    let result = screenshot_name_tags_demo_inner(path, seed, &registry, &data_dir, width, height, ui_scale);
     let _ = std::fs::remove_dir_all(&data_dir);
     result
 }
 
+#[allow(clippy::too_many_arguments)] // public demo wrapper passes the capture target explicitly
 fn screenshot_name_tags_demo_inner(
     path: &Path,
     seed: u64,
@@ -570,6 +602,7 @@ fn screenshot_name_tags_demo_inner(
     data_dir: &Path,
     width: u32,
     height: u32,
+    ui_scale: Option<u16>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut host = Host::open(
         Arc::clone(registry),
@@ -600,6 +633,7 @@ fn screenshot_name_tags_demo_inner(
         render_distance_chunks: 4,
         screenshot_width: width,
         screenshot_height: height,
+        ui_scale,
         ..ClientOptions::default()
     };
     options.game_mode = Some(SettingsGameMode::Survival);
@@ -634,7 +668,9 @@ fn screenshot_name_tags_demo_inner(
         })
         .collect();
     renderer.set_entities(&crate::net::avatar_instances(&avatars));
-    let screen = [width as f32, height as f32];
+    let physical = [width as f32, height as f32];
+    let effective_ui_scale = resolved_ui_scale_percent(settings.ui_scale_percent, physical[1]);
+    let screen = ui_screen(physical, settings.ui_scale_percent);
     let tags = name_tags::project_name_tags(&camera, screen, &players, name_tags::NAME_TAG_MAX_DISTANCE);
     let mut frame = UiFrame::new(screen[0], screen[1]);
     let centre_x = screen[0] / 2.0;
@@ -642,7 +678,9 @@ fn screenshot_name_tags_demo_inner(
     let cross = [0.95, 0.97, 1.0, 0.85];
     frame.rect(centre_x - 1.0, centre_y - 9.0, 2.0, 18.0, cross);
     frame.rect(centre_x - 9.0, centre_y - 1.0, 18.0, 2.0, cross);
-    draw_vitals_for_mode(&mut frame, &UiState::from_settings(settings.clone()), &host, screen);
+    let mut vitals_ui = UiState::from_settings(settings.clone());
+    vitals_ui.ui_scale_percent = effective_ui_scale;
+    draw_vitals_for_mode(&mut frame, &vitals_ui, &host, screen);
     let ui = UiState::from_settings(settings.clone());
     draw_hotbar_for_mode(&mut frame, &ui, registry, &host, screen);
     name_tags::draw_name_tags(&mut frame, &tags, screen);
@@ -670,6 +708,7 @@ fn screenshot_name_tags_demo_inner(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // public demo wrapper passes the capture target explicitly
 fn screenshot_network_demo_inner(
     path: &Path,
     debug_path: Option<&Path>,
@@ -678,6 +717,7 @@ fn screenshot_network_demo_inner(
     data_dir: &Path,
     width: u32,
     height: u32,
+    ui_scale: Option<u16>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut host = Host::open(
         Arc::clone(registry),
@@ -884,11 +924,14 @@ fn screenshot_network_demo_inner(
         render_distance_chunks: 4,
         screenshot_width: width,
         screenshot_height: height,
+        ui_scale,
         ..ClientOptions::default()
     };
     let (settings, _) = effective_settings(&options);
     let (mut renderer, texture_source) = create_offscreen_renderer(&options, &settings)?;
-    let screen = [width as f32, height as f32];
+    let physical = [width as f32, height as f32];
+    let effective_ui_scale = resolved_ui_scale_percent(settings.ui_scale_percent, physical[1]);
+    let screen = ui_screen(physical, settings.ui_scale_percent);
     let eye = client.player().eye();
     let mut camera = Camera::new(eye, client.player().yaw, client.player().pitch);
     camera.far = (client.render_radius() as f32 * 16.0 + 48.0).max(128.0);
@@ -952,6 +995,7 @@ fn screenshot_network_demo_inner(
         adapter: format!("{} (offscreen demo)", renderer.adapter_summary()),
         window: [width, height],
         fov_degrees: settings.fov_degrees,
+        ui_scale: crate::ui_scale::debug_line(settings.ui_scale_percent, [width as f32, height as f32]),
         time_of_day,
         texture_source: describe_texture_source(&texture_source, renderer.texture_resolution()),
         game_mode: "survival",
@@ -972,6 +1016,7 @@ fn screenshot_network_demo_inner(
     };
 
     let mut ui = UiState::from_settings(settings.clone());
+    ui.ui_scale_percent = effective_ui_scale;
     ui.hotbar_selected = client.selected_slot();
     ui.block_name_seconds = ui_state::BLOCK_NAME_SECONDS;
     ui.toasts.push("Picked up Raw Iron x2");
@@ -1162,8 +1207,11 @@ fn screenshot_with_mode(
     // Screenshot mode is also the headless verification path for the UI
     // renderer, since it needs no window or surface.
     let (width, height) = screenshot_dimensions(options);
-    let screen = [width as f32, height as f32];
+    let physical = [width as f32, height as f32];
+    let effective_ui_scale = resolved_ui_scale_percent(settings.ui_scale_percent, physical[1]);
+    let screen = ui_screen(physical, settings.ui_scale_percent);
     let mut ui = UiState::from_settings(settings.clone());
+    ui.ui_scale_percent = effective_ui_scale;
     ui.active_texture_pack = active_texture_pack_label(&texture_source);
     ui.hotbar_selected = host.hotbar_selection();
     if options.screenshot_items
@@ -1259,8 +1307,12 @@ fn screenshot_with_mode(
                 }
                 inventory::draw(&mut frame, &ui, &registry, screen);
             }
-            // Keep the hotbar visible above the dimmed world, as in gameplay.
-            draw_hotbar_for_mode(&mut frame, &ui, &registry, &host, screen);
+            // The survival inventory includes its own hotbar row; only the
+            // creative palette needs the gameplay hotbar underneath it. Drawing
+            // both at 960x540 with 150% scale overlapped the footer.
+            if !survival {
+                draw_hotbar_for_mode(&mut frame, &ui, &registry, &host, screen);
+            }
         }
         ScreenshotMode::Dead => {
             ui.open_death();
@@ -1287,6 +1339,11 @@ fn screenshot_with_mode(
             if let Some(tab) = options.screenshot_settings_tab {
                 ui.settings_select_tab(tab);
             }
+            if ui.settings_tab == SettingsTab::Display
+                && let Some(index) = ui.settings_rows().iter().position(|row| *row == SettingsRow::UiScale)
+            {
+                ui.settings_selected_row = index;
+            }
             if ui.settings_tab == SettingsTab::Controls {
                 // Show the capture affordance on the row it belongs to rather
                 // than leaving Move forward highlighted while Jump captures.
@@ -1305,6 +1362,7 @@ fn screenshot_with_mode(
                 texture_source: texture_source.label(),
                 texture_resolution: renderer.texture_resolution(),
                 mesh_workers: options.mesh_workers,
+                ui_scale_percent: effective_ui_scale,
                 audio_status: "off (headless screenshot)".to_string(),
             };
             ui_state::draw_settings_screen(&mut frame, &ui, &info, screen);
@@ -1380,10 +1438,15 @@ fn screenshot_with_mode(
             let layout = ui_state::debug_overlay_layout(screen, &stats);
             draw_debug_overlay(&mut frame, &stats, screen);
             log::info!(
-                "debug screenshot: {} stats lines, scale {:.1}, columns {:?}, overlay {}x{}",
-                stats.left_lines().len(),
+                "debug screenshot: {} stats lines, scale {:.1}, columns {:?}, compact {}, overlay {}x{}",
+                if layout.compact {
+                    stats.compact_left_lines().len()
+                } else {
+                    stats.left_lines().len()
+                },
                 layout.left.scale,
                 layout.columns,
+                layout.compact,
                 layout.left.panel.w,
                 layout.left.panel.h,
             );
@@ -1546,6 +1609,8 @@ fn screenshot_with_mode(
                         players: Some((2, 8)),
                         progress: Some((12, 49)),
                         failure: None,
+                        selected: 0,
+                        hovered: None,
                     },
                     NetUiKind::Failed => crate::net_ui::ConnectPanel {
                         title: "Connection failed",
@@ -1558,6 +1623,8 @@ fn screenshot_with_mode(
                         players: None,
                         progress: None,
                         failure: Some("server_full: 8/8 players"),
+                        selected: 0,
+                        hovered: Some(0),
                     },
                     NetUiKind::Disconnected => crate::net_ui::ConnectPanel {
                         title: "Disconnected",
@@ -1570,6 +1637,8 @@ fn screenshot_with_mode(
                         players: None,
                         progress: None,
                         failure: Some("timeout: the server stopped responding"),
+                        selected: 0,
+                        hovered: Some(0),
                     },
                     NetUiKind::Roster => unreachable!(),
                 };
@@ -1686,6 +1755,10 @@ fn screenshot_debug_stats(
         adapter: renderer.adapter_summary().to_string(),
         window: [options.screenshot_width, options.screenshot_height],
         fov_degrees: settings.fov_degrees,
+        ui_scale: crate::ui_scale::debug_line(
+            settings.ui_scale_percent,
+            [options.screenshot_width as f32, options.screenshot_height as f32],
+        ),
         time_of_day: Environment::from_ticks(host.tick_count() + DAY_LENGTH_TICKS / 4, DAY_LENGTH_TICKS).time_of_day,
         texture_source: describe_texture_source(texture_source, renderer.texture_resolution()),
         game_mode: host.game_mode().name(),
@@ -2537,8 +2610,35 @@ impl GameState {
         self.last_audio_health = health;
     }
 
+    /// Effective GUI-scale percentage for the current physical window.
+    fn resolved_ui_percent(&self) -> u16 {
+        resolved_ui_scale_percent(self.ui.settings.ui_scale_percent, self.window_size.1)
+    }
+
+    /// Physical-to-logical pointer conversion for the current GUI scale.
+    fn ui_point(&self, point: (f32, f32)) -> (f32, f32) {
+        physical_to_ui_point(
+            point,
+            ui_scale_factor(self.ui.settings.ui_scale_percent, self.window_size.1),
+        )
+    }
+
+    /// Refreshes the cached effective scale after a resize or setting change.
+    fn refresh_ui_scale(&mut self) {
+        let old = self.ui.ui_scale_percent;
+        let new = self.resolved_ui_percent();
+        if new != old {
+            self.ui.cursor = rescale_cursor(self.ui.cursor, old, new);
+            self.ui.ui_scale_percent = new;
+        }
+    }
+
+    /// Logical UI size for the current window and GUI scale.
     fn window_screen(&self) -> [f32; 2] {
-        [self.window_size.0.max(1.0), self.window_size.1.max(1.0)]
+        ui_screen(
+            [self.window_size.0.max(1.0), self.window_size.1.max(1.0)],
+            self.ui.settings.ui_scale_percent,
+        )
     }
 
     fn apply_fullscreen(&mut self, fullscreen: bool) {
@@ -3196,6 +3296,7 @@ impl GameState {
             SettingsRow::MasterVolume | SettingsRow::SfxVolume | SettingsRow::MusicVolume => {
                 self.sync_audio_settings();
             }
+            SettingsRow::UiScale => self.refresh_ui_scale(),
             SettingsRow::ReducedMotion
             | SettingsRow::ShowHud
             | SettingsRow::DebugOverlay
@@ -3377,6 +3478,10 @@ impl GameState {
             adapter: self.renderer.adapter_summary().to_string(),
             window: [self.window_size.0 as u32, self.window_size.1 as u32],
             fov_degrees: self.ui.settings.fov_degrees,
+            ui_scale: crate::ui_scale::debug_line(
+                self.ui.settings.ui_scale_percent,
+                [self.window_size.0, self.window_size.1],
+            ),
             time_of_day: Environment::from_ticks(self.host.tick_count() + DAY_LENGTH_TICKS / 4, DAY_LENGTH_TICKS)
                 .time_of_day,
             texture_source: self.texture_source_description(),
@@ -3425,6 +3530,7 @@ impl GameState {
             texture_source: self.texture_source.label(),
             texture_resolution: self.renderer.texture_resolution(),
             mesh_workers: self.mesh_scheduler.workers(),
+            ui_scale_percent: resolved_ui_scale_percent(self.ui.settings.ui_scale_percent, self.window_size.1),
             audio_status: self.audio_status.clone(),
         }
     }
@@ -3853,11 +3959,16 @@ impl GameState {
 
     /// Builds the UI frame for the current window size.
     fn build_ui_frame(&self) -> Option<UiFrame> {
-        self.build_ui_frame_at(self.window_screen())
+        self.build_ui_frame_at([self.window_size.0.max(1.0), self.window_size.1.max(1.0)])
     }
 
-    /// Builds the UI frame for an explicit target size (screenshots).
-    fn build_ui_frame_at(&self, screen: [f32; 2]) -> Option<UiFrame> {
+    /// Builds the UI frame for an explicit physical target size.
+    ///
+    /// The frame is laid out in logical pixels and `UiFrame::new` uses that
+    /// logical size for its NDC conversion, so the GPU applies exactly one
+    /// scale transform to every rectangle, glyph and block icon.
+    fn build_ui_frame_at(&self, physical: [f32; 2]) -> Option<UiFrame> {
+        let screen = ui_screen(physical, self.ui.settings.ui_scale_percent);
         let [width, height] = screen;
         let playing = self.ui.screen == Screen::Playing;
         let inventory_open = self.ui.screen == Screen::Inventory;
@@ -3865,7 +3976,10 @@ impl GameState {
         let container_open = self.ui.container_open();
         let death_open = self.ui.screen == Screen::Death;
         let survival = self.host.game_mode() == HostGameMode::Survival;
-        let show_hotbar = (playing || inventory_open || death_open) && self.ui.hud_visible;
+        // The survival inventory panel contains its own hotbar and footer; the
+        // gameplay hotbar/vitals would overlap them at 150% on 960x540.
+        let inventory_hud_hotbar = inventory_open && !survival;
+        let show_hotbar = (playing || death_open || inventory_hud_hotbar) && self.ui.hud_visible;
         let show_crosshair = playing && self.ui.hud_visible && !self.host.is_dead();
         let show_debug = self.ui.debug_overlay;
         let settings_open = self.ui.screen == Screen::Settings;
@@ -4457,7 +4571,11 @@ impl GameState {
 /// column is drawn dimmer and one step smaller than the statistics column.
 fn draw_debug_overlay(frame: &mut UiFrame, stats: &DebugStats, screen: [f32; 2]) {
     let layout = ui_state::debug_overlay_layout(screen, stats);
-    let left_lines = stats.left_lines();
+    let left_lines = if layout.compact {
+        stats.compact_left_lines()
+    } else {
+        stats.left_lines()
+    };
     let right_lines = stats.right_lines();
 
     draw_debug_column(frame, &layout.left, &left_lines, true);
@@ -4482,7 +4600,7 @@ fn draw_debug_overlay(frame: &mut UiFrame, stats: &DebugStats, screen: [f32; 2])
         layout.footer_y - 3.0,
         footer_width + 8.0,
         ob_render::line_height(ui_state::DEBUG_FOOTER_SCALE) + 6.0,
-        [0.03, 0.04, 0.07, 0.76],
+        [0.03, 0.04, 0.07, 0.97],
     );
     frame.text(
         ui_state::DEBUG_MARGIN + 4.0,
@@ -4505,7 +4623,7 @@ fn draw_debug_column(frame: &mut UiFrame, column: &ui_state::DebugColumnLayout, 
         column.panel.y,
         column.panel.w,
         column.panel.h,
-        [0.03, 0.04, 0.07, 0.76],
+        [0.03, 0.04, 0.07, 0.97],
     );
     for placement in &column.lines {
         let Some(text) = lines.get(placement.index) else {
@@ -4583,6 +4701,7 @@ impl ApplicationHandler for App {
         let initial_fov = settings.fov_degrees;
         let mut ui = UiState::from_settings(settings);
         ui.active_texture_pack = active_texture_pack_label(&texture_source);
+        ui.ui_scale_percent = resolved_ui_scale_percent(ui.settings.ui_scale_percent, window_size.1);
         let applied_render_distance = ui.settings.render_distance_chunks;
         let mut host = match Host::open(Arc::clone(&registry), config) {
             Ok(host) => host,
@@ -4694,6 +4813,7 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 state.renderer.resize(size.width.max(1), size.height.max(1));
                 state.window_size = (size.width.max(1) as f32, size.height.max(1) as f32);
+                state.refresh_ui_scale();
             }
             WindowEvent::RedrawRequested => {
                 state.frame();
@@ -5002,7 +5122,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                state.ui.cursor = (position.x as f32, position.y as f32);
+                state.ui.cursor = state.ui_point((position.x as f32, position.y as f32));
                 match state.ui.screen {
                     Screen::Inventory => state.update_inventory_hover(),
                     Screen::Settings => {
@@ -5348,6 +5468,9 @@ fn effective_settings(options: &ClientOptions) -> (Settings, PathBuf) {
     }
     if let Some(mode) = options.game_mode {
         settings.game_mode = mode;
+    }
+    if let Some(percent) = options.ui_scale {
+        settings.ui_scale_percent = percent;
     }
     if options.mute {
         settings.audio_enabled = false;
@@ -5757,6 +5880,22 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
             "mute" => options.mute = true,
             "survival" => options.game_mode = Some(SettingsGameMode::Survival),
             "creative" => options.game_mode = Some(SettingsGameMode::Creative),
+            "ui-scale" | "gui-scale" => {
+                let percent = if value.eq_ignore_ascii_case("auto") {
+                    0
+                } else {
+                    value.trim_end_matches('%').parse::<u16>().map_err(|_| {
+                        format!("invalid --ui-scale value '{value}' (expected auto, 75, 100, 125 or 150)")
+                    })?
+                };
+                let normalised = ob_core::config::normalise_ui_scale_percent(percent);
+                if normalised != percent && percent != 0 {
+                    return Err(format!(
+                        "--ui-scale must be one of auto, 75, 100, 125 or 150 (got '{value}')"
+                    ));
+                }
+                options.ui_scale = Some(normalised);
+            }
             "title" | "menu" => options.force_title = true,
             "screenshot-title" => options.screenshot_title = true,
             "screenshot-worlds" => options.screenshot_worlds = true,
@@ -6779,6 +6918,36 @@ mod tests {
         let error =
             options_from_args(&[("screenshot-size".to_string(), "100x100".to_string())]).expect_err("too small");
         assert!(error.contains("320-3840"));
+    }
+
+    #[test]
+    fn ui_scale_flag_accepts_auto_and_supported_percents_only() {
+        for (value, expected) in [
+            ("auto", Some(0_u16)),
+            ("AUTO", Some(0)),
+            ("75", Some(75)),
+            ("100", Some(100)),
+            ("125%", Some(125)),
+            ("150", Some(150)),
+        ] {
+            let options = options_from_args(&[("ui-scale".to_string(), value.to_string())])
+                .unwrap_or_else(|error| panic!("{value}: {error}"));
+            assert_eq!(options.ui_scale, expected, "{value}");
+        }
+        for value in ["50", "110", "151", "many"] {
+            let error = options_from_args(&[("ui-scale".to_string(), value.to_string())])
+                .expect_err("unsupported scale must fail");
+            assert!(error.contains("--ui-scale"), "{error}");
+        }
+        let options = options_from_args(&[
+            ("ui-scale".to_string(), "150".to_string()),
+            ("render-distance".to_string(), "8".to_string()),
+        ])
+        .expect("override");
+        let (settings, _) = effective_settings(&options);
+        assert_eq!(settings.ui_scale_percent, 150);
+        // The CLI override must not force a disk write by itself.
+        assert!(options.data_dir.is_none());
     }
 
     #[test]

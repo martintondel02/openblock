@@ -12,8 +12,8 @@ command-line flag  >  server.toml value  >  built-in default
 ```
 
 `--help` is the source of truth for the flags in your build; this page tracks the
-interim 1.0 build. The server work in progress may add options (for example a
-`game_mode` config key, which is already accepted below).
+interim 1.0 build. Later minors may add options; `game_mode` is already accepted
+below.
 
 ## Command-line flags
 
@@ -30,6 +30,8 @@ interim 1.0 build. The server work in progress may add options (for example a
 | `--max-players N` | `8` | Player cap, 1–500; extra joins get `server_full` |
 | `--motd TEXT` | `A self-hosted OpenBlock world` | Handshake MOTD; control characters become spaces, trimmed and cut to 128 UTF-8 bytes |
 | `--save-interval SECONDS` | `60` | Autosave when dirty; `0` disables periodic autosave; maximum 86400. Shutdown always saves |
+| `--metrics-json PATH` | none | Listener mode only: write an atomic JSON metrics snapshot after bind and every `--metrics-interval` seconds; the file includes world name/seed and the listen address, so keep it `0600`/`0640` |
+| `--metrics-interval SECONDS` | `5` | Seconds between metrics snapshots (only with `--metrics-json`) |
 | `--pack PATH` | built-in base | Load a JSON content pack on the server. The client must match the content fingerprint |
 | `--survival` | default | Default game mode for newly joining network players |
 | `--creative` | — | Creative default for network players; mutually exclusive with `--survival` |
@@ -164,8 +166,10 @@ The packaged systemd unit uses `--data-dir /var/lib/openblock` explicitly, so
 | `RUST_BACKTRACE` | `0`/`1`/`full` | Standard Rust panic backtrace switch; temporary diagnostics only |
 
 There is no `RUST_LOG`, no config-file environment expansion, and no secrets or
-tokens in this build. Player names, IP addresses and chat lines can appear in
-logs; see [security](security.md#data-handling).
+tokens in this build. At the default `info` level logs include player names,
+world name/seed, the bound listen address and events; remote IP addresses and
+chat content are not logged (`debug` adds chat sender + length, still not the
+text). See [security](security.md#data-handling).
 
 ## Changing configuration safely
 
