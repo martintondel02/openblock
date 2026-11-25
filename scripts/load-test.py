@@ -39,7 +39,7 @@ import threading
 import time
 from collections import Counter
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MAX_FRAME_LEN = 2 * 1024 * 1024
 CHUNK_SIZE = 16
 SCENARIOS = ("idle", "movement", "chat", "interact", "mixed")

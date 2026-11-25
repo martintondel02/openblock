@@ -782,7 +782,7 @@ snapshots; sample commands and the gate definition are in
 [plan/08](../plan/08-measurements.md).
 
 **Limits and behaviour.** See [18 §3.13.5](18-networking-multiplayer.md#3135-authority-streaming-and-limits)
-and [18 §3.13.9](18-networking-multiplayer.md#3139-server-authoritative-survival-protocol-v2)
+and [18 §3.13.9](18-networking-multiplayer.md#3139-server-authoritative-survival-protocol-v3)
 for the survival state machine, container windows, entity replication and
 known limitations.
 In short: 8 players (configurable), 2 MiB frames, 256 queued outbound frames

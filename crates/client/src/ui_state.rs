@@ -18,6 +18,9 @@ use crate::inventory::{InventoryLayout, InventoryState, layout as inventory_layo
 
 /// Number of hotbar slots.
 pub const HOTBAR_SLOTS: usize = 9;
+/// Number of player inventory slots (hotbar plus main).
+pub const INVENTORY_SLOTS: usize = 36;
+const _: () = assert!(INVENTORY_SLOTS == ob_protocol::INVENTORY_SLOTS);
 /// Default hotbar contents, in slot order.
 pub const DEFAULT_HOTBAR: [&str; HOTBAR_SLOTS] = [
     "openblock:grass",
@@ -1747,6 +1750,7 @@ impl UiState {
     pub fn close_inventory(&mut self) {
         if self.screen == Screen::Inventory {
             self.screen = Screen::Playing;
+            self.inventory.clear_cursor();
         }
     }
 

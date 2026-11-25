@@ -566,8 +566,8 @@ fn frames_are_length_prefixed_and_encoding_is_stable() {
 #[test]
 fn core_protocol_version_matches_ob_protocol() {
     assert_eq!(ob_core::PROTOCOL_VERSION, ob_protocol::PROTOCOL_VERSION);
-    assert_eq!(ob_core::PROTOCOL_VERSION, 2);
-    assert!(ob_core::version_banner("openblock-server").contains("protocol 2"));
+    assert_eq!(ob_core::PROTOCOL_VERSION, 3);
+    assert!(ob_core::version_banner("openblock-server").contains("protocol 3"));
 }
 
 /// Keeps the import list honest when the protocol grows: every public message

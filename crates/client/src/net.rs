@@ -3,7 +3,7 @@
 //! This module is deliberately independent of winit and the renderer so it can
 //! be exercised by loopback integration tests on CI hosts without a GPU. It
 //! owns the TCP connection, the replicated [`World`], the local [`Player`], the
-//! remote-player table, chat, chunk request bookkeeping and the protocol v2
+//! remote-player table, chat, chunk request bookkeeping and the protocol v3
 //! survival state ([`SurvivalState`]), replicated mobs/items
 //! ([`ReplicatedEntities`]) and container windows ([`RemoteContainers`]). The
 //! windowed client (`net_app`) and the headless tests share exactly this API.
@@ -207,7 +207,7 @@ impl fmt::Display for NetError {
             NetError::Refused(reason) => write!(formatter, "server refused the connection: {reason}"),
             NetError::ProtocolMismatch { server, client } => write!(
                 formatter,
-                "protocol mismatch: server speaks v{server}, this client speaks v{client}"
+                "protocol mismatch: server speaks v{server}, this client speaks v{client}; both sides must be a 1.2+ build (protocol v3)"
             ),
             NetError::ContentMismatch {
                 server,
@@ -1625,8 +1625,9 @@ impl NetworkClient {
         &self.survival
     }
 
-    /// The authoritative hotbar.
-    pub fn inventory(&self) -> &[Option<ItemStack>; ob_protocol::HOTBAR_SLOTS] {
+    /// The authoritative 36-slot player inventory (hotbar `0..9`, main
+    /// `9..36`).
+    pub fn inventory(&self) -> &[Option<ItemStack>; ob_protocol::INVENTORY_SLOTS] {
         &self.survival.inventory
     }
 
@@ -1859,9 +1860,9 @@ impl NetworkClient {
                 message: Some("Waiting for the server to confirm the last item move".to_string()),
             };
         }
-        let hotbar = self.survival.inventory;
+        let inventory = self.survival.inventory;
         let previous_cursor = self.containers.cursor();
-        let mut outcome = self.containers.click(&self.registry, &hotbar, slot, button);
+        let mut outcome = self.containers.click(&self.registry, &inventory, slot, button);
         if let Some(transfer) = outcome.transfer {
             if self.send_inventory_move(transfer.from, transfer.to, transfer.count, transfer.revision) {
                 self.container_awaiting_sync = true;
@@ -1875,10 +1876,51 @@ impl NetworkClient {
         outcome
     }
 
-    /// Equips the armor in `hotbar_slot` or unequips the matching armor slot.
+    /// Equips the armor in any player inventory slot (`0..36`).
+    ///
+    /// Hotbar pieces use the compact `Equip` intent; a piece in the main
+    /// inventory is moved to its equipment address with `InventoryMove`.
+    pub fn equip_inventory_slot(&mut self, slot: usize) -> bool {
+        if !self.state.is_connected() || self.survival.dead || slot >= ob_protocol::INVENTORY_SLOTS {
+            return false;
+        }
+        let Some(stack) = self.survival.inventory[slot].filter(|stack| stack.count > 0) else {
+            return false;
+        };
+        let Some(armor) = self.registry.item(stack.item).armor else {
+            return false;
+        };
+        let Some(address) = crate::net_state::equipment_address(crate::inventory::armor_index(armor.slot)) else {
+            return false;
+        };
+        if slot < ob_protocol::HOTBAR_SLOTS {
+            self.send_equip(slot)
+        } else {
+            self.send_inventory_move(slot as u16, address, 1, None)
+        }
+    }
+
+    /// Shift-click quick transfer between the hotbar and main inventory.
+    ///
+    /// Computes the first compatible/empty destination with the same helper the
+    /// single-player path uses, then sends exactly one `InventoryMove`.
+    pub fn quick_transfer_inventory(&mut self, slot: usize) -> bool {
+        if !self.state.is_connected() || self.survival.dead {
+            return false;
+        }
+        let Some((target, count)) =
+            crate::inventory::quick_transfer_target(&self.registry, &self.survival.inventory, slot)
+        else {
+            return false;
+        };
+        self.send_inventory_move(slot as u16, target as u16, count, None)
+    }
+
+    /// Equips the armor in a player inventory slot or unequips a matching armor
+    /// slot.
     ///
     /// Unequipping uses an `inventory_move` from the equipment address into the
-    /// first empty hotbar slot.
+    /// first empty player inventory slot.
     pub fn toggle_equipment(&mut self, armor_index: usize) -> bool {
         if !self.state.is_connected() || self.survival.dead || armor_index >= ob_protocol::EQUIPMENT_SLOTS {
             return false;
@@ -2452,13 +2494,14 @@ impl NetworkClient {
             }
             ServerMessage::InventorySync {
                 hotbar,
+                main,
                 selected,
                 equipment,
             } => {
                 self.container_awaiting_sync = false;
                 self.container_cursor_rollback = None;
                 self.survival
-                    .apply_inventory(&self.registry, &hotbar, selected, &equipment);
+                    .apply_inventory(&self.registry, &hotbar, &main, selected, &equipment);
                 self.player.health = self.survival.health;
                 self.player.hunger = self.survival.hunger;
                 if self.containers.apply_hotbar(&self.survival.inventory) {

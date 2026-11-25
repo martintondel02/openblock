@@ -11,7 +11,7 @@
 //! * the game loop pauses simulation (and sends no `Move`) while Settings,
 //!   inventory, containers or chat are open;
 //! * vitals, inventory, equipment, containers, mobs and dropped items are
-//!   driven exclusively by protocol v2 messages, never by a local Host.
+//!   driven exclusively by protocol v3 messages, never by a local Host.
 //!
 //! UI drawing that is shared with single-player comes from the crate root and
 //! `inventory`/`containers`/`ui_state`; the multiplayer-specific overlays live
@@ -49,8 +49,8 @@ use crate::net_state;
 use crate::net_ui::{self, ConnectPanel};
 use crate::ui_scale::{physical_to_ui_point, rescale_cursor, resolved_ui_scale_percent, ui_scale_factor, ui_screen};
 use crate::ui_state::{
-    BLOCK_NAME_SECONDS, DamageFlash, DeathAction, DebugStats, HOTBAR_SLOTS as UI_HOTBAR_SLOTS, Screen, SettingsAction,
-    SettingsInfo, SettingsRow, UiState, facing_label,
+    BLOCK_NAME_SECONDS, DamageFlash, DeathAction, DebugStats, HOTBAR_SLOTS as UI_HOTBAR_SLOTS,
+    INVENTORY_SLOTS as UI_INVENTORY_SLOTS, Screen, SettingsAction, SettingsInfo, SettingsRow, UiState, facing_label,
 };
 use crate::{ClientOptions, MAX_MESH_SUBMISSIONS_PER_FRAME, MESH_STATS_INTERVAL, MESH_UPLOAD_BUDGET_US};
 
@@ -1359,12 +1359,12 @@ impl NetGameState {
 
     fn move_inventory_selection(&mut self, dx: i32, dy: i32) {
         self.ui.inventory.selected =
-            inventory::move_survival_selection(self.ui.inventory.selected, dx, dy, UI_HOTBAR_SLOTS);
+            inventory::move_survival_selection(self.ui.inventory.selected, dx, dy, UI_INVENTORY_SLOTS);
     }
 
     fn scroll_inventory(&mut self, rows: i32) {
         self.ui.inventory.selected =
-            inventory::cycle_survival_selection(self.ui.inventory.selected, rows, UI_HOTBAR_SLOTS);
+            inventory::cycle_survival_selection(self.ui.inventory.selected, rows, UI_INVENTORY_SLOTS);
     }
 
     fn equip_selected_slot(&mut self, slot: usize) {
@@ -1378,17 +1378,50 @@ impl NetGameState {
             return;
         }
         let name = inventory::item_display_name(&self.registry, stack.item);
-        if client.send_equip(slot) {
+        if client.equip_inventory_slot(slot) {
             self.ui.toasts.push(format!("Equipping {name}"));
         } else {
             self.ui.toasts.push_warning(format!("Could not equip {name}"));
         }
     }
 
+    /// Click-to-pick/click-to-place on the 36-slot network inventory.
+    ///
+    /// Moves are intents: the first click only previews a stack under the
+    /// pointer, and the second click sends one authoritative `inventory_move`
+    /// that the following `inventory_sync` confirms. Shift-click sends a
+    /// one-click hotbar <-> main transfer.
     fn inventory_click(&mut self) {
         self.update_inventory_hover();
+        let shift = self.keys[5];
         if let Some(armor_slot) = self.ui.inventory.armor_hovered {
             let index = inventory::armor_index(armor_slot);
+            if let Some(cursor) = self.ui.inventory.cursor {
+                let matching = self
+                    .registry
+                    .item(cursor.stack.item)
+                    .armor
+                    .is_some_and(|armor| index == inventory::armor_index(armor.slot));
+                if matching {
+                    let Some(address) = net_state::equipment_address(index) else {
+                        return;
+                    };
+                    let sent = self
+                        .client
+                        .as_mut()
+                        .is_some_and(|client| client.send_inventory_move(cursor.from as u16, address, 1, None));
+                    if sent {
+                        self.ui.inventory.clear_cursor();
+                        self.ui.toasts.push("Equipping armor".to_string());
+                    } else {
+                        self.ui.toasts.push_warning("Could not equip that armor");
+                    }
+                } else {
+                    self.ui.inventory.clear_cursor();
+                    self.ui.toasts.push_warning("That armor does not fit this slot");
+                }
+                return;
+            }
             let Some(client) = &mut self.client else {
                 return;
             };
@@ -1408,24 +1441,96 @@ impl NetGameState {
             return;
         }
         let Some(index) = self.ui.inventory.hovered else {
+            self.ui.inventory.clear_cursor();
             return;
         };
         self.ui.inventory.selected = index;
-        if self
-            .client
-            .as_ref()
-            .and_then(|client| client.inventory().get(index).copied().flatten())
+        if shift {
+            let stack = self
+                .client
+                .as_ref()
+                .and_then(|client| client.inventory().get(index).copied().flatten());
+            let Some(stack) = stack else {
+                return;
+            };
+            if self.registry.item(stack.item).armor.is_some() {
+                self.equip_selected_slot(index);
+                return;
+            }
+            let name = inventory::item_display_name(&self.registry, stack.item);
+            let sent = self
+                .client
+                .as_mut()
+                .is_some_and(|client| client.quick_transfer_inventory(index));
+            if sent {
+                self.ui.inventory.clear_cursor();
+                self.ui.toasts.push(format!("Moved {name}"));
+            } else {
+                self.ui.toasts.push_warning("No room in the other row");
+            }
+            return;
+        }
+        let Some(client) = self.client.as_ref() else {
+            return;
+        };
+        let inventory = client.inventory();
+        if self.ui.inventory.cursor.is_some() {
+            let click = inventory::click_cursor_slot(&mut self.ui.inventory, inventory, index);
+            match click {
+                inventory::CursorClick::Move { from, to, stack } => {
+                    self.place_inventory_cursor(inventory::InventoryCursor { from, stack }, to);
+                }
+                inventory::CursorClick::Cancelled => {}
+                inventory::CursorClick::Picked | inventory::CursorClick::Ignored => {}
+            }
+            return;
+        }
+        if inventory
+            .get(index)
+            .copied()
+            .flatten()
             .is_some_and(|stack| self.registry.item(stack.item).armor.is_some())
         {
             self.equip_selected_slot(index);
             return;
         }
-        self.assign_inventory_selection();
+        if index < UI_HOTBAR_SLOTS {
+            self.select_hotbar(index);
+            self.close_inventory();
+            return;
+        }
+        let click = inventory::click_cursor_slot(&mut self.ui.inventory, inventory, index);
+        debug_assert!(matches!(
+            click,
+            inventory::CursorClick::Picked | inventory::CursorClick::Ignored
+        ));
+    }
+
+    fn place_inventory_cursor(&mut self, cursor: inventory::InventoryCursor, to: usize) {
+        let name = inventory::item_display_name(&self.registry, cursor.stack.item);
+        let sent = self
+            .client
+            .as_mut()
+            .is_some_and(|client| client.send_inventory_move(cursor.from as u16, to as u16, cursor.stack.count, None));
+        self.ui.inventory.clear_cursor();
+        if sent {
+            self.ui.toasts.push(format!("Moved {name}"));
+        } else {
+            self.ui.toasts.push_warning(format!("Cannot move {name}"));
+        }
     }
 
     fn assign_inventory_selection(&mut self) {
-        let slot = self.ui.inventory.selected.min(UI_HOTBAR_SLOTS - 1);
+        let slot = self.ui.inventory.selected.min(UI_INVENTORY_SLOTS - 1);
         self.ui.inventory.selected = slot;
+        if let Some(cursor) = self.ui.inventory.cursor {
+            if cursor.from == slot {
+                self.ui.inventory.clear_cursor();
+            } else {
+                self.place_inventory_cursor(cursor, slot);
+            }
+            return;
+        }
         if self
             .client
             .as_ref()
@@ -1433,6 +1538,16 @@ impl NetGameState {
             .is_some_and(|stack| self.registry.item(stack.item).armor.is_some())
         {
             self.equip_selected_slot(slot);
+            return;
+        }
+        if slot >= UI_HOTBAR_SLOTS {
+            if let Some(stack) = self
+                .client
+                .as_ref()
+                .and_then(|client| client.inventory().get(slot).copied().flatten())
+            {
+                self.ui.inventory.cursor = Some(inventory::InventoryCursor { from: slot, stack });
+            }
             return;
         }
         self.select_hotbar(slot);

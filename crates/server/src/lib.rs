@@ -52,6 +52,10 @@ pub use net_players::{
 
 /// Number of slots in the player's hotbar.
 pub const HOTBAR_SLOTS: usize = 9;
+/// Number of main inventory slots after the hotbar.
+pub const MAIN_SLOTS: usize = 27;
+/// Number of player inventory slots (`hotbar + main`).
+pub const INVENTORY_SLOTS: usize = HOTBAR_SLOTS + MAIN_SLOTS;
 /// Number of armor slots (helmet, chestplate, leggings, boots).
 pub const ARMOR_SLOTS: usize = 4;
 /// Armor points beyond this cap give no further damage reduction.
@@ -330,7 +334,7 @@ pub struct Host {
     world_dir: PathBuf,
     dirty_player: bool,
     game_mode: GameMode,
-    inventory: [Option<ItemStack>; HOTBAR_SLOTS],
+    inventory: [Option<ItemStack>; INVENTORY_SLOTS],
     hotbar_selection: usize,
     spawn: WorldVec,
     items: Vec<ItemEntity>,
@@ -398,7 +402,7 @@ impl Host {
                 world_dir,
                 dirty_player: false,
                 game_mode: GameMode::default(),
-                inventory: [None; HOTBAR_SLOTS],
+                inventory: [None; INVENTORY_SLOTS],
                 hotbar_selection: 0,
                 spawn: WorldVec::ZERO,
                 items: Vec::new(),
@@ -444,7 +448,7 @@ impl Host {
                 world_dir,
                 dirty_player: false,
                 game_mode: GameMode::default(),
-                inventory: [None; HOTBAR_SLOTS],
+                inventory: [None; INVENTORY_SLOTS],
                 hotbar_selection: 0,
                 spawn: WorldVec::ZERO,
                 items: Vec::new(),
@@ -655,8 +659,10 @@ impl Host {
         self.mark_player_dirty();
     }
 
-    /// The nine hotbar slots; `None` is an empty slot.
-    pub fn inventory(&self) -> &[Option<ItemStack>; HOTBAR_SLOTS] {
+    /// The 36 player inventory slots; `None` is an empty slot.
+    ///
+    /// Indices `0..9` are the hotbar and `9..36` the main inventory.
+    pub fn inventory(&self) -> &[Option<ItemStack>; INVENTORY_SLOTS] {
         &self.inventory
     }
 
@@ -692,7 +698,7 @@ impl Host {
     /// The stack keeps its count and remaining tool/armor durability. This is
     /// the mode-independent counterpart of [`Host::consume_selected`], which
     /// only works for the selected slot in survival. Returns `None` for an
-    /// empty slot or an index outside `0..`[`HOTBAR_SLOTS`].
+    /// empty slot or an index outside `0..`[`INVENTORY_SLOTS`].
     pub fn take_inventory_slot(&mut self, slot: usize) -> Option<ItemStack> {
         let taken = self.inventory.get_mut(slot)?.take();
         if taken.is_some() {
@@ -715,7 +721,7 @@ impl Host {
     /// when it was empty). Because invalid requests are no-ops, an unknown item
     /// id also returns the unchanged previous stack.
     pub fn set_inventory_slot(&mut self, slot: usize, stack: Option<ItemStack>) -> Option<ItemStack> {
-        if slot >= HOTBAR_SLOTS {
+        if slot >= INVENTORY_SLOTS {
             return None;
         }
         let previous = self.inventory[slot];
@@ -773,7 +779,7 @@ impl Host {
     /// How many times each recipe can currently be crafted, in deterministic
     /// recipe-id order.
     ///
-    /// Survival counts are limited by the ingredient totals in the nine hotbar
+    /// Survival counts are limited by the ingredient totals in the 36-slot inventory
     /// slots; recipes that need a table report `0` until
     /// [`Host::near_crafting_table`] is true. Counts are capped at
     /// [`u8::MAX`]. Creative bypasses ingredients and table placement and
@@ -812,7 +818,7 @@ impl Host {
 
     /// Crafts one output of `recipe`.
     ///
-    /// Survival requires every ingredient in the nine hotbar slots and, for
+    /// Survival requires every ingredient anywhere in the 36-slot inventory and, for
     /// table recipes, a crafting table within four blocks ([`Host::craft`] uses
     /// [`Host::near_crafting_table`]). Output space is checked against the
     /// post-consumption inventory before anything is committed, so a genuine
@@ -1049,6 +1055,116 @@ impl Host {
             stack.count = remaining;
             Some(stack)
         }
+    }
+
+    /// Moves items between two player inventory slots.
+    ///
+    /// `from` and `to` are hotbar/main addresses in `0..`[`INVENTORY_SLOTS`];
+    /// equipment and container slots use their own APIs. The move merges into
+    /// a compatible destination stack up to the content `max_stack`, fills an
+    /// empty destination, or swaps when `count` is the whole source stack and
+    /// the destination holds an incompatible item. It never creates or destroys
+    /// items.
+    ///
+    /// Returns `Ok(true)` when anything changed. Errors are short reasons
+    /// (`invalid_slot`, `empty_source`, `invalid_count`, `destination_full`,
+    /// `destination_occupied`, `same_slot`).
+    pub fn move_inventory_items(&mut self, from: usize, to: usize, count: u8) -> Result<bool, &'static str> {
+        if from >= INVENTORY_SLOTS || to >= INVENTORY_SLOTS {
+            return Err("invalid_slot");
+        }
+        if from == to {
+            return Err("same_slot");
+        }
+        if count == 0 {
+            return Err("invalid_count");
+        }
+        let source = self.inventory[from]
+            .filter(|stack| stack.count > 0)
+            .ok_or("empty_source")?;
+        if count > source.count {
+            return Err("invalid_count");
+        }
+        let destination = self.inventory[to];
+        let max_stack = self.registry.item(source.item).max_stack.clamp(1, MAX_STACK_SIZE);
+        let (new_source, new_destination) = match destination {
+            None => {
+                let moved = count.min(max_stack);
+                let mut destination_stack = source;
+                destination_stack.count = moved;
+                let mut remainder = source;
+                remainder.count -= moved;
+                ((remainder.count > 0).then_some(remainder), Some(destination_stack))
+            }
+            Some(destination_stack)
+                if destination_stack.item == source.item
+                    && destination_stack.durability == source.durability
+                    && max_stack > 1 =>
+            {
+                let room = max_stack.saturating_sub(destination_stack.count);
+                let moved = count.min(room);
+                if moved == 0 {
+                    return Err("destination_full");
+                }
+                let mut remainder = source;
+                remainder.count -= moved;
+                let mut merged = destination_stack;
+                merged.count += moved;
+                ((remainder.count > 0).then_some(remainder), Some(merged))
+            }
+            Some(destination_stack) => {
+                if count != source.count {
+                    return Err("destination_occupied");
+                }
+                (Some(destination_stack), Some(source))
+            }
+        };
+        if new_source == self.inventory[from] && new_destination == self.inventory[to] {
+            return Ok(false);
+        }
+        self.inventory[from] = new_source;
+        self.inventory[to] = new_destination;
+        self.mark_player_dirty();
+        Ok(true)
+    }
+
+    /// Quick-moves the whole stack in one player inventory slot between the
+    /// hotbar and the main inventory.
+    ///
+    /// The target is the first compatible non-full stack in the other section
+    /// (hotbar `0..9` <-> main `9..36`), then the first empty slot. Returns
+    /// `Err("no_room")` when the other section cannot accept the stack.
+    pub fn quick_transfer_inventory_slot(&mut self, slot: usize) -> Result<bool, &'static str> {
+        if slot >= INVENTORY_SLOTS {
+            return Err("invalid_slot");
+        }
+        let stack = self.inventory[slot]
+            .filter(|stack| stack.count > 0)
+            .ok_or("empty_source")?;
+        let range = if slot < HOTBAR_SLOTS {
+            HOTBAR_SLOTS..INVENTORY_SLOTS
+        } else {
+            0..HOTBAR_SLOTS
+        };
+        let max_stack = self.registry.item(stack.item).max_stack.clamp(1, MAX_STACK_SIZE);
+        let mut merge_target = None;
+        let mut empty_target = None;
+        for target in range {
+            match self.inventory[target] {
+                None if empty_target.is_none() => empty_target = Some(target),
+                Some(existing)
+                    if merge_target.is_none()
+                        && existing.item == stack.item
+                        && existing.durability == stack.durability
+                        && existing.count < max_stack =>
+                {
+                    merge_target = Some(target)
+                }
+                _ => {}
+            }
+        }
+        let target = merge_target.or(empty_target).ok_or("no_room")?;
+        self.move_inventory_items(slot, target, stack.count)
     }
 
     /// The dropped item entities, in ascending entity-id order.
@@ -1382,7 +1498,7 @@ impl Host {
 
     /// Equips the armor piece in hotbar slot `inventory_slot`.
     ///
-    /// The item must be armor and the slot index must be `0..`[`HOTBAR_SLOTS`].
+    /// The item must be armor and the slot index must be `0..`[`INVENTORY_SLOTS`].
     /// The piece moves to its [`ArmorSpec::slot`](ob_content::ArmorSpec::slot);
     /// any previously equipped piece is returned to the inventory (the source
     /// slot is free after the move, so a swap normally always fits). Returns
@@ -1392,7 +1508,7 @@ impl Host {
     /// Equipping is allowed in creative mode; only the defense effect is
     /// survival-only.
     pub fn equip_armor(&mut self, inventory_slot: usize) -> bool {
-        if inventory_slot >= HOTBAR_SLOTS {
+        if inventory_slot >= INVENTORY_SLOTS {
             return false;
         }
         let Some(stack) = self.inventory[inventory_slot].filter(|stack| stack.count > 0) else {
@@ -2702,7 +2818,7 @@ fn load_player(world_dir: &Path, world: &World, generator: &Generator) -> (Playe
 /// The fourth field is only written for tools. Empty lines and empty slots are
 /// skipped, and old three-field lines still load (tools start at full
 /// durability).
-fn inventory_state(registry: &Registry, inventory: &[Option<ItemStack>; HOTBAR_SLOTS]) -> String {
+fn inventory_state(registry: &Registry, inventory: &[Option<ItemStack>; INVENTORY_SLOTS]) -> String {
     let mut text = String::new();
     for (slot, stack) in inventory.iter().enumerate() {
         let Some(stack) = stack else {
@@ -2727,8 +2843,8 @@ fn inventory_state(registry: &Registry, inventory: &[Option<ItemStack>; HOTBAR_S
 /// `slot item count durability` format. Counts clamp to the content
 /// `max_stack`; tool durability clamps to `1..=spec.durability` and defaults to
 /// full for old lines.
-fn load_inventory(world_dir: &Path, registry: &Registry) -> [Option<ItemStack>; HOTBAR_SLOTS] {
-    let mut inventory = [None; HOTBAR_SLOTS];
+fn load_inventory(world_dir: &Path, registry: &Registry) -> [Option<ItemStack>; INVENTORY_SLOTS] {
+    let mut inventory = [None; INVENTORY_SLOTS];
     let path = world_dir.join("inventory.txt");
     let text = match read_sidecar(&path) {
         Ok(text) => text,
@@ -2787,7 +2903,10 @@ fn load_inventory(world_dir: &Path, registry: &Registry) -> [Option<ItemStack>; 
             };
             stack.durability = Some(durability);
         }
-        let slot = slot.min(HOTBAR_SLOTS - 1);
+        if slot >= INVENTORY_SLOTS {
+            log::warn!("inventory.txt:{line_number}: slot {slot} out of range, dropping it");
+            continue;
+        }
         inventory[slot] = Some(stack);
     }
     inventory
@@ -2906,14 +3025,14 @@ fn armor_slot_from_name(name: &str) -> Option<ArmorSlot> {
     ARMOR_SLOT_ORDER.into_iter().find(|slot| slot.name() == name)
 }
 
-/// Whether `count` more of `item` fit in a nine-slot inventory.
+/// Whether `count` more of `item` fit in the 36-slot player inventory.
 ///
 /// Capacity comes from matching non-empty stacks plus empty slots; tools never
 /// merge into a damaged stack and are capped at one per slot by their own
 /// `max_stack`.
 fn can_add_to_inventory(
     registry: &Registry,
-    inventory: &[Option<ItemStack>; HOTBAR_SLOTS],
+    inventory: &[Option<ItemStack>; INVENTORY_SLOTS],
     item: ItemId,
     count: u8,
 ) -> bool {
@@ -2934,11 +3053,11 @@ fn can_add_to_inventory(
     capacity >= u32::from(count)
 }
 
-/// Removes `count` of `item` from a nine-slot inventory in slot order.
+/// Removes `count` of `item` from the player inventory in slot order.
 ///
 /// Callers must have checked availability first; this is a partial helper for
 /// crafting and does not report failure.
-fn consume_from_inventory(inventory: &mut [Option<ItemStack>; HOTBAR_SLOTS], item: ItemId, count: u8) {
+fn consume_from_inventory(inventory: &mut [Option<ItemStack>; INVENTORY_SLOTS], item: ItemId, count: u8) {
     let mut remaining = u32::from(count);
     for slot in inventory.iter_mut() {
         if remaining == 0 {
@@ -3127,8 +3246,9 @@ mod tests {
 
     use super::{
         ARMOR_SLOTS, CHEST_SLOTS, ContainerState, CraftOutcome, DAY_LENGTH_TICKS, FurnaceSlot, FurnaceState, GameMode,
-        HOTBAR_SLOTS, Host, HostConfig, ItemStack, MAX_HOSTILE_MOBS, MAX_PASSIVE_MOBS, MOB_ATTACK_REACH,
-        STRUCTURE_MAX_HALF_EXTENT, StableHasher, apple_drop, armor_damage_reduction, armor_slot_index, block_centre,
+        HOTBAR_SLOTS, Host, HostConfig, INVENTORY_SLOTS, ItemStack, MAX_HOSTILE_MOBS, MAX_PASSIVE_MOBS,
+        MOB_ATTACK_REACH, STRUCTURE_MAX_HALF_EXTENT, StableHasher, apple_drop, armor_damage_reduction,
+        armor_slot_index, block_centre, inventory_state, load_inventory,
     };
 
     /// Test-only temporary data directory removed on drop (best effort).
@@ -3411,7 +3531,7 @@ mod tests {
         bytes[payload_len..].copy_from_slice(&checksum.to_le_bytes());
     }
 
-    /// Total number of `item` across the nine hotbar slots.
+    /// Total number of `item` across the 36-slot inventory.
     fn item_count(host: &Host, item: ItemId) -> u32 {
         host.inventory()
             .iter()
@@ -3656,15 +3776,16 @@ mod tests {
         let dirt_item = host.registry().item_id("openblock:dirt").unwrap();
         let target = high_target(&host);
 
-        assert_eq!(host.give_item(stone_item, 255), 0);
-        assert_eq!(host.give_item(stone_item, 255), 0);
-        assert_eq!(host.give_item(stone_item, 66), 0);
+        for _ in 0..9 {
+            assert_eq!(host.give_item(stone_item, 255), 0);
+        }
+        assert_eq!(host.give_item(stone_item, 9), 0);
         assert!(
             host.inventory()
                 .iter()
                 .all(|slot| matches!(slot, Some(stack) if stack.count == 64))
         );
-        assert_eq!(host.inventory().len(), HOTBAR_SLOTS);
+        assert_eq!(host.inventory().len(), INVENTORY_SLOTS);
         assert_eq!(
             host.give_item(stone_item, 1),
             1,
@@ -3822,7 +3943,7 @@ mod tests {
         assert_eq!(item_count(&host, planks), 0);
         assert_eq!(item_count(&host, sticks), 0);
 
-        // Give each stone tool exactly its ingredients so the nine-slot hotbar
+        // Give each stone tool exactly its ingredients so the 36-slot inventory
         // always has room for the finished tool.
         for (name, cobble_count, stick_count, durability) in [
             ("openblock:stone_pickaxe", 3, 2, 131),
@@ -3855,10 +3976,12 @@ mod tests {
         // Eight full stone stacks leave one slot holding three planks. The
         // sticks recipe needs only two planks, so consuming them frees no slot;
         // the output cannot fit and nothing may be consumed.
-        assert_eq!(host.give_item(stone, 255), 0);
-        assert_eq!(host.give_item(stone, 255), 0);
-        assert_eq!(host.give_item(stone, 2), 0);
+        for _ in 0..8 {
+            assert_eq!(host.give_item(stone, 255), 0);
+        }
+        assert_eq!(host.give_item(stone, 200), 0);
         assert_eq!(host.give_item(planks, 3), 0);
+        assert!(host.inventory().iter().all(Option::is_some));
         let before = *host.inventory();
 
         let outcome = craft(&mut host, "openblock:sticks");
@@ -4187,10 +4310,10 @@ mod tests {
         let damaged = host.make_stack(pickaxe, 1).unwrap().with_durability(7);
 
         assert_eq!(host.inventory_slot(0), None);
-        assert_eq!(host.inventory_slot(HOTBAR_SLOTS), None);
+        assert_eq!(host.inventory_slot(INVENTORY_SLOTS), None);
         assert_eq!(host.take_inventory_slot(0), None, "an empty slot has nothing to take");
         assert_eq!(
-            host.take_inventory_slot(HOTBAR_SLOTS),
+            host.take_inventory_slot(INVENTORY_SLOTS),
             None,
             "out-of-range take is a no-op"
         );
@@ -4221,7 +4344,7 @@ mod tests {
 
         // Slot bounds are hard: a write past the hotbar does nothing.
         assert_eq!(host.set_inventory_slot(HOTBAR_SLOTS, Some(damaged)), None);
-        assert_eq!(host.inventory_slot(HOTBAR_SLOTS), None);
+        assert_eq!(host.inventory_slot(INVENTORY_SLOTS), None);
 
         // Counts clamp to the item's max stack, durability to the tool spec.
         let big_apple = ItemStack {
@@ -4303,7 +4426,7 @@ mod tests {
         assert_eq!(host.inventory()[fresh_slot], Some(fresh));
 
         // A full inventory returns the leftover with the exact durability.
-        for slot in 0..HOTBAR_SLOTS {
+        for slot in 0..INVENTORY_SLOTS {
             let _ = host.set_inventory_slot(slot, Some(ItemStack::new(stone, 64)));
         }
         assert!(host.inventory().iter().all(|slot| slot.is_some()));
@@ -4316,6 +4439,127 @@ mod tests {
             Some(ItemStack::new(ItemId(9999), 1)),
             "unknown items are returned unchanged"
         );
+    }
+
+    #[test]
+    fn inventory_move_merges_swaps_and_rejects_invalid_addresses() {
+        let (_dir, mut host) = survival_host("inventory-move", 33);
+        let stone = host.registry().item_id("openblock:stone").unwrap();
+        let dirt = host.registry().item_id("openblock:dirt").unwrap();
+        let apple = host.registry().item_id("openblock:apple").unwrap();
+
+        host.set_inventory_slot(0, Some(ItemStack::new(stone, 10)));
+        host.set_inventory_slot(9, Some(ItemStack::new(stone, 50)));
+        // Merge 10 hotbar stone into a partial main stack.
+        assert_eq!(host.move_inventory_items(0, 9, 10), Ok(true));
+        assert_eq!(host.inventory_slot(0), None);
+        assert_eq!(host.inventory_slot(9).map(|stack| stack.count), Some(60));
+
+        // Fill both slots and swap incompatible whole stacks.
+        host.set_inventory_slot(0, Some(ItemStack::new(dirt, 3)));
+        host.set_inventory_slot(10, Some(ItemStack::new(apple, 2)));
+        assert_eq!(host.move_inventory_items(0, 10, 3), Ok(true));
+        assert_eq!(host.inventory_slot(0), Some(&ItemStack::new(apple, 2)));
+        assert_eq!(host.inventory_slot(10), Some(&ItemStack::new(dirt, 3)));
+
+        // Partial moves into an occupied incompatible slot are rejected.
+        assert_eq!(host.move_inventory_items(0, 9, 1), Err("destination_occupied"));
+        assert_eq!(host.move_inventory_items(0, 0, 1), Err("same_slot"));
+        assert_eq!(host.move_inventory_items(0, INVENTORY_SLOTS, 1), Err("invalid_slot"));
+        assert_eq!(host.move_inventory_items(0, 10, 9), Err("invalid_count"));
+        assert_eq!(host.move_inventory_items(11, 12, 1), Err("empty_source"));
+    }
+
+    #[test]
+    fn pickup_and_give_fill_hotbar_then_main_and_leave_overflow() {
+        let (_dir, mut host) = survival_host("inventory-overflow", 35);
+        let stone = host.registry().item_id("openblock:stone").unwrap();
+        for slot in 0..HOTBAR_SLOTS {
+            assert_eq!(host.set_inventory_slot(slot, Some(ItemStack::new(stone, 64))), None);
+        }
+        // Hotbar is full: the next stack starts the main inventory.
+        assert_eq!(host.give_item(stone, 5), 0);
+        assert_eq!(host.inventory_slot(9).map(|stack| stack.count), Some(5));
+
+        // Fill every remaining slot and check the overflow comes back intact.
+        assert_eq!(
+            host.set_inventory_slot(9, Some(ItemStack::new(stone, 64))),
+            Some(ItemStack::new(stone, 5))
+        );
+        for slot in 10..INVENTORY_SLOTS {
+            assert_eq!(host.set_inventory_slot(slot, Some(ItemStack::new(stone, 64))), None);
+        }
+        let leftover = host.insert_inventory_stack(ItemStack::new(stone, 7)).expect("overflow");
+        assert_eq!(leftover.count, 7);
+        assert_eq!(host.inventory_slot(9).map(|stack| stack.count), Some(64));
+    }
+
+    #[test]
+    fn quick_transfer_moves_between_hotbar_and_main_only() {
+        let (_dir, mut host) = survival_host("inventory-quick", 36);
+        let stone = host.registry().item_id("openblock:stone").unwrap();
+        let apple = host.registry().item_id("openblock:apple").unwrap();
+        host.set_inventory_slot(0, Some(ItemStack::new(stone, 20)));
+        host.set_inventory_slot(12, Some(ItemStack::new(stone, 40)));
+        // Merge into the existing main stack first.
+        assert_eq!(host.quick_transfer_inventory_slot(0), Ok(true));
+        assert_eq!(host.inventory_slot(0), None);
+        assert_eq!(host.inventory_slot(12).map(|stack| stack.count), Some(60));
+
+        // Main -> first empty hotbar slot.
+        host.set_inventory_slot(10, Some(ItemStack::new(apple, 3)));
+        assert_eq!(host.quick_transfer_inventory_slot(10), Ok(true));
+        assert_eq!(host.inventory_slot(10), None);
+        assert_eq!(host.inventory_slot(0), Some(&ItemStack::new(apple, 3)));
+
+        // No room in the other section is reported, not silently dropped.
+        for slot in HOTBAR_SLOTS..INVENTORY_SLOTS {
+            host.set_inventory_slot(slot, Some(ItemStack::new(stone, 64)));
+        }
+        host.set_inventory_slot(0, Some(ItemStack::new(apple, 1)));
+        assert_eq!(host.quick_transfer_inventory_slot(0), Err("no_room"));
+        assert_eq!(host.inventory_slot(0), Some(&ItemStack::new(apple, 1)));
+    }
+
+    #[test]
+    fn inventory_sidecar_accepts_old_nine_rows_and_saves_all_36() {
+        let dir = TempDir::new("inventory-migration");
+        let registry = Registry::base();
+        let path = dir.path().join("inventory.txt");
+        // A 1.1 file only contains hotbar rows. The loader accepts them and
+        // leaves all 27 main slots empty.
+        std::fs::write(&path, "0 openblock:stone 5\n8 openblock:apple 2\n").expect("write old inventory");
+        let old = load_inventory(dir.path(), &registry);
+        assert_eq!(
+            old[0],
+            Some(ItemStack::new(registry.item_id("openblock:stone").unwrap(), 5))
+        );
+        assert_eq!(old[8].map(|stack| stack.count), Some(2));
+        assert!(old[HOTBAR_SLOTS..].iter().all(Option::is_none));
+
+        // A 1.2 file may address main slots; row 36 is out of range and is
+        // dropped, never clamped onto slot 35.
+        std::fs::write(
+            &path,
+            "9 openblock:dirt 9\n35 openblock:stick 4\n36 openblock:coal 1\n0 openblock:stone 5\n8 openblock:apple 2\n",
+        )
+        .expect("write mixed inventory");
+        let inventory = load_inventory(dir.path(), &registry);
+        assert_eq!(inventory[9].map(|stack| stack.count), Some(9));
+        assert_eq!(inventory[35].map(|stack| stack.count), Some(4));
+        let saved = inventory_state(&registry, &inventory);
+        assert!(saved.lines().any(|line| line.starts_with(&format!(
+            "0 {}",
+            registry.item(registry.item_id("openblock:stone").unwrap()).id
+        ))));
+        assert!(saved.lines().any(|line| line.starts_with("9 ")));
+        assert!(saved.lines().any(|line| line.starts_with("35 ")));
+        assert!(!saved.lines().any(|line| line.starts_with("36 ")));
+        assert_eq!(saved.lines().filter(|line| !line.trim().is_empty()).count(), 4);
+
+        // A missing sidecar (pre-inventory world) is an empty 36-slot array.
+        std::fs::remove_file(&path).expect("remove sidecar");
+        assert!(load_inventory(dir.path(), &registry).iter().all(Option::is_none));
     }
 
     #[test]
@@ -4670,7 +4914,7 @@ mod tests {
         assert_eq!(reopened.inventory()[0], Some(ItemStack::new(stone, 64)));
         assert_eq!(reopened.inventory()[1], None, "unknown item must be dropped");
         assert_eq!(reopened.inventory()[2], Some(ItemStack::new(apple, 1)));
-        assert_eq!(reopened.inventory()[8], Some(ItemStack::new(dirt, 3)));
+        assert_eq!(reopened.inventory()[12], Some(ItemStack::new(dirt, 3)));
     }
 
     #[test]
@@ -4983,9 +5227,10 @@ mod tests {
         settle_player(&mut host);
         let stone = host.registry().item_id("openblock:stone").unwrap();
         let dirt = host.registry().item_id("openblock:dirt").unwrap();
-        assert_eq!(host.give_item(stone, 255), 0);
-        assert_eq!(host.give_item(stone, 255), 0);
-        assert_eq!(host.give_item(stone, 66), 0);
+        for _ in 0..9 {
+            assert_eq!(host.give_item(stone, 255), 0);
+        }
+        assert_eq!(host.give_item(stone, 9), 0);
         let before = *host.inventory();
         let feet = host.player().pos;
         host.spawn_item_entity(WorldVec::new(feet.x, feet.y + 0.1, feet.z), ItemStack::new(dirt, 1));
@@ -5008,9 +5253,14 @@ mod tests {
         settle_player(&mut host);
         let stone = host.registry().item_id("openblock:stone").unwrap();
         let dirt = host.registry().item_id("openblock:dirt").unwrap();
-        assert_eq!(host.give_item(stone, 255), 0);
-        assert_eq!(host.give_item(stone, 255), 0);
-        assert_eq!(host.give_item(dirt, 61), 0);
+        for _ in 0..9 {
+            assert_eq!(host.give_item(stone, 255), 0);
+        }
+        assert_eq!(host.give_item(stone, 9), 0);
+        assert_eq!(
+            host.set_inventory_slot(INVENTORY_SLOTS - 1, Some(ItemStack::new(dirt, 61))),
+            Some(ItemStack::new(stone, 64))
+        );
         let feet = host.player().pos;
         host.spawn_item_entity(WorldVec::new(feet.x, feet.y + 0.1, feet.z), ItemStack::new(dirt, 5));
 
@@ -5723,7 +5973,7 @@ mod tests {
                 *slot = Some(ItemStack::new(stone, 64));
             }
         }
-        assert_eq!(host.inventory().iter().flatten().count(), HOTBAR_SLOTS);
+        assert_eq!(host.inventory().iter().flatten().count(), INVENTORY_SLOTS);
         assert!(!host.unequip_armor(ArmorSlot::Chestplate));
         assert_eq!(host.equipment()[1], Some(chest), "failed unequip changes nothing");
     }

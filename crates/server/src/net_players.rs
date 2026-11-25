@@ -55,7 +55,9 @@ use ob_sim::{
     EYE_HEIGHT, GRAVITY, MAX_HEALTH, MAX_HUNGER, Player, StepEvents, TICK_DT, advance_vitals, fall_damage, reset_vitals,
 };
 
-use crate::{ARMOR_SLOTS, ActionOutcome, AttackOutcome, GameMode, HOTBAR_SLOTS, Host, ItemStack, MAX_STACK_SIZE};
+use crate::{
+    ARMOR_SLOTS, ActionOutcome, AttackOutcome, GameMode, HOTBAR_SLOTS, Host, INVENTORY_SLOTS, ItemStack, MAX_STACK_SIZE,
+};
 
 /// World-directory filename for persisted network players.
 pub const NETWORK_PLAYERS_FILE: &str = "network_players.txt";
@@ -96,8 +98,8 @@ pub struct ServerPlayer {
     pub dead: bool,
     /// Whether a `Death` was sent and a `Respawn` is expected.
     pub respawn_pending: bool,
-    /// Nine hotbar slots.
-    pub inventory: [Option<ItemStack>; HOTBAR_SLOTS],
+    /// 36 player inventory slots: hotbar `0..9`, main `9..36`.
+    pub inventory: [Option<ItemStack>; INVENTORY_SLOTS],
     /// Selected hotbar slot, `0..9`.
     pub selected_slot: usize,
     /// Four armor slots (helmet, chestplate, leggings, boots).
@@ -134,7 +136,7 @@ impl ServerPlayer {
             hunger: MAX_HUNGER,
             dead: false,
             respawn_pending: false,
-            inventory: [None; HOTBAR_SLOTS],
+            inventory: [None; INVENTORY_SLOTS],
             selected_slot: 0,
             equipment: [None; ARMOR_SLOTS],
             game_mode,
@@ -547,7 +549,7 @@ impl Host {
             .unwrap_or(false)
     }
 
-    /// Gives items to a network player's hotbar; returns the overflow.
+    /// Gives items to a network player's inventory; returns the overflow.
     ///
     /// Admin/test entry point. Newly created items start at full tool/armor
     /// durability; use [`Host::give_network_stack`] to preserve an exact stack.
@@ -557,7 +559,7 @@ impl Host {
     }
 
     /// Gives an exact stack (count and durability included) to a network
-    /// player's hotbar and returns the leftover.
+    /// player's inventory and returns the leftover.
     ///
     /// Item-entity pickup uses this path so a damaged tool keeps its remaining
     /// durability instead of being repaired. Returns the whole stack when the
@@ -1115,7 +1117,7 @@ pub(crate) fn load_network_players(world_dir: &Path, registry: &Registry) -> BTr
                     log::warn!("network_players.txt:{line_number}: invalid inventory slot");
                     continue;
                 };
-                if slot >= HOTBAR_SLOTS {
+                if slot >= INVENTORY_SLOTS {
                     log::warn!("network_players.txt:{line_number}: inventory slot {slot} out of range");
                     continue;
                 }
@@ -1222,7 +1224,7 @@ pub fn item_from_dto(registry: &Registry, dto: &ItemStackDto) -> Option<ItemId> 
     registry.item_id(&dto.item)
 }
 
-/// Resolves an armor slot address (`9..13` relative to the equipment base).
+/// Resolves an equipment-array index (`0..4`) to its armor slot.
 pub fn equipment_armor_slot(index: usize) -> Option<ArmorSlot> {
     match index {
         0 => Some(ArmorSlot::Helmet),
@@ -1343,6 +1345,8 @@ mod tests {
             player.health = 13.0;
             player.hunger = 8.5;
             player.selected_slot = 2;
+            player.inventory[9] = Some(ItemStack::new(stone, 9));
+            player.inventory[35] = Some(ItemStack::new(pickaxe, 1).with_durability(7));
             player.equipment[0] = Some(ItemStack {
                 item: helmet,
                 count: 1,
@@ -1371,7 +1375,50 @@ mod tests {
         assert_eq!(saved.selected_slot, 2);
         assert_eq!(saved.inventory[0].expect("stone").count, 32);
         assert_eq!(saved.inventory[1].expect("pickaxe").item, pickaxe);
+        assert_eq!(saved.inventory[9].expect("main stone").count, 9);
+        assert_eq!(saved.inventory[35].expect("main pickaxe").durability, Some(7));
         assert_eq!(saved.equipment[0].expect("helmet").durability, Some(99));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn old_network_players_sidecar_loads_nine_hotbar_rows_and_new_main_rows() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!("ob-net-players-sidecar-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let registry = Registry::base();
+        // A 1.1 record has only i0..i8 hotbar tokens (and e0..e3 equipment).
+        std::fs::write(
+            dir.join(NETWORK_PLAYERS_FILE),
+            "alice 0.5 70.0 0.5 0 0 20 20 0 3 survival i0:openblock:stone,12 i8:openblock:apple,2 e0:openblock:iron_helmet,99\n",
+        )
+        .expect("write old sidecar");
+        let players = load_network_players(&dir, &registry);
+        let alice = players.get("alice").expect("alice");
+        assert_eq!(alice.inventory[0].expect("stone").count, 12);
+        assert_eq!(alice.inventory[8].expect("apple").count, 2);
+        assert!(alice.inventory[HOTBAR_SLOTS..].iter().all(Option::is_none));
+        assert_eq!(alice.equipment[0].expect("helmet").durability, Some(99));
+
+        // A 1.2 record can address main slots 9..36; 36 is out of range and is
+        // dropped instead of being clamped onto slot 35.
+        std::fs::write(
+            dir.join(NETWORK_PLAYERS_FILE),
+            "alice 0.5 70.0 0.5 0 0 20 20 0 0 survival i9:openblock:dirt,4 i35:openblock:stick,3 i36:openblock:coal,1\n",
+        )
+        .expect("write new sidecar");
+        let players = load_network_players(&dir, &registry);
+        let alice = players.get("alice").expect("alice");
+        assert_eq!(alice.inventory[9].expect("dirt").count, 4);
+        assert_eq!(alice.inventory[35].expect("stick").count, 3);
+        let coal = registry.item_id("openblock:coal").unwrap();
+        assert!(
+            alice.inventory.iter().flatten().all(|stack| stack.item != coal),
+            "row 36 must be dropped, not clamped onto row 35"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1434,7 +1481,7 @@ mod tests {
     }
 
     #[test]
-    fn furnace_output_can_only_be_taken_to_the_hotbar() {
+    fn furnace_output_is_take_only_into_any_player_slot() {
         let (dir, mut host) = temp_host("furnace-output");
         host.join_network_player(1, "alice", GameMode::Survival).expect("join");
         let pos = BlockPos::new(3, 70, -2);
@@ -1478,10 +1525,16 @@ mod tests {
         let state = host.furnace_at(pos).expect("furnace");
         assert_eq!(state.input, Some(input));
         assert_eq!(state.output, Some(output));
-        // A hotbar destination is the legal take path.
+        // A hotbar destination is one legal take path.
         assert_eq!(host.network_inventory_move(1, 102, 0, 1, Some(window)), Ok(true));
         assert_eq!(host.furnace_at(pos).expect("furnace").output, None);
         assert_eq!(host.network_player(1).expect("online").inventory[0], Some(output));
+
+        // A main-inventory destination (9..36) works too; v3 output routing is
+        // not restricted to the hotbar.
+        host.furnace_at_mut(pos).expect("furnace").output = Some(output);
+        assert_eq!(host.network_inventory_move(1, 102, 9, 1, Some(window)), Ok(true));
+        assert_eq!(host.network_player(1).expect("online").inventory[9], Some(output));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1649,7 +1702,11 @@ mod tests {
             Err("invalid_count")
         );
         assert_eq!(
-            host.network_inventory_move(1, 13, 1, 1, Some(window)),
+            host.network_inventory_move(1, 40, 1, 1, Some(window)),
+            Err("invalid_slot")
+        );
+        assert_eq!(
+            host.network_inventory_move(1, 99, 1, 1, Some(window)),
             Err("invalid_slot")
         );
         assert_eq!(host.network_inventory_move(1, 100, 1, 1, None), Err("no_window"));
@@ -1665,12 +1722,12 @@ mod tests {
             let from = if next(4) == 0 {
                 100 + next(27) as u16
             } else {
-                next(13) as u16
+                next(40) as u16
             };
             let to = if next(4) == 0 {
                 100 + next(27) as u16
             } else {
-                next(13) as u16
+                next(40) as u16
             };
             let count = [0u8, 1, 2, 3, 5, 64, 255][next(7)];
             let _ = host.network_inventory_move(1, from, to, count, Some(window));
@@ -1722,9 +1779,9 @@ mod tests {
 /// Parsed inventory-move address.
 #[derive(Debug, Clone, Copy)]
 enum SlotAddress {
-    /// Hotbar slot `0..9`.
-    Hotbar(usize),
-    /// Armor slot `0..4` (wire addresses `9..13`).
+    /// Player inventory slot `0..36` (hotbar `0..9`, main `9..36`).
+    Player(usize),
+    /// Armor slot `0..4` (wire addresses `36..40`).
     Equipment(usize),
     /// Slot inside the open window (`100..`).
     Window(usize),
@@ -1733,8 +1790,8 @@ enum SlotAddress {
 /// Parses a wire slot address against the open-window descriptor.
 fn parse_slot_address(slot: u16, window: Option<NetworkWindowRef>) -> Result<SlotAddress, &'static str> {
     match slot {
-        0..=8 => Ok(SlotAddress::Hotbar(usize::from(slot))),
-        9..=12 => Ok(SlotAddress::Equipment(usize::from(slot - 9))),
+        0..=35 => Ok(SlotAddress::Player(usize::from(slot))),
+        36..=39 => Ok(SlotAddress::Equipment(usize::from(slot - 36))),
         value if value >= ob_protocol::SLOT_WINDOW_START => {
             let Some(window) = window else {
                 return Err("no_window");
@@ -1765,8 +1822,8 @@ impl Host {
     /// `net` is not sufficient on its own: a client can report a teleport and
     /// send a container move in the same tick before that check runs.
     ///
-    /// Non-window moves (hotbar/equipment only) do not require an open window or
-    /// a nearby container and behave exactly like
+    /// Non-window moves (player inventory/equipment only) do not require an
+    /// open window or a nearby container and behave exactly like
     /// [`Host::network_inventory_move`].
     pub(crate) fn network_inventory_move_checked(
         &mut self,
@@ -1812,8 +1869,9 @@ impl Host {
 
     /// Applies one validated slot move for a network player.
     ///
-    /// Slot addresses use the protocol layout: hotbar `0..9`, equipment `9..13`
-    /// and an open window from `100`. Window moves require the
+    /// Slot addresses use the protocol layout: player inventory `0..36`
+    /// (hotbar `0..9`, main `9..36`), equipment `36..40` and an open window from
+    /// `100`. Window moves require the
     /// [`NetworkWindowRef`] the net layer is tracking for that player. Counts
     /// are bounded by the source stack; merges respect content max stacks;
     /// incompatible destinations need a full-stack swap. All writes are
@@ -1892,7 +1950,7 @@ impl Host {
         let from_furnace_output = from_address.is_window()
             && window.is_some_and(|window| window.furnace)
             && matches!(from_address, SlotAddress::Window(2));
-        if from_furnace_output && !matches!(to_address, SlotAddress::Hotbar(_)) {
+        if from_furnace_output && !matches!(to_address, SlotAddress::Player(_)) {
             // The furnace output is take-only and the only legal destination is
             // the player's hotbar. A window destination could otherwise swap the
             // destination stack *into* the output slot, because the source write
@@ -1969,7 +2027,7 @@ impl Host {
         window: Option<NetworkWindowRef>,
     ) -> Result<Option<ItemStack>, &'static str> {
         match address {
-            SlotAddress::Hotbar(slot) => Ok(self
+            SlotAddress::Player(slot) => Ok(self
                 .network_players
                 .get(&id)
                 .and_then(|player| player.inventory.get(slot).copied().flatten())),
@@ -2002,7 +2060,7 @@ impl Host {
             _ => None,
         };
         match address {
-            SlotAddress::Hotbar(slot) => {
+            SlotAddress::Player(slot) => {
                 let Some(player) = self.network_players.get_mut(&id) else {
                     return Err("not_connected");
                 };

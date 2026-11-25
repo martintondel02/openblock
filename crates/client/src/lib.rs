@@ -540,7 +540,7 @@ pub fn screenshot(options: &ClientOptions, path: &std::path::Path) -> Result<(),
     screenshot_with_mode(options, path, ScreenshotMode::Hud)
 }
 
-/// Renders one offscreen protocol v2 survival frame from an in-process server.
+/// Renders one offscreen protocol v3 survival frame from an in-process server.
 ///
 /// This is the documentation/demo probe for the network runtime. It opens a
 /// temporary world, installs a small survival scene (mobs, dropped items and a
@@ -1569,8 +1569,7 @@ fn screenshot_with_mode(
                 BlockPos::new(0, 0, 0),
             ));
             let mut session = ContainerSession::new(kind, pos);
-            let mut view = container_snapshot(&host, kind, pos);
-            view.inventory = *host.inventory();
+            let view = container_snapshot(&host, kind, pos);
             let demo_slot = match kind {
                 ContainerKind::Furnace => containers::SlotId::FurnaceOutput,
                 ContainerKind::Chest => containers::SlotId::Chest(0),
@@ -1864,7 +1863,7 @@ fn screenshot_debug_stats(
 /// Gives the screenshot host a deterministic, representative inventory and
 /// wounded vitals.
 ///
-/// The nine hotbar slots are chosen to exercise the expanded catalogue: an iron
+/// The 36 inventory slots are chosen to exercise the expanded catalogue: an iron
 /// tool (held, so the F3 line reports `251/251 speed 6.0`), iron armor, cooked
 /// food, coal, an ingot, raw ore and enough planks/sticks/cobblestone for the
 /// crafting availability colours. This uses only the public host API.
@@ -1921,6 +1920,24 @@ fn seed_screenshot_items(host: &mut Host, registry: &Registry) {
             if leftover > 0 {
                 log::warn!("screenshot items: {name} x{leftover} did not fit");
             }
+        }
+    }
+    // Populate the 27 main slots too, so the 1.2 inventory screenshot shows
+    // all four rows rather than an empty backpack.
+    for (slot, name, count) in [
+        (9usize, "openblock:cobblestone", 64_u8),
+        (10, "openblock:dirt", 64),
+        (11, "openblock:planks", 32),
+        (13, "openblock:stick", 16),
+        (18, "openblock:apple", 5),
+        (19, "openblock:coal", 8),
+        (22, "openblock:iron_ingot", 8),
+        (27, "openblock:raw_iron", 4),
+        (31, "openblock:glass", 12),
+    ] {
+        if let Some(item) = registry.item_id(name) {
+            let stack = host.make_stack(item, count);
+            let _ = host.set_inventory_slot(slot, stack);
         }
     }
     let iron_slot = slot_of(host, "openblock:iron_pickaxe");
@@ -2201,7 +2218,9 @@ fn seed_screenshot_chest(host: &mut Host, registry: &Registry, pos: BlockPos) {
 /// Snapshot used by container drawing and click decisions.
 fn container_snapshot(host: &Host, kind: ContainerKind, pos: BlockPos) -> ContainerSnapshot {
     let mut snapshot = ContainerSnapshot {
-        inventory: *host.inventory(),
+        // Container screens keep their nine-slot hotbar strip; the main
+        // inventory is addressed from the full inventory screen.
+        inventory: std::array::from_fn(|index| host.inventory()[index]),
         ..ContainerSnapshot::default()
     };
     match kind {
@@ -4787,7 +4806,7 @@ impl GameState {
     fn move_inventory_selection(&mut self, dx: i32, dy: i32) {
         if self.host.game_mode() == HostGameMode::Survival {
             self.ui.inventory.selected =
-                inventory::move_survival_selection(self.ui.inventory.selected, dx, dy, ui_state::HOTBAR_SLOTS);
+                inventory::move_survival_selection(self.ui.inventory.selected, dx, dy, ui_state::INVENTORY_SLOTS);
         } else {
             let item_count = self.inventory_item_count();
             self.ui
@@ -4799,7 +4818,7 @@ impl GameState {
     fn scroll_inventory(&mut self, rows: i32) {
         if self.host.game_mode() == HostGameMode::Survival {
             self.ui.inventory.selected =
-                inventory::cycle_survival_selection(self.ui.inventory.selected, rows, ui_state::HOTBAR_SLOTS);
+                inventory::cycle_survival_selection(self.ui.inventory.selected, rows, ui_state::INVENTORY_SLOTS);
             return;
         }
         let item_count = self.inventory_item_count();
@@ -4820,8 +4839,18 @@ impl GameState {
     /// Assigns the current inventory selection and returns to gameplay.
     fn assign_inventory_selection(&mut self) -> bool {
         if self.host.game_mode() == HostGameMode::Survival {
-            let slot = self.ui.inventory.selected.min(ui_state::HOTBAR_SLOTS - 1);
+            let slot = self.ui.inventory.selected.min(ui_state::INVENTORY_SLOTS - 1);
             self.ui.inventory.selected = slot;
+            if let Some(cursor) = self.ui.inventory.cursor {
+                // Enter places a picked-up stack on the keyboard-selected slot,
+                // or cancels when the same slot is selected again.
+                if cursor.from == slot {
+                    self.ui.inventory.clear_cursor();
+                } else {
+                    self.place_inventory_cursor(cursor, slot);
+                }
+                return true;
+            }
             if self
                 .host
                 .inventory()
@@ -4831,6 +4860,15 @@ impl GameState {
                 .is_some_and(|stack| self.registry.item(stack.item).armor.is_some())
             {
                 self.equip_armor_slot(slot);
+                return true;
+            }
+            if slot >= ui_state::HOTBAR_SLOTS {
+                // Main-inventory slots are not hotbar selections: a second
+                // Enter picks the stack up so arrows can move it.
+                if let Some(stack) = self.host.inventory().get(slot).copied().flatten() {
+                    self.ui.inventory.cursor = Some(inventory::InventoryCursor { from: slot, stack });
+                    self.play_ui_sound(true);
+                }
                 return true;
             }
             self.select_hotbar_slot(slot);
@@ -4848,33 +4886,135 @@ impl GameState {
         }
     }
 
-    /// Handles a left click on the inventory: hovering a slot selects and
-    /// activates it. Clicks outside keep the inventory open.
+    /// Handles a left click on the inventory.
+    ///
+    /// In survival the screen uses click-to-pick/click-to-place: the first
+    /// click on a main-inventory stack raises it to the pointer, the second
+    /// click on a hotbar/main slot performs the authoritative move. Shift-click
+    /// quick-moves a stack between the hotbar and main inventory. Clicking a
+    /// hotbar slot without a held stack still selects it and closes the screen;
+    /// armor is equipped by clicking it and unequipped by clicking its slot.
     fn inventory_click(&mut self) {
         self.update_inventory_hover();
-        if self.host.game_mode() == HostGameMode::Survival
-            && let Some(slot) = self.ui.inventory.armor_hovered
-        {
-            self.unequip_armor_slot(slot);
-            return;
-        }
-        let Some(index) = self.ui.inventory.hovered else {
-            return;
-        };
-        self.ui.inventory.selected = index;
-        if self.host.game_mode() == HostGameMode::Survival
-            && self
+        let shift = self.keys[5];
+        if self.host.game_mode() == HostGameMode::Survival {
+            if let Some(slot) = self.ui.inventory.armor_hovered {
+                if let Some(cursor) = self.ui.inventory.cursor {
+                    let armor_index = inventory::armor_index(slot);
+                    let matching = self
+                        .registry
+                        .item(cursor.stack.item)
+                        .armor
+                        .is_some_and(|armor| armor_index == inventory::armor_index(armor.slot));
+                    if matching && self.host.equip_armor(cursor.from) {
+                        self.play_ui_sound(true);
+                        self.ui.inventory.clear_cursor();
+                    } else {
+                        self.ui.toasts.push_warning("That armor does not fit this slot");
+                        self.ui.inventory.clear_cursor();
+                    }
+                    self.update_inventory_hover();
+                    return;
+                }
+                self.unequip_armor_slot(slot);
+                return;
+            }
+            let Some(index) = self.ui.inventory.hovered else {
+                self.ui.inventory.clear_cursor();
+                return;
+            };
+            self.ui.inventory.selected = index;
+            if shift {
+                self.quick_transfer_inventory(index);
+                return;
+            }
+            if self.ui.inventory.cursor.is_some() {
+                match inventory::click_cursor_slot(&mut self.ui.inventory, self.host.inventory(), index) {
+                    inventory::CursorClick::Move { from, to, stack } => {
+                        self.place_inventory_cursor(inventory::InventoryCursor { from, stack }, to);
+                    }
+                    inventory::CursorClick::Cancelled => self.play_ui_sound(false),
+                    inventory::CursorClick::Picked | inventory::CursorClick::Ignored => {}
+                }
+                return;
+            }
+            if self
                 .host
                 .inventory()
                 .get(index)
                 .copied()
                 .flatten()
                 .is_some_and(|stack| self.registry.item(stack.item).armor.is_some())
-        {
-            self.equip_armor_slot(index);
+            {
+                self.equip_armor_slot(index);
+                return;
+            }
+            if index < ui_state::HOTBAR_SLOTS {
+                self.select_hotbar_slot(index);
+                self.ui.close_inventory();
+                self.capture_pointer();
+                self.update_title();
+                return;
+            }
+            if inventory::click_cursor_slot(&mut self.ui.inventory, self.host.inventory(), index)
+                == inventory::CursorClick::Picked
+            {
+                self.play_ui_sound(true);
+            }
             return;
         }
+        let Some(index) = self.ui.inventory.hovered else {
+            return;
+        };
+        self.ui.inventory.selected = index;
         self.assign_inventory_selection();
+    }
+
+    /// Applies a click-to-place preview to `to` in the authoritative host.
+    fn place_inventory_cursor(&mut self, cursor: inventory::InventoryCursor, to: usize) {
+        let name = inventory::item_display_name(&self.registry, cursor.stack.item);
+        match self.host.move_inventory_items(cursor.from, to, cursor.stack.count) {
+            Ok(_) => {
+                self.play_ui_sound(true);
+                self.ui.inventory.clear_cursor();
+                if to < ui_state::HOTBAR_SLOTS {
+                    self.ui.toasts.push(format!("Moved {name}"));
+                }
+            }
+            Err(reason) => {
+                self.ui.inventory.clear_cursor();
+                let message = if reason == "empty_source" {
+                    "That stack moved already".to_string()
+                } else {
+                    format!("Cannot move {name}: {reason}")
+                };
+                self.ui.toasts.push_warning(message);
+            }
+        }
+        self.update_inventory_hover();
+    }
+
+    /// Shift-click quick transfer between the hotbar and main inventory.
+    fn quick_transfer_inventory(&mut self, slot: usize) {
+        let stack = self.host.inventory().get(slot).copied().flatten();
+        let Some(stack) = stack else {
+            return;
+        };
+        if self.registry.item(stack.item).armor.is_some() {
+            self.equip_armor_slot(slot);
+            return;
+        }
+        let name = inventory::item_display_name(&self.registry, stack.item);
+        match self.host.quick_transfer_inventory_slot(slot) {
+            Ok(_) => {
+                self.play_ui_sound(true);
+                self.ui.inventory.clear_cursor();
+                self.ui.toasts.push(format!("Moved {name}"));
+            }
+            Err("no_room") => self.ui.toasts.push_warning("No room in the other row"),
+            Err(_) => {}
+        }
+        self.update_inventory_hover();
     }
 
     /// Moves the crafting selection by `steps` rows and keeps it on screen.

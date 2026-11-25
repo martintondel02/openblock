@@ -15,7 +15,7 @@
 //! Query methods on [`DedicatedServer`] lock briefly and are intended for tests,
 //! the console and future admin surfaces.
 //!
-//! # Protocol v2 survival
+//! # Protocol v3 survival
 //!
 //! Network players are server-authoritative for survival state: vitals,
 //! inventory, equipment, block actions, combat, item pickup, death/respawn and
@@ -57,8 +57,8 @@ use ob_content::{BlockId, MobKind};
 use ob_math::{BlockPos, ChunkPos, WORLD_MAX_Y, WORLD_MIN_Y, WorldVec};
 use ob_protocol::{
     BlockDescriptor, ClientMessage, ContainerKind, DespawnReason, EQUIPMENT_SLOTS, EntityKind, EntitySnapshot,
-    EntityStateEntry, FurnaceProgress, HOTBAR_SLOTS, ItemStackDto, MAX_FRAME_LEN, PROTOCOL_VERSION, PlayerSnapshot,
-    RateLimit, SLOT_WINDOW_START, ServerMessage, block_manifest, content_fingerprint, decode_payload,
+    EntityStateEntry, FurnaceProgress, HOTBAR_SLOTS, ItemStackDto, MAIN_SLOTS, MAX_FRAME_LEN, PROTOCOL_VERSION,
+    PlayerSnapshot, RateLimit, SLOT_WINDOW_START, ServerMessage, block_manifest, content_fingerprint, decode_payload,
     encode_chunk_checked, encode_server_frame, read_frame, sanitise_motd, validate_chat_text, validate_player_name,
 };
 use ob_sim::REACH;
@@ -90,7 +90,7 @@ pub const DEFAULT_SAVE_INTERVAL_SECONDS: u64 = 60;
 pub const MAX_QUEUED_FRAMES: usize = 256;
 /// Maximum concurrent handshakes (a small bound against connection floods).
 pub const MAX_CONCURRENT_HANDSHAKES: usize = 32;
-/// Default network game mode (survival in protocol v2).
+/// Default network game mode (survival in protocol v3).
 pub const DEFAULT_NETWORK_GAME_MODE: GameMode = GameMode::Survival;
 
 /// One simulation tick (20 Hz).
@@ -1048,7 +1048,7 @@ fn handshake(shared: Arc<Shared>, stream: TcpStream) {
         reject_handshake(
             &stream,
             &format!(
-                "protocol_mismatch: server protocol {PROTOCOL_VERSION}, client sent {protocol}; version 1 clients must upgrade"
+                "protocol_mismatch: server protocol {PROTOCOL_VERSION}, client sent {protocol}; 1.1 and older clients must upgrade to a 1.2+ build"
             ),
         );
         return;
@@ -1424,10 +1424,13 @@ fn inventory_sync_message(host: &Host, player: &ServerPlayer) -> ServerMessage {
     let registry = host.registry();
     let hotbar: [Option<ItemStackDto>; HOTBAR_SLOTS] =
         std::array::from_fn(|slot| stack_dto(registry, &player.inventory[slot]));
+    let main: [Option<ItemStackDto>; MAIN_SLOTS] =
+        std::array::from_fn(|slot| stack_dto(registry, &player.inventory[HOTBAR_SLOTS + slot]));
     let equipment: [Option<ItemStackDto>; EQUIPMENT_SLOTS] =
         std::array::from_fn(|slot| stack_dto(registry, &player.equipment[slot]));
     ServerMessage::InventorySync {
         hotbar,
+        main,
         selected: player.selected_slot.min(HOTBAR_SLOTS - 1) as u8,
         equipment,
     }

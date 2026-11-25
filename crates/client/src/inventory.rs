@@ -7,11 +7,12 @@
 //! up without client changes.
 
 use ob_content::{ArmorSlot, BlockId, ItemId, Registry, ToolKind};
+use ob_protocol::{HOTBAR_SLOTS, INVENTORY_SLOTS, MAIN_SLOTS};
 use ob_render::UiFrame;
 use ob_server::{GameMode, ItemStack};
 use ob_sim::MAX_HUNGER;
 
-use crate::ui_state::{BLOCK_NAME_SECONDS, HOTBAR_SLOTS, UiRect, UiState};
+use crate::ui_state::{BLOCK_NAME_SECONDS, UiRect, UiState};
 
 /// Number of columns in the inventory grid.
 pub const INVENTORY_COLUMNS: usize = 9;
@@ -35,21 +36,36 @@ pub const SURVIVAL_PADDING: f32 = 26.0;
 pub const INVENTORY_FOOTER_LINES: [f32; 5] = [12.0, 36.0, 60.0, 82.0, 102.0];
 /// Control hints on the last two footer lines (kept short enough for 960x540).
 pub const INVENTORY_CONTROL_HINTS: [&str; 2] = [
-    "Click armor equip/unequip   Click/Enter select",
-    "Arrows/Wheel navigate   C crafting   E/Esc close",
+    "Click pick/place  Shift quick-move  Armor equip",
+    "Arrows/Wheel  Enter use  C craft  E/Esc close",
 ];
 /// Y offsets of the three creative-inventory footer lines.
 pub const INVENTORY_CREATIVE_FOOTER_LINES: [f32; 3] = [12.0, 40.0, 68.0];
 /// Smallest slot edge length used on very narrow windows.
 const MIN_SLOT_SIZE: f32 = 8.0;
-/// Width of the one-row survival inventory grid, in items.
+/// Number of columns in the survival inventory grid.
 const SURVIVAL_COLUMNS: usize = HOTBAR_SLOTS;
+/// Number of main-inventory rows (three 9-wide rows = 27 slots).
+pub const MAIN_ROWS: usize = MAIN_SLOTS / SURVIVAL_COLUMNS;
 /// Edge length of one survival armor slot in UI pixels.
 pub const ARMOR_SLOT_SIZE: f32 = 40.0;
-/// Vertical space reserved above the hotbar row for armor slots and label.
-pub const ARMOR_ROW_HEIGHT: f32 = 64.0;
-/// Gap between the armor row and the hotbar row.
+/// Edge length of one survival armor slot in compact mode.
+pub const ARMOR_SLOT_SIZE_COMPACT: f32 = 28.0;
+/// Gap between the armor row and the main grid.
 pub const ARMOR_ROW_GAP: f32 = 14.0;
+/// Maximum number of footer lines (name, hint, craft hint, two control lines).
+pub const INVENTORY_FOOTER_LINE_COUNT: usize = 5;
+/// Footer line offsets in compact mode (960x540 at 125% and smaller).
+pub const INVENTORY_FOOTER_LINES_COMPACT: [f32; INVENTORY_FOOTER_LINE_COUNT] = [10.0, 30.0, 48.0, 66.0, 84.0];
+
+/// One stack held by the inventory-screen cursor while planning a move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InventoryCursor {
+    /// Player inventory slot the preview was taken from (`0..36`).
+    pub from: usize,
+    /// Stack shown under the pointer.
+    pub stack: ItemStack,
+}
 
 /// One visible inventory slot: its position in the full block list and its rect.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -108,29 +124,52 @@ pub struct InventoryState {
     pub armor_hovered: Option<ArmorSlot>,
     /// First visible grid row (creative palette only).
     pub scroll: usize,
+    /// Stack picked up by the first inventory click, before the second click
+    /// turns it into an authoritative move.
+    pub cursor: Option<InventoryCursor>,
 }
 
-/// Computed geometry of the one-row survival inventory.
+/// Computed geometry of the four-row survival inventory.
+///
+/// `slots` is in wire-slot order: indices `0..9` are the bottom hotbar row and
+/// `9..36` are the three main rows above it. The visual rows are laid out top to
+/// bottom (main rows, then hotbar), but the vector order matches the server's
+/// slot addresses so hit-testing and drawing can share the inventory array.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SurvivalInventoryLayout {
     /// Centred panel rectangle.
     pub panel: UiRect,
-    /// Nine hotbar-slot rectangles in slot order.
+    /// 36 slot rectangles in wire-slot order (hotbar first, then main).
     pub slots: Vec<UiRect>,
     /// Four armor slots in helmet, chestplate, leggings, boots order.
     pub armor_slots: Vec<UiRect>,
+    /// Y of the armor label.
+    pub armor_label_y: f32,
     /// Y of the armor slot row.
     pub armor_top: f32,
+    /// Y of the "Main" section label.
+    pub main_label_y: f32,
+    /// Y of the first main-inventory row.
+    pub main_top: f32,
+    /// Y of the "Hotbar" section label.
+    pub hotbar_label_y: f32,
+    /// Y of the hotbar row.
+    pub hotbar_top: f32,
     /// Slot edge length after responsive shrinking.
     pub slot_size: f32,
+    /// Whether compact 960x540@125%-style metrics are in use.
+    pub compact: bool,
     /// Y of the footer separator; drawing and spacing tests share it.
     pub footer_top: f32,
-    /// Bottom edge of the hotbar-slot row.
+    /// Footer line offsets from [`Self::footer_top`].
+    pub footer_lines: [f32; INVENTORY_FOOTER_LINE_COUNT],
+    /// Bottom edge of the last visual grid row.
     pub grid_bottom: f32,
 }
 
 impl SurvivalInventoryLayout {
-    /// Maps a UI point to a hotbar slot, or `None` outside every slot.
+    /// Maps a UI point to a player inventory slot (`0..36`), or `None` outside
+    /// every slot.
     pub fn hit_test(&self, x: f32, y: f32) -> Option<usize> {
         self.slots.iter().position(|slot| slot.contains(x, y))
     }
@@ -197,6 +236,12 @@ pub enum HotbarIcon {
         /// Cooked cuts use darker, browner colours.
         cooked: bool,
     },
+    /// A small pile of crop seeds.
+    Seeds,
+    /// A bundle of harvested wheat.
+    Wheat,
+    /// A baked bread loaf.
+    Bread,
 }
 
 /// Metal family for raw ore nuggets.
@@ -339,6 +384,70 @@ const AXE_ART: [&str; ITEM_ICON_GRID] = [
     ".....hh.....",
     "....hh......",
     "...hh.......",
+    "..H.........",
+];
+
+/// 12x12 seed pile (1.2 farming).
+const SEEDS_ART: [&str; ITEM_ICON_GRID] = [
+    "............",
+    "............",
+    "............",
+    "....s.......",
+    "...sSs..s...",
+    "....s..sSs..",
+    "........s...",
+    "..s....s....",
+    ".sSs..sSs...",
+    "..s....s....",
+    "............",
+    "............",
+];
+
+/// 12x12 wheat bundle (1.2 farming).
+const WHEAT_ART: [&str; ITEM_ICON_GRID] = [
+    ".....g.g....",
+    "....gWgWg...",
+    ".....gWg....",
+    "....gWgWg...",
+    ".....gWg....",
+    "....gWgWg...",
+    ".....gWg....",
+    "....gWgWg...",
+    ".....gWg....",
+    ".....hWh....",
+    ".....hWh....",
+    ".....hhh....",
+];
+
+/// 12x12 bread loaf (1.2 farming).
+const BREAD_ART: [&str; ITEM_ICON_GRID] = [
+    "............",
+    "............",
+    "...bbbbbb...",
+    "..bBBBBBBb..",
+    ".bBBbbbbBBb.",
+    ".bBBBBBBBBb.",
+    ".bBBBBBBBBb.",
+    ".bBBbbbbBBb.",
+    "..bBBBBBBb..",
+    "...bbbbbb...",
+    "............",
+    "............",
+];
+
+/// 12x12 hoe silhouette (1.2 farming tool).
+const HOE_ART: [&str; ITEM_ICON_GRID] = [
+    "............",
+    "....+++++...",
+    "...+#####+..",
+    "...##..##...",
+    "....###hh...",
+    ".......hh...",
+    "......hh....",
+    ".....hh.....",
+    "....hh......",
+    "...hh.......",
+    "..hh........",
     "..H.........",
 ];
 
@@ -579,6 +688,12 @@ impl InventoryState {
         self.hovered = None;
         self.armor_hovered = None;
         self.scroll = 0;
+        self.cursor = None;
+    }
+
+    /// Clears a pending click-to-move preview.
+    pub fn clear_cursor(&mut self) {
+        self.cursor = None;
     }
 
     /// Updates the hovered item from a cursor position.
@@ -750,6 +865,7 @@ pub fn tool_kind_label(kind: ToolKind) -> &'static str {
         ToolKind::Axe => "Axe",
         ToolKind::Shovel => "Shovel",
         ToolKind::Sword => "Sword",
+        ToolKind::Hoe => "Hoe",
     }
 }
 
@@ -835,62 +951,134 @@ pub fn draw_stack_durability(frame: &mut UiFrame, slot: UiRect, registry: &Regis
     }
 }
 
-/// Computes the centred panel and the nine-slot survival hotbar row.
+/// Computes the centred panel and the four-row survival inventory layout.
+///
+/// The grid is always nine columns: three main rows (`9..36`) above the hotbar
+/// row (`0..9`), with the armor row above that. The layout is responsive in both
+/// width and height so it fits 1280x720, 960x540, and the logical targets those
+/// physical sizes produce at 125/150% GUI scale (for example 768x432 and
+/// 640x360). Below 560 logical pixels of height it switches to compact chrome
+/// (shorter title/footer, smaller armor slots and tighter rows).
 pub fn survival_layout(screen: [f32; 2]) -> SurvivalInventoryLayout {
     let width = screen[0].max(1.0);
     let height = screen[1].max(1.0);
-    let gap = INVENTORY_GAP;
-    let max_grid_width = (width - 2.0 * INVENTORY_MARGIN - 2.0 * SURVIVAL_PADDING).max(1.0);
+    let compact = height < 560.0;
+    let margin = if compact { 16.0 } else { INVENTORY_MARGIN };
+    let padding = if compact { 20.0 } else { SURVIVAL_PADDING };
+    let gap = if compact { 6.0 } else { INVENTORY_GAP };
     let columns = SURVIVAL_COLUMNS as f32;
+    let max_grid_width = (width - 2.0 * margin - 2.0 * padding).max(1.0);
     let slot_from_width = (max_grid_width - gap * (columns - 1.0)) / columns;
-    let slot_size = slot_from_width.clamp(MIN_SLOT_SIZE, INVENTORY_SLOT_SIZE);
-    let grid_width = columns * slot_size + gap * (columns - 1.0);
-    let panel_width = grid_width + 2.0 * SURVIVAL_PADDING;
-    let panel_height = INVENTORY_TITLE_HEIGHT
-        + ARMOR_ROW_HEIGHT
-        + ARMOR_ROW_GAP
-        + slot_size
-        + INVENTORY_GRID_GAP
-        + INVENTORY_FOOTER_HEIGHT
-        // The armour row starts 10 px lower to clear the header rule.
-        + 10.0;
+
+    let title_height = if compact { 40.0 } else { INVENTORY_TITLE_HEIGHT };
+    let footer_height = if compact { 96.0 } else { INVENTORY_FOOTER_HEIGHT };
+    let armor_slot = if compact {
+        ARMOR_SLOT_SIZE_COMPACT
+    } else {
+        ARMOR_SLOT_SIZE
+    };
+    let label_height = if compact { 10.0 } else { 14.0 };
+    let section_gap = if compact { 2.0 } else { 6.0 };
+    let armor_tail = 14.0;
+    let hotbar_gap = if compact { 6.0 } else { 8.0 };
+    let grid_to_footer = INVENTORY_GRID_GAP;
+
+    // Every offset is relative to the panel top. The slot-dependent part is
+    // four rows plus the three inter-row gaps; the rest is fixed chrome.
+    // Keep the section label clear of the 1 px header rule (drawn at y = 62
+    // regular / 38 compact).
+    let armor_label_y = title_height + if compact { 6.0 } else { 14.0 };
+    let armor_top = armor_label_y + label_height + section_gap;
+    let main_label_y = armor_top + armor_slot + armor_tail;
+    let main_top = main_label_y + label_height + section_gap;
+    let fixed_height = main_top + 2.0 * gap + hotbar_gap + label_height + grid_to_footer + footer_height;
+    let available_height = (height - 2.0 * margin).max(1.0);
+    let slot_from_height = (available_height - fixed_height) / 4.0;
+    let slot_size = slot_from_width
+        .min(slot_from_height)
+        .clamp(MIN_SLOT_SIZE, INVENTORY_SLOT_SIZE);
+    let grid_width = columns * slot_size + (columns - 1.0) * gap;
+    let panel_width = grid_width + 2.0 * padding;
+    let panel_height = fixed_height + 4.0 * slot_size;
     let panel = UiRect::new(
         (width - panel_width) / 2.0,
-        (height - panel_height) / 2.0,
+        ((height - panel_height) / 2.0).max(0.0),
         panel_width,
         panel_height,
     );
-    let grid_x = panel.x + SURVIVAL_PADDING;
-    let armor_top = panel.y + INVENTORY_TITLE_HEIGHT + 30.0;
+    let grid_x = panel.x + padding;
     let armor_gap = 8.0;
-    let armor_width = 4.0 * ARMOR_SLOT_SIZE + 3.0 * armor_gap;
+    let armor_width = 4.0 * armor_slot + 3.0 * armor_gap;
     let armor_x = panel.x + (panel.w - armor_width) / 2.0;
     let armor_slots = (0..4)
         .map(|index| {
             UiRect::new(
-                armor_x + index as f32 * (ARMOR_SLOT_SIZE + armor_gap),
-                armor_top,
-                ARMOR_SLOT_SIZE,
-                ARMOR_SLOT_SIZE,
+                armor_x + index as f32 * (armor_slot + armor_gap),
+                panel.y + armor_top,
+                armor_slot,
+                armor_slot,
             )
         })
         .collect();
-    let grid_y = armor_top + ARMOR_SLOT_SIZE + ARMOR_ROW_GAP;
-    let slots = (0..SURVIVAL_COLUMNS)
-        .map(|index| UiRect::new(grid_x + index as f32 * (slot_size + gap), grid_y, slot_size, slot_size))
-        .collect();
+    let main_top = panel.y + main_top;
+    let hotbar_label_y = main_top + 3.0 * slot_size + 2.0 * gap + hotbar_gap;
+    let hotbar_top = hotbar_label_y + label_height;
+    let mut slots = vec![UiRect::new(0.0, 0.0, 0.0, 0.0); INVENTORY_SLOTS];
+    for (slot, rect) in slots.iter_mut().enumerate().take(HOTBAR_SLOTS) {
+        *rect = UiRect::new(
+            grid_x + slot as f32 * (slot_size + gap),
+            hotbar_top,
+            slot_size,
+            slot_size,
+        );
+    }
+    for (slot, rect) in slots.iter_mut().enumerate().skip(HOTBAR_SLOTS) {
+        let index = slot - HOTBAR_SLOTS;
+        let row = index / SURVIVAL_COLUMNS;
+        let column = index % SURVIVAL_COLUMNS;
+        *rect = UiRect::new(
+            grid_x + column as f32 * (slot_size + gap),
+            main_top + row as f32 * (slot_size + gap),
+            slot_size,
+            slot_size,
+        );
+    }
     SurvivalInventoryLayout {
         panel,
         slots,
         armor_slots,
-        armor_top,
+        armor_label_y: panel.y + armor_label_y,
+        armor_top: panel.y + armor_top,
+        main_label_y: panel.y + main_label_y,
+        main_top,
+        hotbar_label_y,
+        hotbar_top,
         slot_size,
-        footer_top: panel.y + panel.h - INVENTORY_FOOTER_HEIGHT,
-        grid_bottom: grid_y + slot_size,
+        compact,
+        footer_top: panel.y + panel.h - footer_height,
+        footer_lines: if compact {
+            INVENTORY_FOOTER_LINES_COMPACT
+        } else {
+            INVENTORY_FOOTER_LINES
+        },
+        grid_bottom: hotbar_top + slot_size,
     }
 }
 
-/// Maps a UI point to a survival hotbar slot.
+/// Scale applied to the two compact footer control lines.
+///
+/// The lines are long enough to touch the panel edge at 768x432 when drawn at
+/// full size. Scaling them down (never below 0.55) keeps them inside the panel
+/// without changing the regular 1280x720 typography.
+pub fn survival_footer_scale(panel_width: f32, compact: bool, widest_text: f32) -> f32 {
+    if !compact || widest_text <= 0.0 {
+        return 1.0;
+    }
+    let inner = (panel_width - 2.0 * 20.0).max(1.0);
+    (inner / widest_text).clamp(0.55, 1.0)
+}
+
+/// Maps a UI point to a survival player inventory slot (`0..36`).
 pub fn survival_hit_test(screen: [f32; 2], x: f32, y: f32) -> Option<usize> {
     survival_layout(screen).hit_test(x, y)
 }
@@ -910,13 +1098,129 @@ pub fn armor_index(slot: ArmorSlot) -> usize {
     }
 }
 
-/// Moves the survival inventory selection by arrow-key steps, clamped to the row.
+/// Moves the survival inventory selection by arrow-key steps.
+///
+/// Left/right clamp within the nine-column row, up/down move by one row
+/// (nine slots, with the hotbar as the bottom row). The result is clamped to
+/// `0..count`.
 pub fn move_survival_selection(selected: usize, dx: i32, dy: i32, count: usize) -> usize {
     if count == 0 {
         return 0;
     }
-    let delta = i64::from(dx) + i64::from(dy);
-    (selected as i64 + delta).clamp(0, count as i64 - 1) as usize
+    let mut index = selected.min(count - 1);
+    if dx != 0 {
+        let row_start = index / SURVIVAL_COLUMNS * SURVIVAL_COLUMNS;
+        let row_end = (row_start + SURVIVAL_COLUMNS).min(count);
+        index = (index as i64 + i64::from(dx)).clamp(row_start as i64, row_end as i64 - 1) as usize;
+    }
+    if dy != 0 {
+        index = (index as i64 + i64::from(dy) * SURVIVAL_COLUMNS as i64).clamp(0, count as i64 - 1) as usize;
+    }
+    index
+}
+
+/// Result of applying one click to the inventory cursor state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorClick {
+    /// The click picked a stack up; the screen draws it under the pointer.
+    Picked,
+    /// The click put the held preview back (clicking its source again).
+    Cancelled,
+    /// The click completes a two-step move from `from` to `to`.
+    Move {
+        /// Player inventory slot the preview came from.
+        from: usize,
+        /// Player inventory slot that was clicked.
+        to: usize,
+        /// Stack preview held before the click.
+        stack: ItemStack,
+    },
+    /// The clicked slot is empty or out of range; nothing changed.
+    Ignored,
+}
+
+/// Applies the shared click-to-pick/click-to-place state machine.
+///
+/// Both the single-player and network inventory screens call this so a click
+/// maps to the same slots and counts; the caller only has to apply the returned
+/// [`CursorClick::Move`] to its authoritative host or network client.
+pub fn click_cursor_slot(state: &mut InventoryState, inventory: &[Option<ItemStack>], slot: usize) -> CursorClick {
+    if slot >= INVENTORY_SLOTS {
+        state.clear_cursor();
+        return CursorClick::Ignored;
+    }
+    if let Some(cursor) = state.cursor {
+        state.clear_cursor();
+        if cursor.from == slot {
+            return CursorClick::Cancelled;
+        }
+        // A sync may have moved the source stack since the preview was taken;
+        // surface the move anyway and let the host reject it rather than
+        // duplicating a stale count locally.
+        if inventory.get(cursor.from).copied().flatten().is_none() {
+            return CursorClick::Ignored;
+        }
+        return CursorClick::Move {
+            from: cursor.from,
+            to: slot,
+            stack: cursor.stack,
+        };
+    }
+    let Some(stack) = inventory.get(slot).copied().flatten().filter(|stack| stack.count > 0) else {
+        return CursorClick::Ignored;
+    };
+    state.cursor = Some(InventoryCursor { from: slot, stack });
+    CursorClick::Picked
+}
+
+/// Destination and count for a shift-click quick transfer between the hotbar
+/// and main inventory.
+///
+/// The other section is searched for a compatible non-full stack first, then
+/// for the first empty slot. `None` means the item is equipment (click the
+/// armor slot instead) or the other section has no room.
+pub fn quick_transfer_target(registry: &Registry, inventory: &[Option<ItemStack>], slot: usize) -> Option<(usize, u8)> {
+    if slot >= INVENTORY_SLOTS {
+        return None;
+    }
+    let stack = inventory.get(slot).copied().flatten().filter(|stack| stack.count > 0)?;
+    let range = if slot < HOTBAR_SLOTS {
+        HOTBAR_SLOTS..INVENTORY_SLOTS
+    } else {
+        0..HOTBAR_SLOTS
+    };
+    let max_stack = registry.item(stack.item).max_stack.clamp(1, u8::MAX);
+    let mut merge_target = None;
+    let mut empty_target = None;
+    for target in range {
+        match inventory.get(target).copied().flatten() {
+            None if empty_target.is_none() => empty_target = Some(target),
+            Some(existing)
+                if merge_target.is_none()
+                    && existing.item == stack.item
+                    && existing.durability == stack.durability
+                    && existing.count < max_stack =>
+            {
+                merge_target = Some(target)
+            }
+            _ => {}
+        }
+    }
+    merge_target.or(empty_target).map(|target| (target, stack.count))
+}
+
+/// Draws the stack currently held by the pointer on top of the inventory panel.
+pub fn draw_cursor_stack(frame: &mut UiFrame, registry: &Registry, stack: ItemStack, cursor: (f32, f32)) {
+    if stack.count == 0 {
+        return;
+    }
+    let size = 32.0;
+    let x = cursor.0 - size / 2.0;
+    let y = cursor.1 - size / 2.0;
+    frame.rect(x - 2.0, y - 2.0, size + 4.0, size + 4.0, [0.03, 0.04, 0.06, 0.85]);
+    draw_item_icon(frame, registry, Some(stack), x, y, size);
+    let slot = UiRect::new(x, y, size, size);
+    draw_stack_count(frame, slot, stack.count);
 }
 
 /// Cycles the survival inventory selection with the mouse wheel.
@@ -1000,6 +1304,9 @@ pub fn item_icon_for(registry: &Registry, item: ItemId) -> Option<HotbarIcon> {
             kind: MeatKind::Porkchop,
             cooked: true,
         }),
+        "openblock:seeds" => Some(HotbarIcon::Seeds),
+        "openblock:wheat" => Some(HotbarIcon::Wheat),
+        "openblock:bread" => Some(HotbarIcon::Bread),
         _ => None,
     }
 }
@@ -1051,7 +1358,29 @@ fn tool_art(kind: ToolKind) -> [&'static str; ITEM_ICON_GRID] {
         ToolKind::Axe => AXE_ART,
         ToolKind::Shovel => SHOVEL_ART,
         ToolKind::Sword => SWORD_ART,
+        ToolKind::Hoe => HOE_ART,
     }
+}
+
+/// Flat representative colours of the 1.2 crop items.
+fn crop_icon_parts(art: &[&str; ITEM_ICON_GRID], x: f32, y: f32, size: f32) -> Vec<IconPart> {
+    const SEED_DARK: [f32; 4] = [0.36, 0.27, 0.15, 1.0];
+    const SEED_LIGHT: [f32; 4] = [0.72, 0.58, 0.31, 1.0];
+    const WHEAT_STALK: [f32; 4] = [0.58, 0.44, 0.19, 1.0];
+    const WHEAT_GRAIN: [f32; 4] = [0.89, 0.72, 0.31, 1.0];
+    const WHEAT_GRAIN_DARK: [f32; 4] = [0.72, 0.55, 0.20, 1.0];
+    const BREAD_CRUST: [f32; 4] = [0.55, 0.31, 0.13, 1.0];
+    const BREAD_CRUMB: [f32; 4] = [0.82, 0.60, 0.30, 1.0];
+    grid_parts(art, x, y, size, |glyph| match glyph {
+        's' => Some(SEED_DARK),
+        'S' => Some(SEED_LIGHT),
+        'g' => Some(WHEAT_GRAIN_DARK),
+        'W' => Some(WHEAT_GRAIN),
+        'h' => Some(WHEAT_STALK),
+        'b' => Some(BREAD_CRUST),
+        'B' => Some(BREAD_CRUMB),
+        _ => None,
+    })
 }
 
 /// Procedural stick icon geometry, in draw order.
@@ -1197,6 +1526,9 @@ pub fn item_tint_for(registry: &Registry, item: ItemId) -> Option<[f32; 3]> {
             (MeatKind::Porkchop, false) => RAW_PORK,
             (MeatKind::Porkchop, true) => COOKED_PORK,
         },
+        HotbarIcon::Seeds => [0.55, 0.44, 0.24, 1.0],
+        HotbarIcon::Wheat => [0.84, 0.67, 0.28, 1.0],
+        HotbarIcon::Bread => [0.70, 0.46, 0.20, 1.0],
         HotbarIcon::Block { .. } => return None,
     };
     Some([color[0], color[1], color[2]])
@@ -1307,6 +1639,9 @@ fn draw_icon(frame: &mut UiFrame, icon: HotbarIcon, x: f32, y: f32, size: f32) {
         HotbarIcon::Meat { kind, cooked } => {
             draw_icon_parts(frame, &meat_icon_parts(kind, cooked, x, y, size));
         }
+        HotbarIcon::Seeds => draw_icon_parts(frame, &crop_icon_parts(&SEEDS_ART, x, y, size)),
+        HotbarIcon::Wheat => draw_icon_parts(frame, &crop_icon_parts(&WHEAT_ART, x, y, size)),
+        HotbarIcon::Bread => draw_icon_parts(frame, &crop_icon_parts(&BREAD_ART, x, y, size)),
     }
 }
 
@@ -1334,7 +1669,7 @@ pub fn draw_survival_hotbar(
     frame: &mut UiFrame,
     ui: &UiState,
     registry: &Registry,
-    inventory: &[Option<ItemStack>; HOTBAR_SLOTS],
+    inventory: &[Option<ItemStack>],
     selected: usize,
     screen: [f32; 2],
 ) {
@@ -1382,8 +1717,8 @@ pub fn draw_slot_stack(frame: &mut UiFrame, slot: UiRect, registry: &Registry, s
 /// Authoritative host view needed to draw the survival inventory screen.
 #[derive(Debug, Clone, Copy)]
 pub struct SurvivalInventoryView<'a> {
-    /// Nine hotbar stacks.
-    pub inventory: &'a [Option<ItemStack>; HOTBAR_SLOTS],
+    /// 36 player inventory stacks (hotbar `0..9`, main `9..36`).
+    pub inventory: &'a [Option<ItemStack>; INVENTORY_SLOTS],
     /// Four equipped armor stacks.
     pub equipment: &'a [Option<ItemStack>; 4],
     /// Total armor defence points.
@@ -1400,9 +1735,9 @@ pub struct SurvivalInventoryView<'a> {
     pub craft_hint: Option<&'a str>,
 }
 
-/// Draws the survival inventory screen: four armor slots with durability bars
-/// and a defence total above the nine-slot hotbar row, plus a footer describing
-/// the hovered slot.
+/// Draws the survival inventory screen: four armor slots with durability bars,
+/// three main rows and the hotbar row, plus a footer describing the hovered
+/// slot.
 pub fn draw_survival(
     frame: &mut UiFrame,
     ui: &UiState,
@@ -1416,6 +1751,17 @@ pub fn draw_survival(
     let selected = view.selected;
     let near_table = view.near_table;
     let layout = survival_layout(screen);
+    let padding = if layout.compact { 20.0 } else { SURVIVAL_PADDING };
+    let title_scale = if layout.compact { 2.2 } else { 2.6 };
+    let info_name_scale = if layout.compact { 1.6 } else { 2.0 };
+    let widest_hint = INVENTORY_CONTROL_HINTS
+        .iter()
+        .map(|hint| frame.text_width(1.0, hint))
+        .fold(1.0_f32, f32::max);
+    let footer_scale = survival_footer_scale(layout.panel.w, layout.compact, widest_hint);
+    let title_y = if layout.compact { 10.0 } else { 16.0 };
+    let version_y = if layout.compact { 16.0 } else { 24.0 };
+    let rule_y = if layout.compact { 38.0 } else { 62.0 };
     let white = [1.0, 1.0, 1.0, 1.0];
     let muted = [0.78, 0.83, 0.90, 1.0];
     frame.rect(0.0, 0.0, screen[0], screen[1], [0.0, 0.0, 0.0, 0.55]);
@@ -1450,25 +1796,25 @@ pub fn draw_survival(
         [0.15, 0.18, 0.24, 1.0],
     );
     frame.title_text(
-        layout.panel.x + SURVIVAL_PADDING,
-        layout.panel.y + 16.0,
-        2.6,
+        layout.panel.x + padding,
+        layout.panel.y + title_y,
+        title_scale,
         white,
         "Inventory",
     );
     let version = format!("OpenBlock v{}", ob_core::VERSION);
     let version_width = frame.text_width(1.0, &version);
     frame.text(
-        layout.panel.x + layout.panel.w - SURVIVAL_PADDING - version_width,
-        layout.panel.y + 24.0,
+        layout.panel.x + layout.panel.w - padding - version_width,
+        layout.panel.y + version_y,
         1.0,
         [0.64, 0.70, 0.79, 1.0],
-        &version,
+        version.as_str(),
     );
     frame.rect(
-        layout.panel.x + SURVIVAL_PADDING,
-        layout.panel.y + 62.0,
-        layout.panel.w - 2.0 * SURVIVAL_PADDING,
+        layout.panel.x + padding,
+        layout.panel.y + rule_y,
+        layout.panel.w - 2.0 * padding,
         1.0,
         [0.24, 0.28, 0.35, 1.0],
     );
@@ -1476,8 +1822,8 @@ pub fn draw_survival(
     // --- Armor row: four equip slots plus the defence total ---
     frame.text(
         layout.armor_slots.first().map_or(layout.panel.x, |slot| slot.x),
-        layout.armor_top - 17.0,
-        1.2,
+        layout.armor_label_y,
+        if layout.compact { 1.1 } else { 1.2 },
         muted,
         "Armor",
     );
@@ -1551,23 +1897,42 @@ pub fn draw_survival(
     );
     frame.text(
         defense_x,
-        layout.armor_top + 22.0,
+        layout.armor_top + if layout.compact { 16.0 } else { 22.0 },
         1.6,
         [0.90, 0.94, 1.0, 1.0],
         &format!("{defense}"),
     );
     frame.text(
         defense_x,
-        layout.armor_top + 42.0,
+        layout.armor_top + if layout.compact { 30.0 } else { 42.0 },
         0.9,
         [0.68, 0.73, 0.80, 1.0],
         "click armor",
     );
 
-    for (index, slot) in layout.slots.iter().enumerate() {
+    // --- Section labels: Main (three rows) and Hotbar ---
+    let main_label = "Main";
+    frame.text(
+        layout.slots[HOTBAR_SLOTS].x,
+        layout.main_label_y,
+        if layout.compact { 1.1 } else { 1.2 },
+        muted,
+        main_label,
+    );
+    frame.text(
+        layout.slots[0].x,
+        layout.hotbar_label_y,
+        if layout.compact { 1.1 } else { 1.2 },
+        muted,
+        "Hotbar",
+    );
+
+    for index in (HOTBAR_SLOTS..INVENTORY_SLOTS).chain(0..HOTBAR_SLOTS) {
+        let slot = layout.slots[index];
         let stack = inventory[index];
-        let active = index == selected;
+        let active = index < HOTBAR_SLOTS && index == selected;
         let hovered = ui.inventory.hovered == Some(index);
+        let picked = ui.inventory.cursor.is_some_and(|cursor| cursor.from == index);
         let background = if hovered {
             [0.25, 0.30, 0.38, 0.98]
         } else {
@@ -1576,7 +1941,7 @@ pub fn draw_survival(
         frame.rect(slot.x, slot.y, slot.w, slot.h, background);
         let (thickness, border) = if active {
             (2.0, [1.0, 0.92, 0.45, 1.0])
-        } else if hovered {
+        } else if hovered || picked {
             (2.0, [0.88, 0.92, 0.98, 1.0])
         } else if stack.is_none() {
             (1.0, [0.30, 0.33, 0.38, 0.75])
@@ -1593,24 +1958,28 @@ pub fn draw_survival(
                 slot.y + 5.0,
                 (slot.w - 12.0).max(0.0),
             );
-            draw_stack_count(frame, *slot, stack.count);
-            draw_stack_durability(frame, *slot, registry, stack);
+            draw_stack_count(frame, slot, stack.count);
+            draw_stack_durability(frame, slot, registry, stack);
         }
+    }
+
+    if let Some(cursor) = ui.inventory.cursor {
+        draw_cursor_stack(frame, registry, cursor.stack, ui.cursor);
     }
 
     let footer_top = layout.footer_top;
     frame.rect(
-        layout.panel.x + SURVIVAL_PADDING,
+        layout.panel.x + padding,
         footer_top,
-        layout.panel.w - 2.0 * SURVIVAL_PADDING,
+        layout.panel.w - 2.0 * padding,
         1.0,
         [0.30, 0.34, 0.40, 0.9],
     );
     let info_slot = ui
         .inventory
         .hovered
-        .filter(|index| *index < HOTBAR_SLOTS)
-        .unwrap_or(selected.min(HOTBAR_SLOTS - 1));
+        .filter(|index| *index < INVENTORY_SLOTS)
+        .unwrap_or(selected.min(INVENTORY_SLOTS - 1));
     let armor_info = ui
         .inventory
         .armor_hovered
@@ -1628,14 +1997,14 @@ pub fn draw_survival(
     };
     frame.text_centered(
         layout.panel.x + layout.panel.w / 2.0,
-        footer_top + INVENTORY_FOOTER_LINES[0],
-        2.0,
+        footer_top + layout.footer_lines[0],
+        info_name_scale,
         white,
         &name,
     );
     frame.text_centered(
         layout.panel.x + layout.panel.w / 2.0,
-        footer_top + INVENTORY_FOOTER_LINES[1],
+        footer_top + layout.footer_lines[1],
         1.2,
         muted,
         &hint,
@@ -1647,8 +2016,8 @@ pub fn draw_survival(
     });
     frame.text_centered(
         layout.panel.x + layout.panel.w / 2.0,
-        footer_top + INVENTORY_FOOTER_LINES[2],
-        1.0,
+        footer_top + layout.footer_lines[2],
+        footer_scale,
         if near_table {
             [0.96, 0.80, 0.42, 1.0]
         } else {
@@ -1658,15 +2027,15 @@ pub fn draw_survival(
     );
     frame.text_centered(
         layout.panel.x + layout.panel.w / 2.0,
-        footer_top + INVENTORY_FOOTER_LINES[3],
-        1.0,
+        footer_top + layout.footer_lines[3],
+        footer_scale,
         [0.80, 0.85, 0.92, 1.0],
         INVENTORY_CONTROL_HINTS[0],
     );
     frame.text_centered(
         layout.panel.x + layout.panel.w / 2.0,
-        footer_top + INVENTORY_FOOTER_LINES[4],
-        1.0,
+        footer_top + layout.footer_lines[4],
+        footer_scale,
         [0.80, 0.85, 0.92, 1.0],
         INVENTORY_CONTROL_HINTS[1],
     );
@@ -1697,7 +2066,7 @@ pub fn layout(screen: [f32; 2], item_count: usize, scroll: usize) -> InventoryLa
     let hud_reserve = if height < 480.0 { 56.0 } else { 0.0 };
     let compact = height < 480.0;
     let title_height = if compact { 40.0 } else { INVENTORY_TITLE_HEIGHT };
-    let footer_height = if compact { 92.0 } else { INVENTORY_FOOTER_HEIGHT };
+    let footer_height = if compact { 96.0 } else { INVENTORY_FOOTER_HEIGHT };
     let max_panel_height = (height - 2.0 * INVENTORY_MARGIN - hud_reserve).max(1.0);
     let available_grid_height = (max_panel_height - title_height - footer_height - INVENTORY_GRID_GAP).max(0.0);
     let row_pitch = slot_size + gap;
@@ -1883,8 +2252,7 @@ mod tests {
         let registry = Registry::base();
         let items = inventory_blocks(&registry);
         assert_eq!(items.len(), registry.len() - 1);
-        assert_eq!(items.len(), 19);
-        assert_eq!(registry.len(), 20);
+        assert!(items.len() >= 20, "1.0 base blocks plus 1.2 additions");
         assert!(!items.contains(&BlockId::AIR));
         for name in [
             "openblock:stone",
@@ -2060,11 +2428,14 @@ mod tests {
             }
 
             let survival = survival_layout(screen);
+            assert_eq!(survival.slots.len(), INVENTORY_SLOTS);
             assert!(survival.footer_top - survival.grid_bottom >= INVENTORY_GRID_GAP - 0.01);
             assert!(survival.grid_bottom > survival.panel.y + INVENTORY_TITLE_HEIGHT);
             for pair in survival.slots.windows(2) {
-                assert!(pair[1].x - (pair[0].x + pair[0].w) >= INVENTORY_GAP - 0.01);
-                assert!((pair[0].w - INVENTORY_SLOT_SIZE).abs() < 0.01);
+                if (pair[0].y - pair[1].y).abs() > 0.01 {
+                    continue;
+                }
+                assert!(pair[1].x - (pair[0].x + pair[0].w) >= 0.5);
             }
         }
         for pair in INVENTORY_FOOTER_LINES.windows(2) {
@@ -2123,10 +2494,11 @@ mod tests {
     }
 
     #[test]
-    fn survival_layout_is_a_centred_nine_slot_row() {
+    fn survival_layout_is_a_centred_four_row_grid() {
         let screen = [1280.0, 720.0];
         let layout = survival_layout(screen);
-        assert_eq!(layout.slots.len(), HOTBAR_SLOTS);
+        assert_eq!(layout.slots.len(), INVENTORY_SLOTS);
+        assert_eq!(MAIN_ROWS, 3);
         assert_eq!(layout.slot_size, INVENTORY_SLOT_SIZE);
         let centre = layout.panel.center();
         assert!((centre.0 - 640.0).abs() < 0.01);
@@ -2139,7 +2511,131 @@ mod tests {
             layout.hit_test(layout.slots[4].center().0, layout.slots[4].center().1),
             Some(4)
         );
+        assert_eq!(
+            layout.hit_test(layout.slots[9].center().0, layout.slots[9].center().1),
+            Some(9)
+        );
+        assert_eq!(
+            layout.hit_test(layout.slots[35].center().0, layout.slots[35].center().1),
+            Some(35)
+        );
+        assert!(
+            layout.slots[9].y < layout.slots[0].y,
+            "main rows sit above the hotbar row"
+        );
         assert_eq!(survival_hit_test(screen, 1.0, 1.0), None);
+    }
+
+    #[test]
+    fn survival_layout_fits_compact_targets_and_maps_every_main_click() {
+        for screen in [[1280.0_f32, 720.0], [960.0, 540.0], [768.0, 432.0], [640.0, 360.0]] {
+            let layout = survival_layout(screen);
+            assert_eq!(layout.slots.len(), INVENTORY_SLOTS, "{screen:?}");
+            assert!(layout.panel.x >= 0.0 && layout.panel.y >= 0.0, "{screen:?}");
+            assert!(layout.panel.x + layout.panel.w <= screen[0] + 0.01, "{screen:?}");
+            assert!(layout.panel.y + layout.panel.h <= screen[1] + 0.01, "{screen:?}");
+            assert!(layout.slot_size >= MIN_SLOT_SIZE, "{screen:?}");
+            assert!(layout.footer_top >= layout.grid_bottom, "{screen:?}");
+            let last_line = layout.footer_lines[layout.footer_lines.len() - 1] + ob_render::line_height(1.0);
+            assert!(
+                layout.footer_top + last_line <= layout.panel.y + layout.panel.h,
+                "compact footer must fit at {screen:?}"
+            );
+            for (index, slot) in layout.slots.iter().enumerate() {
+                assert!(
+                    slot.x >= layout.panel.x && slot.y >= layout.panel.y,
+                    "{screen:?} {index}"
+                );
+                assert!(slot.x + slot.w <= layout.panel.x + layout.panel.w + 0.01);
+                assert!(slot.y + slot.h <= layout.panel.y + layout.panel.h + 0.01);
+                assert_eq!(
+                    layout.hit_test(slot.center().0, slot.center().1),
+                    Some(index),
+                    "click mapping for slot {index} at {screen:?}"
+                );
+            }
+            for armor in &layout.armor_slots {
+                assert!(armor.x >= layout.panel.x && armor.x + armor.w <= layout.panel.x + layout.panel.w);
+                assert!(armor.y >= layout.panel.y && armor.y + armor.h <= layout.footer_top);
+            }
+            assert!(layout.armor_label_y < layout.armor_top);
+            assert!(layout.main_label_y < layout.main_top);
+            assert!(layout.hotbar_label_y < layout.hotbar_top);
+            let frame = UiFrame::new(screen[0], screen[1]);
+            let widest = INVENTORY_CONTROL_HINTS
+                .iter()
+                .map(|hint| frame.text_width(1.0, hint))
+                .fold(1.0_f32, f32::max);
+            let scale = survival_footer_scale(layout.panel.w, layout.compact, widest);
+            let inner = layout.panel.w - 2.0 * if layout.compact { 20.0 } else { SURVIVAL_PADDING };
+            assert!(
+                widest * scale <= inner + 0.01,
+                "footer controls fit at {screen:?}: widest {widest} × {scale} vs inner {inner}"
+            );
+        }
+        assert!(survival_layout([768.0, 432.0]).compact);
+        assert!(survival_layout([1280.0, 720.0]).slot_size >= 40.0);
+    }
+
+    #[test]
+    fn shared_cursor_click_plan_picks_places_and_cancels() {
+        let registry = Registry::base();
+        let stone = registry.item_id("openblock:stone").unwrap();
+        let mut inventory = [None; INVENTORY_SLOTS];
+        inventory[9] = Some(ItemStack::new(stone, 12));
+        let mut state = InventoryState::default();
+        assert_eq!(click_cursor_slot(&mut state, &inventory, 9), CursorClick::Picked);
+        assert_eq!(state.cursor.map(|cursor| cursor.from), Some(9));
+        assert_eq!(
+            click_cursor_slot(&mut state, &inventory, 3),
+            CursorClick::Move {
+                from: 9,
+                to: 3,
+                stack: ItemStack::new(stone, 12)
+            }
+        );
+        assert!(state.cursor.is_none());
+
+        // Clicking the source again cancels the preview.
+        assert_eq!(click_cursor_slot(&mut state, &inventory, 9), CursorClick::Picked);
+        assert_eq!(click_cursor_slot(&mut state, &inventory, 9), CursorClick::Cancelled);
+        assert!(state.cursor.is_none());
+
+        // Empty/out-of-range slots and a stale source are ignored safely.
+        assert_eq!(click_cursor_slot(&mut state, &inventory, 4), CursorClick::Ignored);
+        assert_eq!(
+            click_cursor_slot(&mut state, &inventory, INVENTORY_SLOTS),
+            CursorClick::Ignored
+        );
+        state.cursor = Some(InventoryCursor {
+            from: 9,
+            stack: ItemStack::new(stone, 12),
+        });
+        inventory[9] = None;
+        assert_eq!(click_cursor_slot(&mut state, &inventory, 3), CursorClick::Ignored);
+        assert!(state.cursor.is_none());
+    }
+
+    #[test]
+    fn quick_transfer_targets_the_other_row_and_reports_no_room() {
+        let registry = Registry::base();
+        let stone = registry.item_id("openblock:stone").unwrap();
+        let apple = registry.item_id("openblock:apple").unwrap();
+        let mut inventory = [None; INVENTORY_SLOTS];
+        inventory[0] = Some(ItemStack::new(stone, 20));
+        inventory[12] = Some(ItemStack::new(stone, 50));
+        assert_eq!(quick_transfer_target(&registry, &inventory, 0), Some((12, 20)));
+        inventory[12] = None;
+        assert_eq!(quick_transfer_target(&registry, &inventory, 0), Some((9, 20)));
+
+        inventory[12] = Some(ItemStack::new(apple, 3));
+        assert_eq!(quick_transfer_target(&registry, &inventory, 12), Some((1, 3)));
+        for slot in inventory.iter_mut().skip(HOTBAR_SLOTS) {
+            *slot = Some(ItemStack::new(stone, 64));
+        }
+        inventory[0] = Some(ItemStack::new(apple, 1));
+        assert_eq!(quick_transfer_target(&registry, &inventory, 0), None);
+        assert_eq!(quick_transfer_target(&registry, &inventory, INVENTORY_SLOTS), None);
     }
 
     #[test]
@@ -2147,10 +2643,10 @@ mod tests {
         let screen = [1280.0, 720.0];
         let layout = survival_layout(screen);
         assert_eq!(layout.armor_slots.len(), 4);
-        assert_eq!(layout.slots.len(), HOTBAR_SLOTS);
-        let first_hotbar = layout.slots[0];
+        assert_eq!(layout.slots.len(), INVENTORY_SLOTS);
+        let first_main = layout.slots[HOTBAR_SLOTS];
         for armor in &layout.armor_slots {
-            assert!(armor.y + armor.h <= first_hotbar.y);
+            assert!(armor.y + armor.h <= first_main.y);
             assert!(layout.panel.contains(armor.x + 0.1, armor.y + 0.1));
             assert!(layout.panel.contains(armor.x + armor.w - 0.1, armor.y + armor.h - 0.1));
         }
@@ -2186,14 +2682,16 @@ mod tests {
 
     #[test]
     fn survival_selection_navigation_clamps_and_wheel_wraps() {
-        assert_eq!(move_survival_selection(0, 1, 0, HOTBAR_SLOTS), 1);
-        assert_eq!(move_survival_selection(0, 0, 1, HOTBAR_SLOTS), 1);
-        assert_eq!(move_survival_selection(0, -1, 0, HOTBAR_SLOTS), 0);
-        assert_eq!(move_survival_selection(8, 1, 0, HOTBAR_SLOTS), 8);
-        assert_eq!(move_survival_selection(8, 0, 2, HOTBAR_SLOTS), 8);
-        assert_eq!(cycle_survival_selection(8, 1, HOTBAR_SLOTS), 0);
-        assert_eq!(cycle_survival_selection(0, -1, HOTBAR_SLOTS), 8);
-        assert_eq!(cycle_survival_selection(3, 20, HOTBAR_SLOTS), 5);
+        assert_eq!(move_survival_selection(0, 1, 0, INVENTORY_SLOTS), 1);
+        assert_eq!(move_survival_selection(0, 0, 1, INVENTORY_SLOTS), 9);
+        assert_eq!(move_survival_selection(0, -1, 0, INVENTORY_SLOTS), 0);
+        assert_eq!(move_survival_selection(8, 1, 0, INVENTORY_SLOTS), 8);
+        assert_eq!(move_survival_selection(8, 0, 1, INVENTORY_SLOTS), 17);
+        assert_eq!(move_survival_selection(35, 0, 1, INVENTORY_SLOTS), 35);
+        assert_eq!(move_survival_selection(35, 1, 0, INVENTORY_SLOTS), 35);
+        assert_eq!(cycle_survival_selection(35, 1, INVENTORY_SLOTS), 0);
+        assert_eq!(cycle_survival_selection(0, -1, INVENTORY_SLOTS), 35);
+        assert_eq!(cycle_survival_selection(3, 20, INVENTORY_SLOTS), 23);
         assert_eq!(move_survival_selection(3, 1, 0, 0), 0);
         assert_eq!(cycle_survival_selection(3, 1, 0), 0);
     }
@@ -2280,7 +2778,7 @@ mod tests {
     #[test]
     fn every_catalogued_item_has_an_icon_and_new_items_use_their_own_shapes() {
         let registry = Registry::base();
-        assert_eq!(registry.item_len(), 52);
+        assert!(registry.item_len() >= 52, "1.0 catalogue plus 1.2 append-only items");
         for (item, item_type) in registry.items() {
             assert!(
                 item_icon_for(&registry, item).is_some(),
@@ -2320,6 +2818,22 @@ mod tests {
                 material: ArmorMaterial::Iron
             }
         );
+        if registry.item_id("openblock:seeds").is_some() {
+            assert_eq!(icon("openblock:seeds"), HotbarIcon::Seeds);
+            assert_eq!(icon("openblock:wheat"), HotbarIcon::Wheat);
+            assert_eq!(icon("openblock:bread"), HotbarIcon::Bread);
+        }
+        for hoe in ["openblock:wood_hoe", "openblock:stone_hoe", "openblock:iron_hoe"] {
+            if let Some(item) = registry.item_id(hoe) {
+                assert!(matches!(
+                    item_icon_for(&registry, item),
+                    Some(HotbarIcon::Tool {
+                        kind: ToolKind::Hoe,
+                        ..
+                    })
+                ));
+            }
+        }
         assert_eq!(
             icon("openblock:raw_beef"),
             HotbarIcon::Meat {
@@ -2744,7 +3258,8 @@ mod tests {
             assert_eq!(name, display_name(item_type.id));
             names.push(name);
         }
-        assert_eq!(names.len(), 52);
+        assert_eq!(names.len(), registry.item_len());
+        assert!(names.len() >= 52, "1.0 catalogue plus append-only 1.2 items");
         for expected in [
             "Iron Pickaxe",
             "Leather Chestplate",

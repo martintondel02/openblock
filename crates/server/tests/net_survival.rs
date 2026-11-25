@@ -1,4 +1,4 @@
-//! Loopback integration tests for protocol v2 server-authoritative survival.
+//! Loopback integration tests for protocol v3 server-authoritative survival.
 //!
 //! Each test starts a real dedicated server on `127.0.0.1:0` with a temporary
 //! world, connects raw `std::net::TcpStream` clients and exchanges the public
@@ -250,6 +250,7 @@ fn inventory_of(message: &ServerMessage) -> ([Option<ItemStackDto>; 9], u8, [Opt
     match message {
         ServerMessage::InventorySync {
             hotbar,
+            main: _,
             selected,
             equipment,
         } => (hotbar.clone(), *selected, equipment.clone()),
@@ -666,7 +667,7 @@ fn eat_and_equip_armor_mitigate_damage() {
         .position(Option::is_none)
         .expect("free slot") as u16;
     alice.send(ClientMessage::InventoryMove {
-        from: 9,
+        from: 36,
         to: free,
         count: 1,
         revision: None,
@@ -1266,16 +1267,151 @@ fn reconnect_and_restart_restore_network_player_state() {
 }
 
 #[test]
-fn protocol_v1_client_is_rejected_with_reason() {
+fn thirty_six_slot_inventory_moves_equips_and_survives_reconnect() {
+    let mut server = TestServer::start("inventory36");
+    let mut alice = TestClient::connect(server.addr());
+    let joined = join(&server, &mut alice, "alice");
+    assert!(server.server().give_network_item(joined.id, "openblock:stone", 40));
+    assert!(server.server().give_network_item(joined.id, "openblock:iron_helmet", 1));
+
+    // Initial sync: all items start in the nine hotbar slots and the 27 main
+    // slots are explicitly present and empty.
+    let sync = alice.recv_until("initial hotbar items", |message| match message {
+        ServerMessage::InventorySync { hotbar, main, .. } => {
+            main.iter().all(Option::is_none)
+                && hotbar.iter().flatten().any(|stack| stack.item == "openblock:stone")
+                && hotbar
+                    .iter()
+                    .flatten()
+                    .any(|stack| stack.item == "openblock:iron_helmet")
+        }
+        _ => false,
+    });
+    let ServerMessage::InventorySync { hotbar, main, .. } = sync else {
+        unreachable!()
+    };
+    assert_eq!(main.len(), 27);
+    assert_eq!(
+        hotbar
+            .iter()
+            .flatten()
+            .filter(|stack| stack.item == "openblock:stone")
+            .map(|stack| u32::from(stack.count))
+            .sum::<u32>(),
+        40
+    );
+    let helmet_slot = hotbar
+        .iter()
+        .position(|slot| slot.as_ref().is_some_and(|stack| stack.item == "openblock:iron_helmet"))
+        .expect("helmet in the hotbar");
+
+    // Hotbar slot 0 -> main slot 9 (wire address 0 -> 9).
+    alice.send(ClientMessage::InventoryMove {
+        from: 0,
+        to: 9,
+        count: 40,
+        revision: None,
+    });
+    alice.recv_until("stone moved to main", |message| match message {
+        ServerMessage::InventorySync { hotbar, main, .. } => {
+            hotbar
+                .iter()
+                .all(|slot| slot.as_ref().is_none_or(|stack| stack.item != "openblock:stone"))
+                && main[0]
+                    .as_ref()
+                    .is_some_and(|stack| stack.item == "openblock:stone" && stack.count == 40)
+        }
+        _ => false,
+    });
+
+    // Main slot 9 -> hotbar slot 0 for a partial stack.
+    alice.send(ClientMessage::InventoryMove {
+        from: 9,
+        to: 0,
+        count: 20,
+        revision: None,
+    });
+    alice.recv_until("half stone moved back", |message| match message {
+        ServerMessage::InventorySync { hotbar, main, .. } => {
+            hotbar[0]
+                .as_ref()
+                .is_some_and(|stack| stack.item == "openblock:stone" && stack.count == 20)
+                && main[0]
+                    .as_ref()
+                    .is_some_and(|stack| stack.item == "openblock:stone" && stack.count == 20)
+        }
+        _ => false,
+    });
+
+    // Equip the helmet from its hotbar slot using the new equipment address 36.
+    alice.send(ClientMessage::InventoryMove {
+        from: helmet_slot as u16,
+        to: 36,
+        count: 1,
+        revision: None,
+    });
+    alice.recv_until("helmet equipped at address 36", |message| match message {
+        ServerMessage::InventorySync { hotbar, equipment, .. } => {
+            equipment[0]
+                .as_ref()
+                .is_some_and(|stack| stack.item == "openblock:iron_helmet")
+                && hotbar[helmet_slot].is_none()
+        }
+        _ => false,
+    });
+
+    // Reconnect with the same name: the inventory and equipment are restored.
+    alice.send(ClientMessage::Disconnect);
+    drop(alice);
+    let deadline = Instant::now() + WAIT;
+    while server.server().player_count() != 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut again = TestClient::connect(server.addr());
+    let rejoined = join(&server, &mut again, "alice");
+    let ServerMessage::InventorySync {
+        hotbar,
+        main,
+        selected,
+        equipment,
+    } = rejoined.inventory
+    else {
+        unreachable!()
+    };
+    assert_eq!(selected, 0);
+    assert_eq!(main.len(), 27);
+    assert!(
+        main[0]
+            .as_ref()
+            .is_some_and(|stack| stack.item == "openblock:stone" && stack.count == 20)
+    );
+    assert!(
+        hotbar[0]
+            .as_ref()
+            .is_some_and(|stack| stack.item == "openblock:stone" && stack.count == 20)
+    );
+    assert!(
+        equipment[0]
+            .as_ref()
+            .is_some_and(|stack| stack.item == "openblock:iron_helmet")
+    );
+    again.send(ClientMessage::Disconnect);
+    drop(again);
+    server.stop();
+}
+
+#[test]
+fn protocol_v2_client_is_rejected_with_reason() {
     let mut server = TestServer::start("protocol");
     let mut old = TestClient::connect(server.addr());
     old.send(ClientMessage::Hello {
-        protocol: 1,
+        protocol: 2,
         name: "legacy".to_string(),
     });
     let reason = old.expect_disconnect("protocol_mismatch");
-    assert!(reason.contains("server protocol 2"), "{reason}");
-    assert_eq!(ob_protocol::PROTOCOL_VERSION, 2);
+    assert!(reason.contains("server protocol 3"), "{reason}");
+    assert!(reason.contains("upgrade"), "{reason}");
+    assert_eq!(ob_protocol::PROTOCOL_VERSION, 3);
     server.stop();
 }
 

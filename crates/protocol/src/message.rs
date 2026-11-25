@@ -17,11 +17,12 @@ use crate::frame::MAX_FRAME_LEN;
 
 /// The protocol version implemented by this crate.
 ///
-/// Version 2 adds server-authoritative survival state (vitals, inventory,
-/// equipment, container windows, damage/death/respawn) and entity replication
-/// for mobs and dropped items. Version 1 clients are rejected with
-/// `protocol_mismatch`; framing and chunk messages are unchanged.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// Version 3 adds the 27-slot main inventory (36 player inventory slots in
+/// total) and moves the four equipment slots from wire addresses `9..13` to
+/// `36..40`. Versions 1 and 2 are rejected with `protocol_mismatch` before any
+/// inventory state is exchanged, so an old client cannot silently misinterpret
+/// main-inventory data as armor. Framing and chunk messages are unchanged.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Maximum number of bytes in a player name.
 pub const MAX_NAME_LEN: usize = 32;
@@ -63,14 +64,26 @@ pub struct PlayerSnapshot {
 
 /// Number of hotbar slots in a [`ServerMessage::InventorySync`].
 pub const HOTBAR_SLOTS: usize = 9;
+/// Number of main inventory slots in a [`ServerMessage::InventorySync`].
+pub const MAIN_SLOTS: usize = 27;
+/// Number of player inventory slots (`hotbar + main`).
+pub const INVENTORY_SLOTS: usize = HOTBAR_SLOTS + MAIN_SLOTS;
 /// Number of equipment (armor) slots in a [`ServerMessage::InventorySync`].
 pub const EQUIPMENT_SLOTS: usize = 4;
+/// First wire address of a main inventory slot.
+pub const MAIN_SLOT_START: u16 = HOTBAR_SLOTS as u16;
+/// First wire address of an equipment (armor) slot.
+///
+/// Player inventory slots are `0..36`, so the four equipment slots are
+/// `36..40`. An open container window starts at [`SLOT_WINDOW_START`].
+pub const EQUIPMENT_SLOT_START: u16 = INVENTORY_SLOTS as u16;
 /// First address of an open container window in an
 /// [`ClientMessage::InventoryMove`].
 ///
-/// Player hotbar slots are `0..9`, equipment slots are `9..13` and an open
-/// window starts at `100`. A furnace exposes input, fuel and output as
-/// `100..103`; a chest exposes its 27 slots as `100..127`.
+/// Player hotbar slots are `0..9`, main inventory slots are `9..36`, equipment
+/// slots are `36..40` and an open window starts at `100`. A furnace exposes
+/// input, fuel and output as `100..103`; a chest exposes its 27 slots as
+/// `100..127`.
 pub const SLOT_WINDOW_START: u16 = 100;
 /// Number of slots in a furnace window.
 pub const FURNACE_WINDOW_SLOTS: usize = 3;
@@ -211,7 +224,7 @@ pub enum ClientMessage {
     /// Request an authoritative block edit. `block` is a session-local block
     /// id; `0` means break.
     ///
-    /// In protocol v2 this is also the survival break/place intent: the server
+    /// In protocol v3 this is also the survival break/place intent: the server
     /// resolves loot, block-entity contents, tool wear and placement
     /// consumption from the sending network player's authoritative state.
     BlockEdit {
@@ -239,9 +252,9 @@ pub enum ClientMessage {
     },
     /// Moves items between player, equipment and open-window slots.
     ///
-    /// Addresses: hotbar `0..9`, equipment `9..13`, open window
-    /// [`SLOT_WINDOW_START`] and above. `revision` should echo the latest
-    /// `ContainerOpen`/`ContainerUpdate` revision when a window slot is
+    /// Addresses: hotbar `0..9`, main inventory `9..36`, equipment `36..40`,
+    /// open window [`SLOT_WINDOW_START`] and above. `revision` should echo the
+    /// latest `ContainerOpen`/`ContainerUpdate` revision when a window slot is
     /// involved; a present stale revision is rejected.
     InventoryMove {
         /// Source slot address.
@@ -372,9 +385,15 @@ pub enum ServerMessage {
     },
     /// Complete inventory, selected slot and equipment of the receiving
     /// player.
+    ///
+    /// The hotbar and main arrays map to wire addresses `0..9` and `9..36`
+    /// respectively; both are always present, including empty stacks. The
+    /// equipment array maps to addresses `36..40`.
     InventorySync {
         /// The nine hotbar slots; `null` is empty.
         hotbar: [Option<ItemStackDto>; HOTBAR_SLOTS],
+        /// The 27 main inventory slots; `null` is empty.
+        main: [Option<ItemStackDto>; MAIN_SLOTS],
         /// Selected hotbar slot, `0..9`.
         selected: u8,
         /// The four armor slots (helmet, chestplate, leggings, boots).
@@ -674,9 +693,15 @@ mod tests {
                 revision: Some(9),
             },
             ClientMessage::InventoryMove {
-                from: 9,
+                from: 36,
                 to: 2,
                 count: 1,
+                revision: None,
+            },
+            ClientMessage::InventoryMove {
+                from: 9,
+                to: 35,
+                count: 64,
                 revision: None,
             },
             ClientMessage::Eat,
@@ -715,6 +740,7 @@ mod tests {
             },
             ServerMessage::InventorySync {
                 hotbar: std::array::from_fn(|_| None),
+                main: std::array::from_fn(|slot| (slot == 0).then(|| stack.clone())),
                 selected: 3,
                 equipment: std::array::from_fn(|_| None),
             },
@@ -793,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_payloads_use_stable_names_and_tags() {
+    fn v3_payloads_use_stable_names_and_tags() {
         let item = EntitySnapshot {
             id: 1,
             kind: EntityKind::Item { stack: sample_stack() },
@@ -826,7 +852,14 @@ mod tests {
             }
         );
         assert_eq!(SLOT_WINDOW_START, 100);
-        assert_eq!(HOTBAR_SLOTS + EQUIPMENT_SLOTS, 13);
+        assert_eq!(MAIN_SLOT_START, 9);
+        assert_eq!(EQUIPMENT_SLOT_START, 36);
+        assert_eq!(HOTBAR_SLOTS, 9);
+        assert_eq!(MAIN_SLOTS, 27);
+        assert_eq!(INVENTORY_SLOTS, 36);
+        assert_eq!(EQUIPMENT_SLOTS, 4);
+        assert_eq!(EQUIPMENT_SLOT_START + EQUIPMENT_SLOTS as u16, 40);
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     #[test]
@@ -848,7 +881,7 @@ mod hostile_json_tests {
     fn duplicate_keys_and_hostile_numbers_are_rejected() {
         for payload in [
             r#"{"type":"ping","id":1,"id":2}"#,
-            r#"{"type":"hello","protocol":2,"name":"a","name":"b"}"#,
+            r#"{"type":"hello","protocol":3,"name":"a","name":"b"}"#,
             r#"{"type":"ping","type":"ping","id":1}"#,
             r#"{"type":"ping","id":-1}"#,
             r#"{"type":"ping","id":4294967296}"#,

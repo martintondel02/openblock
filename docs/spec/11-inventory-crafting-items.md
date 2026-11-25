@@ -1,6 +1,6 @@
 # 11 — Items, Inventory and Crafting
 
-> Status: normative - Last updated: 2026-11-24
+> Status: normative - Last updated: 2026-11-25
 > Depends on: [DEC-006](../decisions.md), [DEC-007](../decisions.md), [DEC-008](../decisions.md), [DEC-017](../decisions.md), [DEC-019](../decisions.md), [DEC-020](../decisions.md), [DEC-022](../decisions.md), [DEC-023](../decisions.md), [DEC-027](../decisions.md), [DEC-029](../decisions.md), [DEC-038](../decisions.md), [DEC-040](../decisions.md), [DEC-041](../decisions.md); [content system](15-content-system.md), [persistence](17-persistence.md), [networking](18-networking-multiplayer.md), [redstone](12-redstone-and-logic.md)
 > Implements: MS-10 (stacks, containers, crafting, stations), MS-11 (enchanting, brewing, trading, loot), MS-14 (parity corpus)
 
@@ -635,6 +635,21 @@ facing and lit block states remain out of scope.
   damaged tool keeps its durability when it enters a hotbar. Container transfer
   code should use the slot APIs rather than the selected-slot
   `consume_selected` workaround.
+- **36-slot inventory (1.2 interim).** The player inventory ships with hotbar
+  `0..8`, main `9..35` and armor `36..39`, i.e. 36 storage slots plus four
+  equipment slots. Offhand slot 40 from §3.1 is reserved by the normative
+  design but is not implemented in 1.2. Protocol v3 addresses hotbar `0..9`,
+  main `9..36`, equipment `36..40` and window slots from 100; `inventory_sync`
+  carries separate fixed `hotbar[9]` and `main[27]` arrays. The single-player
+  `inventory.txt` sidecar keeps `slot item count [durability]` rows and writes
+  only non-empty slots; 1.1 files with rows `0..8` load into the hotbar and
+  leave all main slots empty, while rows `36+` are dropped rather than clamped.
+  The `network_players.txt` sidecar keeps `i<slot>` tokens for the 36 player
+  slots and `e<slot>` for the four equipment slots, so old 9-slot records
+  restore unchanged. Pickup merges matching stacks and then fills hotbar slots
+  before main slots; a full 36-slot inventory leaves the remainder as an item
+  entity. Shift-click and click-to-place move whole stacks between hotbar and
+  main inventory; furnace output may be taken into any player slot.
 - **Limitations.** No open-window state, hopper/piston interaction, facing or lit
   block state, and no container screens. The host slot APIs trust their caller
   (reach, window ownership and alive state are not validated); a multiplayer

@@ -18,7 +18,7 @@ simulator used to test all of it.
 > normative target for a later milestone. The interim contract lives in
 > `ob_protocol` (messages, framing, chunk snapshot codec) and
 > `ob_server::net` (accept/tick/streaming); it is versioned
-> `PROTOCOL_VERSION = 2` and is intentionally unencrypted and
+> `PROTOCOL_VERSION = 3` and is intentionally unencrypted and
 > unauthenticated. The matching client connect mode is implemented in
 > `ob_client::net` / `ob_client::net_app` (§3.13.7–§3.13.8). Do not expose the
 > transport to the public internet without a trusted tunnel or firewall.
@@ -688,10 +688,10 @@ self-hosted without a transport dependency.
 
 #### 3.13.2 Message catalog
 
-`PROTOCOL_VERSION = 2`. Both enums are internally tagged with `"type"`
-(snake_case) and serde-derived. Direction is implicit. The v2 additions are
+`PROTOCOL_VERSION = 3`. Both enums are internally tagged with `"type"`
+(snake_case) and serde-derived. Direction is implicit. The v2/v3 additions are
 listed after the v1 table; framing and the chunk payload codec are unchanged.
-Version 1 clients are refused with `protocol_mismatch`, and the reason names
+Versions 1/2 clients are refused with `protocol_mismatch`, and the reason names
 the server's version so an old client can report an upgrade requirement.
 
 | Dir | `type` | Fields |
@@ -723,8 +723,15 @@ client.
 
 **Protocol v2 additions.** Stack DTOs are
 `{item: "openblock:...", count: u8, durability?: u16}` (stable names, not
-session-local ids). Slot addresses are hotbar `0..9`, equipment `9..13`, open
-window `100..`.
+session-local ids).
+
+**Protocol v3 additions.** The player inventory grows to 36 slots and the
+equipment addresses move from `9..13` to `36..40`; window addresses still start
+at `100`. Slot addresses are hotbar `0..9`, main `9..36`, equipment `36..40`,
+open window `100..`. `inventory_sync` carries the 27 main stacks in a second
+fixed array, so a v2 client cannot decode it without misreading main slots as
+armor; the handshake rejects v2 first. Framing and the chunk codec are
+unchanged.
 
 | Dir | `type` | Fields |
 | --- | --- | --- |
@@ -737,7 +744,7 @@ window `100..`.
 | C→S | `respawn` | — |
 | C→S | `container_close` | — |
 | S→C | `player_vitals` | `health: f32`, `hunger: f32`, `armor_defense: u8` |
-| S→C | `inventory_sync` | `hotbar: [stack?; 9]`, `selected: u8`, `equipment: [stack?; 4]` |
+| S→C | `inventory_sync` | `hotbar: [stack?; 9]`, `main: [stack?; 27]`, `selected: u8`, `equipment: [stack?; 4]` |
 | S→C | `selected_slot` | `slot: u8` |
 | S→C | `container_open` | `window: u32`, `kind: furnace\|chest`, `pos: [i32; 3]`, `revision: u64`, `slots: [stack?]`, `furnace?: {burn_remaining, burn_total, cook_progress}` |
 | S→C | `container_update` | `window`, `revision`, `slots`, `furnace?` |
@@ -1027,10 +1034,12 @@ spawn/despawn and mob transforms described in §3.13.9, kept the existing
 prediction/reconciliation and entity interpolation state already have clean
 seams (`tick_player`, `RemotePlayer`) for post-1.0 work.
 
-#### 3.13.9 Server-authoritative survival (protocol v2)
+<a id="3139-server-authoritative-survival-protocol-v2"></a>
+#### 3.13.9 Server-authoritative survival (protocol v3)
 
 **Status.** Implemented in `ob_server::net_players`, `ob_server::net` and the
-protocol v2 catalog. A network player is a `ServerPlayer`, independent of the
+protocol v3 catalog; the survival model below was introduced in v2 and the
+36-slot inventory/equipment remap is the v3 delta. A network player is a `ServerPlayer`, independent of the
 host's internal single-player `Player`; the single-player `Host` path and state
 hash are unchanged.
 
@@ -1048,7 +1057,8 @@ hello/version/name/whitelist/cap checks
 ```
 
 `ServerPlayer` carries `id`, `name`, `pos`, `yaw`, `pitch`, `health`, `hunger`,
-`dead`, `respawn_pending`, `inventory: [Option<ItemStack>; 9]`,
+`dead`, `respawn_pending`, `inventory: [Option<ItemStack>; 36]` (hotbar `0..9`,
+main `9..36`),
 `selected_slot`, `equipment: [Option<ItemStack>; 4]`, `game_mode`,
 `starvation_timer`, `regen_timer`, `fall_distance`, `pending_move_distance`,
 dirty flags for sync and the last damage cause. The server's default network
@@ -1146,7 +1156,8 @@ at 5 Hz; chest updates are transaction-driven. Content revisions increment
 whenever slots change; `inventory_move` may echo the latest revision, and a
 present stale revision is rejected with `action_rejected`.
 
-Slot addressing for `inventory_move`: hotbar `0..9`, equipment `9..13` and the
+Slot addressing for `inventory_move`: hotbar `0..9`, main `9..36`, equipment
+`36..40` and the
 open window from `100` (`100..103` furnace, `100..127` chest). Counts must be
 positive and no larger than the source; merges respect content max stacks;
 incompatible destinations require a full-stack swap; the furnace output is
@@ -1214,7 +1225,7 @@ All other existing limits (2 MiB frames, 256 queued outbound frames, moves
 30/s, edits 20/s, chat 5/10 s, chunk requests 16/s, 120/s inbound) still apply.
 
 **Client status (1.0 audit).** Client-side ingest caps are implemented in
-`ob_client`: even inside the 2 MiB frame limit, a v2 client bounds every
+`ob_client`: even inside the 2 MiB frame limit, a v3 client bounds every
 server-controlled array.
 `player_list` and the join/player-state stream track at most 1024 remote
 players (the handshake preserves the local entry when a hostile roster would
@@ -1257,12 +1268,12 @@ character boundary and evicts the oldest lines to stay within 100 lines and
 
 ##### Client contract for the next client wave
 
-A v2 client must handle the following and replace the v1 creative gating:
+A v3 client must handle the following and replace the v1 creative gating:
 
 | Message | Client behaviour |
 | --- | --- |
 | `player_vitals` | drive the survival HUD (health/hunger/armor), damage flash, death overlay |
-| `inventory_sync` | replace the nine hotbar slots and four equipment slots (stable item names), highlight selected |
+| `inventory_sync` | replace the nine hotbar slots, 27 main slots and four equipment slots (stable item names), highlight selected |
 | `selected_slot` | update the held slot; send `select_slot` on 1–9/wheel |
 | `container_open` / `container_update` / `container_close` | render a furnace/chest window; send `inventory_move` with slot addresses and the latest revision; close on the server reason |
 | `entity_snapshot` / `entity_spawn` / `entity_state` / `entity_despawn` | create/update/remove interpolated mob and item-entity renderables; treat ids as opaque; item states replace counts |

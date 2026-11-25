@@ -497,7 +497,7 @@ fn large_fields_and_numbers_are_bounded() {
         matches!(message, ServerMessage::ActionRejected { action, reason } if action == "select_slot" && reason == "invalid_slot")
     });
     client.send(ClientMessage::InventoryMove {
-        from: 13,
+        from: 40,
         to: 0,
         count: 1,
         revision: None,
@@ -1042,7 +1042,7 @@ fn inventory_window_authority_and_output_slot_are_per_connection() {
     });
     assert_eq!(
         server.server().server_player(bob_id).expect("online").inventory,
-        [None; 9]
+        [None; ob_server::INVENTORY_SLOTS]
     );
 
     // Alice's window: a present stale revision is rejected.

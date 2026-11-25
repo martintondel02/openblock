@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT OR Apache-2.0
-"""OpenBlock 1.0 multiplayer load gate: spawn a real server, drive protocol-v2
+"""OpenBlock 1.0 multiplayer load gate: spawn a real server, drive protocol-v3
 bots, and report the tick latency, throughput and memory numbers against the
 8-player / 6-chunk gate.
 
@@ -55,7 +55,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MAX_FRAME_LEN = 2 * 1024 * 1024
 CHUNK_SIZE = 16
 DEFAULT_RADIUS = 6
@@ -270,7 +270,7 @@ class Stats:
 
 
 class Bot(threading.Thread):
-    """One minimal protocol-v2 bot: handshake, streaming, Move, edit, chat, ping."""
+    """One minimal protocol-v3 bot: handshake, streaming, Move, edit, chat, ping."""
 
     def __init__(self, index, name, host, port, args, stats, stop):
         super().__init__(daemon=True, name="bot-%02d" % index)

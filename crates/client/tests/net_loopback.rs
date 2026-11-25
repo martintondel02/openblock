@@ -3,7 +3,7 @@
 //! Starts a real [`DedicatedServer`] on `127.0.0.1:0` and drives
 //! [`ob_client::net::NetworkClient`] headlessly. The v1 cases cover the creative
 //! handshake, spawn chunks, movement, block edits, chat, ping and clean
-//! disconnect. The protocol v2 cases exercise survival sync, authoritative
+//! disconnect. The protocol v3 cases exercise survival sync, authoritative
 //! place/break/pickup, mob replication and attacks, furnace and chest windows
 //! with revisions, damage/death/respawn, out-of-reach prediction reverts and
 //! reconnect restore. No window, GPU, external network or wall-clock luck is
@@ -570,6 +570,7 @@ fn survival_handshake_syncs_vitals_inventory_and_selection() {
     assert_eq!(client.armor_defense(), 0);
     assert_eq!(client.selected_slot(), 0);
     assert!(!client.is_dead());
+    assert_eq!(client.inventory().len(), 36, "hotbar 9 + main 27");
     assert!(client.inventory().iter().all(Option::is_none));
     assert!(client.equipment().iter().all(Option::is_none));
     assert_eq!(client.server_info().world_name, "client-loopback");
@@ -583,6 +584,87 @@ fn survival_handshake_syncs_vitals_inventory_and_selection() {
     assert!(client.select_slot(0));
     wait_for(&mut client, "selected slot echo 0", |client| {
         client.selected_slot() == 0
+    });
+
+    client.shutdown();
+    loopback.stop();
+}
+
+#[test]
+fn survival_thirty_six_slots_move_quick_transfer_and_equip() {
+    let registry = Arc::new(Registry::base());
+    let (mut loopback, ()) = Loopback::start_survival(&registry, |_, _| ());
+    let addr = loopback.addr();
+    let mut client = NetworkClient::connect(ConnectOptions::new(
+        addr.to_string(),
+        "inventory36",
+        2,
+        Arc::clone(&registry),
+    ))
+    .expect("connect survival server");
+    wait_ready(&mut client);
+    wait_survival_sync(&mut client);
+    assert_eq!(client.inventory().len(), 36);
+
+    let stone = registry.item_id("openblock:stone").expect("stone item");
+    let helmet = registry.item_id("openblock:iron_helmet").expect("helmet item");
+    assert!(
+        loopback
+            .server()
+            .give_network_item(client.local_id(), "openblock:stone", 20)
+    );
+    wait_for(&mut client, "stone in hotbar", |client| {
+        client.inventory()[0].is_some_and(|stack| stack.item == stone && stack.count == 20)
+    });
+    assert_eq!(
+        client.inventory()[..9].iter().flatten().count(),
+        1,
+        "items start in the hotbar"
+    );
+    assert!(client.inventory()[9..].iter().all(Option::is_none));
+
+    // Click-to-place move: hotbar 0 -> main 9.
+    assert!(client.send_inventory_move(0, 9, 20, None));
+    wait_for(&mut client, "stone in main slot 9", |client| {
+        client.inventory()[9].is_some_and(|stack| stack.item == stone && stack.count == 20)
+            && client.inventory()[0].is_none()
+    });
+
+    // Quick transfer from main back to the first empty hotbar slot.
+    assert!(client.quick_transfer_inventory(9));
+    wait_for(&mut client, "quick transfer back", |client| {
+        client.inventory()[0].is_some_and(|stack| stack.item == stone && stack.count == 20)
+            && client.inventory()[9].is_none()
+    });
+
+    // Equip from a main slot using the wire equipment address 36.
+    assert!(
+        loopback
+            .server()
+            .give_network_item(client.local_id(), "openblock:iron_helmet", 1)
+    );
+    wait_for(&mut client, "helmet sync", |client| {
+        client.inventory().iter().flatten().any(|stack| stack.item == helmet)
+    });
+    let helmet_slot = client
+        .inventory()
+        .iter()
+        .position(|stack| stack.is_some_and(|stack| stack.item == helmet))
+        .expect("helmet slot");
+    assert!(helmet_slot < 9, "new items still fill the hotbar first");
+    assert!(client.send_inventory_move(helmet_slot as u16, 9, 1, None));
+    wait_for(&mut client, "helmet in main", |client| {
+        client.inventory()[9].is_some_and(|stack| stack.item == helmet)
+    });
+    assert!(client.equip_inventory_slot(9));
+    wait_for(&mut client, "helmet equipped from main", |client| {
+        client
+            .survival()
+            .equipment
+            .iter()
+            .flatten()
+            .any(|stack| stack.item == helmet)
+            && client.inventory()[9].is_none()
     });
 
     client.shutdown();
@@ -995,6 +1077,17 @@ fn survival_damage_death_respawn_keeps_inventory() {
             .flatten()
             .any(|stack| stack.item == apple && stack.count == 2)
     });
+    // Put the food in the main inventory so death/respawn proves the 36-slot
+    // range survives, not only the hotbar.
+    let apple_slot = client
+        .inventory()
+        .iter()
+        .position(|stack| stack.is_some_and(|stack| stack.item == apple))
+        .expect("apple slot");
+    assert!(client.send_inventory_move(apple_slot as u16, 9, 2, None));
+    wait_for(&mut client, "apple in main", |client| {
+        client.inventory()[9].is_some_and(|stack| stack.item == apple && stack.count == 2)
+    });
 
     // The admin damage path routes through armor and relays damage + death.
     assert!(loopback.server().damage_network_player(client.local_id(), 20.0));
@@ -1027,6 +1120,10 @@ fn survival_damage_death_respawn_keeps_inventory() {
     assert!((client.health() - 20.0).abs() < 0.01, "health {}", client.health());
     assert!((client.hunger() - 20.0).abs() < 0.01, "hunger {}", client.hunger());
     assert_eq!(client.player().pos, client.server_info().spawn);
+    assert!(
+        client.inventory()[9].is_some_and(|stack| stack.item == apple && stack.count == 2),
+        "main-inventory stacks survive death/respawn"
+    );
     assert!(
         client
             .inventory()
