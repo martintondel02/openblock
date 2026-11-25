@@ -29,6 +29,7 @@ use ob_core::config::{Action, load_settings, save_settings};
 use ob_math::{BlockPos, ChunkPos, SectionPos, WorldVec};
 use ob_render::{
     BlockOutline, Camera, Environment, LodBatchKey, LodConfig, Renderer, SceneParams, TextureSource, UiFrame,
+    far_plane_for_view_distance,
 };
 use ob_server::ContainerState;
 use ob_sim::{Player, PlayerInput, REACH};
@@ -207,6 +208,7 @@ impl ApplicationHandler for NetApp {
             fullscreen: false,
             applied_render_distance,
             lod: LodState::new(LodConfig::for_render_distance(applied_render_distance)),
+            far_terrain: crate::far_terrain::FarTerrainState::new(),
             rolling_frame_ms: Vec::new(),
             window_size,
             debug_stats: DebugStats::default(),
@@ -217,6 +219,8 @@ impl ApplicationHandler for NetApp {
             audio_status,
             audio_enabled_before_mute,
             audio_setting_touched: false,
+            fsr_run_override: self.options.fsr.is_some(),
+            fsr_setting_touched: false,
             placeholder,
             client: None,
             pending_connect: None,
@@ -756,6 +760,8 @@ struct NetGameState {
     /// Distance-LOD state; multiplayer uses the same near/far policy and the
     /// same worker pool as single-player.
     lod: LodState,
+    /// Visual-only far terrain. The seed comes from the handshake server info.
+    far_terrain: crate::far_terrain::FarTerrainState,
     started: Instant,
     auto_exit: Option<Duration>,
     frame_times: Vec<f32>,
@@ -774,6 +780,10 @@ struct NetGameState {
     audio_status: String,
     audio_enabled_before_mute: Option<bool>,
     audio_setting_touched: bool,
+    /// Whether `--fsr` supplied a run-only override for this launch.
+    fsr_run_override: bool,
+    /// Whether the user changed the FSR row after a `--fsr` launch.
+    fsr_setting_touched: bool,
     /// Camera stand-in while connecting or after a failure.
     placeholder: Player,
     client: Option<NetworkClient>,
@@ -879,6 +889,12 @@ impl NetGameState {
         {
             settings.audio_enabled = saved;
         }
+        crate::restore_fsr_after_run_only_override(
+            &mut settings,
+            self.fsr_run_override,
+            self.fsr_setting_touched,
+            &self.data_dir,
+        );
         if let Err(error) = save_settings(&self.data_dir, &settings) {
             log::warn!("could not save settings: {error}");
         }
@@ -1192,6 +1208,7 @@ impl NetGameState {
 
     fn clear_world_render(&mut self) {
         self.lod.reset(&mut self.renderer, &mut self.mesh_scheduler);
+        self.far_terrain.reset(&mut self.renderer);
         self.renderer.clear_meshes();
         self.meshes.clear();
         self.mesh_scheduler = MeshScheduler::new(self.mesh_workers, Arc::clone(&self.registry));
@@ -1997,7 +2014,23 @@ impl NetGameState {
             .client
             .as_ref()
             .map_or(self.ui.settings.render_distance_chunks, NetworkClient::render_radius);
-        camera.far = (radius as f32 * 16.0 + 48.0).max(128.0);
+        camera.far = far_plane_for_view_distance(self.ui.settings.view_distance_chunks);
+        // The far terrain seed comes from the handshake server info; while
+        // connecting (or after a disconnect) the mesh is cleared rather than
+        // generated from a guessed seed.
+        let far_seed = self.client.as_ref().map(|client| client.server_info().seed);
+        let playing = self.client.as_ref().is_some_and(|client| client.state().is_playing());
+        if let (Some(seed), true) = (far_seed, playing) {
+            self.far_terrain.maintain(
+                &mut self.renderer,
+                seed,
+                self.ui.settings.view_distance_chunks,
+                radius,
+                [camera.position.x, camera.position.z],
+            );
+        } else if self.far_terrain.center().is_some() || self.far_terrain.is_building() {
+            self.far_terrain.reset(&mut self.renderer);
+        }
         let outline = self
             .mining
             .targeted_block()
@@ -2365,6 +2398,14 @@ impl NetGameState {
             target,
             seed,
             render_distance: self.ui.settings.render_distance_chunks,
+            view_distance: self.ui.settings.view_distance_chunks,
+            full_detail_radius: self.lod.config().full_detail_radius_chunks,
+            far_tiers: self.far_terrain.stats().map_or(0, |stats| stats.tiers.len()),
+            far_quads: self.far_terrain.stats().map_or(0, |stats| stats.opaque_quads),
+            far_vertices: self.far_terrain.stats().map_or(0, |stats| stats.opaque_vertices),
+            far_build_ms: self.far_terrain.stats().map_or(0.0, |stats| stats.build_ms as f32),
+            far_center: self.far_terrain.center(),
+            far_rebuilding: self.far_terrain.is_building(),
             loaded_chunks: loaded,
             drawn_sections: render_stats.sections as usize,
             cached_sections: self.meshes.len(),
@@ -2420,6 +2461,7 @@ impl NetGameState {
             defense,
             graphics_summary: self.renderer.graphics().summary(),
             shadow_summary: self.renderer.shadow_summary(),
+            fsr_summary: self.renderer.fsr_summary(),
         };
     }
 
@@ -2615,6 +2657,7 @@ impl NetGameState {
                 mesh_workers: self.mesh_scheduler.workers(),
                 ui_scale_percent: resolved_ui_scale_percent(self.ui.settings.ui_scale_percent, self.window_size.1),
                 audio_status: self.audio_status.clone(),
+                fsr_internal: self.renderer.fsr_internal_size().map(|(width, height)| [width, height]),
             };
             crate::ui_state::draw_settings_screen(&mut frame, &self.ui, &info, screen);
         }
@@ -2808,11 +2851,16 @@ impl NetGameState {
             | SettingsRow::WaterQuality
             | SettingsRow::CloudCoverage
             | SettingsRow::Bloom
-            | SettingsRow::Fxaa => {
+            | SettingsRow::Fxaa
+            | SettingsRow::Fsr => {
+                if row == SettingsRow::Fsr {
+                    self.fsr_setting_touched = true;
+                }
                 self.renderer
                     .set_graphics(crate::graphics_settings_from_settings(&self.ui.settings));
             }
             SettingsRow::ReducedMotion
+            | SettingsRow::ViewDistance
             | SettingsRow::ShowHud
             | SettingsRow::DebugOverlay
             | SettingsRow::Fov

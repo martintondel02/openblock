@@ -183,23 +183,44 @@ let amount = 1.0 - exp(-fog_density * h * d * d);
 color = mix(color, sky_color(dir) , amount);
 ```
 
-`fog_end` is the render distance, and the curve is tuned so opacity is ≥ 0.9 there.
-For the v1.1 512-block radius the CPU supplies `(fog_start, fog_end)` as
+`fog_end` tracks the camera far plane, and the curve is tuned so opacity is ≥ 0.9 there.
+For near/legacy far planes the CPU supplies `(fog_start, fog_end)` as
 `max(far − 160, 0.55 × far)` and `0.95 × far`: 400–532 blocks at a 32-chunk radius.
 Smoothstep reaches 0.93 opacity at the 512-block world edge while 200 blocks stays
 perfectly clear, so the horizon reads as terrain fading into sky rather than a grey wall.
 At short render distances the historical 55% start is preserved so the last streamed ring
-still dissolves. Shader modules and packs must read `Camera.fog` and must not hardcode
-distances; the same uniform drives opaque, cutout and entity fog.
+still dissolves.
 
-**Shader work implied by the v1.1 LOD.** Shadow cascades are unchanged in count and
-distance (§3.3.1): far surface-shell batches are opaque geometry and must be included in
-the same cascades as near sections, so cascade 3 remains useful to 96 blocks. Water stays in
-the surface shell and keeps its normal material; a future translucent pass must keep far
-water sorted separately rather than folding it into the opaque batch. Distance fog is the
-only blend between near and far tiers — there is deliberately no LOD cross-fade, because the
-shell preserves the silhouette; a shader that adds dithering or TAA must not treat the tier
-seam as a depth discontinuity.
+For the v1.3 visual horizon the far plane is much longer than the 512-block
+simulated world. Far planes above 1,000 blocks use `0.12 × far` to `0.95 × far`:
+at the 8,320-block maximum the haze starts at 998 blocks and reaches the horizon
+colour at 7,904 blocks. The near world uses the *same* range, so the 512-block
+seam cannot carry a different amount of haze than the far mesh. The 12% start is
+far beyond the 512-block simulation radius at the maximum setting, and the
+fragment shader still reads only `Camera.fog`. Shader modules and packs must not
+hardcode distances; the same uniform drives opaque, cutout, entity, near-water
+and far-terrain fog.
+
+**Far-terrain material and draw.** The v1.3 visual far mesh stores position,
+linear albedo and a heightfield normal per vertex; there are no texture or
+shadow samples. Its fragment stage applies the same sun direction, world-light
+tint and fog uniform as the near world, using `0.78 + 0.22 × max(n·sun, 0)` for
+direct/ambient mix and no cascade visibility. Far water is alpha blended with a
+cheap sky-reflect tint and sun highlight. Both pipelines are created once in
+`SceneRenderer::new`; far terrain casts no shadows, and only one far opaque and
+one far water draw are issued.
+
+**Shader work implied by the LOD.** Shadow cascades are unchanged in count and
+distance (§3.3.1): far surface-shell batches are opaque geometry and are included in
+the same cascades as near sections, so cascade 3 remains useful to 96 blocks. The
+v1.3 far heightfield is deliberately excluded from the shadow pass (it may extend
+8,192 blocks, far beyond any cascade) and receives no shadow map lookup. Water in
+the near surface shell keeps its normal material; far water is a separate
+translucent draw issued before the sorted near water, because it is farther than
+every near section and batch. Distance fog is the only blend between near and far
+tiers — there is deliberately no LOD cross-fade or dithering, because the shell and
+heightfield preserve the silhouette; a shader that adds dithering or TAA must not
+treat the tier seam as a depth discontinuity.
 (REQ-VIS-008). Underwater and lava override the parameters per fluid, with a Beer-Lambert
 absorption on the water colour; blindness and darkness effects scale the exponent and are
 driven by gameplay effect state, never by the shader.
@@ -343,15 +364,20 @@ buffer for moving entities; voxel edges are long and axis-aligned, so ghosting i
 and the residual is bounded by the neighbourhood clamp test in §7.
 
 Render scale is applied before TAA, which doubles as the upscaler: at 0.85 the internal
-buffer is 1632×918 and the resolve is a Catmull-Rom filter to 1920×1080. Vendor upscalers
-are not bundled (DEC-016); the hook for an externally installed one is the same
-jitter/velocity/depth/exposure contract, documented in the API reference.
+buffer is 1632×918 and the resolve is a Catmull-Rom filter to 1920×1080. Binary vendor
+upscalers (DLSS/XeSS) are not bundled (DEC-016); the hook for an externally installed one
+is the same jitter/velocity/depth/exposure contract, documented in the API reference. The
+**MIT-licensed FSR 1.0 spatial upscaler is the one vendorable exception** implemented in
+v1.3 (§3.13.9): it is source code, not a binary SDK, so it does not conflict with the
+repository's MIT/Apache grant. It is optional and off by default; TAA with render scale
+remains the long-term default path.
 
 **1.1 status:** the shipped chain is HDR scene → bloom threshold + 3 mip downsample →
 one final pass with ACES-fit tonemap, two bloom mip samples, conditional FXAA-lite,
 saturation and a 6% vignette. Exposure is fixed, not histogram-adapted, and there is no TAA,
 GTAO, volumetric fog or colour LUT yet. UI is drawn after post. See §3.13.6. Two post
-pipelines (full and bloom/FXAA-free) are compiled at start-up.
+pipelines (full and bloom/FXAA-free) are compiled at start-up. v1.3 optionally inserts FSR
+1.0 EASU+RCAS between post and UI (§3.13.9).
 
 ### 3.7 Materials, WGSL modules and pipeline variants
 
@@ -586,18 +612,22 @@ covered by a test or a measured number in
 | # | Pass | Target | Notes |
 | ---: | --- | --- | --- |
 | 1 | sun shadow, once per active cascade | `Depth32Float` 2D array, 2048² (`low`/`medium` 1024²) | depth only, alpha-cut-out foliage, entities included |
-| 2 | opaque world (sections, far batches, entities) | `Rgba16Float` HDR + `Depth32Float` | HDR cleared to the horizon, depth cleared to 1.0 |
+| 2 | opaque world (sections, far batches, far terrain, entities) | `Rgba16Float` HDR + `Depth32Float` | HDR cleared to the horizon, depth cleared to 1.0; far terrain draws after near geometry |
 | 3 | sky background fill | HDR + depth, no depth write | `LessEqual` at z = 1.0, so only background pixels run clouds/stars |
-| 4 | water + block outline | HDR + depth, no depth write | water alpha blend, back-to-front; outline after water |
+| 4 | water + block outline | HDR + depth, no depth write | far water first, then near water alpha blend back-to-front; outline after water |
 | 5 | bloom threshold + 2 downsamples | `Rgba16Float` mips at ½, ¼, ⅛ | threshold 1.0, soft knee, 4-tap box |
-| 6 | post | LDR surface / offscreen `Rgba8UnormSrgb` | ACES fit, bloom, FXAA-lite, saturation, vignette |
-| 7 | UI | same LDR target, after post | text and HUD stay crisp and are never tonemapped |
+| 6 | post | LDR surface / offscreen `Rgba8UnormSrgb`; under FSR an internal LDR target at render size | ACES fit, bloom, FXAA-lite, saturation, vignette |
+| 7 | FSR EASU + RCAS (optional) | display-sized surface / offscreen target | only when FSR is enabled; two full-screen passes; UI never passes through it |
+| 8 | UI | same display-sized LDR target, after post/FSR | text and HUD stay crisp and are never tonemapped or upscaled |
 
 The windowed `Renderer` and the windowless `OffscreenRenderer` both delegate to one
 private `frame::SceneRenderer`; the only difference is the final output view and the
-readback. All pipelines are created in `SceneRenderer::new`. A graphics-preset change
-reallocates the shadow map and updates uniforms, a resize reallocates the HDR/depth/bloom
-targets and their bind groups, and no frame triggers shader compilation.
+readback. All pipelines are created in `SceneRenderer::new`; the two FSR pipelines are
+created once when the row is first enabled and reused across enabled quality changes (not
+per frame). A graphics-preset change reallocates
+the shadow map and updates uniforms, a resize reallocates the HDR/depth/bloom targets and
+their bind groups, and no frame triggers shader compilation. With FSR off the pass count
+and behaviour are identical to the pre-v1.3 native path.
 
 #### 3.13.2 Uniforms and bindings
 
@@ -704,14 +734,17 @@ pipeline and a simple pipeline with no bloom/FXAA fetches, selected when both ar
 mirror of the ACES/vignette math lives in `tonemap.rs` and is used by tests to predict pixel
 values exactly.
 
-Not shipped: TAA, render scale, histogram exposure, GTAO, volumetric fog, colour LUT and
-sharpening. MSAA stays at 1; FXAA-lite is the shipped antialiasing.
+Not shipped: TAA, histogram exposure, GTAO, volumetric fog and colour LUT. MSAA stays at
+1; FXAA-lite is the shipped antialiasing, and optional FSR 1.0 EASU+RCAS (§3.13.9) provides
+render-scale upscaling plus adaptive sharpening when the user selects it.
 
 #### 3.13.7 Settings, presets and F3
 
 `ob_core::config::Settings` persists `graphics_preset`, `shadow_quality`, `clouds`,
-`water_quality`, `bloom`, `fxaa` and `cloud_coverage` (clamped `0..=1`, non-finite values
-reset). Presets map as follows:
+`water_quality`, `bloom`, `fxaa`, `cloud_coverage` (clamped `0..=1`, non-finite values
+reset) and the independent `fsr_quality` row (`off` default, `ultra_quality`, `quality`,
+`balanced`, `performance`; unknown persisted names normalise to `off`). Presets map as
+follows:
 
 | Preset | Shadows | Clouds | Water | Bloom | FXAA |
 | --- | --- | --- | --- | --- | --- |
@@ -721,30 +754,93 @@ reset). Presets map as follows:
 | Ultra | ultra 2×2048², 5×5 near | high | high | on | on |
 
 The settings screen has a Graphics tab with rows for the preset, shadows, clouds, water,
-cloud coverage, bloom and FXAA. Adjusting an individual row marks the preset Custom. F3
-reports the preset, shadow mode, resolution, cascade count and PCF mode, plus the pass,
-water, shadow, bloom and memory counters. The offscreen tools accept the same settings
-(`--graphics`, `--shadows`, `--clouds`, `--water`, `--bloom/--no-bloom`,
-`--fxaa/--no-fxaa`), so screenshots and benchmarks use the exact playable configuration.
+cloud coverage, bloom, FXAA and **FSR** (Off/Ultra Quality/Quality/Balanced/Performance,
+with the internal resolution shown when active), and a Display tab with **Simulation
+distance** and **View distance** rows (the latter shows `N chunks / 16N blocks` and a
+one-time GPU note above 128 chunks). Adjusting an individual scene-quality row marks the
+preset Custom; FSR is deliberately independent and does **not** mark it Custom. F3 reports
+the preset, shadow mode, resolution, cascade count and PCF mode, an `FSR <preset> <render
+size> -> <display size> (<scale>x)` line (or `FSR native`), plus the pass, water, shadow,
+bloom and memory counters and the far-terrain tier/quad/build/centre line. The offscreen
+tools accept the same settings (`--graphics`, `--shadows`, `--clouds`, `--water`,
+`--bloom/--no-bloom`, `--fxaa/--no-fxaa`, `--fsr`), so screenshots and benchmarks use the
+exact playable configuration. `openblock --fsr QUALITY` is a run-only client override
+(not persisted; unrelated saves restore the stored row, while editing the FSR row makes the
+new value a preference) applied to windowed, screenshot and benchmark paths alike.
 
 #### 3.13.8 Verification and known limitations
 
 Unit tests cover the settings round-trip/clamps, preset mapping, the shadow sphere fit,
 texel snapping, split scaling, AABB culling, the 512-byte uniform layout, the 32-byte post
-layout, opaque/water mesh split parity, far-batch water, and the CPU tonemap. GPU tests
+layout, opaque/water mesh split parity, far-batch water, far-terrain tier coverage/overlap,
+the 512-chunk quad budget, far-mesh determinism and the CPU tonemap. GPU tests
 (run on RADV and skippable with `OPENBLOCK_NO_GPU_TESTS`) cover the shadow pass writing
 casters, shadows darkening terrain, water drawing in its own pass, water-only sections,
-water receiving shadows, far-batch water, cloud determinism and motion, every preset
-rendering with sane colours, post-target resize (including 1×1), and a wgpu validation
-error scope that must stay clean across shadow + water + post frames. The ignored water
+water receiving shadows, far-batch water, the far opaque and far-water pipelines drawing
+into the shared HDR/depth targets and clearing cleanly, cloud determinism and motion, every
+preset rendering with sane colours, post-target resize (including 1×1), and a wgpu
+validation error scope that must stay clean across shadow + water + post frames. The v1.3
+FSR tests add: upscaling at 1920×1080, 1280×720 and an odd 1001×777 target, preset/quality
+changes and resize reallocating the internal targets, native-size UI pixels surviving
+unchanged after the upscale, a clean validation scope around the FSR passes, and graceful
+native fallback for an unsupported `Rgba16Float` output (see §3.13.9). The ignored water
 screenshot test writes `/tmp/openblock-shaders-water.png`; the benchmark provides day,
 dusk, night and sky captures.
 
 Remaining limitations are listed with their measured cost in
 [08-measurements](../plan/08-measurements.md): far-cascade PCF reduction, AABB shadow
 proxies beyond 64 m, no water reflection/refraction/foam/underwater volume, fixed exposure,
-FXAA-lite instead of TAA, and offscreen readback inflating the benchmark tail. The High
-1080p/90 FPS aspirational target is not met; Ultra 1080p/60 FPS is met at p50 but not p95.
+FXAA-lite instead of TAA, offscreen readback inflating the benchmark tail, the far-terrain
+style seam/coarse water described in [1.3-far-terrain](../plan/1.3-far-terrain.md#10-limitations),
+and the spatial-only FSR limits in [1.3-fsr](../plan/1.3-fsr.md#7-limitations).
+The High 1080p/90 FPS aspirational target is not met; Ultra 1080p/60 FPS is met at p50 but not
+p95. The v1.3 512-chunk visual horizon reaches 63.7 FPS p50 / 63.3 FPS p95 at 1080p High in the
+offscreen-readback harness (see [1.3-far-terrain](../plan/1.3-far-terrain.md#8-measurements)).
+
+#### 3.13.9 FSR 1.0 integration (v1.3, optional)
+
+`crates/render/src/fsr.rs` is a self-contained, source-only port of AMD FidelityFX Super
+Resolution 1.0 (EASU + RCAS, `ffx-fsr/ffx_fsr1.h` v1.20210629) with WGSL shaders in
+`crates/render/assets/fsr/`. AMD's MIT notice and the full license text are kept in
+`LICENSE-FSR.txt`; every WGSL file carries an SPDX MIT/AMD header and REUSE annotates the
+directory. The module owns both pipelines, a linear/clamp sampler, two small uniform
+buffers and the output-sized EASU intermediate; a size change only reallocates the
+intermediate.
+
+**Contract and wiring.** The input is the tonemapped, LDR post image at **render size**;
+the output is the surface/offscreen texture at **display size**. `SceneRenderer` keeps the
+two sizes separate:
+
+- HDR scene, depth and bloom targets are allocated at the FSR render size (`FsrQuality::render_size`, even-dimension adjusted, 0.77/0.67/0.59/0.50 linear
+  scale).
+- The camera aspect, shadow-cascade fit and UI use the display size, so FSR's
+  full-target-to-full-output mapping never stretches the image.
+- The post pass writes an internal LDR target at render size using the display target's
+  format, so both post pipelines are reused unchanged. `PostUniform` texel sizes are the
+  render sizes, as FXAA and bloom sampling require.
+- EASU+RCAS are recorded after post and before the caller draws the UI. The windowed
+  surface and offscreen colour texture stay display-sized, UI hit-testing stays in display
+  coordinates, and screenshots keep their requested size (`--screenshot-size` unchanged).
+- Resize updates the display size and reallocates the scene/LDR targets at the new preset
+  size; changing the FSR row reconfigures the same targets. The upscaler itself is created
+  once per device/format, reused across enabled quality changes, dropped when the row goes
+  Off, and its output-sized intermediate follows resizes.
+- FSR requires an sRGB 8-bit output (`Rgba8UnormSrgb`/`Bgra8UnormSrgb`) because the internal
+  LDR target shares the display format and the post shader writes linear values. A non-sRGB
+  or 16-bit/HDR output logs once and takes the native path rather than creating an unusable
+  or gamma-wrong image. Every shipped surface/offscreen format is sRGB, so this is a guard,
+  not a user-visible mode.
+
+The FSR 1 colour model is respected: the internal target is sRGB, the shader re-encodes
+gathered values to perceptual space before EASU, and RCAS decodes once before storing to the
+sRGB output. FSR is spatial only (no motion vectors or history), so the pass is compatible
+with the current FXAA-lite pipeline and does not add temporal ghosting. Its cost and the
+measured 512-chunk comparison are recorded in
+[08-measurements](../plan/08-measurements.md#2026-11-25--v13-fsr-10-on-far-terrain-512-chunks)
+and [1.3-fsr](../plan/1.3-fsr.md).
+
+**Not shipped:** FSR 2/3 (temporal), DLSS/XeSS, frame generation, dynamic resolution
+(auto-scaling), and an FSR sharpness row (RCAS stays at the reference 0.20 stops).
 
 ## 4. Data structures and formats
 

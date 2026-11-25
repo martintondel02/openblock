@@ -276,6 +276,113 @@ impl WaterQuality {
     }
 }
 
+/// FidelityFX Super Resolution (FSR 1.0) upscaling quality persisted in settings.
+///
+/// This is an **independent** quality row: applying a graphics preset never
+/// changes it and changing it never marks the preset [`GraphicsPreset::Custom`],
+/// because it only trades internal render resolution for frame time. The
+/// persisted names mirror the renderer crate's `FsrQuality`; that crate keeps
+/// its own GPU-facing enum and the client maps between them by name.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FsrQuality {
+    /// Native resolution; no upscaling pass.
+    #[default]
+    Off,
+    /// 0.77 linear scale.
+    #[serde(rename = "ultra_quality")]
+    UltraQuality,
+    /// 0.67 linear scale.
+    Quality,
+    /// 0.59 linear scale.
+    Balanced,
+    /// 0.50 linear scale.
+    Performance,
+}
+
+impl FsrQuality {
+    /// All presets in menu order (native first).
+    pub const ALL: [FsrQuality; 5] = [
+        FsrQuality::Off,
+        FsrQuality::UltraQuality,
+        FsrQuality::Quality,
+        FsrQuality::Balanced,
+        FsrQuality::Performance,
+    ];
+
+    /// Stable lowercase settings/CLI name (the `serde` representation).
+    pub fn name(self) -> &'static str {
+        match self {
+            FsrQuality::Off => "off",
+            FsrQuality::UltraQuality => "ultra_quality",
+            FsrQuality::Quality => "quality",
+            FsrQuality::Balanced => "balanced",
+            FsrQuality::Performance => "performance",
+        }
+    }
+
+    /// Display label for the settings row and F3.
+    pub fn label(self) -> &'static str {
+        match self {
+            FsrQuality::Off => "Off",
+            FsrQuality::UltraQuality => "Ultra Quality",
+            FsrQuality::Quality => "Quality",
+            FsrQuality::Balanced => "Balanced",
+            FsrQuality::Performance => "Performance",
+        }
+    }
+
+    /// Whether the upscaler runs (`false` for [`Self::Off`]).
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, FsrQuality::Off)
+    }
+
+    /// Parses a persisted or command-line name.
+    ///
+    /// Matching is case-insensitive and ignores spaces, hyphens and underscores,
+    /// so `ultra_quality`, `ultra-quality` and `Ultra Quality` are equivalent.
+    pub fn parse(value: &str) -> Option<Self> {
+        let normalised: String = value
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace() && *character != '-' && *character != '_')
+            .flat_map(char::to_lowercase)
+            .collect();
+        match normalised.as_str() {
+            "off" | "none" | "native" => Some(Self::Off),
+            "ultraquality" | "ultra" => Some(Self::UltraQuality),
+            "quality" => Some(Self::Quality),
+            "balanced" => Some(Self::Balanced),
+            "performance" | "perf" => Some(Self::Performance),
+            _ => None,
+        }
+    }
+
+    /// Parses a name, defaulting to [`Self::Off`] for unknown values.
+    pub fn from_setting(value: &str) -> Self {
+        Self::parse(value).unwrap_or_default()
+    }
+
+    /// Parses a settings/CLI name strictly (exact names only, case-insensitive).
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|quality| quality.name().eq_ignore_ascii_case(name))
+    }
+}
+
+/// Unknown FSR names deserialize to [`FsrQuality::Off`] instead of failing the
+/// whole settings document ("normalise unknown to Off").
+fn deserialize_fsr_quality<'de, D>(deserializer: D) -> Result<FsrQuality, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::String(name)) => FsrQuality::from_setting(&name),
+        _ => FsrQuality::default(),
+    })
+}
+
 /// Gameplay mode selected by the player.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1214,13 +1321,27 @@ pub fn remember_recent_server(list: &mut Vec<RecentServer>, address: &str, name:
     list.truncate(MAX_RECENT_SERVERS);
 }
 
-/// Smallest supported render distance in chunks.
+/// Smallest supported simulation (full-detail/streaming) distance in chunks.
 pub const MIN_RENDER_DISTANCE: i32 = 2;
-/// Largest render distance offered by the settings screen.
+/// Largest simulation (full-detail/streaming) distance in chunks.
 ///
 /// 32 chunks is a 512-block radius, the v1.1 playable target. The vertical
 /// streaming radius is unchanged; only the horizontal column count grows.
+/// This remains the radius with authoritative simulation, streaming and full
+/// geometry; the visual-only far terrain extends beyond it up to
+/// [`MAX_VIEW_DISTANCE`].
 pub const MAX_RENDER_DISTANCE: i32 = 32;
+/// Smallest supported visual render distance in chunks.
+///
+/// The visual radius may not drop below the current 512-block horizon, so the
+/// far-terrain tier always starts at or beyond the simulated world.
+pub const MIN_VIEW_DISTANCE: i32 = 32;
+/// Largest supported visual render distance in chunks (512 chunks = 8,192 blocks).
+pub const MAX_VIEW_DISTANCE: i32 = 512;
+/// Default visual render distance in chunks (2,048 blocks).
+pub const DEFAULT_VIEW_DISTANCE: i32 = 128;
+/// View distance above which the settings screen warns about GPU cost.
+pub const VIEW_DISTANCE_WARNING_CHUNKS: i32 = 128;
 /// Smallest supported vertical field of view in degrees.
 pub const MIN_FOV_DEGREES: f32 = 30.0;
 /// Largest supported vertical field of view in degrees.
@@ -1273,8 +1394,16 @@ pub fn normalise_ui_scale_percent(value: u16) -> u16 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Streaming radius in chunks.
+    /// Simulation (full-detail/streaming) radius in chunks.
     pub render_distance_chunks: i32,
+    /// Visual render distance in chunks, including visual-only far terrain.
+    ///
+    /// The simulated world and full-detail geometry stop at
+    /// [`Self::render_distance_chunks`]; the low-poly heightfield extends to
+    /// this radius (2..=512 chunks, 8,192 blocks at the maximum). Far terrain
+    /// has no gameplay authority and does not affect streaming, collision,
+    /// spawning or persistence.
+    pub view_distance_chunks: i32,
     /// Vertical field of view in degrees.
     pub fov_degrees: f32,
     /// Mouse look multiplier (1.0 = default).
@@ -1333,6 +1462,10 @@ pub struct Settings {
     pub fxaa: bool,
     /// Cloud coverage in `0.0..=1.0` (0 clear, 1 overcast).
     pub cloud_coverage: f32,
+    /// FSR 1.0 upscaling quality. Independent of the graphics preset; Off by
+    /// default for safety, and unknown persisted values normalise to Off.
+    #[serde(default, deserialize_with = "deserialize_fsr_quality")]
+    pub fsr_quality: FsrQuality,
     /// World name opened by the title screen's Continue button.
     pub last_world: Option<String>,
     /// Remembered multiplayer servers, newest first (at most
@@ -1344,6 +1477,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             render_distance_chunks: 6,
+            view_distance_chunks: DEFAULT_VIEW_DISTANCE,
             fov_degrees: 70.0,
             mouse_sensitivity: 1.0,
             ui_scale_percent: UI_SCALE_AUTO,
@@ -1368,6 +1502,7 @@ impl Default for Settings {
             bloom: true,
             fxaa: true,
             cloud_coverage: 0.45,
+            fsr_quality: FsrQuality::Off,
             last_world: None,
             recent_servers: Vec::new(),
         }
@@ -1381,6 +1516,10 @@ impl Settings {
         self.render_distance_chunks = self
             .render_distance_chunks
             .clamp(MIN_RENDER_DISTANCE, MAX_RENDER_DISTANCE);
+        self.view_distance_chunks = self
+            .view_distance_chunks
+            .clamp(MIN_VIEW_DISTANCE, MAX_VIEW_DISTANCE)
+            .max(self.render_distance_chunks);
         if !self.fov_degrees.is_finite() {
             self.fov_degrees = Settings::default().fov_degrees;
         }
@@ -1913,6 +2052,52 @@ mod tests {
         assert_eq!(preset.shadow_quality, ShadowQuality::Low);
         preset.mark_graphics_custom();
         assert_eq!(preset.graphics_preset, GraphicsPreset::Custom);
+
+        // FSR is independent of the preset: applying a preset never turns it
+        // on or off, and the default is native for safety.
+        let mut independent = Settings::default();
+        assert_eq!(independent.fsr_quality, FsrQuality::Off);
+        independent.fsr_quality = FsrQuality::Quality;
+        independent.graphics_preset = GraphicsPreset::Low;
+        assert!(independent.apply_graphics_preset());
+        assert_eq!(independent.fsr_quality, FsrQuality::Quality);
+    }
+
+    #[test]
+    fn fsr_quality_names_round_trip_and_unknown_values_normalise_to_off() {
+        for quality in FsrQuality::ALL {
+            let json = serde_json::to_string(&quality).expect("serialize");
+            assert_eq!(json, format!("\"{}\"", quality.name()));
+            let parsed: FsrQuality = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(parsed, quality);
+            assert_eq!(FsrQuality::from_name(quality.name()), Some(quality));
+            assert_eq!(FsrQuality::parse(quality.label()), Some(quality));
+        }
+        assert_eq!(
+            serde_json::to_string(&FsrQuality::UltraQuality).unwrap(),
+            "\"ultra_quality\""
+        );
+        // Lenient CLI spellings.
+        assert_eq!(FsrQuality::parse("ultra-quality"), Some(FsrQuality::UltraQuality));
+        assert_eq!(FsrQuality::parse("Ultra Quality"), Some(FsrQuality::UltraQuality));
+        assert_eq!(FsrQuality::parse("perf"), Some(FsrQuality::Performance));
+        assert_eq!(FsrQuality::parse("nonsense"), None);
+        assert_eq!(FsrQuality::from_setting("nonsense"), FsrQuality::Off);
+
+        // The whole settings document survives an unknown FSR value: only that
+        // field normalises to Off.
+        let mut settings: Settings =
+            serde_json::from_str(r#"{"render_distance_chunks": 5, "fsr_quality": "definitely-not-fsr"}"#)
+                .expect("unknown FSR names must not discard the settings document");
+        assert_eq!(settings.fsr_quality, FsrQuality::Off);
+        assert_eq!(settings.render_distance_chunks, 5);
+        settings.fsr_quality = FsrQuality::Balanced;
+        settings.clamp();
+        assert_eq!(settings.fsr_quality, FsrQuality::Balanced);
+
+        // Missing fields keep the safe native default.
+        let settings: Settings = serde_json::from_str("{}").expect("defaults");
+        assert_eq!(settings.fsr_quality, FsrQuality::Off);
     }
 
     #[test]
@@ -1950,6 +2135,10 @@ mod tests {
         assert_eq!(loaded.graphics_preset, GraphicsPreset::High);
         assert_eq!(loaded.shadow_quality, ShadowQuality::High);
         assert!(loaded.bloom);
+        // A 1.2 config has no view distance; it must load as the documented
+        // default instead of failing deserialisation or shrinking to 0.
+        assert_eq!(loaded.view_distance_chunks, DEFAULT_VIEW_DISTANCE);
+        assert_eq!(loaded.render_distance_chunks, 8);
     }
 
     #[test]
@@ -1986,6 +2175,36 @@ mod tests {
         settings.render_distance_chunks = 999;
         assert!(settings.clamp());
         assert_eq!(settings.render_distance_chunks, MAX_RENDER_DISTANCE);
+    }
+
+    #[test]
+    fn view_distance_supports_the_512_chunk_target_and_clamps() {
+        assert_eq!(MIN_VIEW_DISTANCE, 32);
+        assert_eq!(MAX_VIEW_DISTANCE, 512);
+        let mut settings = Settings {
+            view_distance_chunks: 512,
+            ..Settings::default()
+        };
+        assert!(!settings.clamp());
+        assert_eq!(settings.view_distance_chunks, 512);
+
+        settings.view_distance_chunks = 0;
+        assert!(settings.clamp());
+        assert_eq!(settings.view_distance_chunks, MIN_VIEW_DISTANCE);
+        settings.view_distance_chunks = 999;
+        assert!(settings.clamp());
+        assert_eq!(settings.view_distance_chunks, MAX_VIEW_DISTANCE);
+        settings.view_distance_chunks = -4;
+        settings.render_distance_chunks = 3;
+        assert!(settings.clamp());
+        assert_eq!(settings.view_distance_chunks, MIN_VIEW_DISTANCE);
+        assert_eq!(settings.render_distance_chunks, 3);
+
+        // The visual radius can never fall below the simulated radius.
+        settings.view_distance_chunks = 32;
+        settings.render_distance_chunks = 32;
+        assert!(!settings.clamp());
+        assert_eq!(settings.view_distance_chunks, 32);
     }
 
     #[test]

@@ -1954,3 +1954,183 @@ meal/tool tiers beyond iron/offhand, bed pillow fixed +Z, wall torches/coloured
 light absent, predicted multiplayer placement relights locally before the
 authoritative LightUpdate, server chunk memory still grows with exploration, and
 the 1.1 far-shadow/LOD limits apply.
+
+## 2026-11-25 — v1.3 far terrain (512 chunks)
+
+### Environment and method
+
+Fedora Linux 45 (kernel 7.3.4), AMD Ryzen 7 9800X3D, integrated RADV
+RAPHAEL_MENDOCINO, release build (thin LTO, `codegen-units = 1`) in
+`/home/martintondel/Projects/openblock/target-far3`. The harness is
+`render_distance_bench` with seed 42, a 32-chunk simulation radius
+(4,225 columns, 2,620 near sections + 1,010 far batches), 512-chunk view,
+`High` preset, 1280x720 or 1920x1080, 120 measured frames after 10 warm-up
+frames, and a blocking GPU→CPU readback per frame. The same binary and scene were
+run with `--no-far` and `--view-distance 512` back to back on a quiet box (the
+earlier contended runs are retained in the commit history; the GPU was then busy
+with a separate windowed game).
+
+### Geometry and build
+
+| Metric | 512-chunk view, 32-chunk sim |
+| --- | ---: |
+| Far tiers | 5 (8/16/32/64/128 m cells) |
+| Opaque quads | 47,950 |
+| Opaque vertices | 49,950 |
+| Opaque triangles | 95,900 |
+| Water triangles | 11,581 |
+| Vertex + index data | 3.8 MiB |
+| Build + assembly (release, worker) | 8.0–8.4 ms |
+| Far draws | 1 opaque + 1 water |
+
+The mesh covers 416..8,288 blocks around the camera (simulation radius minus
+96-block hysteresis to view radius plus hysteresis) and is recentered on a
+worker only after 96 blocks of travel, throttled to one start per 350 ms. The
+default 128-chunk/6-chunk-sim configuration builds ~42.5k quads (~85k
+triangles); the builder is the same code path in the client worker, screenshots
+and benchmark.
+
+### Frame times (paired, quiet box)
+
+| Run | p50 ms | p95 ms | p99 ms | max ms | p50 FPS | p95 FPS | Paired overhead |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1280x720 `--no-far` | 10.59 | 10.72 | 10.82 | 10.87 | 94.4 | 93.3 | — |
+| **1280x720 far 512** | **11.19** | **11.31** | **11.33** | **11.38** | **89.3** | **88.4** | **+0.60 ms (+5.7%)** |
+| 1920x1080 `--no-far` | 14.85 | 15.04 | 15.93 | 16.09 | 67.1 | 66.5 | — |
+| **1920x1080 far 512** | **15.70** | **15.80** | **15.87** | **16.56** | **63.7** | **63.3** | **+0.85 ms (+5.7%)** |
+
+Draw counters were 716 opaque draws (433 sections + 283 batches) without far
+terrain and 751 (433 + 317 + 1 far) with it; 6.89 M vs 7.65 M submitted vertices
+(the difference includes the far mesh and LOD tier changes caused by the wider
+far plane). The far pass itself submits 95,900 opaque triangles and 11,581 water
+triangles in two draws. Water draws were 18 near + 1 far. Nine passes were
+recorded in both runs (two shadow cascades, main, sky, water, three bloom, post).
+
+Memory: world heap 132.2 MiB, cached near-world vertex estimate 1,490–1,494 MiB,
+far mesh 3.8 MiB, RSS after build 269–271 MiB, peak 273–279 MiB. The far mesh
+adds ~4 MiB, below the ≤32 MiB PERF-FRAME-006 Report ceiling.
+
+### Result against the target
+
+At 1920x1080 `High` with a 512-chunk visual distance the paired run reaches
+**63.7 FPS at p50** and **63.3 FPS at p95** (15.80 ms), so the 60 FPS target is
+met. At 1280x720 it reaches 89.3 FPS p50. The far pass adds 0.60 ms at 720p and
+0.85 ms at 1080p (5.7% of frame time in both cases), while adding ~4 MiB of
+geometry and two draw calls. The absolute values are slightly above the 1.2
+quiet-box baseline (90.6/61.7 FPS) because the near-only scene is now measured
+with the same 120-frame/readback method and a quieter machine; the useful
+comparison is the paired row in the table above.
+
+### Screenshots
+
+- `/tmp/openblock-512chunks-day.png` — ground-level vista, 512 chunks, noon.
+- `/tmp/openblock-512chunks-dusk.png` — same viewpoint at time 0.75.
+- `/tmp/openblock-512chunks-high.png` — 900-block eye height, pitch −0.6 rad,
+  showing the full tier ladder, water and the fogged horizon.
+- `/tmp/openblock-512chunks-faronly3.png` — 1-chunk simulation radius so the
+  far mesh fills the frame (far-quality inspection).
+
+Visual inspection: horizon reaches 8,192 blocks with no holes, the near/far
+seam is covered by the 1.5-cell tier overlap, water bodies and coastlines are
+visible, and the fog blends into the sky horizon. Limitations: the heightfield
+is smoother than the block world, large snow/biome patches read as flat areas
+from high altitude, distant coastlines are quantised to the tier cell, and the
+near/far style change is visible from a flying viewpoint.
+
+### Tests
+
+- `ob_core`: 1.2 config defaulting to view 128, clamp 32..512, view ≥ sim.
+- `ob_worldgen`: `surface_sample` equals `height_at` + `biome_at` on a 900+-point
+  grid for three seeds; determinism and seed sensitivity.
+- `ob_render`: far tier coverage/overlap, 512-chunk quad budget, determinism,
+  water clipping, normal/colour validity, offscreen GPU draw/validation and
+  clear-without-mesh.
+- `ob_client`: view-distance row text/stepping/warning, CLI parsing/run-only
+  override, far worker recenter policy, deterministic synchronous build, F3
+  full/compact line and overlay layout at all GUI scales.
+- `ob_tools`: `--view-distance`, `--no-far` and `--eye-height` parsing; report
+  fields for far build, quads, vertices, memory and draw counters.
+- Existing suites were rerun: `cargo test --workspace --all-targets` reports
+  **989 passed, 0 failed, 18 ignored**; `cargo clippy --workspace --all-targets
+  -- -D warnings`, `cargo fmt --check`, `RUSTDOCFLAGS=-D warnings cargo doc
+  --workspace --no-deps` and `.github/scripts/check-arch.sh` are clean.
+
+## 2026-11-25 — v1.3 FSR 1.0 on far terrain (512 chunks)
+
+### Environment and method
+
+| | |
+| --- | --- |
+| OS | Fedora Linux 45, kernel 7.3.4, headless Vulkan |
+| CPU/GPU | AMD Ryzen 7 9800X3D, integrated RADV "RAPHAEL_MENDOCINO" (Vulkan) |
+| Renderer | wgpu 30.0.2, offscreen `Rgba8UnormSrgb`, seed 42 |
+| Build | release (thin LTO, `codegen-units = 1`), `CARGO_TARGET_DIR=/home/martintondel/Projects/openblock/target-fsr3 ./dev-cargo build --release -p ob_tools --bin render_distance_bench` |
+| Scene | simulation radius 32 chunks (512 blocks), view distance 512 chunks (8,192 blocks), 4,225 columns, 2,620 near sections + 1,010 far batches, 47,950 far quads |
+| Camera | spawn eye +18 m, pitch −0.25, noon-ish environment, `High` preset |
+| Harness | `render-distance-bench --render-distance 32 --view-distance 512 --frames 240 --warmup 20 --graphics high --fsr QUALITY`; blocking GPU→CPU readback in every measured frame |
+
+This entry is the paired native-versus-FSR measurement for the optional FSR 1.0 row added in
+v1.3. FSR is off by default (independent row, never implied by a preset). The same binary
+was used for every row; only the internal render size and the two FSR passes differ.
+
+### Results
+
+| Display | FSR row | Internal | p50 ms | p95 ms | p99 ms | p50 FPS | p95 FPS | Δ p50 vs native |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1280×720 | Native (Off) | 1280×720 | **11.79** | 13.11 | 13.38 | **83.3** | 76.3 | — |
+| 1280×720 | Quality | 858×482 | 18.13 | 19.14 | 19.45 | 55.0 | 52.2 | +6.34 ms (+53.8%) |
+| 1280×720 | Balanced | 756×426 | 18.46 | 19.74 | 20.26 | 54.0 | 50.7 | +6.67 ms (+56.6%) |
+| 1280×720 | Performance | 640×360 | 17.35 | 18.88 | 19.92 | 56.9 | 52.9 | +5.56 ms (+47.2%) |
+| 1920×1080 | Native (Off) | 1920×1080 | **15.84** | 16.53 | 16.91 | **62.6** | 60.5 | — |
+| 1920×1080 | Quality | 1286×724 | 26.63 | 27.96 | 28.32 | 37.4 | 35.8 | +10.79 ms (+68.1%) |
+| 1920×1080 | Balanced | 1134×638 | 24.00 | 25.95 | 26.67 | 41.3 | 38.5 | +8.16 ms (+51.5%) |
+| 1920×1080 | Performance | 960×540 | 25.42 | 26.99 | 27.98 | 39.4 | 37.1 | +9.58 ms (+60.5%) |
+
+Every row submitted the same geometry: 751 opaque draws (433 sections + 317 far batches +
+1 far mesh), 7,649,574 vertices, 312 shadow draws and 19 water draws. Native recorded 9
+passes; FSR recorded 11 (EASU + RCAS added). RSS after build was 272–279 MiB and peak
+277–282 MiB across all rows, i.e. no measurable memory increase because the smaller
+HDR/depth/bloom targets offset the LDR target and the output-sized intermediate. The native
+p50 controls are within 5% (720p) and 1% (1080p) of the previously recorded quiet-box
+far-terrain baseline (11.19 / 15.70 ms), so the native path did not regress.
+
+### Interpretation
+
+FSR 1.0 does **not** help at this scene on the reference-class integrated GPU. The best FSR
+result is 17.35 ms at 720p (vs 11.79 native) and 24.00 ms at 1080p (vs 15.84 native), i.e.
+47–68% slower. An isolated 50-pass probe measured EASU+RCAS alone at 3.5 ms for a 1280×720
+output and 7.8 ms for 1920×1080 on sRGB input (4.6 ms at 1080p with a non-sRGB input), before
+any scene cost. The scene is not fill-rate bound enough at this resolution: shrinking the
+internal area from 0.67× to 0.50× saves only 0.8–1.2 ms, while the EASU gather/re-encode and
+RCAS neighborhood cost more than that. The interaction with shadows is pronounced — with
+shadows off the 720p FSR delta fell to +2.0–2.6 ms, with Low (1024²) shadows it was +3.2 ms,
+and with Ultra (2048², 5×5 PCF) +6.4 ms — consistent with the 48-texel EASU footprint
+competing with the shadow map for memory bandwidth.
+
+The feature is kept as an opt-in row and is **not** a new preset default. A discrete GPU
+with more bandwidth may see a gain, but that is unmeasured here.
+
+### Screenshots
+
+- `/tmp/openblock-fsr-512chunks-native.png` (1920×1080, native)
+- `/tmp/openblock-fsr-512chunks-quality.png` (1286×724 internal)
+- `/tmp/openblock-fsr-512chunks-performance.png` (960×540 internal)
+- `/tmp/openblock-fsr-ui-settings.png` (FSR row `Quality (858x482)` at 1280×720)
+- `/tmp/openblock-fsr-ui-f3.png` (F3 line `FSR Quality 858x482 -> 1280x720 (0.67x)`)
+
+Inspection: Quality/Performance are visibly softer on foliage and block edges; RCAS keeps
+edges coherent and no ringing is visible. The settings panel and F3 text remain pixel-crisp,
+confirming that the UI is drawn after and outside FSR.
+
+### Tests
+
+- `ob_core`: default/normalise/serde/clamp and preset-independence tests for `fsr_quality`.
+- `ob_render`: FSR module unit/GPU tests (EASU/RCAS sharpness, resize, formats, errors) plus
+  integration tests at 1080p/720p/odd sizes, resize and quality reallocation, native UI
+  pixels after upscale, and unsupported-format fallback.
+- `ob_client`: FSR settings row, live apply/no-Custom rule, `--fsr` parsing/run-only mapping,
+  F3 full/compact and GUI-scale layout tests.
+- `ob_tools`: `--fsr` parsing/order independence and report fields.
+
+The full limitation list and the recommendation live in
+[1.3-fsr](../plan/1.3-fsr.md) and [spec/04 §3.13.9](../spec/04-shaders-and-visuals.md#3139-fsr-10-integration-v13-optional).

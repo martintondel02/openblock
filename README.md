@@ -6,18 +6,18 @@
 <p align="center">
   <a href=".github/workflows/ci.yml"><img alt="CI" src="https://github.com/martintondel02/openblock/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE-MIT"><img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-1.2.1%20early%20access-orange.svg">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.3.0%20early%20access-orange.svg">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.100%2B-B7410E.svg?logo=rust">
   <img alt="Primary platform" src="https://img.shields.io/badge/platform-Fedora%2044%2F45%20%7C%20Linux-51A2DA.svg?logo=fedora">
 </p>
 
 OpenBlock is an open-source voxel sandbox: mine, build, explore and survive alone
-or with friends on servers you host yourself. **1.2.1 is an Early Access
+or with friends on servers you host yourself. **1.3.0 is an Early Access
 release**: the core survival game and self-hosted multiplayer are playable and
 tested end-to-end, while crafting-grid, lighting, farming, weather and the
 modding track are explicitly post-1.0 (see [Known limitations](#known-limitations)).
 
-![OpenBlock 1.2 at 512-block render distance with shadows and clouds](docs/img/v1.1.0-vista-day.png)
+![OpenBlock 1.3 at 512-chunk (8,192-block) visual render distance](docs/img/v1.3.0-vista-day.png)
 
 ## What's in 1.0
 
@@ -47,11 +47,13 @@ modding track are explicitly post-1.0 (see [Known limitations](#known-limitation
   stages, bread, hoes, 36-slot inventory (hotbar + main + armor) and protocol v3
   with authoritative light/sleep sync; 1.0/1.1 worlds migrate their fake light
   once.
-- **512-block reach and shaders** — up to **32 chunks / 512 blocks** of view
-  distance with a surface-shell LOD, adaptive streaming and measured 90+ FPS at
-  720p / 60+ FPS at 1080p (High, 512 blocks); HDR pipeline with sun-shadow
-  cascades, translucent animated water, procedural clouds, bloom, ACES
-  tonemapping and FXAA; Low/Medium/High/Ultra presets and a Graphics settings tab.
+- **512-chunk reach + shaders (1.3)** — visual render distance up to **512
+  chunks / 8,192 blocks** via tiered far-terrain heightfield LOD (simulation and
+  full detail stay at 2–32 chunks); measured 89 FPS at 720p / 63.7 FPS at 1080p
+  (High, 512-chunk view, 512-block sim); HDR pipeline with sun-shadow cascades,
+  translucent animated water, procedural clouds, bloom, ACES tonemapping and
+  FXAA; optional FSR 1.0 (EASU+RCAS, MIT) render scaling; Low/Medium/High/Ultra
+  presets, Graphics settings tab, `--view-distance`/`--fsr`.
 - **Exploration content** — deterministic ruined towers, abandoned camps, stone
   circles and mineshaft adits in every world (1.1), with more structures/loot
   planned.

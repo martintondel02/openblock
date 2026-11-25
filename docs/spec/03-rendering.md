@@ -52,13 +52,14 @@ chunk columns, never a 512-block diameter.
 | REQ-RENDER-023 | Entities, items and particles are instanced or vertex-pulled from shared buffers; no per-entity uniform, bind group or pipeline switch in the frame loop. | Draw counter with 500 entities |
 | REQ-RENDER-024 | The UI pass is last, in the swapchain format, `LoadOp::Load`, without world depth, and never influences culling. | Graph inspection |
 | REQ-RENDER-025 | Shadow and post passes are declared in §3.9 and implemented by [chapter 04](04-shaders-and-visuals.md); adding or removing one updates both chapters' budgets. | Pass inventory diff |
-| REQ-RENDER-026 | At a 512-block radius, full 16³ section detail inside a 10-chunk radius; farther columns use the §3.10 surface-shell batch LOD (top 48 blocks, 2×2-chunk groups, at most one geometry draw per group). No impostor or generated terrain exists beyond the render distance. | LOD policy unit tests, renderer distance tests and the 512-block benchmark |
+| REQ-RENDER-026 | At a 512-block simulation radius, full 16³ section detail inside a 10-chunk radius; farther columns use the §3.10 surface-shell batch LOD (top 48 blocks, 2×2-chunk groups, at most one geometry draw per group). Beyond the simulation radius a visual-only heightfield may extend to the view distance (default 128 chunks, maximum 512 chunks / 8,192 blocks); it is never generated into world state and never feeds gameplay. | LOD policy unit tests, renderer distance tests, far-terrain tier/budget tests and the 512-chunk benchmark |
 | REQ-RENDER-027 | Present mode, limiter and vsync map to the §3.10 settings; default `Mailbox` else `Fifo`, vsync off. | Settings schema plus frame trace |
 | REQ-RENDER-028 | Upload bytes, mesh jobs, defrag copies and sorts have hard per-frame caps; exceeding one defers work rather than extending the frame. | p99 gate during streaming |
 | REQ-RENDER-029 | Presets are data (potato, low, medium, high, performance, ultra) mapping to §3.11 settings; `performance` is the 144 FPS mode, not a quality tier above `high`; no automatic preset changes state unreported in the UI. | Settings schema test |
 | REQ-RENDER-030 | Profiling exposes per-pass timestamps, CPU scopes, per-pass markers and the §3.12 scenes with p50/p95/p99. | CI artifact check |
 | REQ-RENDER-031 | Device loss, surface loss and OOM recover without a process restart; meshes rebuild from world state. | Fault-injection test |
 | REQ-RENDER-032 | Golden-image and validation-layer gates pass on all three desktop backends; **on Linux the required matrix is Vulkan through Mesa RADV (AMD), Mesa ANV (Intel) and the NVIDIA driver on Fedora ([DEC-054](../decisions.md))**, with OpenGL/GLES not supported as a fallback; the performance envelope is gated on the Fedora reference machine, with macOS Metal a `Warn` tier until MS-13 proves it ([25 §3.1](25-performance-budgets.md#31-hardware-tiers)). | CI job + Fedora driver matrix |
+| REQ-RENDER-033 | Far terrain is visual-only: it is sampled from the deterministic surface height/biome API, uploaded as neutral world-space vertices/indices, excluded from shadow casting, and never consulted by collision, streaming, spawning, drops, ore knowledge, persistence or anti-cheat. The simulation radius stays at most 32 chunks and the server interest radius is unchanged. | Source inspection, far-terrain unit tests and multiplayer seed/visual-only test |
 
 ## 3. Design
 
@@ -447,23 +448,51 @@ the 512-block radius is playable now:
   neighbourhood (group plus one chunk of border), so a batch is independent of the live
   world and can be cancelled by its epoch. At most four batches are queued at once and one
   batch is uploaded per frame to bound buffer-creation hitches.
-* `render_distance_chunks` is clamped to 2..=32; the settings row shows both the chunk count
-  and the block radius (`32 chunks / 512 blocks`). The camera far plane is
-  `chunks × 16 + 48` (560 blocks at the ceiling). Standard `Depth32Float` is kept — no
-  reverse-Z — because the 0.31 m depth quantum at 512 m is below the sub-pixel size of far
-  terrain.
+* `render_distance_chunks` is clamped to 2..=32 for the simulation/streaming
+  radius; the settings row labels it **Simulation distance** and shows both the
+  chunk count and the block radius (`32 chunks / 512 blocks`). The historical
+  near-only helper `far_plane_for_render_distance = simulation × 16 + 48`
+  (560 blocks at the ceiling) remains for `--no-far` comparisons and existing
+  tests; when visual far terrain is enabled the camera far plane comes from
+  `far_plane_for_view_distance` instead.
+* **v1.3 visual far terrain.** A separate `view_distance_chunks` setting
+  (32..=512, default 128) extends the horizon with a deterministic,
+  visual-only heightfield. The mesh is built on a worker from
+  `Generator::surface_sample` and split into five concentric tiers
+  (inner..512 at 8 m, 512..1024 at 16 m, 1024..2048 at 32 m, 2048..4096 at
+  64 m, 4096..outer at 128 m); tiers overlap by 1.5 cells so no crack can open.
+  At 512 chunks the build is ~48k opaque quads, ~50k vertices and ~3.8 MiB
+  (plus ~11.6k water triangles), built in ~8–9 ms off-thread. The camera far
+  plane is `16 × view + 128` (8,320 blocks at the ceiling), and standard
+  `Depth32Float` is retained: the only near/far overlap is at 512–520 blocks
+  where the quantum is 0.31 m, and the far heightfield has no coplanar second
+  surface. Reverse-Z remains post-1.3 work.
+* The far mesh carries position, linear albedo and a heightfield normal only.
+  It draws after near sections/batches with depth test and depth writes,
+  receives a cheap sun/ambient shade but casts no shadows, and is excluded from
+  every shadow cascade. Far water is clipped to the sea plane and drawn before
+  the sorted near water; there is at most one far opaque and one far water draw.
+* Rebuilds are hysteretic (96 blocks), throttled (350 ms) and single-flight; a
+  result more than 1.5 hysteresis behind a teleport/fast flight is discarded.
+  Fixed world-space geometry means no per-frame recenter and no pop while the
+  worker runs.
 
-Measured at 1280×720 on the RADV integrated reference: 4,225 columns, 716 draws (433 full
-sections + 283 far batches), 6.35 M submitted vertices, p50 5.21 ms (191 FPS) with GPU
-readback. The pre-LOD scene at the same radius needed 8,917 draws and p50 13.87 ms. See
-[plan/08](../plan/08-measurements.md) for the full methodology and the 1,216 MiB vertex-data
-estimate (RSS 455 MiB).
+Measured at 1280×720 on the shared RADV integrated reference (1.2 scene, before
+far terrain): 4,225 columns, 716 draws (433 full sections + 283 far batches),
+6.35 M submitted vertices, p50 5.21 ms (191 FPS) with GPU readback. The pre-LOD
+scene at the same radius needed 8,917 draws and p50 13.87 ms. The v1.3
+far-terrain runs and their paired near-only comparison are in
+[plan/08 §v1.3](../plan/08-measurements.md#2026-11-25--v13-far-terrain-512-chunks)
+and [1.3-far-terrain](../plan/1.3-far-terrain.md). On the quiet reference box the
+512-chunk view reached 89.3 FPS p50 at 1280×720 and 63.7 FPS p50 / 63.3 FPS p95
+at 1920×1080, with a paired far-pass cost of 0.60/0.85 ms.
 
-Beyond the render distance the world still ends in atmospheric fog and sky — no impostor
-tiles, heightfield rings or GPU-generated far terrain, and client-side generation would be an
-information leak. Post-1.0 (MS-20) adds visual-only tiles allocated as whole pages and
-excluded from the shadow pass; they can never feed collision, spawning, drops, ore knowledge
-or anti-cheat.
+Far terrain is not generated into the world and must never be treated as
+authoritative: it cannot feed collision, spawning, drops, ore knowledge or
+anti-cheat, and multiplayer keeps the server interest radius at the simulation
+distance. The old "no impostor/heightfield beyond the render distance" rule is
+therefore superseded for **visual** geometry only by DEC-018's post-1.0
+visual-tier clause; generated far columns remain forbidden.
 
 | Setting | Values | Mapping |
 | --- | --- | --- |
@@ -471,7 +500,8 @@ or anti-cheat.
 | `render.vsync` | off (default), on | `on` forces `Fifo` |
 | `render.fps_limit` | `display` (refresh − 3), `60`, `120`, `144`, `off` | Sleep-based limiter, 0.5 ms granularity, never busy-waits |
 | `render.frames_in_flight` | 2 (default), 3 | §3.3 |
-| `render.distance_blocks` | 128, 256, 384, 512 (default), 768; 1024 post-1.0 | Radius in blocks; the settings row also shows the 16-block chunk radius (8/16/24/32/48; 64 post-1.0) and the 65×65 column count at 512 |
+| `render.simulation_distance_blocks` | 32, 96, 160, 256, 384, 512 (2..=32 chunks) | Simulation/streaming/full-detail radius in blocks; the settings row also shows the chunk radius and the 65×65 column count at 512 |
+| `render.view_distance_chunks` | 32..=512 (default 128) | Visual horizon in chunks; `N chunks / 16N blocks` (`512 chunks / 8192 blocks` at the maximum). Far terrain beyond the simulation radius is low-poly and visual-only; values above 128 show a GPU-cost note |
 | `render.preset` | `potato`, `low`, `medium`, `high` (default), `performance`, `ultra` | Selects the §3.11 column; `performance` is the 144 FPS mode, not a quality tier; a change is persisted and reported in the HUD |
 
 The limiter targets `refresh − 3`: driving `Fifo` at exactly the refresh rate leaves a standing
@@ -498,6 +528,11 @@ periods, with p50/p99 recorded at MS-04.
 | anisotropy | 1× | 4× | 8× | 8× | 8× | 16× |
 | entity distance (blocks) | 48 | 64 | 80 | 96 | 96 | 128 |
 | estimated GPU time | 1.9 ms | 2.2 ms | 3.4 ms | **5.7 ms** | **3.3 ms** | 7.6 ms |
+
+Presets select the simulation/quality envelope above; they do not change the
+persisted `render.view_distance_chunks` visual horizon (default 128), which is
+independent of preset. A player may keep `potato` and still request the 8,192-block
+far horizon; the resulting GPU cost is reported, not silently clamped.
 
 `potato` is the integrated-GPU preset: it drops memory-bandwidth-bound effects and lowers render
 scale, the cheapest lever on any GPU. `performance` is the 144 FPS mode: 512-block radius, 0.85

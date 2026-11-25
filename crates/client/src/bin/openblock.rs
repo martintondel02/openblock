@@ -1,6 +1,6 @@
 //! The `openblock` game client binary.
 
-const USAGE: &str = "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--mesh-workers N] [--survival|--creative] [--fly] [--x11] [--no-audio] [--mute] [--connect HOST:PORT] [--name NAME] [--screenshot PATH] [--screenshot-inventory PATH] [--screenshot-dead] [--screenshot-settings[=TAB]] [--screenshot-settings-tab TAB] [--screenshot-crafting] [--screenshot-title] [--screenshot-new-world] [--screenshot-worlds] [--screenshot-connect] [--screenshot-debug] [--screenshot-mobs] [--screenshot-furnace] [--screenshot-chest] [--screenshot-torch] [--screenshot-farm] [--screenshot-sleep] [--screenshot-items] [--screenshot-network] [--screenshot-name-tags] [--screenshot-net-ui=KIND] [--screenshot-size WxH] [--ui-scale PERCENT|auto] [--seconds N] [--texture-style NAME] [--texture-pack PATH] [--no-texture-pack] [--ui-font PATH] [--default-ui-font] [--time-of-day F] [--title|--menu] [--version]";
+const USAGE: &str = "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--view-distance N] [--mesh-workers N] [--survival|--creative] [--fly] [--x11] [--no-audio] [--mute] [--connect HOST:PORT] [--name NAME] [--screenshot PATH] [--screenshot-inventory PATH] [--screenshot-dead] [--screenshot-settings[=TAB]] [--screenshot-settings-tab TAB] [--screenshot-crafting] [--screenshot-title] [--screenshot-new-world] [--screenshot-worlds] [--screenshot-connect] [--screenshot-debug] [--screenshot-mobs] [--screenshot-furnace] [--screenshot-chest] [--screenshot-torch] [--screenshot-farm] [--screenshot-sleep] [--screenshot-items] [--screenshot-network] [--screenshot-name-tags] [--screenshot-net-ui=KIND] [--screenshot-size WxH] [--ui-scale PERCENT|auto] [--fsr QUALITY] [--seconds N] [--texture-style NAME] [--texture-pack PATH] [--no-texture-pack] [--ui-font PATH] [--default-ui-font] [--time-of-day F] [--title|--menu] [--version]";
 
 fn main() {
     ob_core::init_logging();
@@ -12,6 +12,7 @@ fn main() {
         };
         println!("{}", ob_core::version_banner("openblock"));
         println!("graphics: {}", gpu);
+        println!("fsr:      --fsr off|ultra_quality|quality|balanced|performance (run-only upscaling)");
         println!("textures: --texture-pack PATH loads a Minecraft resource pack and remembers it");
         println!("          --no-texture-pack clears the saved pack and uses the procedural style");
         println!("fonts:    --ui-font PATH loads a TTF/OTF UI font (e.g. Minecraftia) and remembers it");
@@ -82,6 +83,8 @@ fn main() {
         println!("  --screenshot-net-ui=KIND  render loading, failed, disconnected or roster overlay");
         println!("  --screenshot-size WxH  offscreen target size (default 1280x720)");
         println!("  --ui-scale PERCENT|auto  override the persistent GUI scale (auto, 75, 100, 125 or 150)");
+        println!("  --fsr QUALITY      run-only FSR 1.0 override: off, ultra_quality, quality, balanced, performance");
+        println!("                     renders the world at an internal resolution; UI stays native (not saved)");
         println!("  --screenshot-title  render the title screen (requires --screenshot PATH)");
         println!("  --screenshot-new-world  render the new-world form (requires --screenshot PATH)");
         println!("  --screenshot-worlds  render the world list with temporary worlds");

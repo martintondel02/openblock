@@ -6,7 +6,8 @@ version = 1
 path = [
   "README.md", "CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md",
   "CODE_OF_CONDUCT.md", "MAINTAINERS.md", "Cargo.lock", "dev-cargo",
-  "docs/**", "crates/**", "xtask/**", "perf/**", "packs/**", "justfile",
+  "docs/**", "crates/*/Cargo.toml", "crates/*/src/**", "crates/*/tests/**",
+  "crates/*/benches/**", "crates/*/examples/**", "xtask/**", "perf/**", "packs/**", "justfile",
   "Cargo.toml", "rust-toolchain.toml", "rustfmt.toml", "deny.toml",
   "architecture.toml", "REUSE.toml",
   ".github/**", ".editorconfig", ".markdownlint.jsonc", ".gitignore",
@@ -54,6 +55,16 @@ SPDX-License-Identifier = "MIT"
 path = ["LICENSE-APACHE", "LICENSES/Apache-2.0.txt"]
 SPDX-FileCopyrightText = "Apache Software Foundation"
 SPDX-License-Identifier = "Apache-2.0"
+
+# FSR 1.0 EASU/RCAS WGSL ports and their license text are AMD-derived MIT
+# software. The broad annotation above deliberately lists crate sources rather
+# than `crates/**` so this directory is not also claimed as MIT OR Apache-2.0.
+# The full MIT text is kept in the directory as LICENSE-FSR.txt and is also
+# reproduced in crates/render/src/fsr.rs.
+[[annotations]]
+path = ["crates/render/assets/fsr/**"]
+SPDX-FileCopyrightText = "2021 Advanced Micro Devices, Inc."
+SPDX-License-Identifier = "MIT"
 
 # Bundled Minecraft-style UI font (Monocraft) is third-party software under the
 # SIL Open Font License 1.1; it lives outside crates/** so the broad annotation

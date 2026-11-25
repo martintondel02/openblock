@@ -8,8 +8,8 @@ use std::collections::VecDeque;
 
 use ob_content::{BlockType, Registry};
 use ob_core::config::{
-    Action, BindKey, CloudQuality, GameMode, GraphicsPreset, KeybindError, Settings, ShadowQuality, TextureStyle,
-    WaterQuality,
+    Action, BindKey, CloudQuality, FsrQuality, GameMode, GraphicsPreset, KeybindError, Settings, ShadowQuality,
+    TextureStyle, WaterQuality,
 };
 use ob_render::UiFrame;
 
@@ -129,11 +129,19 @@ pub const SETTINGS_HINT_Y_FROM_BOTTOM: f32 = 60.0;
 pub const SETTINGS_HINT_STEP: f32 = 14.0;
 /// Smallest render distance the settings screen offers, in chunks.
 pub const SETTINGS_MIN_RENDER_DISTANCE: i32 = 2;
-/// Largest render distance the settings screen offers, in chunks.
+/// Largest simulation distance the settings screen offers, in chunks.
 ///
 /// 32 chunks is 512 blocks. The settings row shows both values because the
 /// existing `--render-distance` flag and F3 line are chunk-based.
 pub const SETTINGS_MAX_RENDER_DISTANCE: i32 = 32;
+/// Smallest visual view distance the settings screen offers, in chunks.
+pub const SETTINGS_MIN_VIEW_DISTANCE: i32 = ob_core::config::MIN_VIEW_DISTANCE;
+/// Largest visual view distance the settings screen offers (8,192 blocks).
+pub const SETTINGS_MAX_VIEW_DISTANCE: i32 = ob_core::config::MAX_VIEW_DISTANCE;
+/// Step applied by the View distance row's arrows, in chunks.
+pub const SETTINGS_VIEW_DISTANCE_STEP: i32 = 16;
+/// View distance above which the settings screen shows a GPU-cost note.
+pub const SETTINGS_VIEW_DISTANCE_WARNING: i32 = ob_core::config::VIEW_DISTANCE_WARNING_CHUNKS;
 /// Smallest field of view the settings screen offers, in degrees.
 pub const SETTINGS_MIN_FOV_DEGREES: f32 = 50.0;
 /// Largest field of view the settings screen offers, in degrees.
@@ -307,8 +315,10 @@ pub enum SettingsRow {
     ShowHud,
     /// Whether the F3 debug overlay is visible.
     DebugOverlay,
-    /// Streaming radius in chunks.
+    /// Simulation (full-detail/streaming) radius in chunks.
     RenderDistance,
+    /// Visual render distance including far terrain, in chunks.
+    ViewDistance,
     /// Vertical field of view.
     Fov,
     /// Mouse look multiplier.
@@ -357,6 +367,8 @@ pub enum SettingsRow {
     Bloom,
     /// FXAA-lite toggle.
     Fxaa,
+    /// FSR 1.0 upscaling quality (independent of the preset).
+    Fsr,
 }
 
 impl SettingsRow {
@@ -366,7 +378,8 @@ impl SettingsRow {
             SettingsRow::GameMode => "Game mode",
             SettingsRow::ShowHud => "Show HUD",
             SettingsRow::DebugOverlay => "Debug overlay (F3)",
-            SettingsRow::RenderDistance => "Render distance",
+            SettingsRow::RenderDistance => "Simulation distance",
+            SettingsRow::ViewDistance => "View distance",
             SettingsRow::Fov => "Field of view",
             SettingsRow::MouseSensitivity => "Mouse sensitivity",
             SettingsRow::Fullscreen => "Fullscreen",
@@ -391,6 +404,7 @@ impl SettingsRow {
             SettingsRow::CloudCoverage => "Cloud coverage",
             SettingsRow::Bloom => "Bloom",
             SettingsRow::Fxaa => "FXAA",
+            SettingsRow::Fsr => "FSR",
         }
     }
 
@@ -403,7 +417,8 @@ impl SettingsRow {
             | SettingsRow::GraphicsPreset
             | SettingsRow::ShadowQuality
             | SettingsRow::Clouds
-            | SettingsRow::WaterQuality => SettingsRowKind::Choice,
+            | SettingsRow::WaterQuality
+            | SettingsRow::Fsr => SettingsRowKind::Choice,
             SettingsRow::ShowHud
             | SettingsRow::DebugOverlay
             | SettingsRow::Fullscreen
@@ -412,6 +427,7 @@ impl SettingsRow {
             | SettingsRow::Bloom
             | SettingsRow::Fxaa => SettingsRowKind::Toggle,
             SettingsRow::RenderDistance
+            | SettingsRow::ViewDistance
             | SettingsRow::Fov
             | SettingsRow::MouseSensitivity
             | SettingsRow::MasterVolume
@@ -561,6 +577,8 @@ pub struct SettingsInfo {
     pub ui_scale_percent: u16,
     /// One-line audio output description, or `off` when unavailable.
     pub audio_status: String,
+    /// Internal FSR render resolution when the upscaler is active, else `None`.
+    pub fsr_internal: Option<[u32; 2]>,
 }
 
 impl Default for SettingsInfo {
@@ -573,6 +591,7 @@ impl Default for SettingsInfo {
             mesh_workers: 1,
             ui_scale_percent: 100,
             audio_status: "off (headless)".to_string(),
+            fsr_internal: None,
         }
     }
 }
@@ -829,8 +848,24 @@ pub struct DebugStats {
     pub target: Option<(String, [i32; 3])>,
     /// World seed.
     pub seed: u64,
-    /// Streaming radius in chunks.
+    /// Simulation (full-detail/streaming) radius in chunks.
     pub render_distance: i32,
+    /// Visual render distance including far terrain, in chunks.
+    pub view_distance: i32,
+    /// Full-detail radius inside the simulated world, in chunks.
+    pub full_detail_radius: i32,
+    /// Far-terrain LOD tiers currently uploaded (0 when none).
+    pub far_tiers: usize,
+    /// Far-terrain opaque quads.
+    pub far_quads: u64,
+    /// Far-terrain opaque vertices.
+    pub far_vertices: u64,
+    /// Wall time of the last far-terrain build, in milliseconds.
+    pub far_build_ms: f32,
+    /// Far mesh centre in world XZ.
+    pub far_center: Option<[f64; 2]>,
+    /// Whether a far-terrain rebuild is currently in flight.
+    pub far_rebuilding: bool,
     /// Loaded chunk columns.
     pub loaded_chunks: usize,
     /// Sections drawn after frustum culling.
@@ -909,6 +944,8 @@ pub struct DebugStats {
     pub graphics_summary: String,
     /// Shadow mode, resolution and cascade count (`high 2048² ×3 3×3 PCF`).
     pub shadow_summary: String,
+    /// FSR preset, internal resolution and scale, or `native`.
+    pub fsr_summary: String,
 }
 
 impl DebugStats {
@@ -954,11 +991,15 @@ impl DebugStats {
             ),
             self.held_line(),
             format!(
-                "FOV {:.0}   Render distance {} chunks / {} blocks",
+                "FOV {:.0}   View {}c/{}b   Sim {}c/{}b   Near full {}c",
                 self.fov_degrees,
+                self.view_distance,
+                self.view_distance * 16,
                 self.render_distance,
-                self.render_distance * 16
+                self.render_distance * 16,
+                self.full_detail_radius
             ),
+            self.far_terrain_line(),
             format!(
                 "Textures: {}",
                 if self.texture_source.is_empty() {
@@ -1011,6 +1052,40 @@ impl DebugStats {
         lines
     }
 
+    /// Full far-terrain line for the regular F3 overlay.
+    pub fn far_terrain_line(&self) -> String {
+        let Some(center) = self.far_center else {
+            return "Far terrain idle (no visual mesh)".to_string();
+        };
+        format!(
+            "Far {} tiers  {:.1}k quads  {:.1}k verts  {:.1} ms  center {:.0}/{:.0}{}",
+            self.far_tiers,
+            self.far_quads as f64 / 1000.0,
+            self.far_vertices as f64 / 1000.0,
+            self.far_build_ms,
+            center[0],
+            center[1],
+            if self.far_rebuilding { "  rebuilding" } else { "" }
+        )
+    }
+
+    /// Short far-terrain line for the compact F3 overlay.
+    pub fn far_terrain_compact_line(&self) -> String {
+        let Some(center) = self.far_center else {
+            return "Far idle".to_string();
+        };
+        format!(
+            "Far {}t {:.0}kq {:.0}kv {:.0}ms c{:.0}/{:.0}{}",
+            self.far_tiers,
+            self.far_quads as f64 / 1000.0,
+            self.far_vertices as f64 / 1000.0,
+            self.far_build_ms,
+            center[0],
+            center[1],
+            if self.far_rebuilding { " rebuild" } else { "" }
+        )
+    }
+
     /// `Held: Stone Pickaxe 129/131  speed 4.0` line shown in the left column.
     pub fn held_line(&self) -> String {
         let held = if self.held.is_empty() { "empty" } else { &self.held };
@@ -1059,6 +1134,14 @@ impl DebugStats {
                     "off"
                 } else {
                     &self.shadow_summary
+                }
+            ),
+            format!(
+                "FSR {}",
+                if self.fsr_summary.is_empty() {
+                    "native"
+                } else {
+                    &self.fsr_summary
                 }
             ),
         ] {
@@ -1113,12 +1196,15 @@ impl DebugStats {
                 self.health, self.hunger, self.defense
             ),
             format!(
-                "FOV {:.0}   Render distance {} chunks / {} blocks   Facing {}",
+                "FOV {:.0}   View {}c/{}b   Sim {}c/{}b   Facing {}",
                 self.fov_degrees,
+                self.view_distance,
+                self.view_distance * 16,
                 self.render_distance,
                 self.render_distance * 16,
                 self.facing
             ),
+            self.far_terrain_compact_line(),
             format!(
                 "Seed {}   {}",
                 self.seed,
@@ -1243,9 +1329,9 @@ pub const DEBUG_FOOTER_SCALE: f32 = 1.2;
 /// Candidate glyph scales, largest first, used to fit narrow screens.
 pub const DEBUG_SCALES: [f32; 9] = [1.8, 1.7, 1.6, 1.5, 1.4, 1.3, 1.2, 1.1, 1.0];
 /// Section index of every line returned by [`DebugStats::left_lines`].
-pub const DEBUG_LEFT_SECTIONS: [usize; 16] = [0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3];
+pub const DEBUG_LEFT_SECTIONS: [usize; 17] = [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3];
 /// Section index of every line returned by [`DebugStats::compact_left_lines`].
-pub const DEBUG_COMPACT_SECTIONS: [usize; 10] = [0, 0, 1, 1, 1, 1, 2, 2, 2, 3];
+pub const DEBUG_COMPACT_SECTIONS: [usize; 11] = [0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 3];
 /// Maximum glyph scales tried for the compact F3 overlay, largest first.
 pub const DEBUG_COMPACT_SCALES: [f32; 6] = [1.4, 1.3, 1.2, 1.1, 1.0, 0.9];
 /// Logical height below which the F3 overlay uses its reduced line set.
@@ -1635,6 +1721,8 @@ pub struct UiState {
     /// Whether a text field currently owns the keyboard. Keybind capture is
     /// refused while this is set, so typing a world name or chat cannot rebind.
     pub text_input_active: bool,
+    /// Whether the one-time >128-chunk view-distance GPU warning was shown.
+    pub view_distance_warned: bool,
 }
 
 impl Default for UiState {
@@ -1672,6 +1760,7 @@ impl Default for UiState {
             binding_message: None,
             binding_message_error: false,
             text_input_active: false,
+            view_distance_warned: false,
         }
     }
 }
@@ -1886,6 +1975,7 @@ impl UiState {
             SettingsTab::Game => vec![SettingsRow::GameMode, SettingsRow::ShowHud, SettingsRow::DebugOverlay],
             SettingsTab::Display => vec![
                 SettingsRow::RenderDistance,
+                SettingsRow::ViewDistance,
                 SettingsRow::Fov,
                 SettingsRow::MouseSensitivity,
                 SettingsRow::Fullscreen,
@@ -1916,6 +2006,7 @@ impl UiState {
                 SettingsRow::CloudCoverage,
                 SettingsRow::Bloom,
                 SettingsRow::Fxaa,
+                SettingsRow::Fsr,
             ],
         }
     }
@@ -1999,6 +2090,14 @@ impl UiState {
                     value < SETTINGS_MAX_RENDER_DISTANCE
                 }
             }
+            SettingsRow::ViewDistance => {
+                let value = self.settings.view_distance_chunks;
+                if delta < 0 {
+                    value > SETTINGS_MIN_VIEW_DISTANCE
+                } else {
+                    value < SETTINGS_MAX_VIEW_DISTANCE
+                }
+            }
             SettingsRow::Fov => {
                 let value = if self.settings.fov_degrees.is_finite() {
                     self.settings.fov_degrees
@@ -2047,6 +2146,7 @@ impl UiState {
             | SettingsRow::ShadowQuality
             | SettingsRow::Clouds
             | SettingsRow::WaterQuality
+            | SettingsRow::Fsr
             | SettingsRow::Bloom
             | SettingsRow::Fxaa => true,
             SettingsRow::ShowHud
@@ -2106,6 +2206,11 @@ impl UiState {
                 self.settings.render_distance_chunks,
                 self.settings.render_distance_chunks * 16
             ),
+            SettingsRow::ViewDistance => format!(
+                "{} chunks / {} blocks",
+                self.settings.view_distance_chunks,
+                self.settings.view_distance_chunks * 16
+            ),
             SettingsRow::Fov => format!("{:.0} deg", self.settings.fov_degrees),
             SettingsRow::MouseSensitivity => format!("{:.2}x", self.settings.mouse_sensitivity),
             SettingsRow::Fullscreen => checkbox(self.settings.fullscreen),
@@ -2163,6 +2268,17 @@ impl UiState {
             }
             SettingsRow::Bloom => checkbox(self.settings.bloom),
             SettingsRow::Fxaa => checkbox(self.settings.fxaa),
+            SettingsRow::Fsr => {
+                if self.settings.fsr_quality.is_enabled() {
+                    let label = self.settings.fsr_quality.label();
+                    match info.fsr_internal {
+                        Some([width, height]) => format!("{label} ({width}x{height})"),
+                        None => format!("{label} (unavailable)"),
+                    }
+                } else {
+                    "Off".to_string()
+                }
+            }
         }
     }
 
@@ -2192,6 +2308,11 @@ impl UiState {
                 self.settings.render_distance_chunks as f32,
                 SETTINGS_MIN_RENDER_DISTANCE as f32,
                 SETTINGS_MAX_RENDER_DISTANCE as f32,
+            )),
+            SettingsRow::ViewDistance => Some(range_fraction(
+                self.settings.view_distance_chunks as f32,
+                SETTINGS_MIN_VIEW_DISTANCE as f32,
+                SETTINGS_MAX_VIEW_DISTANCE as f32,
             )),
             SettingsRow::Fov => Some(range_fraction(
                 self.settings.fov_degrees,
@@ -2266,6 +2387,31 @@ impl UiState {
                     false
                 } else {
                     self.settings.render_distance_chunks = next;
+                    true
+                }
+            }
+            SettingsRow::ViewDistance => {
+                let current = self
+                    .settings
+                    .view_distance_chunks
+                    .clamp(SETTINGS_MIN_VIEW_DISTANCE, SETTINGS_MAX_VIEW_DISTANCE)
+                    .max(self.settings.render_distance_chunks);
+                let step = SETTINGS_VIEW_DISTANCE_STEP * delta.signum();
+                let next = (current + step).clamp(SETTINGS_MIN_VIEW_DISTANCE, SETTINGS_MAX_VIEW_DISTANCE);
+                let next = next.max(self.settings.render_distance_chunks);
+                if next == self.settings.view_distance_chunks {
+                    false
+                } else {
+                    if current <= SETTINGS_VIEW_DISTANCE_WARNING
+                        && next > SETTINGS_VIEW_DISTANCE_WARNING
+                        && !self.view_distance_warned
+                    {
+                        self.view_distance_warned = true;
+                        self.toasts
+                            .push_warning("View distance above 128 chunks is visual-only far terrain; GPU cost rises");
+                    }
+                    self.settings.view_distance_chunks = next;
+                    self.settings.clamp();
                     true
                 }
             }
@@ -2411,6 +2557,17 @@ impl UiState {
                 self.settings.fxaa = !self.settings.fxaa;
                 self.settings.mark_graphics_custom();
                 true
+            }
+            SettingsRow::Fsr => {
+                // FSR is independent of the preset: changing it never marks
+                // the graphics preset Custom.
+                let next = cycle_quality(&FsrQuality::ALL, self.settings.fsr_quality, delta);
+                if next == self.settings.fsr_quality {
+                    false
+                } else {
+                    self.settings.fsr_quality = next;
+                    true
+                }
             }
             SettingsRow::MeshWorkers
             | SettingsRow::UiFont
@@ -3326,13 +3483,19 @@ fn draw_settings_rows(frame: &mut UiFrame, ui: &UiState, rows: &[SettingsRowInfo
             let track_x = row_arrows.map_or(rect.x + rect.w - track_width - inset, |(left, _)| {
                 left.x - metrics.slider_gap - track_width
             });
-            let track_y = rect.y + rect.h - 7.0;
-            frame.rect(track_x, track_y, track_width, 3.0, [0.10, 0.12, 0.16, 1.0]);
-            let filled = track_width * fraction;
-            if filled > 0.0 {
-                frame.rect(track_x, track_y, filled, 3.0, [0.88, 0.69, 0.28, 1.0]);
+            let track_y = rect.y + rect.h - 2.0;
+            // With eleven Display rows the pitch can be tighter than the old
+            // ten-row layout. Draw the range track only when it clears the
+            // value text; a slider through the words is worse than no slider,
+            // and the value plus arrows still communicate the setting.
+            if track_y >= label_y + ob_render::line_height(metrics.row_scale) {
+                frame.rect(track_x, track_y, track_width, 2.0, [0.24, 0.27, 0.33, 0.95]);
+                let filled = track_width * fraction;
+                if filled > 0.0 {
+                    frame.rect(track_x, track_y, filled, 2.0, [0.88, 0.69, 0.28, 1.0]);
+                }
+                frame.rect(track_x + filled - 2.0, track_y - 1.0, 4.0, 4.0, [0.98, 0.83, 0.43, 1.0]);
             }
-            frame.rect(track_x + filled - 2.0, track_y - 2.0, 4.0, 7.0, [0.98, 0.83, 0.43, 1.0]);
         }
     }
 }
@@ -3612,9 +3775,28 @@ fn draw_settings_footer(frame: &mut UiFrame, panel: UiRect, ui: &UiState, metric
         "Place Minecraftia.ttf in <data>/fonts/ or use --ui-font PATH.",
         "Reset uses built-in Monocraft; Reload re-scans data/system fonts.",
     ]);
+    let simulation_help = (ui.settings_focused_row() == Some(SettingsRow::RenderDistance)).then_some([
+        "Simulation distance streams, simulates and fully meshes the near world.",
+        "It stays at or below 32 chunks; View distance adds visual-only far terrain.",
+    ]);
+    let view_distance_help = (ui.settings_focused_row() == Some(SettingsRow::ViewDistance)).then_some([
+        "Far terrain beyond the Simulation distance is low-poly and visual-only.",
+        "Above 128 chunks it costs GPU time; gameplay, saves and servers are unaffected.",
+    ]);
+    let fsr_help = (ui.settings_tab == SettingsTab::Graphics && ui.settings_focused_row() == Some(SettingsRow::Fsr))
+        .then_some([
+            "FSR renders the world at a lower internal resolution, then sharpens on upscale.",
+            "The UI stays native. Off renders natively; applies immediately.",
+        ]);
     let lines: &[&str] = if let Some(lines) = ui_scale_help.as_ref() {
         lines
     } else if let Some(lines) = ui_font_help.as_ref() {
+        lines
+    } else if let Some(lines) = simulation_help.as_ref() {
+        lines
+    } else if let Some(lines) = view_distance_help.as_ref() {
+        lines
+    } else if let Some(lines) = fsr_help.as_ref() {
         lines
     } else if ui.settings_tab == SettingsTab::Controls {
         &SETTINGS_CONTROLS_HINT_LINES
@@ -4186,6 +4368,14 @@ mod tests {
             target: Some(("openblock:grass".into(), [1, 2, 3])),
             seed: 0,
             render_distance: 6,
+            view_distance: 128,
+            full_detail_radius: 6,
+            far_tiers: 3,
+            far_quads: 42_532,
+            far_vertices: 44_123,
+            far_build_ms: 38.4,
+            far_center: Some([123.0, -234.0]),
+            far_rebuilding: false,
             loaded_chunks: 217,
             drawn_sections: 244,
             cached_sections: 1133,
@@ -4226,6 +4416,7 @@ mod tests {
             graphics_summary: "High preset | shadows high 2048² ×3 | clouds high | water high | bloom on | FXAA on"
                 .into(),
             shadow_summary: "high 2048² ×3 3×3 PCF".into(),
+            fsr_summary: "Quality 1286x724 -> 1920x1080 (0.67x)".into(),
         }
     }
 
@@ -4434,8 +4625,8 @@ mod tests {
         assert_eq!(state.settings_focused_button(), None);
 
         state.settings_select_tab(SettingsTab::Display);
-        assert_eq!(state.settings_focus_count(), 12);
-        state.settings_selected_row = 11;
+        assert_eq!(state.settings_focus_count(), 13);
+        state.settings_selected_row = 12;
         assert_eq!(state.settings_focused_button(), Some(SettingsButton::SaveAndQuit));
         state.settings_row_down();
         assert_eq!(state.settings_selected_row, 0);
@@ -4509,11 +4700,64 @@ mod tests {
     }
 
     #[test]
+    fn view_distance_row_shows_chunks_and_blocks_and_warns_once() {
+        let mut state = UiState::default();
+        let info = SettingsInfo::default();
+        state.settings.view_distance_chunks = 512;
+        assert_eq!(
+            state.settings_row_value(SettingsRow::ViewDistance, &info),
+            "512 chunks / 8192 blocks"
+        );
+        assert_eq!(
+            state.settings_row_value(SettingsRow::RenderDistance, &info),
+            "6 chunks / 96 blocks"
+        );
+
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Display);
+        state.settings_selected_row = 1;
+        state.settings.view_distance_chunks = 112;
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::ViewDistance));
+        assert_eq!(state.settings.view_distance_chunks, 128);
+        assert_eq!(state.toasts.len(), 0, "crossing to 128 itself is not warned about");
+
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::ViewDistance));
+        assert_eq!(state.settings.view_distance_chunks, 144);
+        assert_eq!(state.toasts.len(), 1, "crossing 128 chunks warns once");
+        assert!(
+            state
+                .toasts
+                .iter()
+                .next()
+                .is_some_and(|toast| toast.text.contains("visual-only"))
+        );
+
+        // The warning is one-time per session; further increases are silent.
+        state.toasts = crate::ui_state::ToastQueue::default();
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::ViewDistance));
+        assert_eq!(state.toasts.len(), 0);
+        state.settings.view_distance_chunks = SETTINGS_MAX_VIEW_DISTANCE;
+        assert_eq!(state.settings_adjust(1), None);
+        assert!(!state.settings_can_adjust(SettingsRow::ViewDistance, 1));
+        assert_eq!(
+            state.settings_row_value(SettingsRow::ViewDistance, &info),
+            "512 chunks / 8192 blocks"
+        );
+
+        // Lowering below the warning threshold and crossing again stays silent:
+        // the note is one-time per session, not per crossing.
+        state.settings.view_distance_chunks = 112;
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::ViewDistance));
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::ViewDistance));
+        assert_eq!(state.toasts.len(), 0);
+    }
+
+    #[test]
     fn settings_adjust_clamps_fov() {
         let mut state = UiState::default();
         state.open_settings();
         state.settings_select_tab(SettingsTab::Display);
-        state.settings_selected_row = 1;
+        state.settings_selected_row = 2;
         assert_eq!(state.settings.fov_degrees, 70.0);
         assert_eq!(state.settings_adjust(1), Some(SettingsRow::Fov));
         assert_eq!(state.settings.fov_degrees, 75.0);
@@ -4532,7 +4776,7 @@ mod tests {
         let mut state = UiState::default();
         state.open_settings();
         state.settings_select_tab(SettingsTab::Display);
-        state.settings_selected_row = 2;
+        state.settings_selected_row = 3;
         assert_eq!(state.settings.mouse_sensitivity, 1.0);
         assert_eq!(state.settings_adjust(1), Some(SettingsRow::MouseSensitivity));
         assert!((state.settings.mouse_sensitivity - 1.1).abs() < 1e-6);
@@ -4647,20 +4891,20 @@ mod tests {
         assert!(!state.debug_overlay);
 
         state.settings_select_tab(SettingsTab::Display);
-        state.settings_selected_row = 3;
+        state.settings_selected_row = 4;
         assert!(!state.settings.fullscreen);
         assert_eq!(state.settings_adjust(1), Some(SettingsRow::Fullscreen));
         assert!(state.settings.fullscreen);
-        state.settings_selected_row = 4;
+        state.settings_selected_row = 5;
         assert_eq!(state.settings_focused_row(), Some(SettingsRow::UiScale));
         assert_eq!(state.settings_adjust(1), Some(SettingsRow::UiScale));
         assert_eq!(state.settings.ui_scale_percent, 125);
-        state.settings_selected_row = 5;
+        state.settings_selected_row = 6;
         assert_eq!(state.settings_focused_row(), Some(SettingsRow::ReducedMotion));
         assert!(!state.settings.reduced_motion);
         assert_eq!(state.settings_adjust(1), Some(SettingsRow::ReducedMotion));
         assert!(state.settings.reduced_motion);
-        state.settings_selected_row = 6;
+        state.settings_selected_row = 7;
         assert_eq!(state.settings_focused_row(), Some(SettingsRow::MeshWorkers));
         assert_eq!(state.settings_adjust(1), None);
         assert_eq!(state.settings_activate(), None);
@@ -4677,7 +4921,7 @@ mod tests {
         assert_eq!(state.settings.game_mode, GameMode::Creative);
 
         state.settings_select_tab(SettingsTab::Display);
-        state.settings_selected_row = 3;
+        state.settings_selected_row = 4;
         assert_eq!(
             state.settings_activate(),
             Some(SettingsAction::Adjust(SettingsRow::Fullscreen))
@@ -4714,8 +4958,8 @@ mod tests {
         assert_eq!(state.settings_tab, SettingsTab::Display);
 
         let rows = state.settings_row_rects(screen);
-        assert_eq!(rows.len(), 10);
-        state.cursor = rows[3].center();
+        assert_eq!(rows.len(), 11);
+        state.cursor = rows[4].center();
         assert_eq!(
             state.settings_click(screen),
             Some(SettingsAction::Adjust(SettingsRow::Fullscreen))
@@ -4870,14 +5114,15 @@ mod tests {
         let screen = [1280.0, 720.0];
         let rows = state.settings_row_rects(screen);
         let arrows = state.settings_arrow_rects(screen);
-        assert_eq!(rows.len(), 10);
-        assert!(arrows[0].is_some(), "render distance is a range");
-        assert!(arrows[1].is_some(), "FOV is a range");
-        assert!(arrows[2].is_some(), "sensitivity is a range");
-        assert!(arrows[3].is_none(), "fullscreen is a toggle");
-        assert!(arrows[4].is_some(), "GUI scale is a choice");
-        assert!(arrows[5].is_none(), "reduced motion is a toggle");
-        assert!(arrows[6].is_none(), "mesh workers is read-only");
+        assert_eq!(rows.len(), 11);
+        assert!(arrows[0].is_some(), "simulation distance is a range");
+        assert!(arrows[1].is_some(), "view distance is a range");
+        assert!(arrows[2].is_some(), "FOV is a range");
+        assert!(arrows[3].is_some(), "sensitivity is a range");
+        assert!(arrows[4].is_none(), "fullscreen is a toggle");
+        assert!(arrows[5].is_some(), "GUI scale is a choice");
+        assert!(arrows[6].is_none(), "reduced motion is a toggle");
+        assert!(arrows[7].is_none(), "mesh workers is read-only");
         let (left, right) = arrows[0].expect("render distance arrows");
         assert!(left.x + left.w < right.x, "arrows must not touch");
         assert!(right.x + right.w <= rows[0].x + rows[0].w);
@@ -4917,7 +5162,7 @@ mod tests {
             Some(SettingsAction::Adjust(SettingsRow::RenderDistance))
         );
         assert_eq!(state.settings.render_distance_chunks, 6, "right arrow increments");
-        state.cursor = rows[6].center();
+        state.cursor = rows[7].center();
         assert_eq!(
             state.settings_click(screen),
             None,
@@ -4952,7 +5197,13 @@ mod tests {
         assert_eq!(state.settings_adjust(-1), None);
         assert!(!state.settings_can_adjust(SettingsRow::RenderDistance, -1));
 
+        // The View distance row sits between the simulation radius and FOV.
         state.settings_selected_row = 1;
+        assert_eq!(state.settings.view_distance_chunks, 128);
+        assert_eq!(state.settings_adjust(-1), Some(SettingsRow::ViewDistance));
+        assert_eq!(state.settings.view_distance_chunks, 112);
+
+        state.settings_selected_row = 2;
         assert_eq!(state.settings.fov_degrees, 70.0);
         assert_eq!(state.settings_adjust(-1), Some(SettingsRow::Fov));
         assert!((state.settings.fov_degrees - 65.0).abs() < 1e-6);
@@ -4960,7 +5211,7 @@ mod tests {
         assert_eq!(state.settings_adjust(-1), None);
         assert!(!state.settings_can_adjust(SettingsRow::Fov, -1));
 
-        state.settings_selected_row = 2;
+        state.settings_selected_row = 3;
         assert_eq!(state.settings.mouse_sensitivity, 1.0);
         assert_eq!(state.settings_adjust(-1), Some(SettingsRow::MouseSensitivity));
         assert!((state.settings.mouse_sensitivity - 0.9).abs() < 1e-6);
@@ -4990,7 +5241,7 @@ mod tests {
                     layout.footer_y + ob_render::line_height(DEBUG_FOOTER_SCALE) <= hotbar_top,
                     "{label} F3 footer overlaps the hotbar"
                 );
-                let expected = if layout.compact { 10 } else { 16 };
+                let expected = if layout.compact { 11 } else { 17 };
                 assert_eq!(layout.left.lines.len(), expected, "{label}");
             }
         }
@@ -5004,7 +5255,7 @@ mod tests {
         let layout = debug_overlay_layout(screen, &stats);
         assert!(layout.compact, "640x360 logical needs the compact F3 set");
         assert_eq!(layout.columns, DebugColumns::LeftOnly);
-        assert_eq!(layout.left.lines.len(), 10);
+        assert_eq!(layout.left.lines.len(), 11);
         let hotbar_top = screen[1] - HOTBAR_SLOT_SIZE - 18.0;
         assert!(
             layout.left.panel.y + layout.left.panel.h < hotbar_top,
@@ -5028,7 +5279,7 @@ mod tests {
         let screen = [1280.0, 720.0];
         let layout = debug_overlay_layout(screen, &stats);
         assert_eq!(layout.columns, DebugColumns::SideBySide);
-        assert_eq!(layout.left.lines.len(), 16);
+        assert_eq!(layout.left.lines.len(), 17);
         let right = layout.right.as_ref().expect("hardware column");
         assert!(layout.left.panel.x + layout.left.panel.w + DEBUG_COLUMN_GAP <= right.panel.x + 0.01);
         assert!(layout.left.panel.y + layout.left.panel.h <= layout.footer_y - 4.0);
@@ -5357,6 +5608,14 @@ mod tests {
             target: Some(("openblock:grass".into(), [1, 2, 3])),
             seed: 42,
             render_distance: 8,
+            view_distance: 512,
+            full_detail_radius: 8,
+            far_tiers: 5,
+            far_quads: 55_104,
+            far_vertices: 57_000,
+            far_build_ms: 42.0,
+            far_center: Some([12.0, -34.0]),
+            far_rebuilding: true,
             loaded_chunks: 217,
             drawn_sections: 244,
             cached_sections: 1133,
@@ -5396,9 +5655,10 @@ mod tests {
             defense: 0,
             graphics_summary: "High preset | shadows high | clouds high | water high | bloom on | FXAA on".into(),
             shadow_summary: "high 2048² ×3 3×3 PCF".into(),
+            fsr_summary: "native".into(),
         };
         let left = stats.left_lines();
-        assert_eq!(left.len(), 16);
+        assert_eq!(left.len(), 17);
         assert!(left.iter().any(|line| line == "Held: Stone Pickaxe 129/131  speed 4.0"));
         let joined = left.join("\n");
         for needle in [
@@ -5421,6 +5681,7 @@ mod tests {
         let right = stats.right_lines();
         assert!(right[0].contains("Test GPU"));
         assert!(right[1].contains("1280x720"));
+        assert!(right.iter().any(|line| line.contains("FSR native")));
     }
 
     #[test]
@@ -5835,11 +6096,71 @@ mod tests {
     }
 
     #[test]
+    fn fsr_row_cycles_live_and_is_independent_of_the_preset() {
+        let mut state = UiState::default();
+        state.open_settings();
+        state.settings_select_tab(SettingsTab::Graphics);
+        let index = state
+            .settings_rows()
+            .iter()
+            .position(|row| *row == SettingsRow::Fsr)
+            .expect("Graphics tab has an FSR row");
+        state.settings_selected_row = index;
+        assert_eq!(state.settings_focused_row(), Some(SettingsRow::Fsr));
+        assert_eq!(state.settings.graphics_preset, GraphicsPreset::High);
+        let info = SettingsInfo {
+            fsr_internal: Some([858, 482]),
+            ..SettingsInfo::default()
+        };
+        assert_eq!(state.settings_row_value(SettingsRow::Fsr, &info), "Off");
+
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::Fsr));
+        assert_eq!(state.settings.fsr_quality, FsrQuality::UltraQuality);
+        assert_eq!(
+            state.settings.graphics_preset,
+            GraphicsPreset::High,
+            "FSR is independent and must not mark the preset Custom"
+        );
+        assert_eq!(state.settings_adjust(1), Some(SettingsRow::Fsr));
+        assert_eq!(state.settings.fsr_quality, FsrQuality::Quality);
+        assert_eq!(state.settings_row_value(SettingsRow::Fsr, &info), "Quality (858x482)");
+        assert_eq!(state.settings_adjust(-1), Some(SettingsRow::Fsr));
+        assert_eq!(state.settings.fsr_quality, FsrQuality::UltraQuality);
+
+        // Cycling wraps Ultra Quality -> Quality -> Balanced -> Performance -> Off -> Ultra.
+        for expected in [
+            FsrQuality::Quality,
+            FsrQuality::Balanced,
+            FsrQuality::Performance,
+            FsrQuality::Off,
+            FsrQuality::UltraQuality,
+        ] {
+            assert_eq!(state.settings_adjust(1), Some(SettingsRow::Fsr));
+            assert_eq!(state.settings.fsr_quality, expected);
+        }
+
+        // Applying a different preset keeps the independent FSR choice.
+        state.settings.fsr_quality = FsrQuality::Balanced;
+        state.settings_selected_row = 0;
+        state.settings_adjust(1);
+        assert_eq!(state.settings.fsr_quality, FsrQuality::Balanced);
+        assert_ne!(state.settings.graphics_preset, GraphicsPreset::High);
+
+        // An inactive row has no internal resolution to show.
+        state.settings.fsr_quality = FsrQuality::Quality;
+        let unavailable = SettingsInfo::default();
+        assert_eq!(
+            state.settings_row_value(SettingsRow::Fsr, &unavailable),
+            "Quality (unavailable)"
+        );
+    }
+
+    #[test]
     fn reduced_motion_is_a_display_toggle_and_round_trips() {
         let mut state = UiState::default();
         state.open_settings();
         state.settings_select_tab(SettingsTab::Display);
-        state.settings_selected_row = 5;
+        state.settings_selected_row = 6;
         assert_eq!(state.settings_focused_row(), Some(SettingsRow::ReducedMotion));
         assert_eq!(
             state.settings_activate(),
@@ -6083,7 +6404,7 @@ mod tests {
         let mut state = UiState::default();
         state.open_settings();
         state.settings_select_tab(SettingsTab::Display);
-        state.settings_selected_row = 4;
+        state.settings_selected_row = 5;
         let info = SettingsInfo {
             ui_scale_percent: 100,
             ..SettingsInfo::default()

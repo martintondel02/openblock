@@ -1,6 +1,6 @@
 # 25 — Performance Budgets and Their Enforcement
 
-> Status: normative - Last updated: 2026-11-24
+> Status: normative - Last updated: 2026-11-25
 > Depends on: [DEC-004](../decisions.md), [DEC-007](../decisions.md), [DEC-013](../decisions.md), [DEC-018](../decisions.md), [DEC-025](../decisions.md), [DEC-035](../decisions.md), [DEC-038](../decisions.md), [DEC-039](../decisions.md), [DEC-048](../decisions.md), [DEC-049](../decisions.md), [DEC-051](../decisions.md), [DEC-052](../decisions.md); [conventions](00-conventions.md), [technical architecture](01-technical-architecture.md), [rendering](03-rendering.md), [shaders and visuals](04-shaders-and-visuals.md), [world model](05-world-model.md), [persistence](17-persistence.md)
 > Implements: MS-00 onward; gate owner for the MS-04, MS-06, MS-07, MS-15 and MS-16 performance exits
 
@@ -22,13 +22,24 @@ part of the record (§4.1) rather than a judgement call at review.
 
 Render distance is expressed as a **block radius** with the chunk equivalent in parentheses:
 512 blocks = a 32-chunk radius = 65×65 = 4,225 columns, never a 512-block diameter
-([conventions §4](00-conventions.md#4-units-and-coordinate-conventions)). The client default
-is 512 blocks; a dedicated server defaults to a 256-block render distance equal to its
-256-block simulation distance, and 512 blocks is an opt-in server setting with a published
-cost (DEC-052). Sections are 16³ and a mesh cluster is 2×2×2 sections (32³, visual only,
+([conventions §4](00-conventions.md#4-units-and-coordinate-conventions)). Two independent
+radii exist in v1.3:
+
+* **Simulation distance** (`render_distance_chunks`, 2..=32 chunks, 512 blocks at
+  the ceiling) covers streaming, simulation, collision, full-detail meshes and the
+  server's per-player interest set. A dedicated server defaults to a 256-block
+  render distance equal to its 256-block simulation distance, and 512 blocks is an
+  opt-in server setting with a published cost (DEC-052).
+* **View distance** (`view_distance_chunks`, 32..=512 chunks, default 128, maximum
+  8,192 blocks) is a client-side **visual-only** low-poly heightfield beyond the
+  simulation radius. It does not change interest sets, columns, ticks or saves and
+  is never authoritative (DEC-018).
+
+Sections are 16³ and a mesh cluster is 2×2×2 sections (32³, visual only,
 default from MS-04, [DEC-048](../decisions.md)); the 16³ section remains the storage, edit,
-light and network unit. 1024 blocks is a post-1.0 far-terrain target (MS-20, DEC-018) and is
-reported, not gated at 1.0. The simulation tick is 20 Hz, fixed
+light and network unit. The old 1024-block far-terrain target (MS-20) is superseded
+as a *visual* goal by the 8,192-block far terrain; 1024-block generated/world LOD
+remains post-1.0 and is reported, not gated. The simulation tick is 20 Hz, fixed
 ([DEC-038](../decisions.md)); a "30 Hz" server setting raises only the snapshot rate.
 
 ## 2. Requirements
@@ -163,6 +174,13 @@ Preset scaling, from [chapter 03 §3.11](03-rendering.md); estimates are ±15%, 
 > its two-cascade HDR/shadow/water/post implementation reaches 61.7 FPS p50 at 1080p on the
 > integrated RADV test machine (Ultra) but does not meet the p95 gate methodology above; it
 > is a Report row, not a replacement for the envelope.
+
+Optional FSR 1.0 upscaling (v1.3, off by default) is **not** part of the envelope above and
+does not satisfy `taa + upscale`. Its isolated EASU+RCAS cost on the integrated RADV test
+machine is 3.5 ms at 1280×720 and 7.8 ms at 1920×1080; paired 512-chunk High runs are 47–68%
+slower than native because the scene is not fill-rate bound. It stays a Report-only,
+opt-in row; see [§5.10](#510-v13-fsr-10-on-far-terrain-measured-512-chunk-report-2026-11-25) and
+[1.3-fsr](../plan/1.3-fsr.md).
 
 ### 3.5 Tick budget at 20 Hz
 
@@ -375,6 +393,7 @@ preset, two frames in flight, vsync off. `MB` is 10⁶ bytes.
 | PERF-FRAME-003 | 144 FPS mode: ≥ 144 average, 1% low ≥ 120, p99 ≤ 8.3 ms, 512-block radius, `performance` preset | Gate (mode) | MS-04, MS-12 |
 | PERF-FRAME-004 | Hitch: zero frames > 33 ms in `flythrough`, `cave`, `water`; `tnt` allows ≤ 1 per scene per run | Gate | MS-04 |
 | PERF-FRAME-005 | Input-to-photon ≤ 3 frame periods p99, ≤ 1 additional frame versus single-player at 80 ms RTT | Gate | MS-04, MS-06 |
+| PERF-FRAME-006 | v1.3 far terrain adds ≤ 1.5 ms p50 at 1080p `high` with a 512-chunk view and ≤ 32 MiB of far vertex/index/GPU data; the near-only and far runs use the same scene, seed and readback method | Report | MS-20 |
 | PERF-CPU-001…009 | The bands and values of §3.3, each a Gate except PERF-CPU-007 (client mods, reserved post-1.0 per DEC-049); UI at MS-05, audio at MS-09, server mods at MS-09, diagnostics at MS-02, the rest at MS-04 | Gate | §3.3 |
 | PERF-GPU-001 | All GPU passes ≤ 6.00 ms p95 at 120 mode; pass sum ≤ 5.65 ms (§3.4) | Gate | MS-04 |
 | PERF-GPU-002 | All GPU passes ≤ 4.00 ms p95 at 144 mode; pass sum ≤ 3.33 ms | Gate | MS-04, MS-12 |
@@ -566,12 +585,57 @@ separate water pass, not a regression in the opaque geometry path.
 **Cost attribution.** Diagnostic toggles at 1080p show the opaque/water/cloud/post base at
 ~10 ms, two shadow cascades adding ~3–4 ms (dominated by per-fragment cascade sampling, not
 draw count), clouds high plus water high adding ~0.2–0.8 ms, bloom ~0.1–0.2 ms and FXAA
-~0.2–0.6 ms. The full per-feature table, screenshots and the deviation list (far-cascade
+~0.2–0.6 ms.
+
+**v1.3 far terrain (Report).** The same harness with `--view-distance 512`
+draws 47,950 opaque far quads / 49,950 vertices and 11,581 far water triangles
+(~3.8 MiB) in 8.0–8.4 ms off-thread. Paired against the identical scene with
+`--no-far` on a quiet box, the far pass added 0.60 ms at 1280×720 (11.19 vs
+10.59 ms p50; 89.3 FPS) and 0.85 ms at 1920×1080 (15.70 vs 14.85 ms p50;
+**63.7 FPS p50 / 63.3 FPS p95**). The 60 FPS High target at a 512-chunk visual
+distance is therefore met at p50 and p95 in the offscreen-readback harness.
+PERF-FRAME-006 stays a Report row (not a gate) because it is a v1.3 measurement
+outside the gated milestone scenes; the full rows are in
+[08 §v1.3](../plan/08-measurements.md#2026-11-25--v13-far-terrain-512-chunks). The full per-feature table, screenshots and the deviation list (far-cascade
 single-tap PCF, AABB shadow proxies beyond 64 m, no SSR/refraction/foam/underwater volume,
 fixed exposure, FXAA-lite instead of TAA) live in
 [08-measurements §v1.1 shaders](../plan/08-measurements.md#2026-11-25--v11-high-quality-built-in-shaders-hdr-sun-shadows-water-clouds-post).
 The gate tables in §3.4 and §5.1 remain the long-term target; a future gate run must use
 GPU timestamp queries and the p95 methodology of §3.7 before it can replace this report.
+
+### 5.10 v1.3 FSR 1.0 on far terrain: measured 512-chunk report (2026-11-25)
+
+This is a **Report** measurement of the optional FSR 1.0 row, not a gate and not a change
+to the envelope in §3.4. It uses the same `render_distance_bench` harness and scene as the
+v1.3 far-terrain runs (§5.9): seed 42, simulation radius 32 chunks, view distance 512
+chunks (4,225 columns, 2,620 near sections + 1,010 far batches, 47,950 far quads), High
+preset, offscreen `Rgba8UnormSrgb` with a blocking readback, 20 warm-up + 240 measured
+frames, release build on the integrated RADV `RAPHAEL_MENDOCINO` machine. The FSR row never
+marks the preset Custom and is off by default.
+
+| Display | FSR row | Internal | p50 ms | p95 ms | p99 ms | p50 FPS | p95 FPS |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 1280×720 | Native (Off) | 1280×720 | **11.79** | 13.11 | 13.38 | **83.3** | 76.3 |
+| 1280×720 | Quality | 858×482 | 18.13 | 19.14 | 19.45 | 55.0 | 52.2 |
+| 1280×720 | Balanced | 756×426 | 18.46 | 19.74 | 20.26 | 54.0 | 50.7 |
+| 1280×720 | Performance | 640×360 | 17.35 | 18.88 | 19.92 | 56.9 | 52.9 |
+| 1920×1080 | Native (Off) | 1920×1080 | **15.84** | 16.53 | 16.91 | **62.6** | 60.5 |
+| 1920×1080 | Quality | 1286×724 | 26.63 | 27.96 | 28.32 | 37.4 | 35.8 |
+| 1920×1080 | Balanced | 1134×638 | 24.00 | 25.95 | 26.67 | 41.3 | 38.5 |
+| 1920×1080 | Performance | 960×540 | 25.42 | 26.99 | 27.98 | 39.4 | 37.1 |
+
+The native controls are within 5% (720p) and 1% (1080p) of the recorded quiet-box
+far-terrain baseline (11.19 / 15.70 ms), so the native path did not regress. Every FSR row
+is slower: **+5.6 to +6.7 ms at 720p and +8.2 to +10.8 ms at 1080p**. Geometry and draw
+counters are unchanged (751 opaque draws, 312 shadow draws, 19 water draws); FSR adds two
+passes (9 → 11) and two targets whose memory is offset by the smaller HDR/depth/bloom
+targets (RSS 277–282 MiB FSR vs 278–282 MiB native). The isolated EASU+RCAS probe measured
+3.5 ms at 720p and 7.8 ms at 1080p on sRGB input (4.6 ms at 1080p on a non-sRGB input),
+which already exceeds the saving from rendering at 0.5–0.67× on this GPU; the scene is bound
+by shadows, geometry and memory traffic rather than fill rate. The feature therefore stays
+**off by default** and is an honest negative result for this machine, not a preset
+recommendation. Full detail, screenshots and limitations are in
+[1.3-fsr](../plan/1.3-fsr.md).
 
 ## 6. Failure modes and edge cases
 
@@ -593,10 +657,13 @@ GPU timestamp queries and the p95 methodology of §3.7 before it can replace thi
   closes with the MS-06 simulator at 200 entities.
 - Integrated-GPU floor and mod attribution: `potato` derives from desktop dGPUs and wasmtime fuel
   is not wall time. Close with minimum-tier pass budgets and the MS-09 server wall-clock profiler.
-- 1024-block memory and cull: a post-1.0 (MS-20) extrapolation from 512, and cull cost already
-  exceeds PERF-RENDER-002 there; it is Report, never a 1.0 gate. Closes at MS-20 with LOD (DEC-018)
-  or with a DEC capping the selectable distance at 768 blocks. Scene success also does not prove
-  smooth play, so player stutter reports are triaged against counters.
+- 1024-block generated-world memory and cull: a post-1.0 (MS-20) extrapolation from 512, and
+  cull cost already exceeds PERF-RENDER-002 there; it is Report, never a 1.0 gate. The v1.3
+  visual-only far terrain now covers the 8,192-block horizon at ~3.8 MiB and +0.6–0.9 ms in
+  paired quiet-box runs (1080p High 63.7 FPS p50 / 63.3 p95; see
+  [08 §v1.3](../plan/08-measurements.md#2026-11-25--v13-far-terrain-512-chunks)).
+  Generated far columns and 1024-block world streaming remain post-1.0/MS-20. Scene success
+  also does not prove smooth play, so player stutter reports are triaged against counters.
 - Distributed-server capacity: the 50-player distributed row is an estimate with no shared cache
   and a different simulation distance; it is Report until MS-15 measures it (DEC-052).
 

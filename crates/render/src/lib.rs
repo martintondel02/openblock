@@ -17,8 +17,10 @@
 
 pub mod entities;
 pub mod environment;
+pub mod far_terrain;
 mod frame;
 pub mod frustum;
+pub mod fsr;
 pub mod graphics;
 pub mod lod;
 pub mod mesh;
@@ -40,6 +42,12 @@ use winit::window::Window;
 
 pub use entities::{EntityInstance, entity_layer, entity_layers};
 pub use environment::{DAY_LENGTH_TICKS, Environment, EnvironmentVisual};
+pub use far_terrain::{
+    FAR_RECENTER_HYSTERESIS, FAR_TIER_BOUNDARIES, FAR_TIER_CELLS, FAR_TIER_OVERLAP_CELLS, FarBiome, FarSample,
+    FarTerrainBuild, FarTerrainConfig, FarTerrainMesh, FarTerrainStats, FarTerrainVertex, FarTier, FarTierStats,
+    build_far_terrain,
+};
+
 pub use frustum::{FRUSTUM_PLANE_COUNT, aabb_visible, aabb_within_distance, section_bounds, section_visible};
 pub use graphics::{
     BLOOM_STRENGTH, BLOOM_THRESHOLD, CloudQuality, DEFAULT_EXPOSURE, GraphicsPreset, GraphicsSettings, MAX_EXPOSURE,
@@ -137,14 +145,37 @@ impl Camera {
 
     /// Distance-fog `(start, end)` bounds derived from the far plane.
     ///
-    /// Small render distances keep the historical 55%-of-far start so the
-    /// last streamed ring always dissolves into the sky. At long distances the
-    /// fog instead starts 160 blocks before the far plane (never earlier than
-    /// 55%), so a 512-block world has a crisp horizon while 200 blocks away is
-    /// still clear. The end is clamped to at least `start + 1` so a tiny far
-    /// plane cannot invert the range. Both the windowed and offscreen renderers
-    /// use this method, which keeps their fog identical for the same camera.
+    /// Small/near-far-plane configurations keep the historical 55%-of-far
+    /// start so the last streamed ring dissolves into the sky. Medium far
+    /// planes (600..=1,000 blocks) fade from 62% to 95%. Once the far plane
+    /// grows beyond 1,000 blocks — the visual far-terrain case — the haze
+    /// starts at 12% and ends at 95%, so a 512-chunk (8,320-block) horizon
+    /// starts at ~998 blocks and reaches the sky colour at 7,904 blocks. That
+    /// avoids both the degenerate one-metre band a `far - 160` formula would
+    /// produce and an unnaturally crisp eight-kilometre low-poly horizon. At
+    /// the 128-chunk default the haze starts around 260 blocks, still far
+    /// enough beyond the near world that the seam is only lightly veiled. Near
+    /// and far geometry share this one range, so their seam can never disagree
+    /// about the amount of haze. The end is clamped to at least `start + 1` so
+    /// a tiny far plane cannot invert the range.
     pub fn fog_range(&self) -> (f32, f32) {
+        if self.far > 1000.0 {
+            // Long visual horizons need an early aerial-perspective band,
+            // otherwise eight kilometres of low-poly terrain stay unnaturally
+            // crisp and the far LOD reads as a flat cut-out. At the 512-chunk
+            // maximum this starts near 1 km, well beyond the 512-block
+            // simulated radius; at 128 chunks it starts around 260 blocks, still
+            // far enough that the seam itself is only lightly veiled. The same
+            // range feeds the near-world fog, so both sides of the seam agree.
+            let start = self.far * 0.12;
+            let end = (self.far * 0.95).max(start + 1.0);
+            return (start, end);
+        }
+        if self.far > 600.0 {
+            let start = self.far * 0.62;
+            let end = (self.far * 0.95).max(start + 1.0);
+            return (start, end);
+        }
         let start = (self.far - 160.0).max(self.far * 0.55);
         let end = (self.far * 0.95).max(start + 1.0);
         (start, end)
@@ -156,9 +187,21 @@ impl Camera {
 /// The margin keeps the last streamed ring inside the frustum even when the
 /// camera is close to a column boundary; 512 blocks (32 chunks) therefore maps
 /// to a 560-block far plane. The client and the offscreen benchmark share this
-/// helper so their fog and culling agree.
+/// helper so their fog and culling agree. This remains the function for the
+/// simulation/full-detail radius; visual far terrain uses
+/// [`far_plane_for_view_distance`].
 pub fn far_plane_for_render_distance(chunks: i32) -> f32 {
     (chunks.max(1) as f32 * 16.0 + 48.0).max(128.0)
+}
+
+/// Far plane used for a visual far-terrain radius in chunks.
+///
+/// The 128-block margin covers the far mesh's recenter hysteresis and leaves
+/// room for its last, fully fogged cell. At 512 chunks this is an 8,320-block
+/// far plane. The client, screenshots and the benchmark share this helper so
+/// culling and fog agree everywhere.
+pub fn far_plane_for_view_distance(chunks: i32) -> f32 {
+    (chunks.max(1) as f32 * 16.0 + 128.0).max(192.0)
 }
 
 /// Everything a frame needs besides the camera: the time of day, an optional
@@ -318,10 +361,21 @@ impl MeshData {
 /// Per-frame renderer counters.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RenderStats {
-    /// Draw calls issued for opaque chunk geometry (sections plus far batches).
+    /// Draw calls issued for opaque chunk geometry (sections, far batches and
+    /// the visual-only far heightfield).
     pub draw_calls: u32,
     /// Opaque vertices drawn from all world geometry.
     pub vertices: u64,
+    /// Opaque draw calls issued for the visual-only far terrain (0 or 1).
+    pub far_draw_calls: u32,
+    /// Opaque far-terrain vertices drawn.
+    pub far_vertices: u64,
+    /// Opaque far-terrain triangles drawn.
+    pub far_triangles: u64,
+    /// Draw calls issued for the far-terrain water surface (0 or 1).
+    pub far_water_draw_calls: u32,
+    /// Far-terrain water vertices drawn.
+    pub far_water_vertices: u64,
     /// Full-detail section meshes drawn after frustum and distance culling.
     pub sections: u32,
     /// Merged far-LOD batches drawn.
@@ -332,7 +386,7 @@ pub struct RenderStats {
     pub culled_sections: u32,
     /// Far-LOD batches rejected by the frustum or distance checks.
     pub culled_lod_batches: u32,
-    /// Draw calls issued in the transparent water pass.
+    /// Draw calls issued in the transparent water pass (near and far).
     pub water_draw_calls: u32,
     /// Vertices drawn in the transparent water pass.
     pub water_vertices: u64,
@@ -347,6 +401,8 @@ pub struct RenderStats {
     pub passes: u32,
     /// Bloom threshold/downsample passes recorded this frame.
     pub bloom_passes: u32,
+    /// FSR EASU+RCAS passes recorded this frame (0 on the native path).
+    pub fsr_passes: u32,
 }
 
 /// Errors from renderer initialisation or presentation.
@@ -532,6 +588,26 @@ impl Renderer {
         (self.config.width, self.config.height)
     }
 
+    /// Current internal scene render size (smaller than [`Self::size`] under FSR).
+    pub fn render_size(&self) -> (u32, u32) {
+        self.scene.size()
+    }
+
+    /// Whether the FSR EASU+RCAS pass is active.
+    pub fn fsr_enabled(&self) -> bool {
+        self.scene.fsr_enabled()
+    }
+
+    /// Internal render resolution when FSR is active, else `None`.
+    pub fn fsr_internal_size(&self) -> Option<(u32, u32)> {
+        self.scene.fsr_internal_size()
+    }
+
+    /// One-line FSR preset/internal-resolution description for F3 and logs.
+    pub fn fsr_summary(&self) -> String {
+        self.scene.fsr_summary()
+    }
+
     /// Reconfigures the surface after a resize and reallocates the HDR targets.
     /// Zero-sized sizes are ignored.
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -544,10 +620,14 @@ impl Renderer {
         self.scene.resize(&self.device, width, height);
     }
 
-    /// Applies a new visual quality without recompiling any shader.
+    /// Applies a new visual quality without recompiling any scene shader.
+    ///
+    /// Changing the independent FSR row may compile its two pipelines once and
+    /// reallocates the scene targets at the new internal resolution.
     pub fn set_graphics(&mut self, graphics: GraphicsSettings) {
-        self.scene.set_graphics(&self.device, graphics);
+        self.scene.set_graphics(&self.device, &self.queue, graphics);
         log::info!("graphics: {}", self.scene.graphics.summary());
+        log::info!("fsr: {}", self.scene.fsr_summary());
     }
 
     /// Current visual quality.
@@ -651,6 +731,27 @@ impl Renderer {
     /// Total vertices held by uploaded far-LOD batches.
     pub fn lod_vertex_count(&self) -> u64 {
         self.scene.lod_vertex_count()
+    }
+
+    /// Uploads (or clears, for an empty mesh) the visual-only far-terrain mesh.
+    ///
+    /// The geometry is fixed world-space heightfield data built by the caller;
+    /// the renderer does not know about worldgen, biomes or gameplay. It is
+    /// drawn depth-tested behind the near full-detail world, casts no shadows
+    /// and never feeds collision, streaming or simulation. Passing a mesh with
+    /// no opaque and no water triangles clears the previous mesh.
+    pub fn set_far_terrain(&mut self, mesh: FarTerrainMesh) {
+        self.scene.set_far_terrain(&self.device, &self.queue, mesh);
+    }
+
+    /// Removes the far-terrain mesh.
+    pub fn clear_far_terrain(&mut self) {
+        self.scene.clear_far_terrain();
+    }
+
+    /// World-space bounds of the uploaded far mesh, if any.
+    pub fn far_terrain_bounds(&self) -> Option<([f32; 3], [f32; 3])> {
+        self.scene.far_terrain_bounds()
     }
 
     /// Replaces the dropped-item entities drawn with the world.
@@ -864,6 +965,21 @@ mod tests {
         let (start, end) = camera.fog_range();
         assert!(start >= 0.0);
         assert!(end >= start + 1.0, "fog range is {start}..{end}");
+
+        // The 512-chunk visual horizon uses the long-range formula instead of
+        // a degenerate one-metre fog band.
+        camera.far = far_plane_for_view_distance(512);
+        assert!((camera.far - 8320.0).abs() < 1e-4, "far plane is {}", camera.far);
+        let (start, end) = camera.fog_range();
+        assert!((start - 998.4).abs() < 0.1, "long-range fog start is {start}");
+        assert!((end - 7904.0).abs() < 0.1, "long-range fog end is {end}");
+        assert!(end > 6000.0 && start < end);
+
+        // The 128-chunk default starts far enough out to keep the 512-block
+        // near world crisp and well ahead of the seam.
+        camera.far = far_plane_for_view_distance(128);
+        let (start, end) = camera.fog_range();
+        assert!(start > 200.0 && end > 2000.0);
     }
 
     #[test]
