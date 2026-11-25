@@ -15,7 +15,7 @@
 //! Query methods on [`DedicatedServer`] lock briefly and are intended for tests,
 //! the console and future admin surfaces.
 //!
-//! # Protocol v3 survival
+//! # Protocol v4 survival
 //!
 //! Network players are server-authoritative for survival state: vitals,
 //! inventory, equipment, block actions, combat, item pickup, death/respawn and
@@ -65,8 +65,8 @@ use ob_protocol::{
 use ob_sim::REACH;
 
 use crate::net_players::{
-    ENTITY_INTEREST_RADIUS, MAX_CONTAINER_DISTANCE, NetworkSleepSnapshot, NetworkWindowRef, ServerPlayer, stack_dto,
-    wire_entity_id,
+    ENTITY_INTEREST_RADIUS, MAX_CONTAINER_DISTANCE, NetworkSleepSnapshot, NetworkWindowRef, PROJECTILE_ENTITY_ID_BIT,
+    ServerPlayer, stack_dto, wire_entity_id,
 };
 use crate::{GameMode, Host, HostError, ItemStack};
 
@@ -92,7 +92,7 @@ pub const DEFAULT_SAVE_INTERVAL_SECONDS: u64 = 60;
 pub const MAX_QUEUED_FRAMES: usize = 256;
 /// Maximum concurrent handshakes (a small bound against connection floods).
 pub const MAX_CONCURRENT_HANDSHAKES: usize = 32;
-/// Default network game mode (survival in protocol v3).
+/// Default network game mode (survival in protocol v4).
 pub const DEFAULT_NETWORK_GAME_MODE: GameMode = GameMode::Survival;
 
 /// One simulation tick (20 Hz).
@@ -129,6 +129,8 @@ const CHAT_PER_SECOND: f64 = 0.5;
 const CHUNK_REQUESTS_PER_SECOND: f64 = 16.0;
 /// Block-use intents accepted per second per client.
 const USE_BLOCKS_PER_SECOND: f64 = 5.0;
+/// Mob interaction (feeding) intents accepted per second per client.
+const INTERACTS_PER_SECOND: f64 = 4.0;
 /// Attack intents accepted per second per client.
 const ATTACKS_PER_SECOND: f64 = 10.0;
 /// Inventory transactions accepted per second per client.
@@ -541,6 +543,7 @@ struct NetPlayer {
     edit_limit: RateLimit,
     use_limit: RateLimit,
     attack_limit: RateLimit,
+    interact_limit: RateLimit,
     inventory_limit: RateLimit,
     eat_limit: RateLimit,
     equip_limit: RateLimit,
@@ -1062,7 +1065,7 @@ fn handshake(shared: Arc<Shared>, stream: TcpStream) {
         reject_handshake(
             &stream,
             &format!(
-                "protocol_mismatch: server protocol {PROTOCOL_VERSION}, client sent {protocol}; 1.1 and older clients must upgrade to a 1.2+ build"
+                "protocol_mismatch: server protocol {PROTOCOL_VERSION}, client sent {protocol}; 1.3 and older clients must upgrade to a 1.4+ build"
             ),
         );
         return;
@@ -1240,6 +1243,7 @@ fn handshake(shared: Arc<Shared>, stream: TcpStream) {
         edit_limit: RateLimit::new(EDITS_PER_SECOND, 20),
         use_limit: RateLimit::new(USE_BLOCKS_PER_SECOND, 5),
         attack_limit: RateLimit::new(ATTACKS_PER_SECOND, 10),
+        interact_limit: RateLimit::new(INTERACTS_PER_SECOND, 6),
         inventory_limit: RateLimit::new(INVENTORY_MOVES_PER_SECOND, 30),
         eat_limit: RateLimit::new(EAT_PER_SECOND, 4),
         equip_limit: RateLimit::new(EQUIPS_PER_SECOND, 5),
@@ -1476,6 +1480,17 @@ fn sleep_state_message(host: &Host, id: u64, snapshot: &NetworkSleepSnapshot) ->
     }
 }
 
+/// Builds the authoritative `XpSync` payload for one player.
+fn xp_sync_message(player: &ServerPlayer) -> ServerMessage {
+    let required = ob_sim::xp_required_for_level(player.xp_level);
+    ServerMessage::XpSync {
+        points: player.xp_points,
+        level: player.xp_level,
+        progress: player.xp_points.min(required.saturating_sub(1)),
+        required,
+    }
+}
+
 /// Builds a `PlayerVitals` message for one network player.
 fn vitals_message(host: &Host, player: &ServerPlayer) -> ServerMessage {
     ServerMessage::PlayerVitals {
@@ -1514,9 +1529,32 @@ fn world_entity_views(host: &Host) -> BTreeMap<u64, EntityView> {
             yaw: mob.mob.yaw,
             health: mob.mob.health,
             hurt: mob.mob.hurt_timer > 0.0,
+            variant: mob.mob.variant.min(3),
+            baby: mob.mob.is_baby(),
             stack: None,
         };
         views.insert(mob.id, view);
+    }
+    for projectile in host.projectiles() {
+        let id = projectile.id | PROJECTILE_ENTITY_ID_BIT;
+        let view = EntityView {
+            id,
+            kind: EntityKind::Projectile {
+                projectile: projectile.projectile.kind.name().to_string(),
+            },
+            pos: [
+                projectile.projectile.pos.x,
+                projectile.projectile.pos.y,
+                projectile.projectile.pos.z,
+            ],
+            yaw: 0.0,
+            health: 0.0,
+            hurt: false,
+            variant: 0,
+            baby: false,
+            stack: None,
+        };
+        views.insert(id, view);
     }
     for item in host.item_entities() {
         let Some(stack) = stack_dto(registry, &Some(item.stack)) else {
@@ -1529,6 +1567,8 @@ fn world_entity_views(host: &Host) -> BTreeMap<u64, EntityView> {
             yaw: 0.0,
             health: 0.0,
             hurt: false,
+            variant: 0,
+            baby: false,
             stack: Some(stack),
         };
         views.insert(wire_entity_id(true, item.id), view);
@@ -1594,6 +1634,7 @@ impl Core {
             ClientMessage::SleepRequest { pos } => self.handle_sleep_request(id, pos, now),
             ClientMessage::Wake => self.handle_wake(id, now),
             ClientMessage::Attack { target } => self.handle_attack(id, target, now),
+            ClientMessage::InteractEntity { id: target } => self.handle_interact_entity(id, target, now),
             ClientMessage::InventoryMove {
                 from,
                 to,
@@ -2237,6 +2278,9 @@ impl Core {
                         hit: outcome.hit,
                         damage: outcome.damage,
                         killed: outcome.killed,
+                        charge: outcome.charge,
+                        critical: outcome.critical,
+                        cooldown_remaining_ms: outcome.cooldown_remaining_ms,
                     },
                 );
                 if outcome.hit {
@@ -2252,6 +2296,55 @@ impl Core {
                 }
             }
             Err(reason) => self.send_action_rejected(id, "attack", &reason),
+        }
+    }
+
+    /// Applies one mob feeding/breeding intent.
+    fn handle_interact_entity(&mut self, id: u64, target: u64, now: Instant) {
+        let allowed = self
+            .players
+            .get_mut(&id)
+            .is_some_and(|player| player.interact_limit.allow(now));
+        if !allowed {
+            return;
+        }
+        if self.host.network_player_sleeping(id) {
+            self.send_action_rejected(id, "interact_entity", "sleeping");
+            return;
+        }
+        match self.host.network_interact_mob(id, target) {
+            Ok(outcome) => {
+                self.dirty = true;
+                self.send(
+                    id,
+                    ServerMessage::InteractResult {
+                        id: outcome.id,
+                        accepted: outcome.accepted,
+                        reason: sanitise_reason(&outcome.reason),
+                    },
+                );
+                if outcome.accepted {
+                    if outcome.child.is_none() {
+                        self.send(
+                            id,
+                            ServerMessage::Chat {
+                                from: "server".to_string(),
+                                text: "The animal is in love".to_string(),
+                            },
+                        );
+                    } else {
+                        self.send(
+                            id,
+                            ServerMessage::Chat {
+                                from: "server".to_string(),
+                                text: format!("A baby was born (+{} XP)", outcome.xp_awarded),
+                            },
+                        );
+                    }
+                    self.send_action_sync(id);
+                }
+            }
+            Err(reason) => self.send_action_rejected(id, "interact_entity", &reason),
         }
     }
 
@@ -2328,10 +2421,12 @@ impl Core {
                 ServerMessage::SelectedSlot {
                     slot: player.selected_slot as u8,
                 },
+                xp_sync_message(player),
             ]
         };
         self.host.take_network_inventory_dirty(id);
         self.host.take_network_vitals_dirty(id);
+        self.host.take_network_xp_dirty(id);
         for message in messages {
             self.send(id, message);
         }
@@ -2594,6 +2689,7 @@ impl Core {
         self.dirty = true;
         self.relay_damage_events();
         self.relay_entity_removals();
+        self.relay_explosions();
         // Crop growth and hydration run inside `tick_network`; publish their
         // block changes before generated-chunk dirty sections are discarded.
         self.broadcast_block_updates(0);
@@ -2727,15 +2823,32 @@ impl Core {
         }
     }
 
-    /// Periodic vitals/inventory sync: dirty states are pushed immediately,
+    /// Relays creeper explosion cues produced by the host tick.
+    fn relay_explosions(&mut self) {
+        for explosion in self.host.take_explosion_events() {
+            self.broadcast(
+                &ServerMessage::Explosion {
+                    pos: [explosion.pos.x, explosion.pos.y, explosion.pos.z],
+                    radius: explosion.radius,
+                },
+                None,
+            );
+        }
+    }
+
+    /// Periodic vitals/inventory/XP sync: dirty states are pushed immediately,
     /// otherwise at the configured low rate.
     fn sync_players(&mut self) {
         let ids: Vec<u64> = self.players.keys().copied().collect();
         for id in ids {
             let vitals_dirty = self.host.take_network_vitals_dirty(id);
             let inventory_dirty = self.host.take_network_inventory_dirty(id);
+            let xp_dirty = self.host.take_network_xp_dirty(id);
             let vitals_due = vitals_dirty || self.tick_count.is_multiple_of(VITALS_SYNC_INTERVAL_TICKS);
             let inventory_due = inventory_dirty || self.tick_count.is_multiple_of(INVENTORY_RESYNC_INTERVAL_TICKS);
+            if xp_dirty && let Some(player) = self.host.network_player(id) {
+                self.send(id, xp_sync_message(player));
+            }
             if vitals_due {
                 self.send_vitals_now(id);
             }
@@ -2975,6 +3088,8 @@ struct EntityView {
     yaw: f32,
     health: f32,
     hurt: bool,
+    variant: u8,
+    baby: bool,
     stack: Option<ItemStackDto>,
 }
 
@@ -2987,6 +3102,8 @@ impl EntityView {
             yaw: self.yaw,
             health: self.health,
             hurt: self.hurt,
+            variant: self.variant,
+            baby: self.baby,
         }
     }
 
@@ -2997,6 +3114,8 @@ impl EntityView {
             yaw: self.yaw,
             health: self.health,
             hurt: self.hurt,
+            variant: self.variant,
+            baby: self.baby,
             stack: self.stack.clone(),
         }
     }
@@ -3010,6 +3129,8 @@ impl EntityView {
             || (self.yaw - other.yaw).abs() > 0.001
             || (self.health - other.health).abs() > 0.001
             || self.hurt != other.hurt
+            || self.variant != other.variant
+            || self.baby != other.baby
             || self.stack != other.stack
     }
 }
@@ -3023,6 +3144,8 @@ fn entity_spawn_message(entity: EntitySnapshot) -> ServerMessage {
         yaw: entity.yaw,
         health: entity.health,
         hurt: entity.hurt,
+        variant: entity.variant,
+        baby: entity.baby,
     }
 }
 

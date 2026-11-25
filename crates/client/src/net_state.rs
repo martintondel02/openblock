@@ -1,4 +1,4 @@
-//! Pure server-authoritative state for the protocol v3 client.
+//! Pure server-authoritative state for the protocol v4 client.
 //!
 //! This module is deliberately free of sockets, threads, winit and the
 //! renderer. It turns protocol `ServerMessage` payloads into the state the
@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use ob_content::{ItemId, MobKind, Registry};
+use ob_content::{ItemId, MobKind, ProjectileKind, Registry};
 use ob_math::WorldVec;
 use ob_protocol::{
     ContainerKind as WireContainerKind, DespawnReason, EQUIPMENT_SLOTS, EntityKind, EntitySnapshot, EntityStateEntry,
@@ -94,6 +94,14 @@ pub struct SurvivalState {
     pub vitals_received: bool,
     /// Whether an inventory sync has arrived.
     pub inventory_received: bool,
+    /// XP inside the current level (1.3).
+    pub xp_points: u32,
+    /// Current XP level (1.3).
+    pub xp_level: u32,
+    /// Points required for the next level, mirrored for the HUD bar.
+    pub xp_required: u32,
+    /// Whether an XP sync has arrived.
+    pub xp_received: bool,
 }
 
 impl Default for SurvivalState {
@@ -111,6 +119,10 @@ impl Default for SurvivalState {
             damage_events: VecDeque::new(),
             vitals_received: false,
             inventory_received: false,
+            xp_points: 0,
+            xp_level: 0,
+            xp_required: 7,
+            xp_received: false,
         }
     }
 }
@@ -131,6 +143,14 @@ impl SurvivalState {
         }
         self.armor_defense = armor_defense.min(20);
         self.vitals_received = true;
+    }
+
+    /// Applies an authoritative `xp_sync`.
+    pub fn apply_xp(&mut self, points: u32, level: u32, required: u32) {
+        self.xp_points = points;
+        self.xp_level = level.min(100);
+        self.xp_required = required.max(1);
+        self.xp_received = true;
     }
 
     /// Applies a full `inventory_sync`.
@@ -258,6 +278,8 @@ pub enum ReplicatedKind {
     Mob(MobKind),
     /// A dropped item stack.
     Item(ItemStack),
+    /// A server-simulated projectile (1.3).
+    Projectile(ProjectileKind),
 }
 
 #[derive(Debug, Clone)]
@@ -271,10 +293,22 @@ struct CachedEntity {
     to_yaw: f32,
     updated: Instant,
     moving: bool,
+    variant: u8,
+    baby: bool,
 }
 
 impl CachedEntity {
-    fn new(kind: ReplicatedKind, pos: WorldVec, yaw: f32, health: f32, hurt: bool, now: Instant) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        kind: ReplicatedKind,
+        pos: WorldVec,
+        yaw: f32,
+        health: f32,
+        hurt: bool,
+        variant: u8,
+        baby: bool,
+        now: Instant,
+    ) -> Self {
         Self {
             kind,
             health,
@@ -285,10 +319,13 @@ impl CachedEntity {
             to_yaw: yaw,
             updated: now,
             moving: false,
+            variant,
+            baby,
         }
     }
 
-    fn update(&mut self, pos: WorldVec, yaw: f32, health: f32, hurt: bool, now: Instant) {
+    #[allow(clippy::too_many_arguments)]
+    fn update(&mut self, pos: WorldVec, yaw: f32, health: f32, hurt: bool, variant: u8, baby: bool, now: Instant) {
         self.moving = self.to_pos.distance(pos) > ENTITY_MOVE_EPSILON;
         self.from_pos = self.to_pos;
         self.from_yaw = self.to_yaw;
@@ -296,6 +333,8 @@ impl CachedEntity {
         self.to_yaw = yaw;
         self.health = if health.is_finite() { health } else { self.health };
         self.hurt = hurt;
+        self.variant = variant.min(3);
+        self.baby = baby;
         self.updated = now;
     }
 
@@ -383,7 +422,16 @@ impl ReplicatedEntities {
         let pos = WorldVec::new(entity.pos[0], entity.pos[1], entity.pos[2]);
         self.entries.insert(
             entity.id,
-            CachedEntity::new(kind, pos, entity.yaw, entity.health, entity.hurt, now),
+            CachedEntity::new(
+                kind,
+                pos,
+                entity.yaw,
+                entity.health,
+                entity.hurt,
+                entity.variant.min(3),
+                entity.baby,
+                now,
+            ),
         );
         true
     }
@@ -400,7 +448,7 @@ impl ReplicatedEntities {
                 continue;
             }
             let pos = WorldVec::new(entry.pos[0], entry.pos[1], entry.pos[2]);
-            cached.update(pos, entry.yaw, entry.health, entry.hurt, now);
+            cached.update(pos, entry.yaw, entry.health, entry.hurt, entry.variant, entry.baby, now);
             if let ReplicatedKind::Item(stack) = &mut cached.kind
                 && let Some(dto) = &entry.stack
                 && let Some(replacement) = stack_from_dto(registry, dto)
@@ -450,6 +498,14 @@ impl ReplicatedEntities {
             .count()
     }
 
+    /// Live projectile count.
+    pub fn projectile_count(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|entity| matches!(entity.kind, ReplicatedKind::Projectile(_)))
+            .count()
+    }
+
     /// Live dropped-item count.
     pub fn item_count(&self) -> usize {
         self.entries
@@ -464,7 +520,7 @@ impl ReplicatedEntities {
             .values()
             .filter(|entity| match entity.kind {
                 ReplicatedKind::Mob(kind) => registry.mob(kind).passive(),
-                ReplicatedKind::Item(_) => false,
+                ReplicatedKind::Item(_) | ReplicatedKind::Projectile(_) => false,
             })
             .count()
     }
@@ -529,6 +585,8 @@ impl ReplicatedEntities {
                     hurt: entity.hurt,
                     walk_phase: elapsed * 8.0 + id as f32 * 0.9,
                     moving: entity.moving,
+                    variant: entity.variant,
+                    baby: entity.baby,
                 })
             })
             .collect()
@@ -551,6 +609,41 @@ impl ReplicatedEntities {
             };
             let (pos, _yaw) = entity.interpolated(now);
             instances.push(crate::item_entity_instance(id, pos, stack, registry, elapsed));
+        }
+        instances
+    }
+
+    /// Arrow cubes for the renderer.
+    ///
+    /// The 1.3 client has no textured arrow mesh; a small pale cube plus a
+    /// darker tip reads as an arrow at gameplay distance and keeps this feature
+    /// out of the render crate.
+    pub fn projectile_instances(&self, now: Instant) -> Vec<EntityInstance> {
+        let mut instances = Vec::with_capacity(self.projectile_count() * 2);
+        for id in self.ids() {
+            let Some(entity) = self.entries.get(&id) else {
+                continue;
+            };
+            if !matches!(entity.kind, ReplicatedKind::Projectile(_)) {
+                continue;
+            }
+            let (pos, _yaw) = entity.interpolated(now);
+            instances.push(EntityInstance {
+                position: [pos.x as f32, pos.y as f32, pos.z as f32],
+                scale: 0.14,
+                yaw: 0.0,
+                layer: 0,
+                tint: [0.82, 0.78, 0.66],
+                textured: false,
+            });
+            instances.push(EntityInstance {
+                position: [pos.x as f32, pos.y as f32 + 0.12, pos.z as f32],
+                scale: 0.09,
+                yaw: 0.0,
+                layer: 0,
+                tint: [0.42, 0.39, 0.33],
+                textured: false,
+            });
         }
         instances
     }
@@ -587,6 +680,7 @@ fn kind_from_wire(registry: &Registry, kind: &EntityKind) -> Option<ReplicatedKi
     match kind {
         EntityKind::Mob { mob } => registry.mob_id(mob).map(ReplicatedKind::Mob),
         EntityKind::Item { stack } => stack_from_dto(registry, stack).map(ReplicatedKind::Item),
+        EntityKind::Projectile { projectile } => ProjectileKind::from_name(projectile).map(ReplicatedKind::Projectile),
     }
 }
 
@@ -1487,6 +1581,8 @@ mod tests {
             yaw: 0.0,
             health,
             hurt: false,
+            variant: 0,
+            baby: false,
         }
     }
 
@@ -1525,6 +1621,8 @@ mod tests {
                 yaw: 0.5,
                 health: 7.5,
                 hurt: true,
+                variant: 2,
+                baby: true,
                 stack: None,
             },
             EntityStateEntry {
@@ -1533,6 +1631,8 @@ mod tests {
                 yaw: 0.0,
                 health: 1.0,
                 hurt: false,
+                variant: 0,
+                baby: false,
                 stack: None,
             },
         ];
@@ -1590,6 +1690,8 @@ mod tests {
                 yaw: 0.0,
                 health: 0.0,
                 hurt: false,
+                variant: 0,
+                baby: false,
                 stack: Some(dto(&registry, "openblock:stone", 1, None)),
             }],
             now,
@@ -1648,6 +1750,8 @@ mod tests {
                 yaw: 0.0,
                 health: 1.0,
                 hurt: false,
+                variant: 0,
+                baby: false,
                 stack: None,
             })
             .collect();
@@ -1982,5 +2086,46 @@ mod tests {
             friendly_action_rejection("use_block", "not_night"),
             "You can only sleep at night"
         );
+    }
+
+    #[test]
+    fn projectile_entities_and_xp_sync_are_mirrored() {
+        let registry = Registry::base();
+        let now = Instant::now();
+        let mut entities = ReplicatedEntities::default();
+        assert!(entities.apply_spawn(
+            &registry,
+            snapshot(
+                1,
+                EntityKind::Projectile {
+                    projectile: "openblock:arrow".to_string()
+                },
+                [1.0, 2.0, 3.0],
+                0.0,
+            ),
+            now,
+        ));
+        assert_eq!(entities.projectile_count(), 1);
+        assert_eq!(entities.mob_count(), 0);
+        assert_eq!(entities.projectile_instances(now).len(), 2);
+        assert!(!entities.apply_spawn(
+            &registry,
+            snapshot(
+                2,
+                EntityKind::Projectile {
+                    projectile: "openblock:enderman".to_string()
+                },
+                [0.0; 3],
+                0.0,
+            ),
+            now,
+        ));
+
+        let mut survival = SurvivalState::default();
+        survival.apply_xp(4, 3, 13);
+        assert_eq!(survival.xp_points, 4);
+        assert_eq!(survival.xp_level, 3);
+        assert_eq!(survival.xp_required, 13);
+        assert!(survival.xp_received);
     }
 }

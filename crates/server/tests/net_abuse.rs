@@ -928,6 +928,7 @@ fn entity_replication_respects_interest_and_ignores_client_ids() {
             hit: false,
             damage,
             killed: false,
+            ..
         } if target == mob_id && damage == 0.0
     ));
     server.stop();

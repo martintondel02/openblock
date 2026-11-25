@@ -140,6 +140,9 @@ fn public_mob_combat_ray_drops_and_tool_wear() {
     assert_eq!(first.damage, 1.0, "an empty hand deals 1 HP");
     assert!(!first.killed);
     for _ in 0..9 {
+        // Advance the authoritative clock past the 0.9 charge gate without
+        // ticking the fleeing cow out of reach.
+        host.set_tick_count(host.tick_count() + 20);
         let outcome = host.attack_mob(cow_id);
         if outcome.killed {
             assert_eq!(outcome.damage, 1.0);
@@ -162,6 +165,7 @@ fn public_mob_combat_ray_drops_and_tool_wear() {
             WorldVec::new(center_x as f64 + 2.5, platform_y as f64 + 1.0, center_z as f64 + 2.5),
         )
         .expect("zombie spawns");
+    host.set_tick_count(host.tick_count() + 20);
     let hit = host.attack_mob(zombie_id);
     assert!(hit.hit);
     assert_eq!(hit.damage, 4.0, "wooden sword deals 4 HP");
@@ -209,7 +213,11 @@ fn public_mobs_persist_with_a_stable_state_hash() {
     let text = std::fs::read_to_string(&path).expect("mobs.txt is written");
     assert_eq!(text.lines().count(), host.mob_count());
     for line in text.lines() {
-        assert_eq!(line.split_whitespace().count(), 8, "id kind x y z yaw health age");
+        assert_eq!(
+            line.split_whitespace().count(),
+            13,
+            "id kind x y z yaw health age variant love cooldown growth persistent"
+        );
     }
 
     let config = host.config().clone();
@@ -251,7 +259,12 @@ fn public_zombie_attacks_are_armor_mitigated_and_creative_safe() {
         )
         .expect("zombie spawns adjacent");
     let health = host.player().health;
-    host.tick(&PlayerInput::default());
+    for _ in 0..12 {
+        host.tick(&PlayerInput::default());
+        if host.player().health < health {
+            break;
+        }
+    }
     let mitigated = 3.0 * (1.0 - ob_server::armor_damage_reduction(1));
     assert!(
         (health - host.player().health - mitigated).abs() < 1e-4,

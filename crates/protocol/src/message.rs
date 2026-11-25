@@ -17,12 +17,12 @@ use crate::frame::MAX_FRAME_LEN;
 
 /// The protocol version implemented by this crate.
 ///
-/// Version 3 adds the 27-slot main inventory (36 player inventory slots in
-/// total) and moves the four equipment slots from wire addresses `9..13` to
-/// `36..40`. Versions 1 and 2 are rejected with `protocol_mismatch` before any
-/// inventory state is exchanged, so an old client cannot silently misinterpret
-/// main-inventory data as armor. Framing and chunk messages are unchanged.
-pub const PROTOCOL_VERSION: u16 = 3;
+/// Version 4 adds the 1.3 danger slice: `InteractEntity`, `InteractResult`,
+/// `XpSync`, `Explosion`, projectile entity kinds, mob breeding/baby DTO fields
+/// and charged-attack result fields. Versions 1–3 are rejected with
+/// `protocol_mismatch` before any session state is exchanged. Framing, chunk and
+/// light messages are unchanged.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Maximum number of bytes in a player name.
 pub const MAX_NAME_LEN: usize = 32;
@@ -147,6 +147,11 @@ pub enum EntityKind {
         /// The dropped stack.
         stack: ItemStackDto,
     },
+    /// A server-simulated arrow (1.3).
+    Projectile {
+        /// Stable projectile resource id (`openblock:arrow`).
+        projectile: String,
+    },
 }
 
 /// Complete state of one replicated entity, used by
@@ -161,10 +166,18 @@ pub struct EntitySnapshot {
     pub pos: [f64; 3],
     /// Horizontal look angle in radians (zero for item entities).
     pub yaw: f32,
-    /// Entity health (`0` for item entities).
+    /// Entity health (`0` for item entities and projectiles).
     pub health: f32,
     /// Whether the mob is currently in its hurt/flinch state.
     pub hurt: bool,
+    /// Deterministic inherited colour variant (`0..=3`); `0` for items and
+    /// projectiles.
+    #[serde(default)]
+    pub variant: u8,
+    /// Whether a mob is a growing baby (0.5× scale, no drops); `false` for
+    /// items and projectiles.
+    #[serde(default)]
+    pub baby: bool,
 }
 
 /// One changed entity inside a batched [`ServerMessage::EntityState`].
@@ -180,6 +193,12 @@ pub struct EntityStateEntry {
     pub health: f32,
     /// Updated hurt/flinch state.
     pub hurt: bool,
+    /// Updated colour variant.
+    #[serde(default)]
+    pub variant: u8,
+    /// Updated baby state.
+    #[serde(default)]
+    pub baby: bool,
     /// Updated dropped stack for item entities (`None` for mobs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stack: Option<ItemStackDto>,
@@ -254,7 +273,7 @@ pub enum ClientMessage {
     /// Request an authoritative block edit. `block` is a session-local block
     /// id; `0` means break.
     ///
-    /// In protocol v3 this is also the survival break/place intent: the server
+    /// In protocol v3+ this is also the survival break/place intent: the server
     /// resolves loot, block-entity contents, tool wear and placement
     /// consumption from the sending network player's authoritative state.
     BlockEdit {
@@ -278,7 +297,7 @@ pub enum ClientMessage {
     },
     /// Requests sleep in the bed at `pos` (foot or head block).
     ///
-    /// Equivalent to [`ClientMessage::UseBlock`] on a bed for v3 clients; the
+    /// Equivalent to [`ClientMessage::UseBlock`] on a bed for older bed clients; the
     /// explicit variant lets a client express intent without also triggering a
     /// container interaction. The server checks reach, the sleep window,
     /// obstruction and the other players' sleep state.
@@ -294,6 +313,14 @@ pub enum ClientMessage {
         /// from the player's eye along its look direction.
         #[serde(default)]
         target: Option<u64>,
+    },
+    /// Feeds/uses the selected item on one mob (1.3 breeding).
+    ///
+    /// The server validates reach (3 m), species food, love/cooldown state and
+    /// the area cap; nothing in this message is trusted beyond `id`.
+    InteractEntity {
+        /// Mob entity id.
+        id: u64,
     },
     /// Moves items between player, equipment and open-window slots.
     ///
@@ -428,6 +455,21 @@ pub enum ServerMessage {
         /// Effective armor defense points (`0..=20`).
         armor_defense: u8,
     },
+    /// Authoritative player XP for the receiving player (1.3).
+    ///
+    /// `progress` is the XP inside the current level and `required` the points
+    /// needed to reach the next level. The server awards XP directly; no orb
+    /// entities exist in 1.3.
+    XpSync {
+        /// XP points inside the current level.
+        points: u32,
+        /// Current XP level.
+        level: u32,
+        /// Points already accumulated toward the next level.
+        progress: u32,
+        /// Points required to reach the next level.
+        required: u32,
+    },
     /// Complete inventory, selected slot and equipment of the receiving
     /// player.
     ///
@@ -483,7 +525,7 @@ pub enum ServerMessage {
         /// `out_of_range`, `death`, `replaced`).
         reason: String,
     },
-    /// One newly visible mob or item entity.
+    /// One newly visible mob, item or projectile entity.
     EntitySpawn {
         /// Entity id.
         id: u64,
@@ -493,10 +535,16 @@ pub enum ServerMessage {
         pos: [f64; 3],
         /// Horizontal look angle in radians.
         yaw: f32,
-        /// Entity health (`0` for item entities).
+        /// Entity health (`0` for item and projectile entities).
         health: f32,
         /// Whether the mob is currently in its hurt/flinch state.
         hurt: bool,
+        /// Colour variant (`0..=3`; 0 for items/projectiles).
+        #[serde(default)]
+        variant: u8,
+        /// Whether a mob is a growing baby.
+        #[serde(default)]
+        baby: bool,
     },
     /// Initial set of visible entities, sent once during the handshake.
     EntitySnapshot {
@@ -546,6 +594,33 @@ pub enum ServerMessage {
         damage: f32,
         /// Whether the mob died.
         killed: bool,
+        /// Server-computed attack charge (`0..=1`).
+        charge: f32,
+        /// Whether the hit was a falling critical (1.5×).
+        critical: bool,
+        /// Milliseconds still needed before another charged hit is allowed.
+        cooldown_remaining_ms: u32,
+    },
+    /// Result of one mob interaction (feeding/breeding) intent.
+    InteractResult {
+        /// Target mob id.
+        id: u64,
+        /// Whether the interaction succeeded.
+        accepted: bool,
+        /// Short machine-readable rejection reason (`wrong_food`, `cooldown`,
+        /// `cap`, ...); empty on success.
+        reason: String,
+    },
+    /// A creeper-like explosion happened (1.3 visual/audio cue).
+    ///
+    /// Block removals arrive as ordinary [`ServerMessage::BlockEdit`] frames;
+    /// this message exists so a client can flash/shake or play a one-shot sound
+    /// without inferring an explosion from an edit burst.
+    Explosion {
+        /// Centre position.
+        pos: [f64; 3],
+        /// Radius in metres.
+        radius: f32,
     },
     /// A gameplay action was rejected; the reason is for logs/UI hints.
     ActionRejected {
@@ -820,6 +895,8 @@ mod tests {
             yaw: 0.0,
             health: 0.0,
             hurt: false,
+            variant: 0,
+            baby: false,
         };
         let messages = vec![
             ServerMessage::PlayerVitals {
@@ -859,6 +936,8 @@ mod tests {
                 yaw: entity.yaw,
                 health: entity.health,
                 hurt: entity.hurt,
+                variant: entity.variant,
+                baby: entity.baby,
             },
             ServerMessage::EntitySnapshot {
                 entities: vec![entity.clone()],
@@ -870,6 +949,8 @@ mod tests {
                     yaw: 0.25,
                     health: 9.0,
                     hurt: true,
+                    variant: 2,
+                    baby: true,
                     stack: Some(stack.clone()),
                 }],
             },
@@ -894,6 +975,24 @@ mod tests {
                 hit: true,
                 damage: 4.0,
                 killed: false,
+                charge: 0.95,
+                critical: false,
+                cooldown_remaining_ms: 31,
+            },
+            ServerMessage::InteractResult {
+                id: 7,
+                accepted: true,
+                reason: String::new(),
+            },
+            ServerMessage::XpSync {
+                points: 4,
+                level: 3,
+                progress: 4,
+                required: 13,
+            },
+            ServerMessage::Explosion {
+                pos: [1.0, 64.0, -2.0],
+                radius: 3.5,
             },
             ServerMessage::ActionRejected {
                 action: "block_edit".to_string(),
@@ -953,6 +1052,8 @@ mod tests {
             yaw: 0.0,
             health: 0.0,
             hurt: false,
+            variant: 0,
+            baby: false,
         };
         let json = serde_json::to_value(&item).expect("json");
         assert_eq!(json["kind"]["kind"], "item");
@@ -985,7 +1086,7 @@ mod tests {
         assert_eq!(INVENTORY_SLOTS, 36);
         assert_eq!(EQUIPMENT_SLOTS, 4);
         assert_eq!(EQUIPMENT_SLOT_START + EQUIPMENT_SLOTS as u16, 40);
-        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(PROTOCOL_VERSION, 4);
         assert_eq!(MAX_LIGHT_SECTIONS_PER_UPDATE, 64);
     }
 

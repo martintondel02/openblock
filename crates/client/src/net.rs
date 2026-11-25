@@ -3,7 +3,7 @@
 //! This module is deliberately independent of winit and the renderer so it can
 //! be exercised by loopback integration tests on CI hosts without a GPU. It
 //! owns the TCP connection, the replicated [`World`], the local [`Player`], the
-//! remote-player table, chat, chunk request bookkeeping and the protocol v3
+//! remote-player table, chat, chunk request bookkeeping and the protocol v4
 //! survival state ([`SurvivalState`]), replicated mobs/items
 //! ([`ReplicatedEntities`]) and container windows ([`RemoteContainers`]). The
 //! windowed client (`net_app`) and the headless tests share exactly this API.
@@ -208,7 +208,7 @@ impl fmt::Display for NetError {
             NetError::Refused(reason) => write!(formatter, "server refused the connection: {reason}"),
             NetError::ProtocolMismatch { server, client } => write!(
                 formatter,
-                "protocol mismatch: server speaks v{server}, this client speaks v{client}; both sides must be a 1.2+ build (protocol v3)"
+                "protocol mismatch: server speaks v{server}, this client speaks v{client}; both sides must be a 1.4+ build (protocol v4)"
             ),
             NetError::ContentMismatch {
                 server,
@@ -1062,6 +1062,37 @@ pub enum NetEvent {
         damage: f32,
         /// Whether the mob died.
         killed: bool,
+        /// Server-computed charge (`0..=1`).
+        charge: f32,
+        /// Whether this was a falling critical hit.
+        critical: bool,
+        /// Milliseconds until the next charged swing.
+        cooldown_remaining_ms: u32,
+    },
+    /// Result of one mob feeding/breeding intent.
+    InteractResult {
+        /// Target mob id.
+        id: u64,
+        /// Whether the interaction succeeded.
+        accepted: bool,
+        /// Short rejection reason (empty on success).
+        reason: String,
+    },
+    /// The authoritative XP changed.
+    XpChanged {
+        /// XP inside the current level.
+        points: u32,
+        /// Current level.
+        level: u32,
+        /// Points required for the next level.
+        required: u32,
+    },
+    /// A creeper-like explosion happened nearby.
+    Explosion {
+        /// Centre position.
+        pos: [f64; 3],
+        /// Radius in metres.
+        radius: f32,
     },
     /// A gameplay action was rejected by the server.
     ActionRejected {
@@ -1333,6 +1364,7 @@ pub struct NetworkClient {
     select_limit: RateLimit,
     use_limit: RateLimit,
     attack_limit: RateLimit,
+    interact_limit: RateLimit,
     inventory_limit: RateLimit,
     eat_limit: RateLimit,
     sleep_limit: RateLimit,
@@ -1579,6 +1611,7 @@ impl NetworkClient {
             select_limit: RateLimit::new(20.0, 20),
             use_limit: RateLimit::new(5.0, 5),
             attack_limit: RateLimit::new(10.0, 10),
+            interact_limit: RateLimit::new(4.0, 6),
             inventory_limit: RateLimit::new(20.0, 30),
             eat_limit: RateLimit::new(4.0, 4),
             sleep_limit: RateLimit::new(2.0, 4),
@@ -1822,19 +1855,35 @@ impl NetworkClient {
         let elapsed = self.session_seconds();
         let mut instances = self.entities.mob_instances(&self.registry, now, elapsed);
         instances.extend(self.entities.item_instances(&self.registry, now, elapsed));
+        instances.extend(self.entities.projectile_instances(now));
         instances
     }
 
     /// Mob under the crosshair, using replicated interpolated positions.
     pub fn mob_target(&self) -> Option<u64> {
+        self.mob_target_with_reach(MOB_ATTACK_REACH)
+    }
+
+    /// Mob under the crosshair within an explicit reach.
+    pub fn mob_target_with_reach(&self, reach: f64) -> Option<u64> {
         let now = Instant::now();
-        self.entities.raycast_mob(
-            &self.registry,
-            self.player.eye(),
-            self.player.forward(),
-            MOB_ATTACK_REACH,
-            now,
-        )
+        self.entities
+            .raycast_mob(&self.registry, self.player.eye(), self.player.forward(), reach, now)
+    }
+
+    /// XP inside the current level (authoritative).
+    pub fn xp_points(&self) -> u32 {
+        self.survival.xp_points
+    }
+
+    /// Current XP level (authoritative).
+    pub fn xp_level(&self) -> u32 {
+        self.survival.xp_level
+    }
+
+    /// Points required for the next level (authoritative).
+    pub fn xp_required(&self) -> u32 {
+        self.survival.xp_required
     }
 
     /// Effective seconds to break `pos` with the authoritative selected item.
@@ -1909,6 +1958,14 @@ impl NetworkClient {
             return false;
         }
         self.queue(ClientMessage::Attack { target })
+    }
+
+    /// Sends `interact_entity` for an explicit replicated mob id (1.3 feeding).
+    pub fn send_interact_entity(&mut self, target: u64) -> bool {
+        if !self.state.is_connected() || self.survival.dead || !self.interact_limit.allow_now() {
+            return false;
+        }
+        self.queue(ClientMessage::InteractEntity { id: target })
     }
 
     /// Sends `inventory_move` with an optional window revision.
@@ -2681,6 +2738,19 @@ impl NetworkClient {
                 self.player.health = self.survival.health;
                 self.player.hunger = self.survival.hunger;
             }
+            ServerMessage::XpSync {
+                points,
+                level,
+                progress: _,
+                required,
+            } => {
+                self.survival.apply_xp(points, level, required);
+                events.push(NetEvent::XpChanged {
+                    points,
+                    level,
+                    required,
+                });
+            }
             ServerMessage::InventorySync {
                 hotbar,
                 main,
@@ -2744,6 +2814,8 @@ impl NetworkClient {
                 yaw,
                 health,
                 hurt,
+                variant,
+                baby,
             } => {
                 self.entities.apply_spawn(
                     &self.registry,
@@ -2754,6 +2826,8 @@ impl NetworkClient {
                         yaw,
                         health,
                         hurt,
+                        variant,
+                        baby,
                     },
                     Instant::now(),
                 );
@@ -2812,12 +2886,26 @@ impl NetworkClient {
                 hit,
                 damage,
                 killed,
-            } => events.push(NetEvent::AttackResult {
-                target,
-                hit,
-                damage,
-                killed,
-            }),
+                charge,
+                critical,
+                cooldown_remaining_ms,
+            } => {
+                events.push(NetEvent::AttackResult {
+                    target,
+                    hit,
+                    damage,
+                    killed,
+                    charge,
+                    critical,
+                    cooldown_remaining_ms,
+                });
+            }
+            ServerMessage::InteractResult { id, accepted, reason } => {
+                events.push(NetEvent::InteractResult { id, accepted, reason });
+            }
+            ServerMessage::Explosion { pos, radius } => {
+                events.push(NetEvent::Explosion { pos, radius });
+            }
             ServerMessage::ActionRejected { action, reason } => {
                 if action == "block_edit" {
                     self.revert_latest_prediction();

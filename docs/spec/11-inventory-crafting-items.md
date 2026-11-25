@@ -656,3 +656,34 @@ facing and lit block states remain out of scope.
   protocol must add those checks. Networked clients also need an interim protocol
   extension (open container, slot deltas, cursor/transaction messages) before a
   multiplayer UI can be authoritative.
+
+## Appendix B — 1.3/1.4 danger-slice items and structure loot (2026-11-25)
+
+- **Items (append-only after the 1.2 catalogue).** `openblock:bone`,
+  `openblock:string`, `openblock:gunpowder` and `openblock:arrow` occupy ids
+  67–70, stack to 64 and have procedural client icons/tints. The only new recipe
+  is **1 stick + 1 string → 4 arrows** (no table required). Flint, feathers,
+  carrot, bone meal and new tool tiers are cut lines.
+- **Mob drops.** Spider → 1 string; skeleton → 1 bone + 1 arrow; creeper → 1
+  gunpowder. Drops are fixed, not rolled, and babies drop nothing. Zombies still
+  drop nothing. XP is separate and awarded by the host.
+- **Structure loot.** A code-defined `STRUCTURE_LOOT_TABLE` (bread, wheat, seeds,
+  iron ingot, coal, torch, string, bone, apple, arrow) rolls 4–6 stacks with
+  weights and count ranges recorded in `docs/plan/1.4-mobs.md`. The roll mixes
+  world seed, worldgen region hash and chest position, so it is deterministic per
+  structure/seed and differs between chests.
+- **Chest registration.** Worldgen places one chest in every ruined tower,
+  abandoned camp, stone circle and mineshaft; `ob_worldgen::structure_chests`
+  derives the same positions the builders use. When a structure chunk streams
+  in, the host inserts a `ContainerState` only if the chest block exists and no
+  record is present. Player-placed chests are never auto-filled. Empty records
+  are saved, making looting + reload idempotent; there is no uninitialized-chest
+  path because `UseBlock` requires an existing record.
+- **Container protocol.** `block_entities.txt` format is unchanged (including
+  empty `chest` rows); furnace/chest windows, revisions, stale-window rejection
+  and multiplayer transfer checks are unchanged. Protocol v4 does not alter
+  inventory addresses or slot counts.
+- **Tests.** `ob_content::structure_loot_is_deterministic_and_resolves`,
+  `ob_worldgen::every_structure_places_reachable_loot_chests`,
+  `ob_server/tests/danger14.rs` (registry, take, save, reload, no refill) and the
+  existing container/network suites.

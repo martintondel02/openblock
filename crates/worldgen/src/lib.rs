@@ -530,6 +530,33 @@ pub struct StructureInstance {
     pub hash: u64,
 }
 
+/// The chest block positions a structure places, in world coordinates.
+///
+/// This is the 1.3 loot hook: the worldgen pass writes the chest block and the
+/// server registers a container at exactly these positions when the chunk
+/// streams in. The offsets are derived from the same hash/rotation as the
+/// builders, so there is one source of truth and no chunk-order dependency.
+pub fn structure_chests(structure: &StructureInstance) -> Vec<BlockPos> {
+    let local = match structure.kind {
+        StructureKind::RuinedTower => vec![(1, 0, structure.floor_y + 1)],
+        StructureKind::AbandonedCamp => {
+            let orientation = ((structure.hash >> 24) & 3) as u32;
+            let (dx, dz) = rotated_offset(orientation, 2, -1);
+            vec![(dx, dz, structure.floor_y + 1)]
+        }
+        StructureKind::StoneCircle => vec![(0, 1, structure.floor_y + 1)],
+        StructureKind::Mineshaft => {
+            let orientation = ((structure.hash >> 32) & 3) as u32;
+            let (dx, dz) = rotated_offset(orientation, 3, -1);
+            vec![(dx, dz, structure.floor_y - 3)]
+        }
+    };
+    local
+        .into_iter()
+        .map(|(dx, dz, y)| BlockPos::new(structure.x + dx, y, structure.z + dz))
+        .collect()
+}
+
 /// The structure candidate blocks resolved from a registry.
 ///
 /// The base palette deliberately contains no new ids: cobblestone, planks,
@@ -549,6 +576,7 @@ struct StructureBlocks {
     sand: BlockId,
     gravel: BlockId,
     snow: BlockId,
+    chest: BlockId,
 }
 
 impl StructureBlocks {
@@ -586,6 +614,7 @@ impl StructureBlocks {
             sand: if sand == BlockId::AIR { gravel } else { sand },
             gravel: if gravel == BlockId::AIR { sand } else { gravel },
             snow: if snow == BlockId::AIR { cobblestone } else { snow },
+            chest: registry.id_or_air("openblock:chest"),
         }
     }
 }
@@ -2362,6 +2391,7 @@ fn build_ruined_tower(writer: &mut StructureWriter<'_>, structure: StructureInst
         }
     }
     writer.set(local_x + 1, local_z + 1, floor_y + 1, blocks.crafting_table);
+    writer.set(local_x + 1, local_z, floor_y + 1, blocks.chest);
     writer.set(local_x - 1, local_z + 1, floor_y + 1, blocks.planks);
     writer.set(local_x - 1, local_z, floor_y + 1, blocks.planks);
 }
@@ -2454,7 +2484,7 @@ fn build_abandoned_camp(writer: &mut StructureWriter<'_>, structure: StructureIn
         local_x + crate_dx,
         local_z + crate_dz,
         floor_y + 1,
-        blocks.planks,
+        blocks.chest,
         blocks.cobblestone,
     );
     let (bench_dx, bench_dz) = rotated_offset(orientation, 0, 2);
@@ -2542,6 +2572,7 @@ fn build_stone_circle(writer: &mut StructureWriter<'_>, structure: StructureInst
     writer.set(local_x, local_z, floor_y + 2, blocks.cobblestone);
     writer.set(local_x, local_z, floor_y + 3, blocks.coal_ore);
     writer.set(local_x + 1, local_z, floor_y + 1, blocks.crafting_table);
+    writer.set(local_x, local_z + 1, floor_y + 1, blocks.chest);
     writer.set(local_x - 1, local_z, floor_y + 1, blocks.planks);
 }
 
@@ -2649,6 +2680,10 @@ fn build_mineshaft(writer: &mut StructureWriter<'_>, structure: StructureInstanc
             }
         }
     }
+
+    // A supply chest sits on the tunnel floor near the far end.
+    let (chest_dx, chest_dz) = rotated_offset(orientation, 3, -1);
+    writer.set(local_x + chest_dx, local_z + chest_dz, floor_y - 3, blocks.chest);
 
     // Leave the end face natural; seed a few ore blocks in stone so the adit
     // rewards the player, or leave an opening when the face is cave air.
@@ -3367,6 +3402,7 @@ mod tests {
             "openblock:sand",
             "openblock:gravel",
             "openblock:snow",
+            "openblock:chest",
         ]
         .into_iter()
         .map(|id| registry.id_or_air(id))
@@ -5828,5 +5864,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_structure_places_reachable_loot_chests() {
+        let registry = Registry::base();
+        let generator = Generator::new(0x10_0C_5E_ED);
+        let chest = registry.id_or_air("openblock:chest");
+        assert_ne!(chest, BlockId::AIR);
+        let mut kinds = std::collections::BTreeSet::new();
+        for region_z in -12..=12 {
+            for region_x in -12..=12 {
+                for dz in 0..STRUCTURE_REGION_CHUNKS {
+                    for dx in 0..STRUCTURE_REGION_CHUNKS {
+                        let pos = ChunkPos::new(
+                            region_x * STRUCTURE_REGION_CHUNKS + dx,
+                            region_z * STRUCTURE_REGION_CHUNKS + dz,
+                        );
+                        let Some(structure) = generator.structure_in_chunk(pos) else {
+                            continue;
+                        };
+                        let chests = structure_chests(&structure);
+                        assert!(!chests.is_empty(), "{} placed no chest", structure.kind);
+                        let chunk = generate_structures_only(&generator, pos, &registry);
+                        for chest_pos in chests {
+                            assert_eq!(chest_pos.chunk(), pos, "chest escaped its owning chunk");
+                            assert_eq!(
+                                chunk.get_block(chest_pos),
+                                chest,
+                                "{} chest missing at {chest_pos:?}",
+                                structure.kind
+                            );
+                        }
+                        kinds.insert(structure.kind);
+                        if kinds.len() == StructureKind::ALL.len() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        panic!("did not find every structure kind in the sampled regions: {kinds:?}");
     }
 }

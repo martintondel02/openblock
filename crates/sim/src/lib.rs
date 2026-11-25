@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 #![allow(missing_docs)] // TODO(MS-04): re-enable once the v0.0.1 API surface settles
 
-use ob_content::{BlockId, MobKind, MobSpec, Registry};
+use ob_content::{BlockId, MobAttack, MobKind, MobSpec, ProjectileKind, Registry};
 use ob_math::{Aabb, BlockPos, SEA_LEVEL, WorldVec};
 use ob_world::World;
 
@@ -141,6 +141,10 @@ pub struct Player {
     pub starvation_timer: f64,
     /// Seconds accumulated toward the next regeneration tick.
     pub regen_timer: f64,
+    /// XP points inside the current level (1.3).
+    pub xp_points: u32,
+    /// Current XP level (1.3).
+    pub xp_level: u32,
 }
 
 impl Player {
@@ -160,6 +164,8 @@ impl Player {
             dead: false,
             starvation_timer: 0.0,
             regen_timer: 0.0,
+            xp_points: 0,
+            xp_level: 0,
         }
     }
 
@@ -746,6 +752,32 @@ pub const MOB_DESPAWN_AGE: f64 = 600.0;
 pub const MOB_DESPAWN_DISTANCE: f64 = 64.0;
 /// Mobs below this height request a despawn (the void).
 pub const MOB_DESPAWN_Y: f64 = -64.0;
+/// Maximum distance at which a player can feed/interact with a mob, in metres.
+pub const MOB_INTERACT_REACH: f64 = 3.0;
+/// Love-mode duration after a successful feed, in seconds.
+pub const MOB_LOVE_TIME: f64 = 30.0;
+/// Parent breeding cooldown after pairing, in seconds.
+pub const MOB_BREED_COOLDOWN: f64 = 30.0;
+/// Time a baby needs to become an adult, in seconds (5 minutes at 20 Hz).
+pub const MOB_BABY_GROWTH_TIME: f64 = 300.0;
+/// Maximum distance between two in-love adults for them to pair, in metres.
+pub const MOB_BREED_RADIUS: f64 = 8.0;
+/// Minimum attack charge (`0..=1`) at which a player hit is allowed.
+pub const ATTACK_MIN_CHARGE: f32 = 0.9;
+/// Attack cooldown for a sword, in milliseconds.
+pub const ATTACK_COOLDOWN_MS_SWORD: u64 = 625;
+/// Attack cooldown for a hand or non-sword item, in milliseconds.
+pub const ATTACK_COOLDOWN_MS_DEFAULT: u64 = 1_000;
+/// Damage multiplier for a critical hit while falling.
+pub const CRITICAL_MULTIPLIER: f32 = 1.5;
+/// Skeleton arrow speed, in metres per second.
+pub const PROJECTILE_ARROW_SPEED: f64 = 20.0;
+/// Projectile gravity, in metres per second squared.
+pub const PROJECTILE_GRAVITY: f64 = 28.0;
+/// Maximum projectile lifetime, in seconds.
+pub const PROJECTILE_MAX_AGE: f64 = 4.0;
+/// Largest block count one creeper explosion may remove.
+pub const EXPLOSION_MAX_BLOCKS: usize = 192;
 
 /// The current AI intent of a mob.
 ///
@@ -810,6 +842,22 @@ pub struct Mob {
     pub on_ground: bool,
     /// Seconds of recent-damage reaction remaining (host sets this on a hit).
     pub hurt_timer: f64,
+    /// Deterministic inherited variant/colour index (`0..=3`).
+    pub variant: u8,
+    /// Seconds of love mode remaining (passive breeding).
+    pub love_timer: f64,
+    /// Seconds until this adult may breed again.
+    pub breed_cooldown: f64,
+    /// Seconds until a baby grows up (`0` for an adult).
+    pub growth_timer: f64,
+    /// Creeper fuse seconds remaining (`0` when unlit).
+    pub fuse_timer: f64,
+    /// Melee attack wind-up seconds remaining (`0` when idle).
+    pub windup_timer: f64,
+    /// Spider leap cooldown seconds remaining.
+    pub leap_cooldown: f64,
+    /// Bred/loaded animals skip the age despawn (natural spawns do not).
+    pub persistent: bool,
 }
 
 impl Mob {
@@ -826,6 +874,14 @@ impl Mob {
             attack_cooldown: 0.0,
             on_ground: false,
             hurt_timer: 0.0,
+            variant: 0,
+            love_timer: 0.0,
+            breed_cooldown: 0.0,
+            growth_timer: 0.0,
+            fuse_timer: 0.0,
+            windup_timer: 0.0,
+            leap_cooldown: 0.0,
+            persistent: false,
         }
     }
 
@@ -838,12 +894,117 @@ impl Mob {
     pub fn alive(&self) -> bool {
         self.health > 0.0
     }
+
+    /// Whether this mob is a growing baby.
+    pub fn is_baby(&self) -> bool {
+        self.growth_timer > 0.0
+    }
+
+    /// Whether this mob can currently be fed to enter love mode.
+    pub fn can_love(&self) -> bool {
+        self.alive() && !self.is_baby() && self.breed_cooldown <= TIMER_EPSILON && self.love_timer <= TIMER_EPSILON
+    }
+
+    /// Whether the mob is currently looking for a breeding partner.
+    pub fn in_love(&self) -> bool {
+        self.love_timer > 0.0
+    }
+}
+
+/// XP needed to advance from `level` to `level + 1`.
+///
+/// The 1.3 curve is `7 + 2L` for levels below 15, `37 + 5(L - 15)` for levels
+/// 15..30 and `107 + 9(L - 30)` above 30. Reaching level 30 therefore costs
+/// exactly 1,395 points.
+pub fn xp_required_for_level(level: u32) -> u32 {
+    match level {
+        0..=14 => 7 + 2 * level,
+        15..=29 => 37 + 5 * (level - 15),
+        other => 107 + 9 * (other - 30),
+    }
+}
+
+/// Adds XP, rolling levels up the 1.3 curve, and returns the number of levels
+/// gained. `level` saturates at 100 to keep saved values and the HUD bounded.
+pub fn add_xp(points: &mut u32, level: &mut u32, amount: u32) -> u32 {
+    let before = *level;
+    *points = points.saturating_add(amount);
+    while *level < 100 {
+        let required = xp_required_for_level(*level);
+        if *points < required || required == 0 {
+            break;
+        }
+        *points -= required;
+        *level += 1;
+    }
+    if *level >= 100 {
+        *points = (*points).min(xp_required_for_level(99).saturating_sub(1));
+    }
+    *level - before
+}
+
+/// Attack cooldown for the selected item in milliseconds: swords swing at
+/// 625 ms, every other item and an empty hand at 1,000 ms.
+pub fn attack_cooldown_ms(registry: &Registry, item: Option<ob_content::ItemId>) -> u64 {
+    if let Some(item) = item
+        && let Some(tool) = registry.item(item).tool
+        && tool.kind == ob_content::ToolKind::Sword
+    {
+        ATTACK_COOLDOWN_MS_SWORD
+    } else {
+        ATTACK_COOLDOWN_MS_DEFAULT
+    }
+}
+
+/// Attack charge from the elapsed time since the previous hit.
+///
+/// `elapsed_ticks` is `None` for the first hit after a load or a new target and
+/// charges fully. The result is `0..=1`, and the server allows a hit only at
+/// [`ATTACK_MIN_CHARGE`].
+pub fn attack_charge(elapsed_ticks: Option<u64>, cooldown_ms: u64) -> f32 {
+    let Some(ticks) = elapsed_ticks else {
+        return 1.0;
+    };
+    let elapsed_ms = ticks.saturating_mul(50);
+    (elapsed_ms as f32 / cooldown_ms.max(1) as f32).clamp(0.0, 1.0)
+}
+
+/// Damage scaling for a charged hit: `base * (0.2 + 0.8c²)`, times 1.5 for a
+/// falling critical hit.
+pub fn charged_attack_damage(base: f32, charge: f32, critical: bool) -> f32 {
+    let charge = charge.clamp(0.0, 1.0);
+    let damage = base * (0.2 + 0.8 * charge * charge);
+    if critical { damage * CRITICAL_MULTIPLIER } else { damage }
+}
+
+/// One projectile launch requested by a ranged mob.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MobShot {
+    /// Projectile species.
+    pub kind: ProjectileKind,
+    /// Muzzle position (the mob's eye).
+    pub origin: WorldVec,
+    /// Initial velocity in metres per second.
+    pub velocity: WorldVec,
+    /// Damage before armor on a player hit.
+    pub damage: f32,
+}
+
+/// One explosion requested by a creeper whose fuse completed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MobExplosion {
+    /// Centre of the explosion.
+    pub pos: WorldVec,
+    /// Block/entity radius in metres.
+    pub radius: f32,
+    /// Damage at the centre before armor and falloff.
+    pub damage: f32,
 }
 
 /// Facts produced by one [`step_mob`] call for the authoritative host.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct MobEvents {
-    /// A hostile mob attacked the player this tick.
+    /// A hostile mob's melee wind-up completed and hit the player this tick.
     pub attacked: bool,
     /// Damage the attack would deal before armor mitigation.
     pub damage: f32,
@@ -853,6 +1014,93 @@ pub struct MobEvents {
     pub despawn: bool,
     /// The mob began its flee reaction to recent damage this tick.
     pub hurt: bool,
+    /// A melee wind-up started this tick.
+    pub windup_started: bool,
+    /// A ranged mob launched a projectile this tick.
+    pub shot: Option<MobShot>,
+    /// A creeper fuse started this tick.
+    pub fuse_started: bool,
+    /// A creeper fuse completed; the host should explode and remove the mob.
+    pub exploded: Option<MobExplosion>,
+}
+
+/// One simulated arrow.
+///
+/// Projectiles are deterministic: the velocity is set by the shooter, gravity
+/// is constant and collisions use the world raycast. The server owns the list
+/// and replicates each arrow as a generic entity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Projectile {
+    /// Projectile species.
+    pub kind: ProjectileKind,
+    /// Current position (arrow centre).
+    pub pos: WorldVec,
+    /// Current velocity in metres per second.
+    pub velocity: WorldVec,
+    /// Seconds alive.
+    pub age: f64,
+    /// Damage before armor on a player hit.
+    pub damage: f32,
+}
+
+impl Projectile {
+    /// Creates a projectile with an initial muzzle velocity.
+    pub fn new(kind: ProjectileKind, pos: WorldVec, velocity: WorldVec, damage: f32) -> Self {
+        Self {
+            kind,
+            pos,
+            velocity,
+            age: 0.0,
+            damage,
+        }
+    }
+}
+
+/// Facts produced by one [`step_projectile`] call.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ProjectileEvents {
+    /// A solid block stopped the projectile this tick.
+    pub hit_block: bool,
+    /// The projectile should be removed (block impact, age or the void).
+    pub despawn: bool,
+}
+
+/// Advances one projectile by `dt` seconds.
+///
+/// The substep is capped at 0.4 m and each substep raycasts the travelled
+/// segment, so a fast arrow cannot tunnel through a block. Gravity is
+/// [`PROJECTILE_GRAVITY`]; projectiles despawn after [`PROJECTILE_MAX_AGE`] or
+/// below [`MOB_DESPAWN_Y`]. Player collision is the server's job because only it
+/// knows which AABBs are targetable.
+pub fn step_projectile(world: &World, projectile: &mut Projectile, dt: f64) -> ProjectileEvents {
+    let mut events = ProjectileEvents::default();
+    if !dt.is_finite() || dt <= 0.0 {
+        return events;
+    }
+    projectile.age += dt;
+    projectile.velocity.y -= PROJECTILE_GRAVITY * dt;
+    let delta = projectile.velocity * dt;
+    let distance = delta.length();
+    if distance > 0.0 {
+        let steps = (distance / 0.4).ceil().max(1.0) as u32;
+        let step = delta / f64::from(steps);
+        for _ in 0..steps {
+            let step_len = step.length();
+            if step_len > 0.0
+                && let Some(hit) = world.raycast(projectile.pos, step, step_len)
+            {
+                projectile.pos = hit.position;
+                events.hit_block = true;
+                events.despawn = true;
+                return events;
+            }
+            projectile.pos += step;
+        }
+    }
+    if projectile.age >= PROJECTILE_MAX_AGE || projectile.pos.y < MOB_DESPAWN_Y {
+        events.despawn = true;
+    }
+    events
 }
 
 /// One ray-selectable mob.
@@ -908,6 +1156,24 @@ pub fn mob_aabb(registry: &Registry, kind: MobKind, pos: WorldVec) -> Aabb {
 /// land refuses to step into a column without solid support, so it stops at a
 /// shoreline or cliff edge instead of walking into deep water.
 pub fn step_mob(world: &World, mob: &mut Mob, player_pos: WorldVec, player_alive: bool, dt: f64) -> MobEvents {
+    step_mob_with_environment(world, mob, player_pos, player_alive, 0.0, 1.0, dt)
+}
+
+/// Advances one mob with explicit daylight/weather factors.
+///
+/// This is the server entry point for the 1.3 spider neutrality rule: gameplay
+/// light `>= 9` (`World::gameplay_light`) makes an unprovoked spider wander
+/// instead of chase. Damage clears the neutrality, matching the plan's simple
+/// "neutral in bright light" rule.
+pub fn step_mob_with_environment(
+    world: &World,
+    mob: &mut Mob,
+    player_pos: WorldVec,
+    player_alive: bool,
+    day_factor: f32,
+    weather_factor: f32,
+    dt: f64,
+) -> MobEvents {
     let mut events = MobEvents::default();
     if !dt.is_finite() || dt <= 0.0 {
         return events;
@@ -926,6 +1192,16 @@ pub fn step_mob(world: &World, mob: &mut Mob, player_pos: WorldVec, player_alive
         mob.hurt_timer = 0.0;
     }
     mob.attack_cooldown = (mob.attack_cooldown - dt).max(0.0);
+    let windup_before = mob.windup_timer;
+    mob.windup_timer = (mob.windup_timer - dt).max(0.0);
+    mob.leap_cooldown = (mob.leap_cooldown - dt).max(0.0);
+    mob.love_timer = (mob.love_timer - dt).max(0.0);
+    mob.breed_cooldown = (mob.breed_cooldown - dt).max(0.0);
+    if mob.growth_timer > 0.0 {
+        mob.growth_timer = (mob.growth_timer - dt).max(0.0);
+    }
+    let fuse_before = mob.fuse_timer;
+    mob.fuse_timer = (mob.fuse_timer - dt).max(0.0);
 
     // Passive mobs drop everything and run for the duration of the hurt timer.
     // A caller may also construct `Flee` directly (tests, future scripted
@@ -961,8 +1237,26 @@ pub fn step_mob(world: &World, mob: &mut Mob, player_pos: WorldVec, player_alive
     } else {
         f64::INFINITY
     };
+    let player_eye = player_pos + WorldVec::new(0.0, 1.62, 0.0);
+    let mob_eye = WorldVec::new(mob.pos.x, mob.pos.y + f64::from(spec.height) * 0.85, mob.pos.z);
+    let line_of_sight = player_valid && has_line_of_sight(world, mob_eye, player_eye);
 
-    if spec.hostile && player_valid && player_distance <= MOB_CHASE_RADIUS {
+    // Spider neutrality is evaluated from the gameplay light at the body
+    // centre. A hurt spider stops being neutral (provoked).
+    let lit_neutral = spec.neutral_in_light
+        && mob.hurt_timer <= TIMER_EPSILON
+        && world.gameplay_light(
+            BlockPos::new(
+                mob.pos.x.floor() as i32,
+                (mob.pos.y + f64::from(spec.height) * 0.5).floor() as i32,
+                mob.pos.z.floor() as i32,
+            ),
+            day_factor,
+            weather_factor,
+        ) >= 9;
+    let hostile = spec.hostile && !lit_neutral;
+
+    if hostile && player_valid && player_distance <= MOB_CHASE_RADIUS {
         mob.ai = MobAi::Chase { target: player_pos };
     } else if !matches!(mob.ai, MobAi::Flee { .. }) {
         if matches!(mob.ai, MobAi::Chase { .. }) {
@@ -974,12 +1268,50 @@ pub fn step_mob(world: &World, mob: &mut Mob, player_pos: WorldVec, player_alive
 
     let in_water = mob_in_water(world, mob);
     let mut wish = desired_velocity(mob, spec, in_water);
-    if spec.hostile && player_valid && player_distance <= MOB_CHASE_RADIUS {
-        // A zombie stops just inside attack range instead of walking through
-        // the player.
+    let attack = spec.attack;
+    if hostile && player_valid && player_distance <= MOB_CHASE_RADIUS {
         let horizontal = horizontal_distance(mob.pos, player_pos);
-        if horizontal <= MOB_ATTACK_RANGE * 0.9 {
-            wish = WorldVec::ZERO;
+        match attack {
+            MobAttack::Melee { range, .. } => {
+                if horizontal <= f64::from(range) * 0.9 {
+                    wish = WorldVec::ZERO;
+                }
+            }
+            MobAttack::Explosive { trigger_range, .. } => {
+                if horizontal <= f64::from(trigger_range) * 0.9 {
+                    wish = WorldVec::ZERO;
+                }
+            }
+            MobAttack::Ranged {
+                min_range, max_range, ..
+            } => {
+                let min_range = f64::from(min_range);
+                let max_range = f64::from(max_range);
+                let Some(direction) = horizontal_direction(player_pos - mob.pos) else {
+                    return finalize_mob_events(
+                        world,
+                        mob,
+                        spec,
+                        &mut events,
+                        player_valid,
+                        player_distance,
+                        player_eye,
+                        line_of_sight,
+                        fuse_before,
+                        windup_before,
+                        dt,
+                    );
+                };
+                if horizontal < min_range {
+                    // Back away while keeping the player in front for the bow.
+                    wish = direction * -(f64::from(spec.speed) * if in_water { MOB_WATER_SPEED_FACTOR } else { 1.0 });
+                } else if horizontal > max_range || !line_of_sight {
+                    wish = direction * (f64::from(spec.speed) * if in_water { MOB_WATER_SPEED_FACTOR } else { 1.0 });
+                } else {
+                    wish = WorldVec::ZERO;
+                }
+            }
+            MobAttack::None => {}
         }
     }
 
@@ -995,6 +1327,21 @@ pub fn step_mob(world: &World, mob: &mut Mob, player_pos: WorldVec, player_alive
         mob.velocity.x = 0.0;
         mob.velocity.z = 0.0;
         mob.ai = MobAi::Idle;
+    }
+
+    // Spiders leap at a nearby player when grounded; this is a short vertical
+    // hop rather than pathfinding. Climbing one-block steps is handled below.
+    if hostile
+        && spec.climbs
+        && mob.on_ground
+        && mob.leap_cooldown <= TIMER_EPSILON
+        && line_of_sight
+        && (2.0..=6.0).contains(&player_distance)
+        && let Some(direction) = horizontal_direction(player_pos - mob.pos)
+    {
+        wish = direction * (f64::from(spec.speed) * 1.5);
+        mob.velocity.y = 6.0;
+        mob.leap_cooldown = 2.0;
     }
 
     mob.velocity.x = wish.x;
@@ -1028,41 +1375,189 @@ pub fn step_mob(world: &World, mob: &mut Mob, player_pos: WorldVec, player_alive
     if blocked_z {
         mob.velocity.z = 0.0;
     }
-
-    // Hostile attack: only a living player can be hit. The host runs the
-    // damage through armor and may die; the sim only reports the intent.
-    if spec.hostile
-        && player_valid
-        && mob.attack_cooldown <= TIMER_EPSILON
-        && mob.pos.distance(player_pos) <= MOB_ATTACK_RANGE
-    {
-        let direction = horizontal_direction(player_pos - mob.pos).unwrap_or_else(|| {
-            horizontal_direction(WorldVec::new(-mob.yaw.sin() as f64, 0.0, -mob.yaw.cos() as f64))
-                .unwrap_or(WorldVec::new(0.0, 0.0, 1.0))
-        });
-        events.attacked = true;
-        events.damage = MOB_ATTACK_DAMAGE;
-        events.knockback = WorldVec::new(
-            direction.x * MOB_KNOCKBACK_HORIZONTAL,
-            MOB_KNOCKBACK_UP,
-            direction.z * MOB_KNOCKBACK_HORIZONTAL,
-        );
-        mob.attack_cooldown = MOB_ATTACK_COOLDOWN;
-        mob.yaw = yaw_from_direction(direction);
+    if spec.climbs && mob.on_ground && (blocked_x || blocked_z) {
+        try_mob_step_up(world, registry, mob, wish * dt);
     }
 
-    let despawn_age = mob.age > MOB_DESPAWN_AGE;
+    finalize_mob_events(
+        world,
+        mob,
+        spec,
+        &mut events,
+        player_valid,
+        player_distance,
+        player_eye,
+        line_of_sight,
+        fuse_before,
+        windup_before,
+        dt,
+    )
+}
+
+/// Applies the attack/fuse/despawn rules after movement and returns `events`.
+///
+/// Split out so the early-return ranged case (a degenerate horizontal
+/// direction) runs exactly the same post-movement rules as the normal path.
+#[allow(clippy::too_many_arguments)]
+fn finalize_mob_events(
+    _world: &World,
+    mob: &mut Mob,
+    spec: &MobSpec,
+    events: &mut MobEvents,
+    player_valid: bool,
+    player_distance: f64,
+    player_eye: WorldVec,
+    line_of_sight: bool,
+    fuse_before: f64,
+    windup_before: f64,
+    _dt: f64,
+) -> MobEvents {
+    let chases = matches!(mob.ai, MobAi::Chase { .. });
+    match spec.attack {
+        MobAttack::Melee {
+            damage,
+            range,
+            cooldown,
+            ..
+        } => {
+            let in_range = player_valid
+                && line_of_sight
+                && mob.pos.distance(player_eye - WorldVec::new(0.0, 1.62, 0.0)) <= f64::from(range);
+            if chases && in_range {
+                if windup_before <= TIMER_EPSILON
+                    && mob.attack_cooldown <= TIMER_EPSILON
+                    && mob.windup_timer <= TIMER_EPSILON
+                {
+                    mob.windup_timer = match spec.attack {
+                        MobAttack::Melee { windup, .. } => windup,
+                        _ => 0.0,
+                    };
+                    events.windup_started = true;
+                } else if windup_before > TIMER_EPSILON
+                    && mob.windup_timer <= TIMER_EPSILON
+                    && mob.attack_cooldown <= TIMER_EPSILON
+                {
+                    let direction = horizontal_direction(player_eye - mob.pos)
+                        .unwrap_or_else(|| WorldVec::new(-mob.yaw.sin() as f64, 0.0, -mob.yaw.cos() as f64));
+                    events.attacked = true;
+                    events.damage = damage;
+                    events.knockback = WorldVec::new(
+                        direction.x * MOB_KNOCKBACK_HORIZONTAL,
+                        MOB_KNOCKBACK_UP,
+                        direction.z * MOB_KNOCKBACK_HORIZONTAL,
+                    );
+                    mob.attack_cooldown = cooldown;
+                    mob.yaw = yaw_from_direction(direction);
+                }
+            } else {
+                mob.windup_timer = 0.0;
+            }
+        }
+        MobAttack::Ranged {
+            damage,
+            min_range,
+            max_range,
+            cooldown,
+        } => {
+            let in_band = player_distance >= f64::from(min_range) * 0.8
+                && player_distance <= f64::from(max_range)
+                && line_of_sight;
+            if chases && in_band && mob.attack_cooldown <= TIMER_EPSILON {
+                let origin = WorldVec::new(mob.pos.x, mob.pos.y + f64::from(spec.height) * 0.85, mob.pos.z);
+                let target = player_eye;
+                let dx = target.x - origin.x;
+                let dz = target.z - origin.z;
+                let horizontal = dx.hypot(dz);
+                if horizontal > 0.5 {
+                    let speed = PROJECTILE_ARROW_SPEED;
+                    let flight = (horizontal / speed).max(0.05);
+                    let vy = (target.y - origin.y) / flight + 0.5 * PROJECTILE_GRAVITY * flight;
+                    events.shot = Some(MobShot {
+                        kind: spec.projectile.unwrap_or(ProjectileKind::Arrow),
+                        origin,
+                        velocity: WorldVec::new(dx / flight, vy, dz / flight),
+                        damage,
+                    });
+                    mob.attack_cooldown = cooldown;
+                    mob.yaw = yaw_from_direction(WorldVec::new(dx, 0.0, dz));
+                }
+            }
+        }
+        MobAttack::Explosive {
+            trigger_range,
+            fuse,
+            radius,
+            max_damage,
+        } => {
+            let in_range = player_valid && player_distance <= f64::from(trigger_range);
+            if chases && in_range {
+                if mob.fuse_timer <= TIMER_EPSILON && fuse_before <= TIMER_EPSILON {
+                    mob.fuse_timer = fuse;
+                    events.fuse_started = true;
+                }
+            } else if !chases || !in_range {
+                mob.fuse_timer = 0.0;
+            }
+            if fuse_before > TIMER_EPSILON && mob.fuse_timer <= TIMER_EPSILON && in_range {
+                events.exploded = Some(MobExplosion {
+                    pos: WorldVec::new(mob.pos.x, mob.pos.y + f64::from(spec.height) * 0.5, mob.pos.z),
+                    radius,
+                    damage: max_damage,
+                });
+                mob.attack_cooldown = 1.0;
+            }
+        }
+        MobAttack::None => {}
+    }
+
+    let despawn_age = !mob.persistent && mob.age > MOB_DESPAWN_AGE;
     let despawn_void = mob.pos.y < MOB_DESPAWN_Y;
-    let despawn_distance = player_pos.is_finite() && mob.pos.distance(player_pos) > MOB_DESPAWN_DISTANCE;
+    let despawn_distance = !mob.persistent
+        && player_valid
+        && mob.pos.distance(player_eye - WorldVec::new(0.0, 1.62, 0.0)) > MOB_DESPAWN_DISTANCE;
     if despawn_age || despawn_void || despawn_distance {
         events.despawn = true;
         mob.ai = MobAi::Despawn;
     }
-
-    events
+    *events
 }
 
-/// Chooses or advances a wander leg.
+/// Whether a straight ray from `from` to `to` reaches the target without a
+/// solid block in between.
+fn has_line_of_sight(world: &World, from: WorldVec, to: WorldVec) -> bool {
+    let delta = to - from;
+    let distance = delta.length();
+    if distance <= 0.5 {
+        return true;
+    }
+    world
+        .raycast(from, delta, distance)
+        .is_none_or(|hit| hit.distance >= distance - 0.25)
+}
+
+/// Tries a one-block step-up for a climbing mob whose horizontal sweep was
+/// blocked. Reverts cleanly when the raised AABB would overlap a block.
+fn try_mob_step_up(world: &World, registry: &Registry, mob: &mut Mob, horizontal: WorldVec) {
+    let saved = mob.pos;
+    if horizontal.x.abs() < 1e-9 && horizontal.z.abs() < 1e-9 {
+        return;
+    }
+    mob.pos.y += 1.001;
+    if aabb_collides(world, &mob.aabb(registry)) {
+        mob.pos = saved;
+        return;
+    }
+    let blocked_x = sweep_mob_axis(world, registry, mob.kind, &mut mob.pos, AXIS_X, horizontal.x);
+    let blocked_z = sweep_mob_axis(world, registry, mob.kind, &mut mob.pos, AXIS_Z, horizontal.z);
+    let moved = (mob.pos.x - saved.x).abs() > 0.02 || (mob.pos.z - saved.z).abs() > 0.02;
+    if !moved || (blocked_x && blocked_z) {
+        mob.pos = saved;
+    } else {
+        mob.on_ground = false;
+    }
+}
+
+/// Chooses or advances a wander leg./// Chooses or advances a wander leg.
 fn update_wander(mob: &mut Mob, dt: f64) {
     if let MobAi::Wander { target, timer } = mob.ai {
         let timer = (timer - dt).max(0.0);
@@ -2085,11 +2580,20 @@ mod tests {
             zombie.pos.distance(player)
         );
 
-        // Place it inside attack range: one attack, then the cooldown blocks it.
+        // Place it inside attack range: a 0.5 s wind-up, then the hit.
         zombie.pos = WorldVec::new(13.0, 1.0, 8.5);
         zombie.attack_cooldown = 0.0;
-        let hit = step_mob(&world, &mut zombie, player, true, TICK_DT);
-        assert!(hit.attacked);
+        let first = step_mob(&world, &mut zombie, player, true, TICK_DT);
+        assert!(first.windup_started, "the zombie must telegraph its attack");
+        assert!(!first.attacked, "a wind-up must not hit on the same tick");
+        let mut hit = first;
+        for _ in 0..15 {
+            hit = step_mob(&world, &mut zombie, player, true, TICK_DT);
+            if hit.attacked {
+                break;
+            }
+        }
+        assert!(hit.attacked, "the wind-up never landed");
         assert_eq!(hit.damage, MOB_ATTACK_DAMAGE);
         assert!(hit.knockback.x > 0.0, "knockback must push away from the zombie");
         assert!((hit.knockback.y - MOB_KNOCKBACK_UP).abs() < 1e-9);
@@ -2277,5 +2781,160 @@ mod tests {
             },
         ];
         assert_eq!(raycast_mob(&registry, &tied, origin, forward, 20.0), Some(4));
+    }
+
+    #[test]
+    fn spider_is_neutral_in_daylight_and_hostile_in_darkness() {
+        let world = flat_world(1);
+        let player = WorldVec::new(14.5, 1.0, 8.5);
+        let mut lit = mob(&world, MobKind::Spider, 8.5, 1.0, 8.5);
+        let events = step_mob_with_environment(&world, &mut lit, player, true, 1.0, 1.0, TICK_DT);
+        assert!(!matches!(lit.ai, MobAi::Chase { .. }), "a lit spider must stay neutral");
+        assert!(!events.attacked);
+        lit.hurt_timer = 1.0;
+        step_mob_with_environment(&world, &mut lit, player, true, 1.0, 1.0, TICK_DT);
+        assert!(
+            matches!(lit.ai, MobAi::Chase { .. }),
+            "a provoked spider chases even in light"
+        );
+
+        let mut dark = mob(&world, MobKind::Spider, 8.5, 1.0, 8.5);
+        step_mob_with_environment(&world, &mut dark, player, true, 0.0, 1.0, TICK_DT);
+        assert!(matches!(dark.ai, MobAi::Chase { .. }), "a spider chases in darkness");
+    }
+
+    #[test]
+    fn spider_steps_up_one_block_ledges() {
+        let mut world = flat_world(1);
+        // A one-block-high plateau from x = 9: the step face is at x = 9 and
+        // the top is wide enough that the spider stays on it.
+        for x in 9..=20 {
+            for z in 7..=9 {
+                world.set_block(BlockPos::new(x, 1, z), BlockId(1));
+            }
+        }
+        let player = WorldVec::new(20.5, 2.0, 8.5);
+        let mut spider = mob(&world, MobKind::Spider, 8.0, 1.0, 8.5);
+        let mut highest = spider.pos.y;
+        for _ in 0..80 {
+            step_mob(&world, &mut spider, player, true, TICK_DT);
+            highest = highest.max(spider.pos.y);
+        }
+        assert!(highest > 1.5, "the spider never rose onto the step (highest {highest})");
+        assert!(
+            spider.pos.x > 9.0,
+            "the spider did not climb past the ledge: {}",
+            spider.pos.x
+        );
+        assert!(
+            spider.pos.y > 1.9,
+            "the spider fell back below the step: {}",
+            spider.pos.y
+        );
+        assert!(!aabb_collides(&world, &spider.aabb(world.registry())));
+    }
+
+    #[test]
+    fn skeleton_shoots_a_ballistic_arrow_with_line_of_sight() {
+        let world = flat_world(1);
+        let player = WorldVec::new(18.5, 1.0, 8.5);
+        let mut skeleton = mob(&world, MobKind::Skeleton, 8.5, 1.0, 8.5);
+        skeleton.attack_cooldown = 0.0;
+        let events = step_mob(&world, &mut skeleton, player, true, TICK_DT);
+        let shot = events.shot.expect("skeleton must shoot a player in range");
+        assert_eq!(shot.kind, ProjectileKind::Arrow);
+        assert!(shot.velocity.x > 0.0);
+        assert!(shot.velocity.y > 0.0, "ballistic aim must compensate for gravity");
+        assert!((shot.velocity.x.hypot(shot.velocity.z) - PROJECTILE_ARROW_SPEED).abs() < 1.0);
+
+        // A solid wall blocks line of sight and therefore the shot.
+        let mut walled = flat_world(1);
+        for y in 1..=3 {
+            walled.set_block(BlockPos::new(13, y, 8), BlockId(1));
+        }
+        let mut blocked = mob(&walled, MobKind::Skeleton, 8.5, 1.0, 8.5);
+        blocked.attack_cooldown = 0.0;
+        for _ in 0..5 {
+            let events = step_mob(&walled, &mut blocked, player, true, TICK_DT);
+            assert!(events.shot.is_none(), "a wall must block the skeleton's line of sight");
+        }
+    }
+
+    #[test]
+    fn creeper_fuse_starts_and_explodes_after_the_timer() {
+        let world = flat_world(1);
+        let player = WorldVec::new(10.5, 1.0, 8.5);
+        let mut creeper = mob(&world, MobKind::Creeper, 9.0, 1.0, 8.5);
+        let first = step_mob(&world, &mut creeper, player, true, TICK_DT);
+        assert!(first.fuse_started);
+        assert!(first.exploded.is_none());
+        let mut explosion = None;
+        for _ in 0..40 {
+            let events = step_mob(&world, &mut creeper, player, true, TICK_DT);
+            if let Some(event) = events.exploded {
+                explosion = Some(event);
+                break;
+            }
+        }
+        let explosion = explosion.expect("creeper fuse must complete");
+        assert!((explosion.radius - 3.5).abs() < 1e-5);
+        assert!(explosion.damage > 0.0);
+        assert!(explosion.pos.distance(player) < 2.0);
+
+        // Leaving the trigger range resets the fuse.
+        let mut runner = mob(&world, MobKind::Creeper, 9.0, 1.0, 8.5);
+        step_mob(&world, &mut runner, player, true, TICK_DT);
+        assert!(runner.fuse_timer > 0.0);
+        let far = WorldVec::new(30.5, 1.0, 8.5);
+        step_mob(&world, &mut runner, far, true, TICK_DT);
+        assert_eq!(runner.fuse_timer, 0.0, "the fuse must reset when the player escapes");
+    }
+
+    #[test]
+    fn projectile_gravity_and_block_impact_are_deterministic() {
+        let world = flat_world(1);
+        let mut a = Projectile::new(
+            ProjectileKind::Arrow,
+            WorldVec::new(8.5, 3.0, 8.5),
+            WorldVec::new(0.0, -2.0, 4.0),
+            3.0,
+        );
+        let mut b = a.clone();
+        let first_a = step_projectile(&world, &mut a, TICK_DT);
+        let first_b = step_projectile(&world, &mut b, TICK_DT);
+        assert_eq!(first_a, first_b);
+        assert_eq!(a.pos, b.pos);
+        assert!(a.velocity.y < b.velocity.y + 1e-9);
+        assert!(a.velocity.y < -2.0, "gravity must accelerate the arrow downward");
+        let mut hit = first_a;
+        for _ in 0..80 {
+            if hit.despawn {
+                break;
+            }
+            hit = step_projectile(&world, &mut a, TICK_DT);
+        }
+        assert!(hit.hit_block, "the arrow must hit the flat floor");
+        assert!((a.pos.y - 1.0).abs() < 0.5, "arrow stopped at y = {}", a.pos.y);
+    }
+
+    #[test]
+    fn attack_charge_damage_and_xp_curve_are_fixed() {
+        assert_eq!(xp_required_for_level(0), 7);
+        assert_eq!(xp_required_for_level(14), 35);
+        assert_eq!(xp_required_for_level(15), 37);
+        assert_eq!(xp_required_for_level(29), 107);
+        assert_eq!(xp_required_for_level(30), 107);
+        let mut points = 0u32;
+        let mut level = 0u32;
+        add_xp(&mut points, &mut level, 1_395);
+        assert_eq!(level, 30, "level 30 must cost exactly 1,395 points");
+        assert_eq!(points, 0);
+
+        assert_eq!(attack_charge(None, 625), 1.0);
+        assert_eq!(attack_charge(Some(0), 625), 0.0);
+        assert!((attack_charge(Some(18), 1_000) - 0.9).abs() < 1e-6);
+        assert!((charged_attack_damage(6.0, 1.0, false) - 6.0).abs() < 1e-6);
+        assert!((charged_attack_damage(6.0, 0.0, false) - 1.2).abs() < 1e-6);
+        assert!((charged_attack_damage(6.0, 1.0, true) - 9.0).abs() < 1e-6);
     }
 }

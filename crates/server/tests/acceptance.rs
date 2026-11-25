@@ -823,6 +823,9 @@ fn survival_loop_from_spawn_to_reload_seed_42() {
     for id in cows {
         let mut killed = false;
         for _ in 0..6 {
+            // Charged combat: advance the authoritative clock instead of
+            // ticking the (fleeing) cow out of reach.
+            host.set_tick_count(host.tick_count() + 20);
             let outcome = host.attack_mob(id);
             if outcome.killed {
                 assert_eq!(outcome.drops.len(), 2, "a cow must drop beef and leather");
@@ -884,6 +887,7 @@ fn survival_loop_from_spawn_to_reload_seed_42() {
         .expect("zombie spawns on the yard");
     let mut zombie_killed = false;
     for _ in 0..8 {
+        host.set_tick_count(host.tick_count() + 20);
         let outcome = host.attack_mob(zombie);
         if outcome.killed {
             zombie_killed = true;
@@ -1004,7 +1008,7 @@ fn find_chest_empty(host: &Host, pos: BlockPos) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------------
-// Multiplayer survival variant (raw protocol v3 client)
+// Multiplayer survival variant (raw protocol v4 client)
 // ---------------------------------------------------------------------------
 
 use ob_math::Aabb;
@@ -1483,6 +1487,22 @@ fn multiplayer_survival_join_mine_smelt_fight_death_reconnect() {
     );
     let mut killed = false;
     for _ in 0..8 {
+        // Wait out the 625 ms sword cooldown, then follow the cow's latest
+        // replicated position so the reach check stays valid while it flees.
+        std::thread::sleep(Duration::from_millis(950));
+        if let ServerMessage::EntityState { entities } = alice.recv_until_in(
+            "cow state",
+            Duration::from_secs(2),
+            |message| matches!(message, ServerMessage::EntityState { entities } if entities.iter().any(|entry| entry.id == cow)),
+        ) && let Some(entry) = entities.into_iter().find(|entry| entry.id == cow)
+        {
+            alice.send(ClientMessage::Move {
+                pos: entry.pos,
+                yaw: 0.0,
+                pitch: 0.0,
+            });
+            std::thread::sleep(Duration::from_millis(120));
+        }
         alice.send(ClientMessage::Attack { target: Some(cow) });
         let result = alice.recv_until(
             "cow attack",

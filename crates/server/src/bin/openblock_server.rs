@@ -3,7 +3,7 @@
 //! Modes:
 //!   openblock-server                        20 Hz headless host (console: help/status/save/stop)
 //!   openblock-server --listen 127.0.0.1:25565
-//!                                           dedicated TCP server (interim JSON protocol v3)
+//!                                           dedicated TCP server (interim JSON protocol v4)
 //!   openblock-server --smoke                generate, tick, save, reload and verify determinism
 //!   openblock-server --ticks N              run N headless ticks and save
 //!   openblock-server --version              print version and protocol information

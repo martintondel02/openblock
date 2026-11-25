@@ -22,7 +22,7 @@ pub const SAVE_FORMAT_VERSION: u16 = 4;
 /// is a plain constant rather than a re-export. It must track
 /// `ob_protocol::PROTOCOL_VERSION`; the server integration tests assert that
 /// both values agree.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 struct SimpleLogger;
 
@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn protocol_version_matches_the_implemented_wire_protocol() {
-        assert_eq!(PROTOCOL_VERSION, 3);
-        assert!(version_banner("openblock").contains("protocol 3"));
+        assert_eq!(PROTOCOL_VERSION, 4);
+        assert!(version_banner("openblock").contains("protocol 4"));
     }
 }

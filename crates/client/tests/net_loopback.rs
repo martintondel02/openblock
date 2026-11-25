@@ -3,7 +3,7 @@
 //! Starts a real [`DedicatedServer`] on `127.0.0.1:0` and drives
 //! [`ob_client::net::NetworkClient`] headlessly. The v1 cases cover the creative
 //! handshake, spawn chunks, movement, block edits, chat, ping and clean
-//! disconnect. The protocol v3 cases exercise survival sync, authoritative
+//! disconnect. The protocol v4 cases exercise survival sync, authoritative
 //! place/break/pickup, mob replication and attacks, furnace and chest windows
 //! with revisions, damage/death/respawn, out-of-reach prediction reverts and
 //! reconnect restore. No window, GPU, external network or wall-clock luck is
@@ -825,19 +825,38 @@ fn survival_mob_spawn_state_and_kill_by_attack() {
     );
     assert_eq!(client.entities().hurt(id), Some(true));
 
-    // Finish the kill. Rate limits allow the whole burst; the server broadcasts
+    // Finish the kill. The server requires 0.9 charge (1,000 ms for a hand), so
+    // pace each follow-up swing; the kill broadcast is
     // `entity_despawn { reason: killed }`.
-    for _ in 0..4 {
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_millis(950));
+        // The hurt chicken flees; follow its replicated position so the
+        // charged swing stays inside the server's reach check.
+        if let Some(pos) = client.entities().position(id, Instant::now()) {
+            assert!(client.send_move_now([pos.x, pos.y, pos.z], 0.0, 0.0));
+            std::thread::sleep(Duration::from_millis(120));
+        }
         assert!(client.send_attack(Some(id)));
-        std::thread::sleep(Duration::from_millis(20));
+        // Drain the authoritative result now so the despawn/health state is
+        // visible before the next swing.
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < deadline && client.entities().kind(id).is_some() {
+            let _ = client.poll();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if client.entities().kind(id).is_none() {
+            break;
+        }
     }
     wait_for(&mut client, "mob killed despawn", |client| {
         client.entities().kind(id).is_none()
     });
-    assert!(client.entities().mob_count() == 0);
+    assert!(client.entities().kind(id).is_none(), "the target is gone");
     assert_eq!(
         client.entities().last_despawn().map(|(reason, _)| reason),
-        Some(ob_protocol::DespawnReason::Killed)
+        Some(ob_protocol::DespawnReason::Killed),
+        "last despawn: {:?}",
+        client.entities().last_despawn()
     );
 
     client.shutdown();
@@ -1493,6 +1512,8 @@ fn hostile_server_payloads_are_bounded() {
             yaw: 0.0,
             health: 10.0,
             hurt: false,
+            variant: 0,
+            baby: false,
         })
         .collect();
     send_server(&mut control, &ob_protocol::ServerMessage::EntitySnapshot { entities });
@@ -1509,6 +1530,8 @@ fn hostile_server_payloads_are_bounded() {
             yaw: 0.0,
             health: 5.0,
             hurt: false,
+            variant: 0,
+            baby: false,
             stack: None,
         })
         .collect();

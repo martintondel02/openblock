@@ -495,3 +495,38 @@ Every requirement in §2 names its layer. The playthrough harness fails if the f
 - Research: [feature inventory](../research/05-minecraft-feature-inventory.md), [networking SOTA](../research/04-networking-sota.md), [modding and content](../research/06-modding-and-content-system.md).
 - Chapters: [05](05-world-model.md), [07](07-light-and-weather.md), [09](09-entities-ai.md), [10](10-physics-and-collision.md), [11](11-inventory-crafting-items.md), [12](12-redstone-and-logic.md), [13](13-ui-and-ux.md), [17](17-persistence.md), [18](18-networking-multiplayer.md), [20](20-security-and-anti-cheat.md), [25](25-performance-budgets.md).
 - External facts checked against the parity baseline: [Health](https://minecraft.wiki/w/Health), [Hunger](https://minecraft.wiki/w/Hunger), [Damage](https://minecraft.wiki/w/Damage), [Experience](https://minecraft.wiki/w/Experience), [Combat](https://minecraft.wiki/w/Combat), [Portal](https://minecraft.wiki/w/Portal), [Bed](https://minecraft.wiki/w/Bed), [Spawn](https://minecraft.wiki/w/Spawn), [Game rule](https://minecraft.wiki/w/Game_rule).
+
+## Appendix B — 1.3/1.4 danger-slice implementation (2026-11-25)
+
+The shipped interim slice implements a subset of §3.5–§3.6 and §3.11 with
+code-defined constants in `crates/content` and `crates/sim`. The full fixed-point
+and balance-profile design remains the MS-10/MS-14 target; these values are the
+current server-authoritative behaviour and are covered by unit/integration tests.
+
+- **Charge and damage.** `c = min(1, elapsed_ms / cooldown_ms)`; sword cooldown
+  625 ms, hand/other 1,000 ms; a hit needs `c >= 0.9`; damage is
+  `base × (0.2 + 0.8c²)`. A falling (`!on_ground && vy < -0.1`) non-sprinting
+  internal player crits for ×1.5. Early swings return `hit:false` and
+  `cooldown_remaining_ms` without tool wear. Reach is 5.5 m from the eye to the
+  mob AABB; line of sight is required for mob melee.
+- **Armor.** Existing 1.0 formula: `mitigated = amount × (1 − min(defense,20) ×
+  0.04)`; one durability per equipped piece per damaging hit, removed at zero.
+  Mob melee, arrows, explosions, fall and starvation all use this path.
+- **XP.** Next level costs `7+2L` (`L≤14`), `37+5(L−15)` (`15≤L≤29`) and
+  `107+9(L−30)` above; level 30 costs exactly 1,395 points. Level saturates at
+  100 in this slice. Sources are mob kills (zombie 3; spider/skeleton/creeper 5;
+  passive 1) and breeding (1–7). XP is direct — no orb entity. Death keeps XP
+  (1.5 adds orb drops and `keep_inventory`). `Player` gains `xp_points` and
+  `xp_level`; `player.txt` appends them as fields 11–12 (7/10-field rows still
+  load), and `network_players.txt` appends `xp<points>:<level>`.
+- **Replication.** `PlayerVitals` is unchanged; a separate
+  `XpSync { points, level, progress, required }` carries owner-only XP. Both
+  clients draw a green level bar above the hotbar.
+- **Combat feedback.** Both clients draw a crosshair cooldown bar and a mob
+  name/health bar; the network client mirrors the server's
+  `cooldown_remaining_ms` after every `AttackResult`. Critical hits are only
+  detected for the internal player because network movement is still
+  client-authoritative in v4.
+- **Tests.** `ob_sim::attack_charge_damage_and_xp_curve_are_fixed`,
+  `ob_server::tests::survival_attacks_wear_tools_and_break_at_zero`, the paced
+  loopback attack tests and `ob_server/tests/danger14.rs`.

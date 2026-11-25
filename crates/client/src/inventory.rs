@@ -242,6 +242,14 @@ pub enum HotbarIcon {
     Wheat,
     /// A baked bread loaf.
     Bread,
+    /// A white bone.
+    Bone,
+    /// A coil of spider string.
+    String,
+    /// A pile of creeper gunpowder.
+    Gunpowder,
+    /// A fletched arrow.
+    Arrow,
 }
 
 /// Metal family for raw ore nuggets.
@@ -449,6 +457,70 @@ const HOE_ART: [&str; ITEM_ICON_GRID] = [
     "...hh.......",
     "..hh........",
     "..H.........",
+];
+
+/// 12x12 bone (1.3 mob drop).
+const BONE_ART: [&str; ITEM_ICON_GRID] = [
+    "............",
+    "............",
+    "...bb..bb...",
+    "..bBBbbBBb..",
+    "..bBBBBBBb..",
+    "...bbBBbb...",
+    "....bBBb....",
+    "....bBBb....",
+    "...bbBBbb...",
+    "..bBBbbBBb..",
+    "..bb....bb..",
+    "............",
+];
+
+/// 12x12 string coil (1.3 spider drop).
+const STRING_ART: [&str; ITEM_ICON_GRID] = [
+    "............",
+    "...sssss....",
+    "..sSSSSSs...",
+    "..sS...Ss...",
+    "..sS...Ss...",
+    "...sSSSs....",
+    "....sSs.....",
+    "...sSSSs....",
+    "..sSSSSSs...",
+    "..sS...Ss...",
+    "...sssss....",
+    "............",
+];
+
+/// 12x12 gunpowder pile (1.3 creeper drop).
+const GUNPOWDER_ART: [&str; ITEM_ICON_GRID] = [
+    "............",
+    "............",
+    "......g.....",
+    "....gggg....",
+    "...gGgGgg...",
+    "..ggGggGgg..",
+    ".ggGgggGggg.",
+    ".gGggGggGgg.",
+    "..gggGgggg..",
+    "...gggggg...",
+    "............",
+    "............",
+];
+
+/// 12x12 arrow (1.3 skeleton drop/recipe).
+const ARROW_ART: [&str; ITEM_ICON_GRID] = [
+    "............",
+    "...ww.......",
+    "..wWWw......",
+    ".wWWWWw.....",
+    "..wWWw......",
+    "...ww.......",
+    "....hh......",
+    "....hh......",
+    "...hhhh.....",
+    "....hh......",
+    "....hh......",
+    "............",
 ];
 
 /// 12x12 shovel silhouette.
@@ -1307,6 +1379,10 @@ pub fn item_icon_for(registry: &Registry, item: ItemId) -> Option<HotbarIcon> {
         "openblock:seeds" => Some(HotbarIcon::Seeds),
         "openblock:wheat" => Some(HotbarIcon::Wheat),
         "openblock:bread" => Some(HotbarIcon::Bread),
+        "openblock:bone" => Some(HotbarIcon::Bone),
+        "openblock:string" => Some(HotbarIcon::String),
+        "openblock:gunpowder" => Some(HotbarIcon::Gunpowder),
+        "openblock:arrow" => Some(HotbarIcon::Arrow),
         _ => None,
     }
 }
@@ -1379,6 +1455,26 @@ fn crop_icon_parts(art: &[&str; ITEM_ICON_GRID], x: f32, y: f32, size: f32) -> V
         'h' => Some(WHEAT_STALK),
         'b' => Some(BREAD_CRUST),
         'B' => Some(BREAD_CRUMB),
+        _ => None,
+    })
+}
+
+/// Colours for the 1.3 mob-drop icons.
+fn danger_icon_parts(art: &[&str; ITEM_ICON_GRID], x: f32, y: f32, size: f32) -> Vec<IconPart> {
+    const BONE: [f32; 4] = [0.86, 0.85, 0.78, 1.0];
+    const BONE_DARK: [f32; 4] = [0.62, 0.61, 0.55, 1.0];
+    const STRING: [f32; 4] = [0.86, 0.86, 0.82, 1.0];
+    const STRING_DARK: [f32; 4] = [0.62, 0.62, 0.58, 1.0];
+    const POWDER: [f32; 4] = [0.56, 0.56, 0.53, 1.0];
+    const POWDER_DARK: [f32; 4] = [0.30, 0.30, 0.29, 1.0];
+    const SHAFT: [f32; 4] = [0.55, 0.36, 0.17, 1.0];
+    const FLETCH: [f32; 4] = [0.92, 0.92, 0.88, 1.0];
+    grid_parts(art, x, y, size, |glyph| match glyph {
+        'b' | 'B' => Some(if glyph == 'b' { BONE_DARK } else { BONE }),
+        's' | 'S' => Some(if glyph == 's' { STRING_DARK } else { STRING }),
+        'g' | 'G' => Some(if glyph == 'g' { POWDER } else { POWDER_DARK }),
+        'h' => Some(SHAFT),
+        'w' | 'W' => Some(FLETCH),
         _ => None,
     })
 }
@@ -1529,6 +1625,10 @@ pub fn item_tint_for(registry: &Registry, item: ItemId) -> Option<[f32; 3]> {
         HotbarIcon::Seeds => [0.55, 0.44, 0.24, 1.0],
         HotbarIcon::Wheat => [0.84, 0.67, 0.28, 1.0],
         HotbarIcon::Bread => [0.70, 0.46, 0.20, 1.0],
+        HotbarIcon::Bone => [0.86, 0.85, 0.78, 1.0],
+        HotbarIcon::String => [0.80, 0.80, 0.76, 1.0],
+        HotbarIcon::Gunpowder => [0.46, 0.46, 0.44, 1.0],
+        HotbarIcon::Arrow => [0.68, 0.62, 0.52, 1.0],
         HotbarIcon::Block { .. } => return None,
     };
     Some([color[0], color[1], color[2]])
@@ -1642,6 +1742,10 @@ fn draw_icon(frame: &mut UiFrame, icon: HotbarIcon, x: f32, y: f32, size: f32) {
         HotbarIcon::Seeds => draw_icon_parts(frame, &crop_icon_parts(&SEEDS_ART, x, y, size)),
         HotbarIcon::Wheat => draw_icon_parts(frame, &crop_icon_parts(&WHEAT_ART, x, y, size)),
         HotbarIcon::Bread => draw_icon_parts(frame, &crop_icon_parts(&BREAD_ART, x, y, size)),
+        HotbarIcon::Bone => draw_icon_parts(frame, &danger_icon_parts(&BONE_ART, x, y, size)),
+        HotbarIcon::String => draw_icon_parts(frame, &danger_icon_parts(&STRING_ART, x, y, size)),
+        HotbarIcon::Gunpowder => draw_icon_parts(frame, &danger_icon_parts(&GUNPOWDER_ART, x, y, size)),
+        HotbarIcon::Arrow => draw_icon_parts(frame, &danger_icon_parts(&ARROW_ART, x, y, size)),
     }
 }
 
@@ -2337,6 +2441,18 @@ mod tests {
         assert!(hint.contains("Durability 250/250"), "got {hint}");
         let bread = registry.item_id("openblock:bread").expect("bread");
         assert_eq!(item_info_hint(&registry, bread, None), "Food +5 hunger");
+
+        // 1.3 mob-drop icons and tints exist and are stable.
+        for (name, tint) in [
+            ("openblock:bone", [0.86, 0.85, 0.78]),
+            ("openblock:string", [0.80, 0.80, 0.76]),
+            ("openblock:gunpowder", [0.46, 0.46, 0.44]),
+            ("openblock:arrow", [0.68, 0.62, 0.52]),
+        ] {
+            let item = registry.item_id(name).expect("1.3 item");
+            assert!(item_icon_for(&registry, item).is_some(), "{name} icon");
+            assert_eq!(item_tint_for(&registry, item), Some(tint), "{name} tint");
+        }
     }
 
     #[test]

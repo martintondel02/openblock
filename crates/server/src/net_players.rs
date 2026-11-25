@@ -56,7 +56,8 @@ use ob_sim::{
 };
 
 use crate::{
-    ARMOR_SLOTS, ActionOutcome, AttackOutcome, GameMode, HOTBAR_SLOTS, Host, INVENTORY_SLOTS, ItemStack, MAX_STACK_SIZE,
+    ARMOR_SLOTS, ActionOutcome, AttackOutcome, GameMode, HOTBAR_SLOTS, Host, INVENTORY_SLOTS, InteractOutcome,
+    ItemStack, MAX_STACK_SIZE,
 };
 
 /// World-directory filename for persisted network players.
@@ -126,6 +127,14 @@ pub struct ServerPlayer {
     pub bed: Option<BlockPos>,
     /// Personal bed respawn point, persisted with the player record.
     pub respawn_point: Option<WorldVec>,
+    /// XP points inside the current level (1.3).
+    pub xp_points: u32,
+    /// Current XP level (1.3).
+    pub xp_level: u32,
+    /// Whether the net layer should send a fresh `XpSync`.
+    pub xp_dirty: bool,
+    /// Tick of this player's last charged melee hit (runtime only).
+    pub last_attack_tick: Option<u64>,
 }
 
 impl ServerPlayer {
@@ -156,6 +165,10 @@ impl ServerPlayer {
             sleeping: false,
             bed: None,
             respawn_point: None,
+            xp_points: 0,
+            xp_level: 0,
+            xp_dirty: true,
+            last_attack_tick: None,
         }
     }
 
@@ -210,6 +223,8 @@ pub struct RemovedEntity {
 /// protocol uses one entity id space, so item ids carry the high bit. Clients
 /// treat entity ids as opaque.
 pub const ITEM_ENTITY_ID_BIT: u64 = 1 << 63;
+/// Namespaced wire id for a projectile entity (1.3).
+pub const PROJECTILE_ENTITY_ID_BIT: u64 = 1 << 62;
 
 /// Largest host-local mob or item entity id accepted from a sidecar.
 ///
@@ -790,6 +805,23 @@ impl Host {
         Ok(outcome)
     }
 
+    /// Applies one mob feeding/breeding interaction for a network player.
+    pub(crate) fn network_interact_mob(&mut self, id: u64, target: u64) -> Result<InteractOutcome, String> {
+        let Some(player) = self.network_players.get(&id) else {
+            return Err("not_connected".to_string());
+        };
+        if player.dead {
+            return Err("dead".to_string());
+        }
+        if self.mob_entity(target).is_none() {
+            return Err("no_target".to_string());
+        }
+        let outcome = self
+            .with_network_player_action(id, |host| host.interact_mob(target))
+            .ok_or_else(|| "not_connected".to_string())?;
+        Ok(outcome)
+    }
+
     /// Eats one item from a network player's selected hotbar slot.
     pub(crate) fn network_eat(&mut self, id: u64) -> bool {
         self.with_network_player_action(id, |host| host.eat_selected())
@@ -862,6 +894,23 @@ impl Host {
         dirty
     }
 
+    /// Takes and clears the XP-dirty flag for one network player.
+    pub fn take_network_xp_dirty(&mut self, id: u64) -> bool {
+        let Some(player) = self.network_players.get_mut(&id) else {
+            return false;
+        };
+        let dirty = player.xp_dirty;
+        player.xp_dirty = false;
+        dirty
+    }
+
+    /// Marks a network player's XP as needing a fresh `XpSync`.
+    pub fn mark_network_xp_dirty(&mut self, id: u64) {
+        if let Some(player) = self.network_players.get_mut(&id) {
+            player.xp_dirty = true;
+        }
+    }
+
     /// Marks a network player's inventory as needing a fresh `InventorySync`.
     pub fn mark_network_inventory_dirty(&mut self, id: u64) {
         if let Some(player) = self.network_players.get_mut(&id) {
@@ -909,6 +958,7 @@ impl Host {
         let inventory_before = actor.inventory;
         let equipment_before = actor.equipment;
         let selected_before = actor.selected_slot;
+        let xp_before = (actor.xp_points, actor.xp_level);
 
         let mut player = Player::new(actor.pos);
         player.yaw = actor.yaw;
@@ -920,12 +970,15 @@ impl Host {
         player.regen_timer = actor.regen_timer;
         player.flying = actor.game_mode == GameMode::Creative;
         player.on_ground = true;
+        player.xp_points = actor.xp_points;
+        player.xp_level = actor.xp_level;
 
         let previous_player = std::mem::replace(&mut self.player, player);
         let previous_inventory = std::mem::replace(&mut self.inventory, actor.inventory);
         let previous_selected = std::mem::replace(&mut self.hotbar_selection, actor.selected_slot);
         let previous_mode = std::mem::replace(&mut self.game_mode, actor.game_mode);
         let previous_equipment = std::mem::replace(&mut self.equipment, actor.equipment);
+        let previous_attack_tick = std::mem::replace(&mut self.last_attack_tick, actor.last_attack_tick);
 
         let result = action(self);
 
@@ -937,17 +990,24 @@ impl Host {
         actor.dead = self.player.dead;
         actor.starvation_timer = self.player.starvation_timer;
         actor.regen_timer = self.player.regen_timer;
+        actor.xp_points = self.player.xp_points;
+        actor.xp_level = self.player.xp_level;
+        actor.last_attack_tick = self.last_attack_tick;
         actor.inventory = std::mem::replace(&mut self.inventory, previous_inventory);
         actor.selected_slot = std::mem::replace(&mut self.hotbar_selection, previous_selected);
         actor.game_mode = std::mem::replace(&mut self.game_mode, previous_mode);
         actor.equipment = std::mem::replace(&mut self.equipment, previous_equipment);
         self.player = previous_player;
+        self.last_attack_tick = previous_attack_tick;
 
         if actor.inventory != inventory_before
             || actor.equipment != equipment_before
             || actor.selected_slot != selected_before
         {
             actor.inventory_dirty = true;
+        }
+        if (actor.xp_points, actor.xp_level) != xp_before {
+            actor.xp_dirty = true;
         }
         self.network_players.insert(id, actor);
         Some(result)
@@ -1333,6 +1393,7 @@ pub(crate) fn network_players_state(
             let durability = stack.durability.unwrap_or(0);
             text.push_str(&format!(" e{slot}:{name},{durability}"));
         }
+        text.push_str(&format!(" xp{}:{}", player.xp_points, player.xp_level));
         text.push('\n');
     }
     text

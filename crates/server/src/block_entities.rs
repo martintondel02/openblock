@@ -19,8 +19,11 @@
 //!   the slot APIs on [`Host`](crate::Host); no open-window state exists.
 //! * The slot APIs do **not** validate reach, line of sight, window ownership or
 //!   that the player is alive/survival. The single-player client is trusted to
-//!   call them for the container it has open; a multiplayer protocol extension
-//!   must add those checks before exposing the same actions to remote clients.
+//!   call them for the container it has open; the network layer adds those
+//!   checks before exposing the same actions to remote clients.
+//! * Worldgen structure chests are registered by the host when a structure chunk
+//!   streams in; their initial contents are deterministic (`structure_chest_state`)
+//!   and an empty record is still saved, so looting cannot refill a chest.
 //! * Cook progress is not tied to a recipe id. Removing the input or filling the
 //!   output pauses and later resumes the stored progress; swapping in a
 //!   different smeltable input also continues from that progress.
@@ -29,9 +32,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use ob_content::{Registry, SMELT_TICKS_PER_ITEM};
+use ob_content::{Registry, SMELT_TICKS_PER_ITEM, structure_loot_rolls, structure_loot_stacks};
 use ob_math::BlockPos;
 use ob_world::World;
+use ob_worldgen::StructureInstance;
 
 use crate::{ItemStack, MAX_STACK_SIZE};
 
@@ -174,6 +178,28 @@ impl ContainerState {
             .filter(|stack| stack.count > 0)
             .collect()
     }
+}
+
+/// Builds the deterministic initial contents of one worldgen structure chest.
+///
+/// `structure.hash` seeds the loot roll and the chest position is mixed in by
+/// [`structure_loot_stacks`], so two chests in one structure differ and a reload
+/// of the same save reproduces the same contents. Each roll occupies one slot in
+/// table order; a chest is filled to at most six slots.
+pub(crate) fn structure_chest_state(
+    registry: &Registry,
+    seed: u64,
+    structure: &StructureInstance,
+    pos: BlockPos,
+) -> ContainerState {
+    let rolls = structure_loot_rolls(structure.hash);
+    let stacks = structure_loot_stacks(registry, seed, structure.hash, (pos.x, pos.y, pos.z), rolls);
+    let mut state = ContainerState::default();
+    for (slot, (item, count)) in stacks.into_iter().enumerate().take(CHEST_SLOTS) {
+        let max_stack = registry.item(item).max_stack.clamp(1, MAX_STACK_SIZE);
+        state.slots[slot] = Some(ItemStack::for_item(item, registry.item(item), count.min(max_stack)));
+    }
+    state
 }
 
 /// Advances one furnace by exactly one host tick.

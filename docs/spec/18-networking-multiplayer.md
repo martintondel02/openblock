@@ -1586,3 +1586,54 @@ convergence rather than absence of a crash.
   rustls 0.23 <https://docs.rs/rustls/0.23.46/rustls/>; MDN WebTransport
   <https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API>; iroh
   <https://github.com/n0-computer/iroh>.
+
+## Appendix B — Protocol v4 danger slice (2026-11-25)
+
+`PROTOCOL_VERSION` is **4** in both `ob_protocol` and `ob_core`; v1–v3 peers are
+rejected before state exchange with
+`protocol_mismatch: server protocol 4, client sent N; 1.3 and older clients must
+upgrade to a 1.4+ build`. JSON/TCP framing, the 2 MiB frame cap, chunk/light
+codecs and inventory addressing are unchanged.
+
+### B.1 New and changed messages
+
+| Direction | Message | Fields |
+| --- | --- | --- |
+| C→S | `interact_entity` | `id` (server validates 3 m reach, food, cooldown, love state, area caps) |
+| S→C | `xp_sync` | `points`, `level`, `progress`, `required` (owner only) |
+| S→C | `interact_result` | `id`, `accepted`, `reason` |
+| S→C | `explosion` | `pos`, `radius` (block edits still arrive as `block_edit`) |
+| S→C | `attack_result` | adds `charge`, `critical`, `cooldown_remaining_ms` |
+| S→C | `entity_kind` | adds `projectile { projectile }` (`openblock:arrow`) |
+| S→C | `entity_spawn` / `entity_snapshot` | add `variant` (0–3, default 0) and `baby` (default false) |
+| S→C | `entity_state_entry` | adds `variant` and `baby` |
+
+`entity_spawn` is used for arrows as well as mobs/items; removing a spent arrow
+uses the normal entity interest diff or an immediate despawn. Mob/entity ids are
+still opaque: projectile ids carry `1 << 62` in addition to the existing item
+namespace bit, and clients must not interpret either.
+
+### B.2 Semantics and persistence
+
+- Breeding is a server action: `interact_entity` consumes food only in survival,
+  sets love, schedules the 60-tick birth and returns `interact_result`; a
+  successful pairing also sends a short `chat` line and fresh `xp_sync`.
+- XP is direct (no orb entity); `xp_sync` is sent on join, after XP changes and
+  when the per-player dirty flag is set. `progress`/`required` drive the HUD bar.
+- Charged attacks are validated from the server tick clock; a rejected swing
+  still sends `attack_result { hit:false, cooldown_remaining_ms }` so the client
+  can show the real cooldown. Tool wear, drops and XP only happen on a hit.
+- Projectiles, creeper explosions, AI timers and pending births are transient and
+  are not written to sidecars. `mobs.txt` appends variant/love/cooldown/growth/
+  persistent; `player.txt` appends XP; `network_players.txt` appends
+  `xp<points>:<level>`. All older row shapes still load.
+- The 1.3 client contract is otherwise unchanged: `InventorySync`, containers,
+  light, sleep, roster and prediction behave exactly as in v3.
+
+### B.3 Verification
+
+`ob_protocol` round-trips every new message and pins the version at 4;
+`ob_server/tests/net_survival.rs` covers the v3→v4 rejection message, charged
+attacks, network breeding + `xp_sync`, arrow entity replication from a skeleton,
+mob sync and reconnect; `ob_client/tests/net_loopback.rs` covers replicated
+breeding/XP/projectile state reducers and a paced authoritative kill.
