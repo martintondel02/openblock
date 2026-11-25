@@ -1581,6 +1581,16 @@ pub fn load_settings(data_dir: &Path) -> Settings {
             if settings.clamp() {
                 log::warn!("settings in {} were out of range and have been clamped", path.display());
             }
+            // Older configs (and hand-edited ones) can name a preset but carry
+            // stale/default individual quality fields. A non-Custom preset is
+            // authoritative on load; Custom keeps the explicit overrides.
+            if settings.apply_graphics_preset() {
+                log::info!(
+                    "applied the {} graphics preset to settings loaded from {}",
+                    settings.graphics_preset.label(),
+                    path.display()
+                );
+            }
             settings
         }
         Err(err) => {
@@ -1809,6 +1819,54 @@ mod tests {
         assert_eq!(load_settings(&dir).ui_font_path, None);
         let text = fs::read_to_string(settings_path(&dir)).expect("read");
         assert!(!text.contains("bad"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn loaded_named_preset_reapplies_quality_fields_but_custom_keeps_overrides() {
+        let dir = temp_dir("preset-reapply");
+        // A legacy/hand-edited config can carry a preset name with stale low
+        // quality fields (the pre-1.1 configs had no quality fields at all).
+        fs::write(
+            settings_path(&dir),
+            serde_json::json!({
+                "graphics_preset": "high",
+                "shadow_quality": "off",
+                "clouds": "off",
+                "water_quality": "off",
+                "bloom": false,
+                "fxaa": false,
+            })
+            .to_string(),
+        )
+        .expect("write");
+        let loaded = load_settings(&dir);
+        assert_eq!(loaded.graphics_preset, GraphicsPreset::High);
+        assert_eq!(loaded.shadow_quality, ShadowQuality::High);
+        assert_eq!(loaded.clouds, CloudQuality::High);
+        assert_eq!(loaded.water_quality, WaterQuality::High);
+        assert!(loaded.bloom && loaded.fxaa);
+
+        // Custom is a set of explicit overrides and must not be rewritten.
+        fs::write(
+            settings_path(&dir),
+            serde_json::json!({
+                "graphics_preset": "custom",
+                "shadow_quality": "off",
+                "clouds": "off",
+                "water_quality": "off",
+                "bloom": false,
+                "fxaa": false,
+            })
+            .to_string(),
+        )
+        .expect("write");
+        let custom = load_settings(&dir);
+        assert_eq!(custom.graphics_preset, GraphicsPreset::Custom);
+        assert_eq!(custom.shadow_quality, ShadowQuality::Off);
+        assert_eq!(custom.clouds, CloudQuality::Off);
+        assert_eq!(custom.water_quality, WaterQuality::Off);
+        assert!(!custom.bloom && !custom.fxaa);
         let _ = fs::remove_dir_all(dir);
     }
 

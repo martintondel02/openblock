@@ -62,7 +62,7 @@ modules:
     sources:
       - type: git
         url: https://github.com/martintondel02/openblock.git
-        tag: v1.2.0
+        tag: v1.2.1
         commit: 19e489e63b6aa656f6569f81c1c8b4fb8ed3c74a   # v1.0.0 release commit
       # BLOCKED: uncomment after generating and committing the file.
       # Without this source the offline Cargo build cannot resolve crates.
