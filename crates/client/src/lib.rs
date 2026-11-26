@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ob_audio::{AudioEngine, Material as AudioMaterial, Sfx as AudioSfx};
+use ob_audio::{AudioEngine, ClipId, Material as AudioMaterial, Sfx as AudioSfx};
 use ob_content::{ArmorSlot, BlockId, MobKind, Registry};
 use ob_core::config::{
     Action, BindKey, FsrQuality as SettingsFsrQuality, GameMode as SettingsGameMode, KeyName, Settings, TextureStyle,
@@ -26,7 +26,8 @@ use ob_core::config::{
 use ob_math::{BlockPos, ChunkPos, N_SECTIONS, SEA_LEVEL, SECTION_SIZE, SectionPos, WorldVec};
 use ob_render::{
     BlockOutline, Camera, DAY_LENGTH_TICKS, EntityInstance, Environment, LodBatchKey, LodConfig, OffscreenRenderer,
-    Renderer, SceneParams, TextureSource, UiFrame, far_plane_for_view_distance,
+    ParticleSystem, Renderer, SceneParams, TextureSource, UiFrame, WeatherPrecipitation, WeatherVisual,
+    far_plane_for_view_distance,
 };
 use ob_server::{
     CHEST_SLOTS, DedicatedServer, FurnaceSlot, GameMode as HostGameMode, Host, HostConfig, ItemEntity, ItemStack,
@@ -59,6 +60,7 @@ mod net_ui;
 pub mod ui_font;
 pub mod ui_scale;
 pub mod ui_state;
+pub mod weather;
 
 use containers::{ClickButton, ContainerAction, ContainerKind, ContainerSession, ContainerSnapshot};
 use crafting::{CraftingRow, crafting_rows};
@@ -182,6 +184,12 @@ pub struct ClientOptions {
     pub screenshot_farm: bool,
     /// Render a bed with the sleep overlay active at night.
     pub screenshot_sleep: bool,
+    /// 1.5 weather visual proof: rain, thunder or snow.
+    pub screenshot_weather: Option<WeatherScreenshot>,
+    /// 1.5 fire visual proof: a burning campfire at dusk.
+    pub screenshot_fire: bool,
+    /// 1.5 explosion visual proof: dust, sparks and a camera flash.
+    pub screenshot_explosion: bool,
     /// Select the settings tab used by an offscreen settings screenshot.
     pub screenshot_settings_tab: Option<SettingsTab>,
     /// Do not open an audio device at all (headless/streaming setups).
@@ -266,6 +274,9 @@ impl Default for ClientOptions {
             screenshot_torch: false,
             screenshot_farm: false,
             screenshot_sleep: false,
+            screenshot_weather: None,
+            screenshot_fire: false,
+            screenshot_explosion: false,
             screenshot_settings_tab: None,
             no_audio: false,
             mute: false,
@@ -394,6 +405,12 @@ pub fn run(options: ClientOptions) -> Result<(), Box<dyn std::error::Error>> {
             ScreenshotMode::Farm
         } else if options.screenshot_sleep {
             ScreenshotMode::Sleep
+        } else if let Some(weather) = options.screenshot_weather {
+            ScreenshotMode::Weather(weather)
+        } else if options.screenshot_fire {
+            ScreenshotMode::Fire
+        } else if options.screenshot_explosion {
+            ScreenshotMode::Explosion
         } else {
             ScreenshotMode::Hud
         };
@@ -465,6 +482,41 @@ pub fn should_show_title(options: &ClientOptions) -> bool {
 fn clear_ui_font_cli_overrides(options: &mut ClientOptions) {
     options.ui_font = None;
     options.default_ui_font = false;
+}
+
+/// Which 1.5 weather state a visual-proof screenshot should render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeatherScreenshot {
+    /// Moderate rain with an overcast sky.
+    Rain,
+    /// Full thunderstorm with a lightning flash and strike sparks.
+    Thunder,
+    /// Snow with the cold-weather wind presentation.
+    Snow,
+}
+
+impl WeatherScreenshot {
+    /// Every weather capture, in menu/documentation order.
+    pub const ALL: [Self; 3] = [Self::Rain, Self::Thunder, Self::Snow];
+
+    /// Stable CLI name.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Rain => "rain",
+            Self::Thunder => "thunder",
+            Self::Snow => "snow",
+        }
+    }
+
+    /// Parses the stable CLI name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "rain" => Some(Self::Rain),
+            "thunder" | "storm" => Some(Self::Thunder),
+            "snow" => Some(Self::Snow),
+            _ => None,
+        }
+    }
 }
 
 /// Which front-end screen an offscreen screenshot should render.
@@ -562,6 +614,12 @@ enum ScreenshotMode {
     Farm,
     /// 1.2 visual proof: night bed with the sleep overlay.
     Sleep,
+    /// 1.5 visual proof: rain, thunderstorm or snow.
+    Weather(WeatherScreenshot),
+    /// 1.5 visual proof: animated fire at dusk.
+    Fire,
+    /// 1.5 visual proof: explosion particles and flash.
+    Explosion,
     /// Multiplayer loading/failure/roster overlay over a world.
     NetUi(NetUiKind),
 }
@@ -785,6 +843,7 @@ fn screenshot_name_tags_demo_inner(
             ui: Some(&frame),
             outline: None,
             time_seconds: 0.0,
+            ..SceneParams::default()
         },
     )?;
     let rgba = renderer.read_rgba();
@@ -1054,6 +1113,7 @@ fn screenshot_network_demo_inner(
             ui: None,
             outline: None,
             time_seconds: 0.0,
+            ..SceneParams::default()
         },
     )?;
     let render_stats = renderer.stats();
@@ -1138,6 +1198,8 @@ fn screenshot_network_demo_inner(
         graphics_summary: renderer.graphics().summary(),
         shadow_summary: renderer.shadow_summary(),
         fsr_summary: renderer.fsr_summary(),
+        weather: Vec::new(),
+        weather_compact: String::new(),
     };
 
     let mut ui = UiState::from_settings(settings.clone());
@@ -1185,6 +1247,7 @@ fn screenshot_network_demo_inner(
                 ui: Some(frame),
                 outline: None,
                 time_seconds: 0.0,
+                ..SceneParams::default()
             };
             renderer.render_world_scene(client.world(), &camera, &scene)?;
             let rgba = renderer.read_rgba();
@@ -1282,6 +1345,9 @@ fn screenshot_with_mode(
     // block placement raycasts, so it runs after the first full stream.
     let mut screenshot_container: Option<(ContainerKind, BlockPos)> = None;
     let mut screenshot_sleep_remaining: Option<u32> = None;
+    let mut screenshot_fire_positions: Vec<[f32; 3]> = Vec::new();
+    let mut screenshot_blast: Option<[f32; 3]> = None;
+    let mut screenshot_weather_snapshot: Option<crate::weather::WeatherSnapshot> = None;
     match mode {
         ScreenshotMode::Mobs => {
             let count = seed_screenshot_mobs(&mut host, &registry);
@@ -1332,6 +1398,43 @@ fn screenshot_with_mode(
             screenshot_sleep_remaining = seed_screenshot_sleep(&mut host, &registry);
             if screenshot_sleep_remaining.is_none() {
                 log::warn!("sleep screenshot: could not enter the bed");
+            }
+        }
+        ScreenshotMode::Weather(kind) => {
+            use ob_protocol::{PrecipitationKind, WeatherPhase};
+            let (phase, intensity_permille, remaining, epoch, precipitation) = match kind {
+                WeatherScreenshot::Rain => (WeatherPhase::Precipitating, 800, 4_200, 7, PrecipitationKind::Rain),
+                WeatherScreenshot::Thunder => (WeatherPhase::Thunder, 950, 6_300, 9, PrecipitationKind::Rain),
+                WeatherScreenshot::Snow => (WeatherPhase::Precipitating, 750, 5_100, 11, PrecipitationKind::Snow),
+            };
+            host.set_weather_state(phase, remaining, intensity_permille);
+            if kind == WeatherScreenshot::Snow {
+                screenshot_weather_snapshot = Some(crate::weather::WeatherSnapshot::new(
+                    phase,
+                    f64::from(intensity_permille) / 1_000.0,
+                    remaining,
+                    epoch,
+                    precipitation,
+                    "snowy_taiga",
+                    f64::from(host.weather_factor()),
+                ));
+            }
+            // A slightly elevated, open-sky viewpoint shows the precipitation
+            // against the terrain instead of a wall directly in front.
+            let player = host.player().clone();
+            let feet = WorldVec::new(player.pos.x, player.pos.y + 4.0, player.pos.z);
+            place_screenshot_player(&mut host, feet, player.yaw, -0.08);
+        }
+        ScreenshotMode::Fire => {
+            screenshot_fire_positions = seed_screenshot_fire(&mut host, &registry);
+            if screenshot_fire_positions.is_empty() {
+                log::warn!("fire screenshot: could not ignite the campfire");
+            }
+        }
+        ScreenshotMode::Explosion => {
+            screenshot_blast = seed_screenshot_explosion(&mut host, &registry);
+            if screenshot_blast.is_none() {
+                log::warn!("explosion screenshot: could not build the blast scene");
             }
         }
         _ => {}
@@ -1396,10 +1499,124 @@ fn screenshot_with_mode(
         (None, ScreenshotMode::Sleep) => {
             Environment::from_ticks(host.tick_count() + DAY_LENGTH_TICKS / 4, DAY_LENGTH_TICKS)
         }
+        // 1.5 weather captures read best at noon with the storm palette applied.
+        (None, ScreenshotMode::Weather(WeatherScreenshot::Thunder)) => Environment::new(0.47),
+        // Fire and explosion are dusk/night captures: the point is the light.
+        (None, ScreenshotMode::Fire | ScreenshotMode::Explosion) => Environment::new(0.84),
         // A torch-lit room is dark by construction; keeping the default noon
         // light shows that the glow comes from block light alone.
         (None, _) => Environment::default(),
     };
+
+    // 1.5 visual-proof effects. These reuse the exact particle/weather path the
+    // interactive client uses; only the input state is synthetic.
+    let mut screenshot_weather = WeatherVisual::default();
+    let mut screenshot_weather_hud = None;
+    let mut screenshot_particles = ParticleSystem::new(0x000B_1E5E_ED15);
+    match mode {
+        ScreenshotMode::Weather(kind) => {
+            let snapshot = screenshot_weather_snapshot.unwrap_or_else(|| {
+                crate::weather::WeatherSnapshot::new(
+                    host.weather_phase(),
+                    f64::from(host.weather_intensity()),
+                    host.weather_remaining_ticks(),
+                    host.storm_epoch(),
+                    host.precipitation_at_pos(BlockPos::new(
+                        camera.position.x.floor() as i32,
+                        camera.position.y.floor() as i32,
+                        camera.position.z.floor() as i32,
+                    )),
+                    host.biome_name_at(camera.position.x.floor() as i32, camera.position.z.floor() as i32),
+                    f64::from(host.weather_factor()),
+                )
+            });
+            let flash = if kind == WeatherScreenshot::Thunder { 0.55 } else { 0.0 };
+            screenshot_weather = snapshot.visual(flash);
+            let wind = ob_render::weather_wind(
+                snapshot.epoch,
+                snapshot.intensity,
+                snapshot.precipitation == ob_protocol::PrecipitationKind::Snow,
+            );
+            let ground = host
+                .world()
+                .height_at(camera.position.x.floor() as i32, camera.position.z.floor() as i32)
+                .map_or(camera.position.y as f32 - 48.0, |height| height as f32);
+            let settings = snapshot.particles(wind, 1.0, ground);
+            screenshot_particles.prefill_weather(
+                [
+                    camera.position.x as f32,
+                    camera.position.y as f32,
+                    camera.position.z as f32,
+                ],
+                settings,
+            );
+            // Age the prefill past the fade-in window so the still frame shows
+            // full-density precipitation (the interactive path fades in over a
+            // few frames).
+            screenshot_particles.advance(0.4);
+            if kind == WeatherScreenshot::Thunder {
+                let forward = camera.forward();
+                let strike = [
+                    camera.position.x as f32 + forward[0] * 34.0,
+                    camera.position.y as f32 + forward[1] * 34.0 + 10.0,
+                    camera.position.z as f32 + forward[2] * 34.0,
+                ];
+                screenshot_particles.spawn_lightning_strike(strike);
+            }
+            let mut presentation = crate::weather::WeatherPresentation::new();
+            presentation.apply_snapshot(snapshot);
+            if kind == WeatherScreenshot::Thunder {
+                presentation.trigger_lightning(
+                    [camera.position.x, camera.position.y, camera.position.z - 34.0],
+                    true,
+                    [
+                        camera.position.x as f32,
+                        camera.position.y as f32,
+                        camera.position.z as f32,
+                    ],
+                    camera.yaw,
+                );
+            }
+            presentation.update(0.0, screenshot_fire_positions.len());
+            screenshot_weather_hud = presentation.hud();
+            let visual = environment.visual_with_weather(screenshot_weather);
+            log::info!(
+                "weather screenshot: intensity {:.2} precip {:?} horizon {:?} daylight {:.2} sun {:.2} flash {:.2} particles {}",
+                screenshot_weather.intensity,
+                screenshot_weather.precipitation,
+                visual.horizon,
+                visual.daylight,
+                visual.sun_intensity,
+                screenshot_weather.flash,
+                screenshot_particles.precipitation_count(),
+            );
+        }
+        ScreenshotMode::Fire => {
+            if screenshot_fire_positions.is_empty() {
+                // Fall back to a few particles at the crosshair so the capture
+                // still proves the effect path on a pack without a campfire.
+                let eye = camera.position;
+                screenshot_fire_positions.push([eye.x as f32, eye.y as f32 - 1.0, eye.z as f32 - 4.0]);
+            }
+            let wind = ob_render::weather_wind(5, 0.2, false);
+            for _ in 0..180 {
+                screenshot_particles.emit_fire(&screenshot_fire_positions, 1.0 / 60.0, wind);
+                screenshot_particles.advance(1.0 / 60.0);
+            }
+        }
+        ScreenshotMode::Explosion => {
+            if let Some(blast) = screenshot_blast {
+                screenshot_particles.spawn_explosion(blast, 4.5);
+                for _ in 0..10 {
+                    screenshot_particles.advance(1.0 / 60.0);
+                }
+                // The orange fireball carries the blast read; a post exposure
+                // flash on a still frame washes the whole scene grey.
+                screenshot_weather = WeatherVisual::new(0.0, 0.0, WeatherPrecipitation::None, 0.0);
+            }
+        }
+        _ => {}
+    }
     // The debug screenshot reports real world counters. Render the world once
     // without the overlay to fill `RenderStats` deterministically, then compose
     // the final frame with the HUD and F3 overlay on top.
@@ -1412,6 +1629,7 @@ fn screenshot_with_mode(
                 ui: None,
                 outline: None,
                 time_seconds: 0.0,
+                ..SceneParams::default()
             },
             &LodConfig::for_render_distance(host.render_distance_chunks()),
         )?;
@@ -1786,6 +2004,21 @@ fn screenshot_with_mode(
                 host.day_phase(),
             );
         }
+        ScreenshotMode::Weather(_) | ScreenshotMode::Fire | ScreenshotMode::Explosion => {
+            ui.block_name_seconds = ui_state::BLOCK_NAME_SECONDS;
+            let cross = [0.95, 0.97, 1.0, 0.85];
+            frame.rect(centre_x - 1.0, centre_y - 9.0, 2.0, 18.0, cross);
+            frame.rect(centre_x - 9.0, centre_y - 1.0, 18.0, 2.0, cross);
+            draw_vitals_for_mode(&mut frame, &ui, &host, screen);
+            draw_hotbar_for_mode(&mut frame, &ui, &registry, &host, screen);
+            draw_selected_name(&mut frame, &ui, &registry, &host, screen);
+            if survival {
+                ui_state::draw_toasts(&mut frame, &ui.toasts, screen);
+            }
+            if let Some(hud) = &screenshot_weather_hud {
+                crate::weather::draw_weather_hud(&mut frame, hud, screen);
+            }
+        }
         ScreenshotMode::NetUi(kind) => {
             if kind == NetUiKind::Roster {
                 let cross = [0.95, 0.97, 1.0, 0.85];
@@ -1875,11 +2108,14 @@ fn screenshot_with_mode(
     entities.extend(mobs::mob_instances(&registry, host.mobs(), 1.0));
     renderer.set_entities(&entities);
     log_ui_frame(&format!("{:?}", mode), &frame);
+    let screenshot_particle_instances = screenshot_particles.instances();
     let scene = SceneParams {
         environment,
         ui: Some(&frame),
         outline: None,
         time_seconds: 0.0,
+        weather: screenshot_weather,
+        particles: (!screenshot_particle_instances.is_empty()).then_some(screenshot_particle_instances),
     };
     renderer.render_world_scene_lod(
         host.world(),
@@ -1910,6 +2146,30 @@ fn screenshot_with_mode(
         host.player().hunger,
     );
     Ok(())
+}
+
+/// Builds the authoritative weather snapshot from a single-player host.
+///
+/// Shared by the live runtime and the debug screenshot so both report the same
+/// phase, intensity, precipitation, biome, remaining time and factors.
+fn weather_snapshot_for_host(host: &Host) -> crate::weather::WeatherSnapshot {
+    let player = host.player();
+    let feet = BlockPos::new(
+        player.pos.x.floor() as i32,
+        player.pos.y.floor() as i32,
+        player.pos.z.floor() as i32,
+    );
+    let precipitation = host.precipitation_at_pos(feet);
+    let biome = host.biome_name_at(feet.x, feet.z).to_string();
+    crate::weather::WeatherSnapshot::new(
+        host.weather_phase(),
+        f64::from(host.weather_intensity()),
+        host.weather_remaining_ticks(),
+        host.storm_epoch(),
+        precipitation,
+        biome,
+        f64::from(host.weather_factor()),
+    )
 }
 
 /// Builds the deterministic F3 statistics snapshot used by `--screenshot-debug`.
@@ -2027,6 +2287,24 @@ fn screenshot_debug_stats(
         graphics_summary: renderer.graphics().summary(),
         shadow_summary: renderer.shadow_summary(),
         fsr_summary: renderer.fsr_summary(),
+        weather: {
+            let mut presentation = crate::weather::WeatherPresentation::new();
+            presentation.apply_snapshot(weather_snapshot_for_host(host));
+            presentation.sheltered = !host.sky_exposed(BlockPos::new(
+                eye.x.floor() as i32,
+                eye.y.floor() as i32,
+                eye.z.floor() as i32,
+            ));
+            presentation.update(0.0, host.fire_count());
+            presentation.debug_lines()
+        },
+        weather_compact: {
+            let mut presentation = crate::weather::WeatherPresentation::new();
+            presentation.apply_snapshot(weather_snapshot_for_host(host));
+            presentation
+                .hud()
+                .map_or_else(|| "Weather clear".to_string(), |hud| hud.summary_line())
+        },
     }
 }
 
@@ -2534,6 +2812,105 @@ fn seed_screenshot_sleep(host: &mut Host, registry: &Registry) -> Option<u32> {
     }
 }
 
+/// Builds a small campfire clearing and returns the burning block centres.
+///
+/// Uses the authoritative fire seam (`Host::ignite_fire`) so the screenshot
+/// exercises the real block, emission and light path, not a client-side fake.
+fn seed_screenshot_fire(host: &mut Host, registry: &Registry) -> Vec<[f32; 3]> {
+    let (Some(stone), Some(log)) = (registry.id("openblock:stone"), registry.id("openblock:log")) else {
+        return Vec::new();
+    };
+    let (cx, floor, cz) = screenshot_build_origin(host, 10);
+    let world = host.world_mut();
+    for x in -6_i32..=6 {
+        for z in -7_i32..=7 {
+            for y in floor..=floor + 5 {
+                world.set_block(BlockPos::new(cx + x, y, cz + z), BlockId::AIR);
+            }
+            // A stone clearing reads better than grass under the warm light.
+            world.set_block(BlockPos::new(cx + x, floor - 1, cz + z), stone);
+        }
+    }
+    // Three log piles; the low stone ring keeps the fire from blending into
+    // the ground at dusk.
+    let logs = [(cx, floor, cz - 4), (cx - 3, floor, cz - 2), (cx + 3, floor, cz - 2)];
+    for (x, y, z) in logs {
+        world.set_block(BlockPos::new(x, y, z), log);
+        world.set_block(BlockPos::new(x + 1, y, z), log);
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                if dx == 0 && dz == 0 {
+                    continue;
+                }
+                world.set_block(BlockPos::new(x + dx, floor - 1, z + dz), stone);
+            }
+        }
+    }
+    let mut positions = Vec::new();
+    for (x, y, z) in logs {
+        let fire_pos = BlockPos::new(x, y + 1, z);
+        if host.ignite_fire(fire_pos) {
+            positions.push([x as f32 + 0.5, y as f32 + 1.2, z as f32 + 0.5]);
+        }
+        let second = BlockPos::new(x + 1, y + 1, z);
+        if host.ignite_fire(second) {
+            positions.push([x as f32 + 1.5, y as f32 + 1.2, z as f32 + 0.5]);
+        }
+    }
+    place_screenshot_player(
+        host,
+        WorldVec::new(f64::from(cx) + 0.5, f64::from(floor), f64::from(cz) + 4.0),
+        0.0,
+        -0.22,
+    );
+    log::info!("fire screenshot: {} burning cells", positions.len());
+    // Give the light updates a moment to relight the clearing.
+    for _ in 0..3 {
+        host.tick(&PlayerInput::default());
+    }
+    positions
+}
+
+/// Builds a small rubble field and returns the blast centre for the screenshot.
+fn seed_screenshot_explosion(host: &mut Host, registry: &Registry) -> Option<[f32; 3]> {
+    let (Some(stone), Some(cobble), Some(gravel)) = (
+        registry.id("openblock:stone"),
+        registry.id("openblock:cobblestone"),
+        registry.id("openblock:gravel"),
+    ) else {
+        return None;
+    };
+    let (cx, floor, cz) = screenshot_build_origin(host, 10);
+    let world = host.world_mut();
+    for x in -7_i32..=7 {
+        for z in -8_i32..=7 {
+            for y in floor..=floor + 5 {
+                world.set_block(BlockPos::new(cx + x, y, cz + z), BlockId::AIR);
+            }
+            world.set_block(BlockPos::new(cx + x, floor - 1, cz + z), stone);
+        }
+    }
+    // A broken wall and scattered rubble frame the blast without pretending to
+    // simulate block damage in the screenshot path.
+    for dx in -3_i32..=3 {
+        for y in 0..=2 {
+            if (dx + y) % 3 != 0 {
+                world.set_block(BlockPos::new(cx + dx, floor + y, cz - 5), cobble);
+            }
+        }
+    }
+    for (x, z) in [(-2, -1), (1, -2), (2, 0), (-1, 1), (0, -3), (3, -1)] {
+        world.set_block(BlockPos::new(cx + x, floor - 1, cz + z), gravel);
+    }
+    place_screenshot_player(
+        host,
+        WorldVec::new(f64::from(cx) + 0.5, f64::from(floor), f64::from(cz) + 4.5),
+        0.0,
+        -0.18,
+    );
+    Some([cx as f32 + 0.5, floor as f32 + 1.4, cz as f32 - 4.0])
+}
+
 /// Fills a screenshot furnace with a representative in-progress smelt.
 fn seed_screenshot_furnace(host: &mut Host, registry: &Registry, pos: BlockPos, full: bool) {
     let (input_count, fuel_count) = if full { (64, 64) } else { (3, 8) };
@@ -3034,6 +3411,12 @@ struct GameState {
     audio_status: String,
     /// Last health value observed for hurt/death sound edges.
     last_audio_health: f32,
+    /// Last authoritative XP level, for the level-up cue and particles.
+    last_xp_level: u32,
+    /// Ambient hostile-mob cue cooldowns, seconds.
+    skeleton_cue_seconds: f32,
+    spider_cue_seconds: f32,
+    creeper_cue_seconds: f32,
     /// Horizontal ground distance accumulated for the next footstep.
     footstep_distance: f64,
     /// Water state from the previous frame (splash edge detection).
@@ -3056,6 +3439,15 @@ struct GameState {
     sleep_ticks: u32,
     /// Previous frame's sleep state, for start/wake toasts.
     was_sleeping: bool,
+    /// Authoritative weather presentation (visuals, flash, shake, audio).
+    weather: crate::weather::WeatherPresentation,
+    /// Camera-local weather/fire/effect particles.
+    particles: ParticleSystem,
+    /// Cached sky exposure/ground and nearby burning blocks.
+    weather_sky: crate::weather::SkySample,
+    weather_fires: Vec<[f32; 3]>,
+    weather_scan_timer: f32,
+    last_weather_eye: Option<[f32; 3]>,
 }
 
 impl GameState {
@@ -3124,6 +3516,161 @@ impl GameState {
     }
 
     /// Updates footstep, splash, hurt and listener state for this frame.
+    /// Builds the authoritative weather snapshot from the single-player host.
+    fn weather_snapshot(&self) -> crate::weather::WeatherSnapshot {
+        weather_snapshot_for_host(&self.host)
+    }
+
+    /// Samples the host heightmap for rain occlusion and nearby fires.
+    fn sample_weather_world(&mut self, eye: WorldVec) {
+        let x = eye.x.floor() as i32;
+        let z = eye.z.floor() as i32;
+        let eye_y = eye.y.floor() as i32;
+        let sky_pos = BlockPos::new(x, eye_y.max(ob_math::WORLD_MIN_Y), z);
+        let exposed = self.host.sky_exposed(sky_pos);
+        let ground = self
+            .host
+            .world()
+            .height_at(x, z)
+            .map_or(ob_math::WORLD_MIN_Y as f32, |height| height as f32);
+        self.weather_sky = crate::weather::SkySample {
+            exposure: if exposed { 1.0 } else { 0.0 },
+            ground_y: ground,
+            sheltered: !exposed,
+        };
+        self.weather_fires.clear();
+        let player = self.host.player();
+        let eye_pos = player.eye();
+        for pos in self.host.fires().keys() {
+            let dx = pos.x as f64 + 0.5 - eye_pos.x;
+            let dz = pos.z as f64 + 0.5 - eye_pos.z;
+            let dy = pos.y as f64 + 0.5 - eye_pos.y;
+            if dx * dx + dz * dz <= f64::from(crate::weather::FIRE_SCAN_RADIUS.pow(2)) && dy.abs() <= 6.0 {
+                self.weather_fires
+                    .push([pos.x as f32 + 0.5, pos.y as f32 + 0.2, pos.z as f32 + 0.5]);
+                if self.weather_fires.len() >= 32 {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Applies the latest weather to visuals, particles and ambient audio.
+    fn update_weather_state(&mut self, dt: f32, eye: WorldVec) {
+        // Lightning events are queued by the host tick and must be drained even
+        // when the storm is over, otherwise the next storm would replay them.
+        let lightning = self.host.take_lightning_events();
+        let snapshot = self.weather_snapshot();
+        self.weather.apply_snapshot(snapshot);
+        self.weather_scan_timer -= dt;
+        if self.weather_scan_timer <= 0.0 {
+            self.weather_scan_timer = 0.2;
+            self.sample_weather_world(eye);
+        }
+        self.weather.sheltered = self.weather_sky.sheltered;
+
+        let player = self.host.player().clone();
+        let listener_eye = player.eye();
+        let listener = [listener_eye.x as f32, listener_eye.y as f32, listener_eye.z as f32];
+        for event in lightning {
+            let pos = [event.pos.x, event.pos.y, event.pos.z];
+            let immediate = self.weather.trigger_lightning(pos, event.flash, listener, player.yaw);
+            if let Some(engine) = &mut self.audio {
+                for (cue, pan) in immediate {
+                    engine.play_cue(cue, pan);
+                }
+            }
+            if event.flash {
+                self.particles
+                    .spawn_lightning_strike([event.pos.x as f32, event.pos.y as f32, event.pos.z as f32]);
+            }
+        }
+
+        let audio = self.weather.update(dt, self.weather_fires.len());
+        if let Some(engine) = &mut self.audio {
+            engine.set_loop_volume(ClipId::RainLoop, audio.rain_light);
+            engine.set_loop_volume(ClipId::RainHeavyLoop, audio.rain_heavy);
+            engine.set_loop_volume(ClipId::SnowWindLoop, audio.snow);
+            engine.set_loop_volume(ClipId::FireCrackleLoop, audio.fire);
+            for (cue, pan) in audio.cues {
+                engine.play_cue(cue, pan);
+            }
+        }
+
+        let eye_f = [eye.x as f32, eye.y as f32, eye.z as f32];
+        if let Some(previous) = self.last_weather_eye {
+            self.particles.recenter_if_needed(previous, eye_f);
+        }
+        self.last_weather_eye = Some(eye_f);
+        let settings =
+            self.weather
+                .snapshot
+                .particles(self.weather.wind, self.weather_sky.exposure, self.weather_sky.ground_y);
+        self.particles.update(dt, eye_f, settings);
+        if !self.weather_fires.is_empty() {
+            self.particles.emit_fire(&self.weather_fires, dt, self.weather.wind);
+        }
+
+        self.skeleton_cue_seconds = (self.skeleton_cue_seconds - dt).max(0.0);
+        self.spider_cue_seconds = (self.spider_cue_seconds - dt).max(0.0);
+        self.creeper_cue_seconds = (self.creeper_cue_seconds - dt).max(0.0);
+        self.ambient_mob_cues(listener, player.yaw);
+        self.xp_feedback_audio(listener);
+    }
+
+    /// Plays sparse skeleton/spider/creeper cues for nearby hostile mobs.
+    fn ambient_mob_cues(&mut self, listener: [f32; 3], yaw: f32) {
+        let Some(engine) = &mut self.audio else {
+            return;
+        };
+        let eye = [listener[0], listener[1], listener[2]];
+        for entity in self.host.mobs() {
+            let position = [
+                entity.mob.pos.x as f32,
+                entity.mob.pos.y as f32 + 1.0,
+                entity.mob.pos.z as f32,
+            ];
+            let distance =
+                ((position[0] - eye[0]).powi(2) + (position[1] - eye[1]).powi(2) + (position[2] - eye[2]).powi(2))
+                    .sqrt();
+            let (timer, clip, max_distance) = match entity.mob.kind {
+                MobKind::Skeleton => (&mut self.skeleton_cue_seconds, ClipId::SkeletonRattle, 14.0),
+                MobKind::Spider => (&mut self.spider_cue_seconds, ClipId::SpiderChitter, 10.0),
+                MobKind::Creeper => (&mut self.creeper_cue_seconds, ClipId::CreeperHiss, 6.0),
+                _ => continue,
+            };
+            if *timer > 0.0 || distance > max_distance {
+                continue;
+            }
+            *timer = 6.0;
+            let pan = ob_audio::world_pan(eye, yaw, position);
+            let gain = 0.75 * ob_audio::distance_attenuation(distance, max_distance);
+            if gain > 0.0 {
+                engine.play_clip(clip, gain, Some(pan));
+            }
+        }
+    }
+
+    /// Plays the XP pickup/level cues and spawns pickup sparks.
+    fn xp_feedback_audio(&mut self, listener: [f32; 3]) {
+        let level = self.host.player().xp_level;
+        if self.last_xp_level == u32::MAX {
+            // First observation: adopt the starting level without a fake
+            // level-up cue on spawn or load.
+            self.last_xp_level = level;
+            return;
+        }
+        if level > self.last_xp_level {
+            if let Some(engine) = &mut self.audio {
+                engine.play_clip(ClipId::LevelUp, 0.9, None);
+                engine.play_clip(ClipId::XpPickup, 0.8, None);
+            }
+            self.particles
+                .spawn_xp_pickup([listener[0], listener[1] - 0.6, listener[2]], 8);
+        }
+        self.last_xp_level = level;
+    }
+
     fn update_audio_state(&mut self, dt: f32) {
         let playing = self.ui.screen == Screen::Playing && !self.host.is_dead();
         let survival = self.host.game_mode() == HostGameMode::Survival;
@@ -3834,9 +4381,26 @@ impl GameState {
     /// The server collects dropped entities during its fixed ticks; this is the
     /// only place that announces them so break drops are never double-toasted.
     fn drain_pickup_events(&mut self) {
-        // Explosion cues are drained even though 1.3 has no particle pass; a
-        // later render slice can turn these into smoke/flash effects.
-        let _ = self.host.take_explosion_events();
+        let explosions = self.host.take_explosion_events();
+        if !explosions.is_empty() {
+            let player = self.host.player().clone();
+            let player_eye = player.eye();
+            let listener = [player_eye.x as f32, player_eye.y as f32, player_eye.z as f32];
+            for explosion in explosions {
+                let pos = [explosion.pos.x, explosion.pos.y, explosion.pos.z];
+                if let Some(cue) = self
+                    .weather
+                    .trigger_explosion(pos, explosion.radius, listener, player.yaw)
+                    && let Some(engine) = &mut self.audio
+                {
+                    engine.play_cue(cue.0, cue.1);
+                }
+                self.particles.spawn_explosion(
+                    [explosion.pos.x as f32, explosion.pos.y as f32, explosion.pos.z as f32],
+                    explosion.radius,
+                );
+            }
+        }
         for stack in self.host.take_pickup_events() {
             if stack.count == 0 || stack.item.0 as usize >= self.registry.item_len() {
                 continue;
@@ -3844,8 +4408,13 @@ impl GameState {
             let name = inventory::item_display_name(&self.registry, stack.item);
             self.ui.toasts.push(format!("Picked up {name} x{}", stack.count));
             if let Some(engine) = &mut self.audio {
-                engine.play_sfx(AudioSfx::Pickup);
+                engine.play_clip(ClipId::XpPickup, 0.45, None);
             }
+            let eye = self.host.player().eye();
+            self.particles.spawn_xp_pickup(
+                [eye.x as f32, eye.y as f32 - 0.8, eye.z as f32],
+                stack.count.min(4) as u32,
+            );
         }
     }
 
@@ -4143,6 +4712,11 @@ impl GameState {
             graphics_summary: self.renderer.graphics().summary(),
             shadow_summary: self.renderer.shadow_summary(),
             fsr_summary: self.renderer.fsr_summary(),
+            weather: self.weather.debug_lines(),
+            weather_compact: self
+                .weather
+                .hud()
+                .map_or_else(|| "Weather clear".to_string(), |hud| hud.summary_line()),
         };
     }
 
@@ -4678,13 +5252,21 @@ impl GameState {
         }
         let alpha = (self.accumulator.as_secs_f32() / TICK.as_secs_f32()).clamp(0.0, 1.0);
         let eye = self.prev_eye.lerp(self.current_eye, alpha as f64);
-        let player = self.host.player();
+        let player = self.host.player().clone();
+        self.update_weather_state(dt.as_secs_f32(), eye);
         let shake = if !self.ui.settings.reduced_motion && self.camera_shake > 0.0 {
             (self.started.elapsed().as_secs_f32() * 72.0).sin() * self.camera_shake
         } else {
             0.0
         };
-        let mut camera = Camera::new(eye, player.yaw, (player.pitch + shake).clamp(-1.5533, 1.5533));
+        let weather_shake = self
+            .weather
+            .shake_angle(self.started.elapsed().as_secs_f32(), self.ui.settings.reduced_motion);
+        let mut camera = Camera::new(
+            eye,
+            player.yaw,
+            (player.pitch + shake + weather_shake).clamp(-1.5533, 1.5533),
+        );
         // Sprinting slightly widens the FOV; crouching leaves it alone. Reduced
         // motion disables the pump entirely.
         let target_fov = target_fov(&self.ui.settings, player.sprinting);
@@ -4720,11 +5302,14 @@ impl GameState {
             .mining
             .targeted_block()
             .map(|block| BlockOutline::for_block([block.x, block.y, block.z]));
+        let particle_instances = self.particles.instances();
         let scene = SceneParams {
             environment,
             ui: ui_frame.as_ref(),
             outline,
             time_seconds: elapsed,
+            weather: self.weather.visual(),
+            particles: (!particle_instances.is_empty()).then_some(particle_instances),
         };
         if let Err(err) = self.renderer.render_scene(&camera, &scene) {
             log::error!("render error: {err}");
@@ -4796,6 +5381,7 @@ impl GameState {
             ui: ui_frame.as_ref().or(ui),
             outline,
             time_seconds: elapsed,
+            ..SceneParams::default()
         };
         if let Err(err) = renderer.render_world_scene_lod(self.host.world(), camera, &scene, &self.lod.config()) {
             log::warn!("screenshot render failed: {err}");
@@ -4929,6 +5515,9 @@ impl GameState {
             }
 
             if playing {
+                if let Some(hud) = self.weather.hud() {
+                    crate::weather::draw_weather_hud(&mut frame, &hud, screen);
+                }
                 let mode = if survival {
                     "survival - Shift crouch, Ctrl sprint, RMB use/eat/place"
                 } else if self.host.player().flying {
@@ -5966,6 +6555,10 @@ impl ApplicationHandler for App {
             audio,
             audio_status,
             last_audio_health,
+            last_xp_level: u32::MAX,
+            skeleton_cue_seconds: 0.0,
+            spider_cue_seconds: 0.0,
+            creeper_cue_seconds: 0.0,
             footstep_distance: 0.0,
             was_in_water,
             audio_enabled_before_mute,
@@ -5977,6 +6570,16 @@ impl ApplicationHandler for App {
             camera_shake: 0.0,
             sleep_ticks: 0,
             was_sleeping: false,
+            weather: crate::weather::WeatherPresentation::new(),
+            particles: ParticleSystem::new(0x000B_1E5E_ED15),
+            weather_sky: crate::weather::SkySample {
+                exposure: 1.0,
+                ground_y: f32::NEG_INFINITY,
+                sheltered: false,
+            },
+            weather_fires: Vec::new(),
+            weather_scan_timer: 0.0,
+            last_weather_eye: None,
         };
         if state.fly_toggle {
             let player = state.host.player_mut();
@@ -6649,6 +7252,7 @@ fn audio_material_for(registry: &Registry, block: BlockId) -> Option<AudioMateri
         "openblock:stone" | "openblock:cobblestone" | "openblock:bedrock" => AudioMaterial::Stone,
         "openblock:sand" => AudioMaterial::Sand,
         "openblock:snow" => AudioMaterial::Snow,
+        "openblock:fire" => AudioMaterial::Fire,
         "openblock:log" | "openblock:planks" | "openblock:crafting_table" => AudioMaterial::Wood,
         "openblock:gravel" => AudioMaterial::Gravel,
         _ => AudioMaterial::Stone,
@@ -7258,6 +7862,16 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
             "screenshot-torch" => options.screenshot_torch = true,
             "screenshot-farm" => options.screenshot_farm = true,
             "screenshot-sleep" => options.screenshot_sleep = true,
+            "screenshot-weather" => {
+                if value.is_empty() {
+                    return Err("--screenshot-weather requires rain, thunder or snow".into());
+                }
+                options.screenshot_weather = Some(WeatherScreenshot::from_name(value).ok_or_else(|| {
+                    format!("unknown --screenshot-weather value '{value}' (expected rain, thunder or snow)")
+                })?);
+            }
+            "screenshot-fire" => options.screenshot_fire = true,
+            "screenshot-explosion" => options.screenshot_explosion = true,
             "screenshot-items" => options.screenshot_items = true,
             "no-audio" => options.no_audio = true,
             "mute" => options.mute = true,
@@ -7329,6 +7943,9 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
         + usize::from(options.screenshot_torch)
         + usize::from(options.screenshot_farm)
         + usize::from(options.screenshot_sleep)
+        + usize::from(options.screenshot_weather.is_some())
+        + usize::from(options.screenshot_fire)
+        + usize::from(options.screenshot_explosion)
         + usize::from(options.screenshot_network)
         + usize::from(options.screenshot_name_tags)
         + usize::from(options.screenshot_net_ui.is_some())
@@ -7397,6 +8014,15 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
     if options.screenshot_sleep && options.screenshot.is_none() {
         return Err("--screenshot-sleep requires --screenshot PATH".into());
     }
+    if options.screenshot_weather.is_some() && options.screenshot.is_none() {
+        return Err("--screenshot-weather requires --screenshot PATH".into());
+    }
+    if options.screenshot_fire && options.screenshot.is_none() {
+        return Err("--screenshot-fire requires --screenshot PATH".into());
+    }
+    if options.screenshot_explosion && options.screenshot.is_none() {
+        return Err("--screenshot-explosion requires --screenshot PATH".into());
+    }
     if options.screenshot_network && options.screenshot.is_none() {
         return Err("--screenshot-network requires --screenshot PATH".into());
     }
@@ -7418,6 +8044,9 @@ pub fn options_from_args(flags: &[(String, String)]) -> Result<ClientOptions, St
         || options.screenshot_torch
         || options.screenshot_farm
         || options.screenshot_sleep
+        || options.screenshot_weather.is_some()
+        || options.screenshot_fire
+        || options.screenshot_explosion
         || options.screenshot_items)
         && options.game_mode == Some(SettingsGameMode::Creative)
     {
@@ -8798,5 +9427,117 @@ mod tests {
             "debug screenshots must not rewrite the saved mode"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod weather_visual_tests {
+    use super::*;
+    use crate::mobs::{MobVisual, mob_instances_from_visuals};
+
+    fn screenshot_flag(name: &str, value: &str) -> Vec<(String, String)> {
+        vec![
+            ("screenshot".to_string(), "/tmp/weather-test.png".to_string()),
+            (name.to_string(), value.to_string()),
+        ]
+    }
+
+    #[test]
+    fn weather_screenshot_flags_parse_and_require_a_path() {
+        for weather in WeatherScreenshot::ALL {
+            let options = options_from_args(&screenshot_flag("screenshot-weather", weather.name())).expect("weather");
+            assert_eq!(options.screenshot_weather, Some(weather));
+            assert!(options.screenshot.is_some());
+        }
+        assert_eq!(WeatherScreenshot::from_name("storm"), Some(WeatherScreenshot::Thunder));
+        assert_eq!(WeatherScreenshot::from_name("hail"), None);
+        // Without --screenshot the mode is rejected.
+        let error = options_from_args(&[("screenshot-weather".to_string(), "rain".to_string())])
+            .expect_err("weather screenshot needs a path");
+        assert!(error.contains("requires --screenshot PATH"));
+        // Empty and unknown values are actionable errors.
+        let error =
+            options_from_args(&[("screenshot-weather".to_string(), "".to_string())]).expect_err("empty weather value");
+        assert!(error.contains("rain, thunder or snow"));
+        let error = options_from_args(&[("screenshot-weather".to_string(), "hail".to_string())])
+            .expect_err("unknown weather value");
+        assert!(error.contains("unknown --screenshot-weather"));
+    }
+
+    #[test]
+    fn fire_and_explosion_capture_flags_are_exclusive() {
+        let fire = options_from_args(&screenshot_flag("screenshot-fire", "")).expect("fire");
+        assert!(fire.screenshot_fire);
+        let explosion = options_from_args(&screenshot_flag("screenshot-explosion", "")).expect("explosion");
+        assert!(explosion.screenshot_explosion);
+        let mut flags = screenshot_flag("screenshot-fire", "");
+        flags.push(("screenshot-explosion".to_string(), String::new()));
+        let error = options_from_args(&flags).expect_err("modes cannot combine");
+        assert!(error.contains("cannot be combined"));
+        let error =
+            options_from_args(&[("screenshot-fire".to_string(), String::new())]).expect_err("fire needs a path");
+        assert!(error.contains("requires --screenshot PATH"));
+    }
+
+    #[test]
+    fn fire_blocks_use_the_new_audio_material() {
+        let registry = Registry::base();
+        let fire = registry.id("openblock:fire").expect("fire");
+        assert_eq!(audio_material_for(&registry, fire), Some(AudioMaterial::Fire));
+        assert_eq!(
+            audio_material_for(&registry, registry.id("openblock:stone").expect("stone")),
+            Some(AudioMaterial::Stone)
+        );
+    }
+
+    #[test]
+    fn creeper_fuse_swells_and_flashes_the_avatar() {
+        let registry = Registry::base();
+        let calm = MobVisual {
+            kind: MobKind::Creeper,
+            pos: WorldVec::new(2.0, 64.0, 3.0),
+            yaw: 0.0,
+            hurt: false,
+            walk_phase: 0.0,
+            moving: false,
+            variant: 0,
+            baby: false,
+            fuse: 0.0,
+            fuse_flash: 0.0,
+        };
+        let primed = MobVisual {
+            fuse: 0.95,
+            fuse_flash: 1.0,
+            ..calm
+        };
+        let calm_cubes = mob_instances_from_visuals(&registry, &[calm]);
+        let primed_cubes = mob_instances_from_visuals(&registry, &[primed]);
+        assert_eq!(calm_cubes.len(), primed_cubes.len());
+        // Swell grows every cube and the flash pushes the tint towards white.
+        let calm_top = calm_cubes
+            .iter()
+            .map(|cube| cube.position[1] + cube.scale)
+            .fold(f32::MIN, f32::max);
+        let primed_top = primed_cubes
+            .iter()
+            .map(|cube| cube.position[1] + cube.scale)
+            .fold(f32::MIN, f32::max);
+        assert!(primed_top > calm_top + 0.15, "primed creeper must visibly swell");
+        let calm_tint = calm_cubes[0].tint;
+        let primed_tint = primed_cubes[0].tint;
+        assert!(
+            primed_tint.iter().sum::<f32>() > calm_tint.iter().sum::<f32>(),
+            "flash tint must brighten the avatar"
+        );
+    }
+
+    #[test]
+    fn weather_screenshot_environment_and_hud_are_available() {
+        // The screenshot modes reuse the same weather presentation the
+        // interactive client runs; this pins the labels used in the capture
+        // documentation.
+        assert_eq!(WeatherScreenshot::Rain.name(), "rain");
+        assert_eq!(WeatherScreenshot::Thunder.name(), "thunder");
+        assert_eq!(WeatherScreenshot::Snow.name(), "snow");
     }
 }

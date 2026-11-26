@@ -620,6 +620,7 @@ mod tests {
         Arc::new(ClipBank {
             groups,
             clips: vec![clip.clone()],
+            loops: vec![clip.clone(); crate::synth::LOOP_COUNT],
             ambient: clip.clone(),
             music: clip,
         })
@@ -928,7 +929,7 @@ mod tests {
 
     #[test]
     fn writer_renders_fixed_blocks_from_the_mixer_and_disarms() {
-        let control = Arc::new(Control::new(1.0, 1.0, 0.0));
+        let control = Arc::new(Control::new(1.0, 1.0, 0.0, 1.0));
         let queue = Arc::new(CommandQueue::new());
         queue.push(
             PlayCommand {
@@ -997,7 +998,7 @@ mod tests {
 
     #[test]
     fn writer_gives_up_after_repeated_failures() {
-        let control = Arc::new(Control::new(1.0, 1.0, 0.0));
+        let control = Arc::new(Control::new(1.0, 1.0, 0.0, 1.0));
         let queue = Arc::new(CommandQueue::new());
         let mixer = test_mixer(&control, &queue);
         let running = Arc::new(AtomicBool::new(true));
@@ -1020,7 +1021,7 @@ mod tests {
 
     #[test]
     fn transient_write_errors_are_retried() {
-        let control = Arc::new(Control::new(1.0, 1.0, 0.0));
+        let control = Arc::new(Control::new(1.0, 1.0, 0.0, 1.0));
         let queue = Arc::new(CommandQueue::new());
         let mixer = test_mixer(&control, &queue);
         let running = Arc::new(AtomicBool::new(true));

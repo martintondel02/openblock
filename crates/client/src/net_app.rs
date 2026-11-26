@@ -23,13 +23,13 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ob_audio::{AudioEngine, Material as AudioMaterial, Sfx as AudioSfx};
+use ob_audio::{AudioEngine, ClipId, Material as AudioMaterial, Sfx as AudioSfx};
 use ob_content::{BlockId, Registry};
 use ob_core::config::{Action, load_settings, save_settings};
 use ob_math::{BlockPos, ChunkPos, SectionPos, WorldVec};
 use ob_render::{
-    BlockOutline, Camera, Environment, LodBatchKey, LodConfig, Renderer, SceneParams, TextureSource, UiFrame,
-    far_plane_for_view_distance,
+    BlockOutline, Camera, Environment, LodBatchKey, LodConfig, ParticleSystem, Renderer, SceneParams, TextureSource,
+    UiFrame, far_plane_for_view_distance,
 };
 use ob_server::ContainerState;
 use ob_sim::{Player, PlayerInput, REACH};
@@ -241,6 +241,21 @@ impl ApplicationHandler for NetApp {
             was_sleeping: false,
             last_bed: None,
             log_network: true,
+            weather: crate::weather::WeatherPresentation::new(),
+            particles: ParticleSystem::new(0x000B_1E5E_ED15),
+            weather_sky: crate::weather::SkySample {
+                exposure: 1.0,
+                ground_y: f32::NEG_INFINITY,
+                sheltered: false,
+            },
+            weather_fires: Vec::new(),
+            weather_scan_timer: 0.0,
+            last_weather_eye: None,
+            last_xp_level: 0,
+            xp_seen: false,
+            skeleton_cue_seconds: 0.0,
+            spider_cue_seconds: 0.0,
+            creeper_cue_seconds: 0.0,
         };
         let fullscreen = state.ui.settings.fullscreen;
         state.apply_fullscreen(fullscreen);
@@ -810,6 +825,23 @@ struct NetGameState {
     /// Last bed the player was seen sleeping in (death-screen respawn hint).
     last_bed: Option<[i32; 3]>,
     log_network: bool,
+    /// Server-authoritative weather presentation (flash, shake, thunder).
+    weather: crate::weather::WeatherPresentation,
+    /// Camera-local weather/fire/effect particles.
+    particles: ParticleSystem,
+    /// Cached sky-exposure sample and nearby fire centres.
+    weather_sky: crate::weather::SkySample,
+    weather_fires: Vec<[f32; 3]>,
+    weather_scan_timer: f32,
+    /// Previous eye used to recycle drops after a teleport.
+    last_weather_eye: Option<[f32; 3]>,
+    /// Last XP level seen, for the level-up cue/particles.
+    last_xp_level: u32,
+    xp_seen: bool,
+    /// Ambient hostile-mob cue cooldowns, seconds.
+    skeleton_cue_seconds: f32,
+    spider_cue_seconds: f32,
+    creeper_cue_seconds: f32,
 }
 
 impl NetGameState {
@@ -1254,6 +1286,12 @@ impl NetGameState {
                     cooldown_remaining_ms,
                     ..
                 } => {
+                    if hit
+                        && critical
+                        && let Some(engine) = &mut self.audio
+                    {
+                        engine.play_clip(ClipId::CriticalHit, 0.9, None);
+                    }
                     // Mirror the server's remaining cooldown so a rejected or
                     // landed swing leaves the crosshair cue exact even when the
                     // local send time drifted.
@@ -1285,9 +1323,87 @@ impl NetGameState {
                             .push_warning(format!("Cannot feed: {}", reason.replace('_', " ")));
                     }
                 }
-                NetEvent::XpChanged { .. } => {}
-                NetEvent::Explosion { radius, .. } => {
-                    log::debug!("explosion of radius {radius:.1}");
+                NetEvent::XpChanged { points, level, .. } => {
+                    let levelled = self.xp_seen && level > self.last_xp_level;
+                    self.xp_seen = true;
+                    self.last_xp_level = level;
+                    if let Some(engine) = &mut self.audio {
+                        engine.play_clip(ClipId::XpPickup, 0.8, None);
+                        if levelled {
+                            engine.play_clip(ClipId::LevelUp, 0.9, None);
+                        }
+                    }
+                    let player = self.player();
+                    let pos = [player.pos.x, player.pos.y + 0.8, player.pos.z];
+                    self.particles
+                        .spawn_xp_pickup([pos[0] as f32, pos[1] as f32, pos[2] as f32], points.min(8));
+                }
+                NetEvent::ProjectileSpawned { pos } => {
+                    let (listener, yaw) = self.weather_listener();
+                    let target = [pos[0] as f32, pos[1] as f32, pos[2] as f32];
+                    let distance = (target[0] - listener[0]).hypot(target[2] - listener[2]);
+                    if let Some(engine) = &mut self.audio {
+                        let gain = ob_audio::distance_attenuation(distance, 24.0) * 0.7;
+                        if gain > 0.0 {
+                            engine.play_clip(ClipId::BowShoot, gain, Some(ob_audio::world_pan(listener, yaw, target)));
+                        }
+                    }
+                }
+                NetEvent::ProjectileDespawned { pos } => {
+                    let (listener, yaw) = self.weather_listener();
+                    let target = [pos[0] as f32, pos[1] as f32, pos[2] as f32];
+                    let distance = (target[0] - listener[0]).hypot(target[2] - listener[2]);
+                    if let Some(engine) = &mut self.audio {
+                        let gain = ob_audio::distance_attenuation(distance, 24.0) * 0.8;
+                        if gain > 0.0 {
+                            engine.play_clip(
+                                ClipId::ArrowImpact,
+                                gain,
+                                Some(ob_audio::world_pan(listener, yaw, target)),
+                            );
+                        }
+                    }
+                }
+                NetEvent::WeatherSynced { epoch, phase, .. } => {
+                    log::debug!("weather sync: epoch {epoch} phase {}", phase.name());
+                }
+                NetEvent::LightningStrike {
+                    pos,
+                    block,
+                    ignited,
+                    flash,
+                } => {
+                    let (listener, yaw) = self.weather_listener();
+                    let immediate = self.weather.trigger_lightning(pos, flash, listener, yaw);
+                    if let Some(engine) = &mut self.audio {
+                        for (cue, pan) in immediate {
+                            engine.play_cue(cue, pan);
+                        }
+                    }
+                    if flash {
+                        self.particles
+                            .spawn_lightning_strike([pos[0] as f32, pos[1] as f32, pos[2] as f32]);
+                    }
+                    if ignited {
+                        self.ui.toasts.push_warning("Lightning started a fire");
+                    }
+                    log::debug!(
+                        "lightning at block {} {} {} (ignited {ignited})",
+                        block[0],
+                        block[1],
+                        block[2]
+                    );
+                }
+                NetEvent::Explosion { pos, radius } => {
+                    let (listener, yaw) = self.weather_listener();
+                    if let Some(cue) = self.weather.trigger_explosion(pos, radius, listener, yaw)
+                        && let Some(engine) = &mut self.audio
+                    {
+                        engine.play_cue(cue.0, cue.1);
+                    }
+                    self.particles
+                        .spawn_explosion([pos[0] as f32, pos[1] as f32, pos[2] as f32], radius);
+                    log::debug!("explosion of radius {radius:.1} at {pos:?}");
                 }
                 NetEvent::ActionRejected { reason, hint, .. } => {
                     log::debug!("action rejected: {reason}");
@@ -2065,13 +2181,21 @@ impl NetGameState {
         }
         let alpha = (self.accumulator.as_secs_f32() / TICK.as_secs_f32()).clamp(0.0, 1.0);
         let eye = self.prev_eye.lerp(self.current_eye, f64::from(alpha));
-        let player = self.player();
+        let player = self.player().clone();
+        self.update_weather_state(dt.as_secs_f32(), eye);
         let shake = if !self.ui.settings.reduced_motion && self.camera_shake > 0.0 {
             (self.started.elapsed().as_secs_f32() * 72.0).sin() * self.camera_shake
         } else {
             0.0
         };
-        let mut camera = Camera::new(eye, player.yaw, (player.pitch + shake).clamp(-1.5533, 1.5533));
+        let weather_shake = self
+            .weather
+            .shake_angle(self.started.elapsed().as_secs_f32(), self.ui.settings.reduced_motion);
+        let mut camera = Camera::new(
+            eye,
+            player.yaw,
+            (player.pitch + shake + weather_shake).clamp(-1.5533, 1.5533),
+        );
         let target_fov = crate::target_fov(&self.ui.settings, player.sprinting);
         let blend = 1.0 - (-dt.as_secs_f32() * 12.0).exp();
         self.current_fov += (target_fov - self.current_fov) * blend;
@@ -2123,11 +2247,14 @@ impl NetGameState {
             self.renderer.set_entities(&entities);
             self.refresh_debug_stats();
             let ui_frame = self.build_ui_frame();
+            let particle_instances = self.particles.instances();
             let scene = SceneParams {
                 environment,
                 ui: ui_frame.as_ref(),
                 outline,
-                time_seconds: 0.0,
+                time_seconds: self.started.elapsed().as_secs_f32(),
+                weather: self.weather.visual(),
+                particles: (!particle_instances.is_empty()).then_some(particle_instances),
             };
             if let Err(error) = self.renderer.render_scene(&camera, &scene) {
                 log::error!("render error: {error}");
@@ -2142,6 +2269,7 @@ impl NetGameState {
                 ui: ui_frame.as_ref(),
                 outline: None,
                 time_seconds: 0.0,
+                ..SceneParams::default()
             };
             if let Err(error) = self.renderer.render_scene(&camera, &scene) {
                 log::error!("render error: {error}");
@@ -2350,6 +2478,168 @@ impl NetGameState {
         })
     }
 
+    /// Resets weather presentation, particles and ambient audio beds.
+    fn reset_weather(&mut self) {
+        self.weather.clear();
+        self.particles.clear();
+        self.weather_fires.clear();
+        self.weather_sky = crate::weather::SkySample {
+            exposure: 1.0,
+            ground_y: f32::NEG_INFINITY,
+            sheltered: false,
+        };
+        self.weather_scan_timer = 0.0;
+        self.last_weather_eye = None;
+        if let Some(engine) = &mut self.audio {
+            for clip in [
+                ClipId::RainLoop,
+                ClipId::RainHeavyLoop,
+                ClipId::SnowWindLoop,
+                ClipId::FireCrackleLoop,
+            ] {
+                engine.set_loop_volume(clip, 0.0);
+            }
+        }
+    }
+
+    /// Applies one weather audio frame to the mixer.
+    fn apply_weather_audio(&mut self, frame: crate::weather::WeatherAudioFrame) {
+        let Some(engine) = &mut self.audio else {
+            return;
+        };
+        engine.set_loop_volume(ClipId::RainLoop, frame.rain_light);
+        engine.set_loop_volume(ClipId::RainHeavyLoop, frame.rain_heavy);
+        engine.set_loop_volume(ClipId::SnowWindLoop, frame.snow);
+        engine.set_loop_volume(ClipId::FireCrackleLoop, frame.fire);
+        for (cue, pan) in frame.cues {
+            engine.play_cue(cue, pan);
+        }
+    }
+
+    /// Advances weather visuals, particles and ambient audio from the cached
+    /// authoritative snapshot. Called once per frame before rendering.
+    fn update_weather_state(&mut self, dt: f32, eye: WorldVec) {
+        if !self.client_playing() {
+            // Clear once rather than every frame; `clear` is idempotent but the
+            // loop-target writes are not free when the mixer is running.
+            if self.weather.is_active() || !self.particles.is_empty() {
+                self.reset_weather();
+            }
+            return;
+        }
+        let (listener, yaw) = self.weather_listener();
+        let snapshot = self.client.as_ref().and_then(|client| client.weather().cloned());
+        if let Some(snapshot) = snapshot {
+            if self.weather.apply_snapshot(snapshot) {
+                log::debug!(
+                    "weather: {} intensity {:.2} precipitation {}",
+                    self.weather.snapshot.phase_label(),
+                    self.weather.snapshot.intensity,
+                    self.weather.snapshot.precipitation.name(),
+                );
+            }
+        } else {
+            // A reconnect before the first `weather_sync` must not keep the old
+            // storm visible.
+            if self.weather.snapshot.phase != ob_protocol::WeatherPhase::Clear {
+                self.weather.clear();
+            }
+        }
+
+        self.weather_scan_timer -= dt;
+        if self.weather_scan_timer <= 0.0 {
+            self.weather_scan_timer = 0.2;
+            if let Some(client) = &self.client {
+                self.weather_sky = crate::weather::sky_exposure(client.world(), &self.registry, eye);
+                self.weather_fires = crate::weather::nearby_fires(
+                    client.world(),
+                    &self.registry,
+                    eye,
+                    crate::weather::FIRE_SCAN_RADIUS,
+                    32,
+                );
+            }
+        }
+        self.weather.sheltered = self.weather_sky.sheltered;
+        let audio = self.weather.update(dt, self.weather_fires.len());
+        self.apply_weather_audio(audio);
+
+        let eye_f = [eye.x as f32, eye.y as f32, eye.z as f32];
+        if let Some(previous) = self.last_weather_eye {
+            self.particles.recenter_if_needed(previous, eye_f);
+        }
+        self.last_weather_eye = Some(eye_f);
+        let settings =
+            self.weather
+                .snapshot
+                .particles(self.weather.wind, self.weather_sky.exposure, self.weather_sky.ground_y);
+        self.particles.update(dt, eye_f, settings);
+        if !self.weather_fires.is_empty() {
+            self.particles.emit_fire(&self.weather_fires, dt, self.weather.wind);
+        }
+        self.ambient_mob_cues(dt, listener, yaw);
+    }
+
+    /// Sparse hostile-mob ambience (skeleton rattle, spider chitter, creeper
+    /// hiss) derived from replicated positions. Network snapshots do not carry a
+    /// fuse timer, so the creeper hiss is a proximity warning, not an
+    /// authoritative fuse cue; the server-owned explosion still drives the
+    /// blast audio.
+    fn ambient_mob_cues(&mut self, dt: f32, listener: [f32; 3], yaw: f32) {
+        self.skeleton_cue_seconds = (self.skeleton_cue_seconds - dt).max(0.0);
+        self.spider_cue_seconds = (self.spider_cue_seconds - dt).max(0.0);
+        self.creeper_cue_seconds = (self.creeper_cue_seconds - dt).max(0.0);
+        let Some(client) = &self.client else {
+            return;
+        };
+        let now = Instant::now();
+        let ids = client.entities().ids();
+        let mut cues = Vec::new();
+        for id in ids {
+            let kind = match client.entities().kind(id) {
+                Some(crate::net_state::ReplicatedKind::Mob(kind)) => *kind,
+                _ => continue,
+            };
+            let (timer, clip, max_distance) = match kind {
+                ob_content::MobKind::Skeleton => (&mut self.skeleton_cue_seconds, ClipId::SkeletonRattle, 14.0),
+                ob_content::MobKind::Spider => (&mut self.spider_cue_seconds, ClipId::SpiderChitter, 10.0),
+                ob_content::MobKind::Creeper => (&mut self.creeper_cue_seconds, ClipId::CreeperHiss, 6.0),
+                _ => continue,
+            };
+            if *timer > 0.0 {
+                continue;
+            }
+            let Some(position) = client.entities().position(id, now) else {
+                continue;
+            };
+            let target = [position.x as f32, position.y as f32 + 1.0, position.z as f32];
+            let distance = ((target[0] - listener[0]).powi(2)
+                + (target[1] - listener[1]).powi(2)
+                + (target[2] - listener[2]).powi(2))
+            .sqrt();
+            if distance > max_distance {
+                continue;
+            }
+            *timer = 6.0;
+            let gain = 0.75 * ob_audio::distance_attenuation(distance, max_distance);
+            if gain > 0.0 {
+                cues.push((clip, gain, ob_audio::world_pan(listener, yaw, target)));
+            }
+        }
+        if let Some(engine) = &mut self.audio {
+            for (clip, gain, pan) in cues {
+                engine.play_clip(clip, gain, Some(pan));
+            }
+        }
+    }
+
+    /// Current listener eye and yaw for one-shot weather audio.
+    fn weather_listener(&self) -> ([f32; 3], f32) {
+        let player = self.player();
+        let eye = player.eye();
+        ([eye.x as f32, eye.y as f32, eye.z as f32], player.yaw)
+    }
+
     fn update_audio_state(&mut self, dt: f32) {
         let playing = self.ui.screen == Screen::Playing && !self.chat_active() && !self.client_dead();
         let player = self.player().clone();
@@ -2529,6 +2819,11 @@ impl NetGameState {
             graphics_summary: self.renderer.graphics().summary(),
             shadow_summary: self.renderer.shadow_summary(),
             fsr_summary: self.renderer.fsr_summary(),
+            weather: self.weather.debug_lines(),
+            weather_compact: self
+                .weather
+                .hud()
+                .map_or_else(|| "Weather clear".to_string(), |hud| hud.summary_line()),
         };
     }
 
@@ -2652,6 +2947,9 @@ impl NetGameState {
                 }
                 crate::ui_state::draw_toasts(&mut frame, &self.ui.toasts, screen);
                 crate::ui_state::draw_damage_flash(&mut frame, screen, self.damage_flash.alpha());
+                if let Some(hud) = self.weather.hud() {
+                    crate::weather::draw_weather_hud(&mut frame, &hud, screen);
+                }
                 net_ui::draw_multiplayer_notice(&mut frame, self.notice_seconds, screen);
             }
             if let Some(client) = client {

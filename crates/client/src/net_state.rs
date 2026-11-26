@@ -587,6 +587,8 @@ impl ReplicatedEntities {
                     moving: entity.moving,
                     variant: entity.variant,
                     baby: entity.baby,
+                    fuse: 0.0,
+                    fuse_flash: 0.0,
                 })
             })
             .collect()

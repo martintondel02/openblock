@@ -85,6 +85,12 @@ pub struct Options {
     pub pitch: Option<f32>,
     /// Optional camera yaw override (radians); `None` uses the spawn yaw.
     pub yaw: Option<f32>,
+    /// Weather presentation to measure (`rain`, `thunder`, `snow`), or `None`.
+    ///
+    /// A weather run also simulates and draws the camera-local particle
+    /// system, so its frame time includes both the additional GPU pass and the
+    /// CPU update/instance packing. `None` keeps the clear v1.4 baseline.
+    pub weather: Option<String>,
 }
 
 impl Default for Options {
@@ -107,6 +113,7 @@ impl Default for Options {
             eye_height: 18.0,
             pitch: None,
             yaw: None,
+            weather: None,
         }
     }
 }
@@ -198,6 +205,10 @@ pub struct Report {
     pub water_draw_calls: u32,
     /// Water vertices in the last frame.
     pub water_vertices: u64,
+    /// Instanced particle billboards in the last frame (0 on the clear baseline).
+    pub particle_instances: u32,
+    /// Weather mode used for this run (`clear`, `rain`, `thunder`, `snow`).
+    pub weather: String,
     /// Shadow-cascade draw calls in the last frame.
     pub shadow_draw_calls: u32,
     /// Active shadow cascades in the last frame.
@@ -304,6 +315,24 @@ pub fn options_from_flags(flags: &[(String, String)]) -> Result<Options, String>
             "yaw" => {
                 let raw = required(name, value)?;
                 options.yaw = Some(raw.parse().map_err(|_| format!("invalid --yaw value '{raw}'"))?);
+            }
+            "weather" => {
+                let raw = required(name, value)?;
+                match raw {
+                    "clear" | "none" | "off" => options.weather = None,
+                    "rain" | "thunder" | "storm" | "snow" => {
+                        options.weather = Some(if raw == "storm" {
+                            "thunder".to_string()
+                        } else {
+                            raw.to_string()
+                        })
+                    }
+                    other => {
+                        return Err(format!(
+                            "invalid --weather value '{other}' (clear/none, rain, thunder or snow)"
+                        ));
+                    }
+                }
             }
             "shadows" => {
                 let raw = required(name, value)?;
@@ -474,6 +503,7 @@ pub fn run(options: &Options) -> Result<Report, String> {
         fsr: fsr_summary,
         render_width,
         render_height,
+        weather: options.weather.clone().unwrap_or_else(|| "clear".to_string()),
         ..Report::default()
     };
     let lod = LodConfig {
@@ -503,25 +533,93 @@ pub fn run(options: &Options) -> Result<Report, String> {
     report.mesh_bytes = report.cache_vertices * std::mem::size_of::<ob_render::Vertex>() as u64 * 2 + report.far_bytes;
     report.rss_after_build_mib = measure::rss_kib().map_or(0.0, |kib| kib as f64 / 1024.0);
 
-    let scene = SceneParams {
-        environment: Environment::new(options.time_of_day),
-        ui: None,
-        outline: None,
-        time_seconds: options.time_seconds,
-    };
+    // Clear-weather baseline keeps exactly the v1.4 scene. A weather run adds
+    // the same presentation state and camera-local precipitation the client
+    // uses, updated once per frame.
+    let mut weather_visual = ob_render::WeatherVisual::default();
+    let mut particles = ob_render::ParticleSystem::new(0x000B_1E5E_ED15);
+    let mut particle_settings = ob_render::WeatherParticles::default();
+    if let Some(weather) = options.weather.as_deref() {
+        let (precipitation, intensity, storm) = match weather {
+            "rain" => (ob_render::Precipitation::Rain, 0.8, 0.0),
+            "thunder" => (ob_render::Precipitation::Rain, 1.0, 1.0),
+            "snow" => (ob_render::Precipitation::Snow, 0.8, 0.0),
+            _ => (ob_render::Precipitation::None, 0.0, 0.0),
+        };
+        weather_visual = ob_render::WeatherVisual::new(
+            intensity,
+            storm,
+            match precipitation {
+                ob_render::Precipitation::Rain => ob_render::WeatherPrecipitation::Rain,
+                ob_render::Precipitation::Snow => ob_render::WeatherPrecipitation::Snow,
+                ob_render::Precipitation::None => ob_render::WeatherPrecipitation::None,
+            },
+            0.0,
+        );
+        particle_settings = ob_render::WeatherParticles {
+            precipitation,
+            intensity,
+            wind: ob_render::weather_wind(7, intensity, precipitation == ob_render::Precipitation::Snow),
+            exposure: 1.0,
+            ground_y: camera.position.y as f32 - 48.0,
+        };
+        particles.prefill_weather(
+            [
+                camera.position.x as f32,
+                camera.position.y as f32,
+                camera.position.z as f32,
+            ],
+            particle_settings,
+        );
+        particles.advance(0.4);
+    }
+    let environment = Environment::new(options.time_of_day);
+    let particle_eye = [
+        camera.position.x as f32,
+        camera.position.y as f32,
+        camera.position.z as f32,
+    ];
     for _ in 0..options.warmup {
+        particles.update(1.0 / 60.0, particle_eye, particle_settings);
+        let instances = particles.instances();
+        let scene = SceneParams {
+            environment,
+            ui: None,
+            outline: None,
+            time_seconds: options.time_seconds,
+            weather: weather_visual,
+            particles: (!instances.is_empty()).then_some(instances),
+        };
         renderer
             .render_cached_scene(&camera, &scene)
             .map_err(|error| format!("warm-up frame: {error}"))?;
     }
     let mut samples = Vec::with_capacity(options.frames as usize);
     let mut last_stats = ob_render::RenderStats::default();
+    let mut last_particle_count = 0usize;
     for _ in 0..options.frames {
         let start = Instant::now();
+        // Particle update + packing is inside the timed region: the cost being
+        // reported is the client's per-frame presentation cost, not only GPU.
+        particles.update(1.0 / 60.0, particle_eye, particle_settings);
+        let instances = particles.instances();
+        last_particle_count = instances.len();
+        let scene = SceneParams {
+            environment,
+            ui: None,
+            outline: None,
+            time_seconds: options.time_seconds,
+            weather: weather_visual,
+            particles: (!instances.is_empty()).then_some(instances),
+        };
         last_stats = renderer
             .render_cached_scene(&camera, &scene)
             .map_err(|error| format!("measured frame: {error}"))?;
         samples.push(millis(start));
+    }
+    if last_particle_count > 0 {
+        report.passes = last_stats.passes;
+        report.particle_instances = last_stats.particle_instances;
     }
     report.frames = Stats::from_samples(&samples);
     report.draw_calls = last_stats.draw_calls;
@@ -789,6 +887,12 @@ pub fn format_report(options: &Options, report: &Report) -> String {
         report.shadow_cascades,
         report.water_draw_calls,
         report.water_vertices
+    ));
+    out.push_str(&format!(
+        "  particles: {} billboards ({} instanced draw), weather {}\n",
+        report.particle_instances,
+        if report.particle_instances > 0 { 1 } else { 0 },
+        report.weather,
     ));
     out.push_str(&format!(
         "  memory: world heap {:.1} MiB, mesh estimate {:.1} MiB, RSS after build {:.0} MiB, peak {:.0} MiB\n",

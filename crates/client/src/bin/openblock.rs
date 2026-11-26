@@ -1,6 +1,6 @@
 //! The `openblock` game client binary.
 
-const USAGE: &str = "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--view-distance N] [--mesh-workers N] [--survival|--creative] [--fly] [--x11] [--no-audio] [--mute] [--connect HOST:PORT] [--name NAME] [--screenshot PATH] [--screenshot-inventory PATH] [--screenshot-dead] [--screenshot-settings[=TAB]] [--screenshot-settings-tab TAB] [--screenshot-crafting] [--screenshot-title] [--screenshot-new-world] [--screenshot-worlds] [--screenshot-connect] [--screenshot-debug] [--screenshot-mobs] [--screenshot-furnace] [--screenshot-chest] [--screenshot-torch] [--screenshot-farm] [--screenshot-sleep] [--screenshot-items] [--screenshot-network] [--screenshot-name-tags] [--screenshot-net-ui=KIND] [--screenshot-size WxH] [--ui-scale PERCENT|auto] [--fsr QUALITY] [--seconds N] [--texture-style NAME] [--texture-pack PATH] [--no-texture-pack] [--ui-font PATH] [--default-ui-font] [--time-of-day F] [--title|--menu] [--version]";
+const USAGE: &str = "usage: openblock [--world NAME] [--seed N] [--data-dir DIR] [--render-distance N] [--view-distance N] [--mesh-workers N] [--survival|--creative] [--fly] [--x11] [--no-audio] [--mute] [--connect HOST:PORT] [--name NAME] [--screenshot PATH] [--screenshot-inventory PATH] [--screenshot-dead] [--screenshot-settings[=TAB]] [--screenshot-settings-tab TAB] [--screenshot-crafting] [--screenshot-title] [--screenshot-new-world] [--screenshot-worlds] [--screenshot-connect] [--screenshot-debug] [--screenshot-mobs] [--screenshot-furnace] [--screenshot-chest] [--screenshot-torch] [--screenshot-farm] [--screenshot-sleep] [--screenshot-weather=rain|thunder|snow] [--screenshot-fire] [--screenshot-explosion] [--screenshot-items] [--screenshot-network] [--screenshot-name-tags] [--screenshot-net-ui=KIND] [--screenshot-size WxH] [--ui-scale PERCENT|auto] [--fsr QUALITY] [--seconds N] [--texture-style NAME] [--texture-pack PATH] [--no-texture-pack] [--ui-font PATH] [--default-ui-font] [--time-of-day F] [--title|--menu] [--version]";
 
 fn main() {
     ob_core::init_logging();
@@ -35,6 +35,9 @@ fn main() {
         println!("          --screenshot-torch renders a sealed room lit only by a 1.2 torch");
         println!("          --screenshot-farm renders a watered wheat farm at four growth stages");
         println!("          --screenshot-sleep enters a bed at night and renders the sleep overlay");
+        println!("          --screenshot-weather=rain|thunder|snow renders a 1.5 storm (rain, lightning or snow)");
+        println!("          --screenshot-fire renders an animated campfire at dusk (1.5 fire block proof)");
+        println!("          --screenshot-explosion renders an explosion particle/flash proof");
         println!("          --screenshot-network renders a network survival frame from an in-process loopback server");
         println!("          --screenshot-name-tags renders synthetic remote-player name tags over a world");
         println!("          --screenshot-net-ui=loading|failed|disconnected|roster  multiplayer overlay audit frame");
@@ -77,6 +80,9 @@ fn main() {
         println!("  --screenshot-torch  render a sealed room lit only by a torch (1.2 light proof)");
         println!("  --screenshot-farm   render watered farmland with wheat at four growth stages");
         println!("  --screenshot-sleep  enter a bed at night and render the sleep overlay");
+        println!("  --screenshot-weather=rain|thunder|snow  render a 1.5 weather state with precipitation");
+        println!("  --screenshot-fire  render the animated fire block and embers at dusk");
+        println!("  --screenshot-explosion  render an explosion particle burst and flash");
         println!("  --screenshot-items  seed ores, ingots, iron tools/armor, food, planks and 14 HP / 12 hunger");
         println!("  --screenshot-network  render network survival from an in-process loopback server");
         println!("  --screenshot-name-tags  render synthetic remote-player name tags over a world");

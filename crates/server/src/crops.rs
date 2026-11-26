@@ -14,7 +14,8 @@
 //! * Growth pauses when `World::gameplay_light` at the crop is below
 //!   [`CROP_MIN_LIGHT`] (9), so a dark cellar farm stays at its current stage.
 //! * Hydration is re-evaluated every [`CROP_HYDRATION_INTERVAL_TICKS`] ticks:
-//!   water within [`CROP_HYDRATION_RADIUS`] blocks horizontally and ±1 Y. The
+//!   water within [`CROP_HYDRATION_RADIUS`] blocks horizontally and ±1 Y, or
+//!   rain reaching an open-sky crop during a storm. The
 //!   farmland block below is swapped between `farmland_dry` and `farmland_wet`
 //!   so the visual state follows the logic; the swap is a normal block update.
 //!
@@ -35,7 +36,7 @@
 //! is authoritative for the stage so a hand-edited world cannot leave a crop
 //! record pointing at air.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use ob_content::{BlockId, ItemId, Registry};
@@ -163,6 +164,7 @@ pub(crate) fn tick_crops(
     tick_count: u64,
     day_factor: f32,
     weather_factor: f32,
+    rain_hydrated: &BTreeSet<BlockPos>,
 ) -> Vec<(BlockPos, BlockId)> {
     let mut updates = Vec::new();
     let check_hydration = tick_count.is_multiple_of(CROP_HYDRATION_INTERVAL_TICKS);
@@ -184,7 +186,11 @@ pub(crate) fn tick_crops(
             crop.age = 0;
         }
         if check_hydration {
-            let hydrated = water_near(world, registry, *pos);
+            // Rain reaching an open-sky crop hydrates it exactly like water
+            // within the radius. The host precomputes this set from the weather
+            // phase and the pure worldgen precipitation query, so the crop pass
+            // keeps a single `&mut World` borrow and stays deterministic.
+            let hydrated = rain_hydrated.contains(pos) || water_near(world, registry, *pos);
             if hydrated != crop.hydrated {
                 crop.hydrated = hydrated;
                 let below = pos.offset(0, -1, 0);
@@ -406,7 +412,15 @@ mod tests {
 
         // Without water: 2,400 ticks per stage.
         for tick in 0..CROP_GROWTH_DRY_TICKS - 1 {
-            let updates = tick_crops(&mut world, &registry, &mut crops, u64::from(tick), 1.0, 1.0);
+            let updates = tick_crops(
+                &mut world,
+                &registry,
+                &mut crops,
+                u64::from(tick),
+                1.0,
+                1.0,
+                &BTreeSet::new(),
+            );
             assert!(updates.is_empty());
         }
         let updates = tick_crops(
@@ -416,6 +430,7 @@ mod tests {
             u64::from(CROP_GROWTH_DRY_TICKS - 1),
             1.0,
             1.0,
+            &BTreeSet::new(),
         );
         assert_eq!(updates, vec![(pos, wheat_block(&registry, 1))]);
         assert_eq!(crops[&pos].stage, 1);
@@ -425,14 +440,14 @@ mod tests {
         assert!(world.set_block(BlockPos::new(7, 65, 4), water));
         let mut tick = u64::from(CROP_GROWTH_DRY_TICKS);
         while !crops[&pos].hydrated {
-            tick_crops(&mut world, &registry, &mut crops, tick, 1.0, 1.0);
+            tick_crops(&mut world, &registry, &mut crops, tick, 1.0, 1.0, &BTreeSet::new());
             tick += 1;
             assert!(tick < 3_000, "hydration must be observed within one interval");
         }
         assert_eq!(world.get_block(BlockPos::new(4, 64, 4)), wet);
         let age_at_hydration = crops[&pos].age;
         for _ in 0..CROP_GROWTH_WET_TICKS - age_at_hydration {
-            tick_crops(&mut world, &registry, &mut crops, tick, 1.0, 1.0);
+            tick_crops(&mut world, &registry, &mut crops, tick, 1.0, 1.0, &BTreeSet::new());
             tick += 1;
         }
         assert_eq!(crops[&pos].stage, 2);
@@ -470,7 +485,7 @@ mod tests {
             },
         )]);
         for tick in 0..10_000 {
-            tick_crops(&mut world, &registry, &mut crops, tick, 1.0, 1.0);
+            tick_crops(&mut world, &registry, &mut crops, tick, 1.0, 1.0, &BTreeSet::new());
         }
         assert_eq!(crops[&pos].stage, 1, "a sealed cellar must pause growth");
         assert_eq!(crops[&pos].age, 0);
@@ -478,9 +493,59 @@ mod tests {
         let torch = registry.id_or_air("openblock:torch");
         assert!(world.set_block(BlockPos::new(4, 66, 4), torch));
         for tick in 10_000..20_000 {
-            tick_crops(&mut world, &registry, &mut crops, tick, 1.0, 1.0);
+            tick_crops(&mut world, &registry, &mut crops, tick, 1.0, 1.0, &BTreeSet::new());
         }
         assert_eq!(crops[&pos].stage, 3, "torch light must resume growth");
+    }
+
+    #[test]
+    fn rain_hydrates_a_crop_without_water_and_swaps_farmland() {
+        let registry = Registry::base();
+        let mut world = World::new(Arc::new(Registry::base()), 11);
+        let dirt = registry.id_or_air("openblock:dirt");
+        let dry = farmland_block(&registry, false);
+        let wet = farmland_block(&registry, true);
+        let mut column = ob_world::ChunkColumn::new(ChunkPos::new(0, 0));
+        for z in 0..16 {
+            for x in 0..16 {
+                column.set_block(BlockPos::new(x, 64, z), dirt);
+            }
+        }
+        world.insert_chunk(column);
+        let pos = BlockPos::new(5, 65, 5);
+        assert!(world.set_block(BlockPos::new(5, 64, 5), dry));
+        assert!(world.set_block(pos, wheat_block(&registry, 0)));
+        let mut crops = BTreeMap::from([(pos, CropState::new(1, pos))]);
+        // Dry until rain reaches the open-sky column.
+        tick_crops(&mut world, &registry, &mut crops, 0, 1.0, 0.8, &BTreeSet::new());
+        assert!(!crops[&pos].hydrated);
+        assert_eq!(world.get_block(BlockPos::new(5, 64, 5)), dry);
+        let rain = BTreeSet::from([pos]);
+        let updates = tick_crops(
+            &mut world,
+            &registry,
+            &mut crops,
+            CROP_HYDRATION_INTERVAL_TICKS,
+            1.0,
+            0.8,
+            &rain,
+        );
+        assert!(crops[&pos].hydrated, "rain must hydrate an open-sky crop");
+        assert_eq!(world.get_block(BlockPos::new(5, 64, 5)), wet);
+        assert_eq!(updates, vec![(BlockPos::new(5, 64, 5), wet)]);
+        assert_eq!(crops[&pos].stage_ticks(), CROP_GROWTH_WET_TICKS);
+        // Rain stopping clears hydration on the next interval (no water nearby).
+        tick_crops(
+            &mut world,
+            &registry,
+            &mut crops,
+            CROP_HYDRATION_INTERVAL_TICKS * 2,
+            1.0,
+            0.8,
+            &BTreeSet::new(),
+        );
+        assert!(!crops[&pos].hydrated);
+        assert_eq!(world.get_block(BlockPos::new(5, 64, 5)), dry);
     }
 
     #[test]

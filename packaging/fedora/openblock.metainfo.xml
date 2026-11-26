@@ -43,6 +43,15 @@
     <content_attribute id="social-chat">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="1.5.0" date="2026-11-26" type="stable">
+      <description>
+        <p>Weather &amp; fire: a server-authoritative clear/rain/thunder cycle
+        with biome rain/snow, lightning strikes, flammable-block fire with
+        spreading and rain/water extinguishing, protocol v5 weather/lightning
+        sync, procedural storm/fire audio, and rain/snow particles, storm
+        sky/fog, lightning flash, animated fire and effect particles.</p>
+      </description>
+    </release>
     <release version="1.4.0" date="2026-11-25" type="stable">
       <description>
         <p>Danger &amp; Detail: spider/skeleton/creeper threats, arrows and

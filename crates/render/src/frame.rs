@@ -42,6 +42,7 @@ use crate::frustum::{aabb_visible, aabb_within_distance, section_visible};
 use crate::fsr::{self, FsrQuality, FsrUpscaler};
 use crate::graphics::{GraphicsSettings, ShadowConfig};
 use crate::lod::LodBatchKey;
+use crate::particles::{MAX_PARTICLES, ParticleInstance};
 use crate::pipeline;
 use crate::shadow::{MAX_SHADOW_CASCADES, ShadowCascades};
 use crate::ssao::{self, SsaoPipelines, SsaoResources, SsaoUniform};
@@ -686,6 +687,9 @@ pub(crate) struct SceneRenderer {
     far_pipeline: wgpu::RenderPipeline,
     far_water_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
+    particle_pipeline: wgpu::RenderPipeline,
+    /// One instanced vertex buffer sized for the renderer's hard particle cap.
+    particle_buffer: wgpu::Buffer,
     outline_pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     post_layout: wgpu::BindGroupLayout,
@@ -843,6 +847,13 @@ impl SceneRenderer {
             far_terrain::create_far_water_pipeline(device, pipeline::HDR_FORMAT, &bind_group_layout);
         let sky_pipeline = pipeline::create_sky_pipeline(device, pipeline::HDR_FORMAT, &bind_group_layout);
         let outline_pipeline = pipeline::create_outline_pipeline(device, pipeline::HDR_FORMAT, &bind_group_layout);
+        let particle_pipeline = pipeline::create_particle_pipeline(device, pipeline::HDR_FORMAT, &bind_group_layout);
+        let particle_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("particle-instances"),
+            size: (MAX_PARTICLES * std::mem::size_of::<ParticleInstance>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let shadow_pipeline = pipeline::create_shadow_pipeline(device, &shadow_bind_group_layout);
         let post_pipeline =
             pipeline::create_post_pipeline(device, output_format, &post_layout, "fs_post", "post-pipeline");
@@ -882,6 +893,8 @@ impl SceneRenderer {
             far_pipeline,
             far_water_pipeline,
             sky_pipeline,
+            particle_pipeline,
+            particle_buffer,
             outline_pipeline,
             shadow_pipeline,
             post_layout,
@@ -1567,6 +1580,7 @@ impl SceneRenderer {
             self.graphics,
             &shadow,
             seam,
+            scene.weather,
         );
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
         let eye = [
@@ -1575,7 +1589,14 @@ impl SceneRenderer {
             camera.position.z as f32,
         ];
         let underwater = self.is_underwater(eye);
-        let post = pipeline::PostUniform::new(width, height, self.graphics, scene.time_seconds, underwater);
+        let post = pipeline::PostUniform::new(
+            width,
+            height,
+            self.graphics,
+            scene.time_seconds,
+            underwater,
+            scene.weather.flash,
+        );
         queue.write_buffer(&self.post_buffer, 0, bytemuck::bytes_of(&post));
 
         let outline_vertices = scene
@@ -1871,6 +1892,47 @@ impl SceneRenderer {
                 pass.draw(0..OUTLINE_VERTEX_COUNT as u32, 0..1);
             }
             stats.passes += 1;
+        }
+
+        // --- 4b. Instanced particles ---------------------------------------
+        // Rain, snow, fire, explosion and pickup effects share one alpha-blended
+        // pass. Depth is tested but not written, so particles are occluded by
+        // terrain/entities and do not disturb the water or SSAO depth inputs.
+        if let Some(instances) = scene.particles {
+            let count = instances.len().min(MAX_PARTICLES);
+            if count > 0 {
+                queue.write_buffer(&self.particle_buffer, 0, bytemuck::cast_slice(&instances[..count]));
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("particles"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.targets.hdr_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.targets.depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.particle_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.particle_buffer.slice(..));
+                pass.draw(0..6, 0..count as u32);
+                stats.particle_instances = count as u32;
+                stats.particle_draw_calls = 1;
+                stats.passes += 1;
+            }
         }
 
         // --- 5. SSAO (High/Ultra) ------------------------------------------

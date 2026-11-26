@@ -1,4 +1,4 @@
-//! The OpenBlock interim wire protocol v4: JSON messages and chunk snapshots.
+//! The OpenBlock interim wire protocol v5: JSON messages and chunk snapshots.
 //!
 //! **Status: implemented for the 1.0 self-hosted multiplayer milestone.** This
 //! crate is the shared contract between the dedicated server
@@ -67,6 +67,16 @@
 //! the 100-tick sunrise fast-forward. Clients that do not understand a new
 //! variant must ignore it (the interim client already has a catch-all arm).
 //!
+//! # Weather and lightning (v5)
+//!
+//! Protocol v5 makes the 1.5 weather machine observable without giving the
+//! client authority over it. [`ServerMessage::WeatherSync`] publishes the global
+//! phase/intensity/remaining/epoch plus the precipitation kind and biome at the
+//! receiving player's column; [`ServerMessage::LightningStrike`] is a one-shot
+//! flash/position event that may be accompanied by ordinary `BlockEdit` fire
+//! placements. Both are additive: older payloads are unchanged and a client that
+//! does not understand a variant ignores it.
+//!
 //! # Chunk snapshots
 //!
 //! [`encode_chunk`] writes a deterministic paletted column with per-section
@@ -115,6 +125,6 @@ pub use message::{
     EQUIPMENT_SLOT_START, EQUIPMENT_SLOTS, EntityKind, EntitySnapshot, EntityStateEntry, FURNACE_WINDOW_SLOTS,
     FurnaceProgress, HOTBAR_SLOTS, INVENTORY_SLOTS, ItemStackDto, LightSectionDto, MAIN_SLOT_START, MAIN_SLOTS,
     MAX_CHAT_LEN, MAX_LIGHT_SECTIONS_PER_UPDATE, MAX_MOTD_LEN, MAX_NAME_LEN, PROTOCOL_VERSION, PlayerSnapshot,
-    SLOT_WINDOW_START, ServerMessage, block_manifest, content_fingerprint, default_max_frame_len, manifest_matches,
-    sanitise_motd, validate_chat_text, validate_player_name,
+    PrecipitationKind, SLOT_WINDOW_START, ServerMessage, WeatherPhase, block_manifest, content_fingerprint,
+    default_max_frame_len, manifest_matches, sanitise_motd, validate_chat_text, validate_player_name,
 };

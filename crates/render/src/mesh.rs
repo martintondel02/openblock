@@ -585,33 +585,41 @@ fn mesh_cross(out: &mut MeshData, snapshot: &SectionSnapshot, registry: &Registr
     let block = registry.block(snapshot.block(x, y, z));
     let layer = u32::from(block.textures.side.0);
     let base = [origin.x + x, origin.y + y, origin.z + z];
-    let planes: [[(f32, f32, i32, i32); 4]; 2] = [
+    // Two vertical, perpendicular diagonal planes. The previous implementation
+    // emitted a horizontal square for both "planes"; torches, crops and fire
+    // were therefore flat ground decals instead of upright cut-outs.
+    // Each corner is (x, y, z) inside the block, then the light-sample dx/dz.
+    let planes: [[([f32; 3], i32, i32); 4]; 2] = [
         [
-            (0.15, 0.15, -1, -1),
-            (0.85, 0.15, 1, -1),
-            (0.85, 0.85, 1, 1),
-            (0.15, 0.85, -1, 1),
+            ([0.15, 0.0, 0.15], -1, -1),
+            ([0.85, 0.0, 0.85], 1, 1),
+            ([0.85, 1.0, 0.85], 1, 1),
+            ([0.15, 1.0, 0.15], -1, -1),
         ],
         [
-            (0.85, 0.15, 1, -1),
-            (0.15, 0.15, -1, -1),
-            (0.15, 0.85, -1, 1),
-            (0.85, 0.85, 1, 1),
+            ([0.85, 0.0, 0.15], 1, -1),
+            ([0.15, 0.0, 0.85], -1, 1),
+            ([0.15, 1.0, 0.85], -1, 1),
+            ([0.85, 1.0, 0.15], 1, -1),
         ],
     ];
     let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
     for plane in planes {
         let mut light = [(0u8, 0u8, 0.0f32); 4];
-        for (index, (_, _, dx, dz)) in plane.into_iter().enumerate() {
+        for (index, (_, dx, dz)) in plane.into_iter().enumerate() {
             light[index] = cross_corner_light(snapshot, x, y, z, dx, dz);
         }
         for reversed in [false, true] {
             let order: [usize; 6] = if reversed { [0, 2, 1, 0, 3, 2] } else { TRIANGLE_INDICES };
             for index in order {
-                let (u, v, _, _) = plane[index];
+                let (corner, _, _) = plane[index];
                 let (sky, block, ao) = light[index];
                 out.vertices.push(Vertex {
-                    position: [base[0] as f32 + u, base[1] as f32, base[2] as f32 + v],
+                    position: [
+                        base[0] as f32 + corner[0],
+                        base[1] as f32 + corner[1],
+                        base[2] as f32 + corner[2],
+                    ],
                     uv: uvs[index],
                     layer,
                     light: packed_vertex_light(sky, block, ao),

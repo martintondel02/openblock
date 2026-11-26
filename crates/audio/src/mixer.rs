@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
 use crate::synth::GroupRange;
-use crate::synth::{Clip, ClipBank, group_of, hash_u64, rate_limit_seconds};
-use crate::{MAX_VOICES, SAMPLE_RATE, Sfx};
+use crate::synth::{Clip, ClipBank, LOOP_COUNT, group_of, hash_u64, rate_limit_seconds};
+use crate::{LOOP_FADE_SECONDS, MAX_VOICES, SAMPLE_RATE, Sfx, constant_power_pan};
 
 /// Capacity of the main-thread to audio-thread command ring.
 pub(crate) const COMMAND_CAPACITY: usize = 256;
@@ -26,6 +26,8 @@ const GAIN_SMOOTHING: f32 = 0.0015;
 const MUSIC_BUS: f32 = 0.18;
 /// Ambient bed level relative to the music pad.
 const AMBIENT_BUS: f32 = 0.75;
+/// Level of a 1.5 weather/fire loop before its per-bed target and the ambient bus.
+const LOOP_BUS: f32 = 0.65;
 /// Per-sample smoothing of the music/ambience fade gate (about 1.5 s to settle).
 const MUSIC_FADE_SMOOTHING: f32 = 0.00004;
 
@@ -61,6 +63,8 @@ pub(crate) struct Control {
     master: AtomicU32,
     sfx: AtomicU32,
     music: AtomicU32,
+    ambient: AtomicU32,
+    loop_targets: [AtomicU32; LOOP_COUNT],
     enabled: AtomicBool,
     active_voices: AtomicUsize,
     accepted_commands: AtomicU64,
@@ -69,11 +73,13 @@ pub(crate) struct Control {
 }
 
 impl Control {
-    pub(crate) fn new(master: f32, sfx: f32, music: f32) -> Self {
+    pub(crate) fn new(master: f32, sfx: f32, music: f32, ambient: f32) -> Self {
         Self {
             master: AtomicU32::new(sanitise_gain(master).to_bits()),
             sfx: AtomicU32::new(sanitise_gain(sfx).to_bits()),
             music: AtomicU32::new(sanitise_gain(music).to_bits()),
+            ambient: AtomicU32::new(sanitise_gain(ambient).to_bits()),
+            loop_targets: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
             enabled: AtomicBool::new(true),
             active_voices: AtomicUsize::new(0),
             accepted_commands: AtomicU64::new(0),
@@ -94,6 +100,24 @@ impl Control {
         self.music.store(sanitise_gain(value).to_bits(), Ordering::Relaxed);
     }
 
+    pub(crate) fn set_ambient(&self, value: f32) {
+        self.ambient.store(sanitise_gain(value).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Target gain for one 1.5 loop bed; out-of-range indices are ignored.
+    pub(crate) fn set_loop_target(&self, index: usize, value: f32) {
+        if let Some(slot) = self.loop_targets.get(index) {
+            slot.store(sanitise_gain(value).to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// Target gain for one 1.5 loop bed, or zero for an invalid index.
+    pub(crate) fn loop_target(&self, index: usize) -> f32 {
+        self.loop_targets
+            .get(index)
+            .map_or(0.0, |slot| sanitise_gain(f32::from_bits(slot.load(Ordering::Relaxed))))
+    }
+
     pub(crate) fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Relaxed);
     }
@@ -108,6 +132,10 @@ impl Control {
 
     pub(crate) fn music(&self) -> f32 {
         volume(&self.music)
+    }
+
+    pub(crate) fn ambient(&self) -> f32 {
+        volume(&self.ambient)
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -166,16 +194,17 @@ impl CommandQueue {
         }
     }
 
-    pub(crate) fn push(&self, command: PlayCommand, control: &Control) {
+    pub(crate) fn push(&self, command: PlayCommand, control: &Control) -> bool {
         let Ok(mut ring) = self.inner.lock() else {
-            return;
+            return false;
         };
         if ring.len == COMMAND_CAPACITY {
             control.dropped_commands.fetch_add(1, Ordering::Relaxed);
-            return;
+            return false;
         }
         ring.push(command);
         control.accepted_commands.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// Copies up to `out.len()` commands; never blocks.
@@ -255,9 +284,13 @@ pub(crate) struct Mixer {
     voices: Vec<Voice>,
     ambient_position: f64,
     music_position: f64,
+    loop_positions: [f64; LOOP_COUNT],
+    loop_gains: [f32; LOOP_COUNT],
+    loop_step: f32,
     master: f32,
     sfx: f32,
     music: f32,
+    ambient: f32,
     music_fade: f32,
 }
 
@@ -268,6 +301,7 @@ impl Mixer {
         } else {
             f64::from(SAMPLE_RATE)
         };
+        let loop_step = (1.0 / (f64::from(LOOP_FADE_SECONDS) * device_rate).max(1.0)) as f32;
         Self {
             bank,
             control,
@@ -276,9 +310,13 @@ impl Mixer {
             voices: Vec::with_capacity(MAX_VOICES),
             ambient_position: 0.0,
             music_position: 0.0,
+            loop_positions: [0.0; LOOP_COUNT],
+            loop_gains: [0.0; LOOP_COUNT],
+            loop_step,
             master: 0.0,
             sfx: 0.0,
             music: 0.0,
+            ambient: 0.0,
             music_fade: 0.0,
         }
     }
@@ -303,11 +341,16 @@ impl Mixer {
         };
         let sfx_target = self.control.sfx();
         let music_target = self.control.music();
+        let ambient_target = self.control.ambient();
         let music_fade_target = if self.control.enabled() && music_target > 0.0 {
             1.0
         } else {
             0.0
         };
+        let mut loop_targets = [0.0f32; LOOP_COUNT];
+        for (index, target) in loop_targets.iter_mut().enumerate() {
+            *target = self.control.loop_target(index);
+        }
         let bank: &ClipBank = &self.bank;
         let rate_ratio = f64::from(SAMPLE_RATE) / self.device_rate;
 
@@ -315,6 +358,7 @@ impl Mixer {
             self.master += (master_target - self.master) * GAIN_SMOOTHING;
             self.sfx += (sfx_target - self.sfx) * GAIN_SMOOTHING;
             self.music += (music_target - self.music) * GAIN_SMOOTHING;
+            self.ambient += (ambient_target - self.ambient) * GAIN_SMOOTHING;
             self.music_fade += (music_fade_target - self.music_fade) * MUSIC_FADE_SMOOTHING;
 
             let mut left = 0.0f32;
@@ -360,9 +404,40 @@ impl Mixer {
                 advance_loop(&bank.music, &mut self.music_position, rate_ratio);
             }
 
+            // 1.5 weather/fire beds. Each bed moves linearly by `loop_step`
+            // towards its target, which gives a click-free 1.2 s ramp for
+            // start, stop and volume changes. Beds at zero are not advanced.
+            let loop_scale = self.master * self.ambient * LOOP_BUS;
+            let mut loop_left = 0.0f32;
+            let mut loop_right = 0.0f32;
+            for index in 0..LOOP_COUNT {
+                let target = loop_targets[index];
+                let current = self.loop_gains[index];
+                let ramped = if target > current {
+                    (current + self.loop_step).min(target)
+                } else {
+                    (current - self.loop_step).max(target)
+                };
+                // Snap the final sub-step so a stopped bed reaches exact zero
+                // and never leaves a denormal tail running.
+                let next = if (ramped - target).abs() <= self.loop_step {
+                    target
+                } else {
+                    ramped
+                };
+                self.loop_gains[index] = next;
+                if next > 0.0
+                    && let Some(clip) = bank.loop_clip(index)
+                {
+                    let value = sample_loop(clip, &mut self.loop_positions[index], rate_ratio) * next * loop_scale;
+                    loop_left += value;
+                    loop_right += value;
+                }
+            }
+
             let sfx_scale = self.master * self.sfx;
-            let output_left = soft_limit(left * sfx_scale + music_left);
-            let output_right = soft_limit(right * sfx_scale + music_right);
+            let output_left = soft_limit(left * sfx_scale + music_left + loop_left);
+            let output_right = soft_limit(right * sfx_scale + music_right + loop_right);
             let base = frame * channels;
             if channels == 1 {
                 data[base] = (output_left + output_right) * 0.5;
@@ -403,8 +478,7 @@ impl Mixer {
         } else {
             0.0
         };
-        let pan_left = ((1.0 - pan) * 0.5).sqrt();
-        let pan_right = ((1.0 + pan) * 0.5).sqrt();
+        let (pan_left, pan_right) = constant_power_pan(pan);
         let rate = if command.rate.is_finite() {
             command.rate.clamp(0.5, 2.0)
         } else {
@@ -519,13 +593,14 @@ mod tests {
         Arc::new(ClipBank {
             groups,
             clips: vec![clip.clone()],
+            loops: vec![clip.clone(); LOOP_COUNT],
             ambient: clip.clone(),
             music: clip,
         })
     }
 
     fn mixer() -> (Mixer, Arc<Control>, Arc<CommandQueue>) {
-        let control = Arc::new(Control::new(1.0, 1.0, 0.0));
+        let control = Arc::new(Control::new(1.0, 1.0, 0.0, 1.0));
         let queue = Arc::new(CommandQueue::new());
         let mixer = Mixer::new(test_bank(), Arc::clone(&control), Arc::clone(&queue), 48_000.0);
         (mixer, control, queue)
@@ -543,7 +618,7 @@ mod tests {
 
     #[test]
     fn gains_are_clamped_and_non_finite_becomes_zero() {
-        let control = Control::new(0.8, 1.0, 0.55);
+        let control = Control::new(0.8, 1.0, 0.55, 1.0);
         assert!((control.master() - 0.8).abs() < 1e-6);
         control.set_master(2.0);
         assert!((control.master() - 1.0).abs() < 1e-6);
@@ -551,13 +626,23 @@ mod tests {
         assert_eq!(control.sfx(), 0.0);
         control.set_music(f32::NAN);
         assert_eq!(control.music(), 0.0);
+        control.set_ambient(0.4);
+        assert!((control.ambient() - 0.4).abs() < 1e-6);
+        control.set_ambient(9.0);
+        assert_eq!(control.ambient(), 1.0);
+        control.set_loop_target(0, 1.5);
+        assert_eq!(control.loop_target(0), 1.0);
+        control.set_loop_target(1, f32::NAN);
+        assert_eq!(control.loop_target(1), 0.0);
+        control.set_loop_target(999, 1.0);
+        assert_eq!(control.loop_target(999), 0.0);
         control.set_enabled(false);
         assert!(!control.enabled());
     }
 
     #[test]
     fn command_ring_is_bounded_and_drains_in_order() {
-        let control = Control::new(0.8, 1.0, 0.55);
+        let control = Control::new(0.8, 1.0, 0.55, 1.0);
         let queue = CommandQueue::new();
         for index in 0..(COMMAND_CAPACITY + 10) {
             let mut command = command(1.0);
@@ -665,6 +750,58 @@ mod tests {
         assert!(
             left_energy > right_energy,
             "hard-left voice must favour the left channel"
+        );
+    }
+
+    #[test]
+    fn one_shot_groups_overlap_in_the_voice_pool() {
+        let (mut mixer, control, queue) = mixer();
+        for group in 0..3u16 {
+            let mut play = command(1.0);
+            play.group = group;
+            play.seed = u32::from(group) + 10;
+            queue.push(play, &control);
+        }
+        let mut buffer = vec![0.0f32; 512 * 2];
+        mixer.render(&mut buffer, 2);
+        assert_eq!(control.active_voices(), 3, "different cues must overlap");
+    }
+
+    #[test]
+    fn ambient_loop_gain_ramps_without_clicks_and_stops_cleanly() {
+        let (mut mixer, control, _queue) = mixer();
+        // Let the master and ambient smoothers settle while every loop target
+        // is still zero.
+        let mut settle = vec![0.0f32; 4_800 * 2];
+        mixer.render(&mut settle, 2);
+        assert!(settle.iter().all(|sample| *sample == 0.0));
+
+        control.set_loop_target(0, 1.0);
+        let frames = (LOOP_FADE_SECONDS * SAMPLE_RATE as f32) as usize;
+        let mut ramp_up = vec![0.0f32; frames * 2];
+        mixer.render(&mut ramp_up, 2);
+        let stereo = ramp_up.as_chunks::<2>().0;
+        let early: f32 = stereo[..frames / 8].iter().map(|frame| frame[0].abs()).sum();
+        let late: f32 = stereo[frames - frames / 8..].iter().map(|frame| frame[0].abs()).sum();
+        assert!(early < late, "the loop must fade in, not start at full level");
+        assert!(stereo.last().expect("last frame")[0].abs() > 0.10);
+        let mut previous = 0.0f32;
+        let mut maximum_step = 0.0f32;
+        for frame in stereo {
+            maximum_step = maximum_step.max((frame[0] - previous).abs());
+            previous = frame[0];
+        }
+        assert!(maximum_step < 1.0e-3, "loop start click: {maximum_step}");
+
+        control.set_loop_target(0, 0.0);
+        let mut ramp_down = vec![0.0f32; (frames + 4_800) * 2];
+        mixer.render(&mut ramp_down, 2);
+        assert!(
+            ramp_down
+                .iter()
+                .skip(ramp_down.len() - 2_000)
+                .all(|sample| *sample == 0.0),
+            "the loop must reach silence after the fade-out"
         );
     }
 }

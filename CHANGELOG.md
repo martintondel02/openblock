@@ -6,6 +6,81 @@ to [Semantic Versioning](https://semver.org/) from `1.0.0` onward. Pre-1.0
 releases may change APIs, save formats and the protocol between minors; see
 [docs/plan/00-roadmap.md](docs/plan/00-roadmap.md) §2.
 
+## [1.5.0] — 2026-11-26 (Weather & Fire)
+
+Storms roll in: a server-authoritative weather cycle drives rain, snow, thunder,
+lightning and fire, with full client visuals/particles and procedural audio.
+Protocol **v5**; save format 4 stays with additive `level.txt`/`fire.txt` and an
+append-only fire block.
+
+### Added — weather, lightning and fire
+- Deterministic **weather state machine**: Clear (12k–72k ticks), Precipitating
+  (3k–12k; 15% thunder / 85% clear next) and Thunder (3.6k–12k; 30% rain / 70%
+  clear), intensity ramps, `epoch`-salted `mix64` streams, `weather_factor`
+  1.0/0.8/0.6 in gameplay light.
+- **Precipitation** per column from biome temperature: rain, snow or none;
+  farmland hydrates in rain, exposed fire is extinguished, skies/fog/clouds dim
+  and thicken with intensity.
+- **Lightning** during thunder (deterministic, resident/precipitating/sky-exposed
+  columns near players): flash event, falloff damage, capped fire ignition.
+- **Fire** block (append-only id 29, animated cross cut-out): 160-tick burn,
+  bounded deterministic spread to flammable blocks (25%/40 ticks, 64 world/8
+  per-chunk caps), rain/snow/water extinguish, contact damage, light emission and
+  block-edit/relight path; item/creative placement routes through timed ignition.
+- Persistence: `level.txt` v1 (clock + weather phase/remaining/intensity/epoch,
+  old saves initialise from player.txt) and `fire.txt` v1 (sorted burning cells);
+  state hash covers weather and fire timers. Seed-42 smoke hash
+  `9296c15dd313ccde`.
+- **Protocol v5**: weather_sync (phase/intensity/remaining/epoch/precipitation/
+  biome/factor, join + 20-tick cadence) and lightning_strike (pos/block/ignited/
+  flash); 1.4 and older peers are rejected with an upgrade message. Fire arrives
+  through ordinary block_edit messages.
+
+### Added — weather/fire presentation and audio
+- Renderer **particle system** (bounded deterministic CPU sim, one instanced
+  billboard draw): rain/snow around the camera with cover culling, smoke/ember/
+  debris/XP/heart kinds, wind and fog fade; `SceneParams` weather/particles.
+- Storm sky: luminance-preserving desaturate/darken, dimmer sun/shadows, lower/
+  thicker/faster clouds, pulled-in fog; lightning is an HDR exposure flash plus
+  screen flash, no flat-white frame; camera shake for lightning/explosions.
+- **Fire visuals**: fixed cross-mesh orientation renderer bug (torch/wheat/fire
+  now stand vertically), procedural flame texture in all texture styles with
+  resource-pack `fire_0/1`/`fire` support, animated UV/flicker emissive shader,
+  embers/smoke/warm halo particles.
+- Explosion/creeper/XP feedback: capped smoke/debris/sparks/fireball, exposure
+  pulse, creeper fuse swell in single-player, XP pickup/level particles and cues,
+  bow/arrow/critical/mob cues.
+- Procedural audio bank (18 new one-shots/4 loops): rain light/heavy, snow wind,
+  fire crackle, thunder near/distant, lightning crack, explosion, creeper hiss,
+  bow/arrow/crit, skeleton/spider, XP/level; click-free loop fades, distance/
+  intensity gains, panning and speed-of-sound thunder scheduling.
+- Weather HUD chip + F3 lines (phase/intensity/remaining/factor/shelter/flash);
+  `--screenshot-weather=rain|thunder|snow`, `--screenshot-fire`,
+  `--screenshot-explosion`; benchmark `--weather`.
+- Weather visuals add ≤+0.5 ms paired at 512-chunk view/High in the offscreen
+  harness (clear vs thunder), one extra draw for ≤1,700 billboards; absolute
+  timings on the shared host were contended, so paired relative results are the
+  gate.
+
+### Verification
+- Weather/fire: 434 targeted tests pass (server lib 128, weather_fire 9,
+  net_survival 24, etc.); render/client: 322 render + 220 client + 19 loopback;
+  clippy `-D warnings`, fmt, rustdoc and docs/architecture checks clean.
+- Full workspace tests run for the release gate; smoke twice
+  (`9296c15dd313ccde`), backup/restore pass; load-gate/load-test bots updated to
+  protocol v5 and the quick gate passes.
+- New v1.5.0 screenshots: rain, thunder, snow, fire, explosion, night, settings,
+  F3; plan docs `1.5-weather/1.5-audio/1.5-visuals.md`.
+
+### Known limitations
+No dynamic point lights, rain splashes/snow accumulation/screen droplets, or
+per-dimension weather; network creeper fuse and ranged bow remain follow-ups;
+lightning has no copper-rod/redstone transformations; sleep fast-forward does
+not advance weather/fire timers yet; fire timers drop with unloaded chunks;
+`do_fire_tick`/`do_weather_cycle` gamerules are not exposed; older visual limits
+(far terrain, FSR1, particles not lit) remain; next are villagers/enchanting,
+dimensions, redstone, modding and multiplayer hardening.
+
 ## [1.4.0] — 2026-11-25 (Danger & Detail)
 
 The danger release: three new hostile mobs with arrows and explosions, charged

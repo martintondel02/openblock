@@ -285,9 +285,10 @@ mod tests {
             catalogue::WHEAT_1.0 as usize,
             catalogue::WHEAT_2.0 as usize,
             catalogue::WHEAT_3.0 as usize,
+            catalogue::FIRE.0 as usize,
         ];
-        let mut holes = [false; 6];
-        let mut solids = [false; 6];
+        let mut holes = [false; 7];
+        let mut solids = [false; 7];
         for (index, texel) in first.as_chunks::<4>().0.iter().enumerate() {
             let layer = index / (TEXTURE_SIZE * TEXTURE_SIZE) as usize;
             if let Some(slot) = cut_out.iter().position(|candidate| *candidate == layer) {
@@ -298,7 +299,7 @@ mod tests {
                 assert_eq!(texel[3], 255, "layer {layer} must stay opaque");
             }
         }
-        for (slot, name) in ["leaves", "torch", "wheat_0", "wheat_1", "wheat_2", "wheat_3"]
+        for (slot, name) in ["leaves", "torch", "wheat_0", "wheat_1", "wheat_2", "wheat_3", "fire"]
             .iter()
             .enumerate()
         {

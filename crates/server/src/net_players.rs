@@ -936,11 +936,13 @@ impl Host {
     /// unchanged.
     pub fn tick_network(&mut self) {
         self.tick_count += 1;
+        self.tick_weather();
         tick_network_players(self);
         self.tick_mobs();
         self.tick_furnaces();
         tick_network_items(self);
         self.tick_crops();
+        self.tick_fires();
         // After mob damage has had a chance to wake a sleeper.
         self.tick_network_sleep();
         self.mark_player_dirty();

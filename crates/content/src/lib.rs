@@ -630,9 +630,13 @@ pub mod textures {
     pub const BED_HEAD_TOP: TextureId = TextureId(36);
     /// Bed head side.
     pub const BED_HEAD_SIDE: TextureId = TextureId(37);
+    /// Fire cross cut-out (animated by the renderer; the procedural catalogue
+    /// still stores one layer so a client/render agent can drive the animation
+    /// from the layer name `fire`).
+    pub const FIRE: TextureId = TextureId(38);
 
     /// Number of texture layers the renderer must generate.
-    pub const COUNT: usize = 38;
+    pub const COUNT: usize = 39;
 
     /// Names of the procedural textures, indexed by layer.
     pub const NAMES: [&str; COUNT] = [
@@ -674,6 +678,7 @@ pub mod textures {
         "bed_foot_side",
         "bed_head_top",
         "bed_head_side",
+        "fire",
     ];
 
     // Compile-time guard: the layer table and the catalogue must stay in sync.
@@ -824,6 +829,10 @@ pub struct BlockType {
     /// 15 zeroes the column below. Air is 0, water and leaves are 1, opaque
     /// blocks are 15. Wheat and torches are 0; beds are 1.
     pub sky_attenuation: u8,
+    /// Whether fire may spread to this block (planks, logs, leaves, beds and
+    /// the wooden crafting table/chest). Defaults to `false` for packs that do
+    /// not declare it, so a custom pack can never make stone burn by omission.
+    pub flammable: bool,
     /// Rendered geometry.
     pub shape: BlockShape,
 }
@@ -2055,6 +2064,7 @@ impl Registry {
                     } else {
                         0
                     },
+                    flammable: false,
                     shape: BlockShape::Cube,
                 },
             )
@@ -2064,6 +2074,19 @@ impl Registry {
                 block.attenuation = [1; 3];
                 block.sky_attenuation = 1;
             }
+            // 1.3 flammability: the wooden building blocks, natural wood and
+            // both bed halves. Wool is not in the palette; a future wool block
+            // should declare `flammable: true` in its own definition.
+            block.flammable = matches!(
+                block.id,
+                "openblock:planks"
+                    | "openblock:log"
+                    | "openblock:leaves"
+                    | "openblock:crafting_table"
+                    | "openblock:chest"
+                    | "openblock:bed_foot"
+                    | "openblock:bed_head"
+            );
         }
         // 1.2 "Light & Home" content delta. Ids are append-only: torch 20,
         // farmland 21-22, wheat stages 23-26, bed 27-28. None of these blocks
@@ -2083,6 +2106,7 @@ impl Registry {
                 emission: [14, 14, 14],
                 attenuation: [0; 3],
                 sky_attenuation: 0,
+                flammable: false,
                 shape: BlockShape::Cross,
             },
             BlockType {
@@ -2098,6 +2122,7 @@ impl Registry {
                 emission: [0; 3],
                 attenuation: [15; 3],
                 sky_attenuation: 15,
+                flammable: false,
                 shape: BlockShape::Cube,
             },
             BlockType {
@@ -2113,6 +2138,7 @@ impl Registry {
                 emission: [0; 3],
                 attenuation: [15; 3],
                 sky_attenuation: 15,
+                flammable: false,
                 shape: BlockShape::Cube,
             },
             BlockType {
@@ -2128,6 +2154,7 @@ impl Registry {
                 emission: [0; 3],
                 attenuation: [0; 3],
                 sky_attenuation: 0,
+                flammable: false,
                 shape: BlockShape::Cross,
             },
             BlockType {
@@ -2143,6 +2170,7 @@ impl Registry {
                 emission: [0; 3],
                 attenuation: [0; 3],
                 sky_attenuation: 0,
+                flammable: false,
                 shape: BlockShape::Cross,
             },
             BlockType {
@@ -2158,6 +2186,7 @@ impl Registry {
                 emission: [0; 3],
                 attenuation: [0; 3],
                 sky_attenuation: 0,
+                flammable: false,
                 shape: BlockShape::Cross,
             },
             BlockType {
@@ -2173,6 +2202,7 @@ impl Registry {
                 emission: [0; 3],
                 attenuation: [0; 3],
                 sky_attenuation: 0,
+                flammable: false,
                 shape: BlockShape::Cross,
             },
             // Beds collide as a full cube in 1.2 (no partial shapes yet) but
@@ -2191,6 +2221,7 @@ impl Registry {
                 emission: [0; 3],
                 attenuation: [1; 3],
                 sky_attenuation: 1,
+                flammable: true,
                 shape: BlockShape::Cube,
             },
             BlockType {
@@ -2206,7 +2237,28 @@ impl Registry {
                 emission: [0; 3],
                 attenuation: [1; 3],
                 sky_attenuation: 1,
+                flammable: true,
                 shape: BlockShape::Cube,
+            },
+            // 1.3 "Weather & Danger" content delta: fire id 29. A non-solid
+            // cross that emits full block light and is replaced by air when it
+            // burns out or is extinguished. The server owns ignition, spread,
+            // burn-out and damage; the block carries no timers itself.
+            BlockType {
+                id: "openblock:fire",
+                color: [1.0, 0.56, 0.12],
+                solid: false,
+                opaque: false,
+                fluid: false,
+                textures: BlockTextures::all(tex::FIRE),
+                hardness: 0.0,
+                preferred_tool: None,
+                required_tier: 0,
+                emission: [15, 15, 15],
+                attenuation: [0; 3],
+                sky_attenuation: 0,
+                flammable: false,
+                shape: BlockShape::Cross,
             },
         ]);
         Self::from_blocks(blocks).expect("the built-in base block set is valid")
@@ -2365,14 +2417,15 @@ impl Registry {
 
         // Item ids 47..=51: block items for the 1.0 blocks appended after the
         // frozen catalogue; 1.2's nine new blocks take the next free ids
-        // (52..=60). Any extra custom-pack blocks follow in deterministic
-        // block-index order.
-        for block_index in 0..blocks.len() {
+        // (52..=60). Stop at the 1.4 block count (29) so later block additions
+        // cannot move the frozen 1.2/1.3 item ids.
+        let frozen_block_count = 29usize.min(blocks.len());
+        for block_index in 0..frozen_block_count {
             add_block_item(&blocks, block_index, &mut items, &mut item_by_id, &mut item_for_block);
         }
 
-        // 1.2 non-block items append after every block item, so the existing
-        // item ids 0..=60 cannot move when blocks are appended later.
+        // 1.2 non-block items append after every frozen block item, so the
+        // existing item ids 0..=60 cannot move when blocks are appended later.
         for def in LIGHT_ITEMS {
             add_item(
                 &mut items,
@@ -2396,6 +2449,14 @@ impl Registry {
                 def.armor,
                 def.max_stack,
             );
+        }
+
+        // 1.5 weather slice: block items for blocks appended after the 1.4
+        // catalogue (fire id 29) go after every frozen item, so the 1.2/1.3
+        // non-block ids do not move. Custom-pack blocks that are neither in the
+        // frozen catalogue nor among the 1.4 blocks follow in block-index order.
+        for block_index in frozen_block_count..blocks.len() {
+            add_block_item(&blocks, block_index, &mut items, &mut item_by_id, &mut item_for_block);
         }
 
         // Resolve the base recipe table against this registry. A custom pack
@@ -2770,7 +2831,7 @@ mod tests {
         assert_eq!(reg.id("openblock:grass"), Some(BlockId(3)));
         assert!(reg.block(BlockId(3)).opaque);
         assert!(reg.block(reg.id("openblock:water").unwrap()).fluid);
-        assert_eq!(reg.len(), 29);
+        assert_eq!(reg.len(), 30);
         assert_eq!(reg.block(reg.id("openblock:bedrock").unwrap()).hardness, f32::INFINITY);
         assert!(!reg.block(reg.id("openblock:bedrock").unwrap()).breakable());
         assert_eq!(reg.block(reg.id("openblock:stone").unwrap()).hardness, 1.5);
@@ -2790,6 +2851,48 @@ mod tests {
         assert_eq!(reg.id("openblock:wheat_3"), Some(BlockId(26)));
         assert_eq!(reg.id("openblock:bed_foot"), Some(BlockId(27)));
         assert_eq!(reg.id("openblock:bed_head"), Some(BlockId(28)));
+        // 1.3 content delta: fire is append-only id 29.
+        assert_eq!(reg.id("openblock:fire"), Some(BlockId(29)));
+    }
+
+    #[test]
+    fn fire_block_is_a_non_solid_full_light_cross_and_wood_is_flammable() {
+        let reg = Registry::base();
+        let fire = reg.block(reg.id("openblock:fire").unwrap());
+        assert!(!fire.solid);
+        assert!(!fire.opaque);
+        assert_eq!(fire.emission, [15, 15, 15]);
+        assert_eq!(fire.attenuation, [0; 3]);
+        assert_eq!(fire.shape, BlockShape::Cross);
+        assert_eq!(fire.textures.top, textures::FIRE);
+        assert!(fire.breakable());
+        assert!(!fire.flammable, "fire is not itself a spread target");
+        for name in [
+            "openblock:planks",
+            "openblock:log",
+            "openblock:leaves",
+            "openblock:crafting_table",
+            "openblock:chest",
+            "openblock:bed_foot",
+            "openblock:bed_head",
+        ] {
+            assert!(reg.block(reg.id(name).unwrap()).flammable, "{name} must be flammable");
+        }
+        for name in [
+            "openblock:stone",
+            "openblock:dirt",
+            "openblock:water",
+            "openblock:torch",
+        ] {
+            assert!(
+                !reg.block(reg.id(name).unwrap()).flammable,
+                "{name} must not be flammable"
+            );
+        }
+        assert!(
+            reg.item_for_block(BlockId(29)).is_some(),
+            "fire has a creative block item"
+        );
     }
 
     #[test]
@@ -2955,7 +3058,7 @@ mod tests {
             }
         }
         assert_eq!(textures::NAMES.len(), textures::COUNT);
-        assert_eq!(textures::COUNT, 38);
+        assert_eq!(textures::COUNT, 39);
         assert_eq!(textures::NAMES[14], "planks");
         assert_eq!(textures::NAMES[15], "cobblestone");
         assert_eq!(textures::NAMES[16], "crafting_table_top");
@@ -2996,6 +3099,8 @@ mod tests {
         assert_eq!(textures::WHEAT_3, TextureId(33));
         assert_eq!(textures::BED_FOOT_TOP, TextureId(34));
         assert_eq!(textures::BED_HEAD_SIDE, TextureId(37));
+        assert_eq!(textures::FIRE, TextureId(38));
+        assert_eq!(textures::NAMES[38], "fire");
         let mut names: Vec<&str> = textures::NAMES.to_vec();
         names.sort_unstable();
         names.dedup();
@@ -3017,7 +3122,7 @@ mod tests {
         // v0.0.7/v0.0.8 item ids are frozen: eleven block items, the apple,
         // three block items, then the stick and eight tools. v0.0.9 appends 23
         // non-block items at 24..=46 and five block items at 47..=51.
-        assert_eq!(reg.item_len(), 71);
+        assert_eq!(reg.item_len(), 72);
         assert_eq!(reg.item_id("openblock:stone"), Some(ItemId(0)));
         assert_eq!(reg.item_id("openblock:dirt"), Some(ItemId(1)));
         assert_eq!(reg.item_id("openblock:grass"), Some(ItemId(2)));
@@ -3068,6 +3173,8 @@ mod tests {
         assert_eq!(reg.item_id("openblock:string"), Some(ItemId(68)));
         assert_eq!(reg.item_id("openblock:gunpowder"), Some(ItemId(69)));
         assert_eq!(reg.item_id("openblock:arrow"), Some(ItemId(70)));
+        // 1.5 fire block item appends after every frozen 1.2/1.3 item.
+        assert_eq!(reg.item_id("openblock:fire"), Some(ItemId(71)));
 
         // The v0.0.9 non-block item ids 24..=46 are frozen in this exact order.
         let appended = [

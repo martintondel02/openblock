@@ -128,7 +128,8 @@
       },
       "hardness": 2.0,
       "preferred_tool": "axe",
-      "required_tier": 0
+      "required_tier": 0,
+      "flammable": true
     },
     {
       "id": "openblock:leaves",
@@ -151,7 +152,8 @@
         1,
         1
       ],
-      "sky_attenuation": 1
+      "sky_attenuation": 1,
+      "flammable": true
     },
     {
       "id": "openblock:bedrock",
@@ -244,7 +246,8 @@
       },
       "hardness": 2.0,
       "preferred_tool": "axe",
-      "required_tier": 0
+      "required_tier": 0,
+      "flammable": true
     },
     {
       "id": "openblock:cobblestone",
@@ -282,7 +285,8 @@
       },
       "hardness": 2.5,
       "preferred_tool": "axe",
-      "required_tier": 0
+      "required_tier": 0,
+      "flammable": true
     },
     {
       "id": "openblock:coal_ore",
@@ -379,7 +383,8 @@
       },
       "hardness": 2.5,
       "preferred_tool": "axe",
-      "required_tier": 0
+      "required_tier": 0,
+      "flammable": true
     },
     {
       "id": "openblock:torch",
@@ -547,7 +552,8 @@
         1,
         1
       ],
-      "sky_attenuation": 1
+      "sky_attenuation": 1,
+      "flammable": true
     },
     {
       "id": "openblock:bed_head",
@@ -571,7 +577,38 @@
         1,
         1
       ],
-      "sky_attenuation": 1
+      "sky_attenuation": 1,
+      "flammable": true
+    },
+    {
+      "id": "openblock:fire",
+      "solid": false,
+      "opaque": false,
+      "fluid": false,
+      "color": [
+        1.0,
+        0.56,
+        0.12
+      ],
+      "textures": {
+        "top": "fire",
+        "side": "fire",
+        "bottom": "fire"
+      },
+      "hardness": 0.0,
+      "required_tier": 0,
+      "emission": [
+        15,
+        15,
+        15
+      ],
+      "attenuation": [
+        0,
+        0,
+        0
+      ],
+      "sky_attenuation": 0,
+      "shape": "cross"
     }
   ]
 }

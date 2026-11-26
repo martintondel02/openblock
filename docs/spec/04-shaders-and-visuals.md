@@ -1,6 +1,6 @@
 # 04 — Shaders and Visuals: Lighting, Shadows, Sky, Post and Shader Packs
 
-> Status: normative - Last updated: 2026-11-25
+> Status: normative - Last updated: 2026-11-26
 > Depends on: DEC-005, DEC-011, DEC-014, DEC-015, DEC-016, DEC-017, DEC-022, DEC-029, DEC-032, DEC-045, DEC-048, DEC-051; [conventions](00-conventions.md), [rendering](03-rendering.md), [light and weather](07-light-and-weather.md), [performance budgets](25-performance-budgets.md)
 > Implements: MS-04, MS-12
 
@@ -354,6 +354,17 @@ with motion-stretched billboards (8,192 instances), animated entirely on the GPU
 time uniform; lightning is a short directional flash plus an exposure pulse, rate-limited to
 3 flashes per second and never full-screen white (REQ-VIS-028). Weather *state* is replicated
 from the host ([chapter 07](07-light-and-weather.md)); only its appearance is local.
+
+> **1.5 implementation envelope.** The shipped client uses a smaller, measured
+> envelope than the long-term 8,192-instance target: 4,096 live particles
+> (2,048 precipitation, 1,700 rain / 1,100 snow at full intensity), one instanced
+> draw call, one 560-byte camera-uniform row and no per-particle draw or texture
+> binding. Lightning is a post-processing exposure lift (`1 + flash × 3`) rather
+> than a directional light, and fire/explosion use baked emission plus a
+> screen-space warm particle halo instead of dynamic point lights. The concrete
+> state/visual/audio mapping, costs, captures and limitations are in
+> [§3.13.11](#31311-v15-weather-fire-and-particle-slice-2026-11-26) and
+> [1.5-visuals](../plan/1.5-visuals.md).
 
 ### 3.6 The post-processing chain
 
@@ -963,6 +974,59 @@ tonemap rather than separating direct sun); projected cloud shadows are Ultra-on
 Low/Medium intentionally keep the 1.3 look. A dedicated `cloud_shadows` quality row (or
 `gtao`/`ssao` row) would let High trade the quarter-res AO or cloud shadows explicitly and
 is recommended for the Lead rather than added here.
+
+#### 3.13.11 v1.5 weather, fire and particle slice (2026-11-26)
+
+The renderer/client weather slice consumes protocol v5 `weather_sync` and
+`lightning_strike` without changing simulation authority. It adds:
+
+- **Particles.** A bounded deterministic CPU simulation (`ParticleSystem`) and one
+  instanced billboard pass for rain, snow, smoke, embers, debris, XP sparks and
+  hearts. Camera-local precipitation follows the eye, obeys the server's
+  precipitation/intensity, derives wind from the storm epoch, recycles below the
+  client heightmap/ground and clears under a roof. Caps: 4,096 total, 2,048
+  precipitation, 384 fire effects. `SceneParams` gained defaulted `weather` and
+  `particles` fields, so every clear-weather scene renders the v1.4 look exactly;
+  a frame with no particles records no pass.
+- **Storm presentation.** `EnvironmentVisual::with_weather` desaturates then
+  darkens the sky/fog palette in a luminance-preserving way, dims the sun disc,
+  ambient light and baked block-light multiplier, and hides stars/moon. The
+  camera uniform carries a weather row used by the sky shader to lower the cloud
+  plane (190 m → ~110 m at full storm), raise coverage/wind and darken the cloud
+  body. Fog start/end are pulled in by up to 45%/35%. A lightning event applies a
+  post-process exposure lift (`1 + flash × 3`) rather than a scene light, so the
+  whole HDR frame brightens uniformly without a flat white wash; a compact
+  top-centre HUD chip and three F3 lines report phase/intensity/precipitation/
+  remaining/factor/flash/shelter.
+- **Fire.** The 1.5 content fire block is a full-light cross. The mesher now emits
+  two perpendicular **vertical** diagonal planes (the previous implementation
+  emitted a horizontal square twice, flattening torches, wheat and fire), the
+  procedural texture catalogue generates a ragged flame cut-out in every style,
+  and resource packs accept `fire_0/1.png`/`fire.png`. The shader animates layer 38
+  with a wobbling mip-0 UV and flickering alpha threshold and writes a warm HDR
+  colour; embers, smoke and a low-alpha warm halo are emitted around nearby
+  burning cells. `Material::Fire` feeds block-break/place audio.
+- **Explosion/creeper/XP.** Explosion events spawn capped smoke/debris/sparks
+  plus a short fireball, shake the camera, pulse exposure and play
+  `explosion_cue`; single-player creeper avatars read `fuse_timer` to swell/flash.
+  Network creeper fuses are not in v5, so multiplayer uses a proximity hiss and
+  leaves the explosion authoritative. XP/level, critical, skeleton/spider and
+  arrow spawn/despawn cues are wired through `ob_audio`.
+- **Captures and verification.** `--screenshot-weather=rain|thunder|snow`,
+  `--screenshot-fire` and `--screenshot-explosion` produce deterministic offscreen
+  proof frames; `render_distance_bench --weather …` includes the per-frame
+  particle update/packing and draw in the measured frame. At 1,920×1,080 High,
+  512-chunk view, the same-host median clear p50 was 55.9 ms and thunder 55.5 ms
+  (median delta −0.42 ms; worst pair +0.12 ms; 1,700 billboards, one extra draw).
+  The absolute host baseline is higher than the earlier 16.6 ms report on the same
+  machine and should be re-measured on an idle bench box before quoting. Render
+  and client unit tests cover caps/determinism, weather mapping, fire texture and
+  vertical cross geometry, the GPU particle/flash frame, HUD/F3 layout and a
+  loopback v5 weather/lightning exchange.
+
+Limitations are recorded in [1.5-visuals](../plan/1.5-visuals.md) §9: no dynamic
+point lights, rain splashes, snow accumulation, network creeper fuse field,
+screen droplets, or single-player bow item; the flash is post-only.
 
 ## 4. Data structures and formats
 

@@ -30,7 +30,7 @@ sudo cp -a /usr/bin/openblock-server /usr/bin/openblock-server.previous
 ```
 
 Also read the release notes/CHANGELOG for the target version. Within 1.0.x a
-patch release keeps save format 4 and protocol 4; a later minor may add a save
+patch release keeps save format 4 and protocol 5; a later minor may add a save
 migration or protocol revision, and the changelog says which. Do not mix a new
 server with an old client if the protocol version changed; the server rejects
 mismatched clients with `protocol_mismatch`. Pre-1.0 builds are unsupported and

@@ -30,11 +30,13 @@ use rayon::prelude::*;
 
 mod block_entities;
 mod crops;
+mod fire;
 mod items;
 mod mobs;
 pub mod net;
 pub mod net_players;
 mod save_worker;
+mod weather;
 
 pub use save_worker::SaveReport;
 
@@ -42,6 +44,10 @@ pub use block_entities::{CHEST_SLOTS, ContainerState, FurnaceSlot, FurnaceState}
 pub use crops::{
     CROP_GROWTH_DRY_TICKS, CROP_GROWTH_WET_TICKS, CROP_HARVEST_SEEDS_MAX, CROP_HARVEST_SEEDS_MIN,
     CROP_HYDRATION_INTERVAL_TICKS, CROP_HYDRATION_RADIUS, CROP_MIN_LIGHT, CropState, GRASS_SEED_DROP_MODULUS,
+};
+pub use fire::{
+    FIRE_BURN_TICKS, FIRE_DAMAGE_INTERVAL_TICKS, FIRE_DAMAGE_PER_SECOND, FIRE_MAX_ACTIVE, FIRE_MAX_PER_CHUNK,
+    FIRE_SPREAD_INTERVAL_TICKS, FIRE_SPREAD_PERCENT, FireCell,
 };
 pub use items::ItemEntity;
 pub use mobs::{
@@ -54,6 +60,14 @@ pub use mobs::{
 pub use net::{ConfigError, DedicatedServer, NetConfig, ServerFileConfig, load_server_config, parse_server_config};
 pub use net_players::{
     ENTITY_INTEREST_RADIUS, NETWORK_PLAYERS_FILE, NetworkDamageEvent, NetworkMoveResult, NetworkWindowRef, ServerPlayer,
+};
+pub use weather::{
+    CLEAR_MAX_TICKS, CLEAR_MIN_TICKS, CLEAR_WEATHER_FACTOR, LEVEL_VERSION, LIGHTNING_DAMAGE, LIGHTNING_DAMAGE_RADIUS,
+    LIGHTNING_RATE_DENOMINATOR, LIGHTNING_ROLL_STREAM, LIGHTNING_SEARCH_RADIUS, LIGHTNING_TARGET_STREAM,
+    LightningEvent, PRECIPITATING_MAX_TICKS, PRECIPITATING_MIN_TICKS, RAIN_INTENSITY_MAX_PERMILLE,
+    RAIN_INTENSITY_MIN_PERMILLE, RAIN_WEATHER_FACTOR, THUNDER_INTENSITY_MAX_PERMILLE, THUNDER_INTENSITY_MIN_PERMILLE,
+    THUNDER_MAX_TICKS, THUNDER_MIN_TICKS, THUNDER_WEATHER_FACTOR, WEATHER_RAMP_PERMILLE_PER_TICK, WEATHER_RAMP_TICKS,
+    WEATHER_STREAM, WeatherState,
 };
 
 /// Number of slots in the player's hotbar.
@@ -90,8 +104,6 @@ pub const SLEEP_FAST_FORWARD_TICKS: u32 = 100;
 pub const SLEEP_REQUEST_TIMEOUT_TICKS: u64 = 600;
 /// Maximum distance from the player to a bed they may use, in metres.
 pub const BED_USE_DISTANCE: f64 = 3.5;
-/// Weather multiplier for the light query while 1.2 has no weather machine.
-pub const CLEAR_WEATHER_FACTOR: f32 = 1.0;
 
 /// Defensive upper bound on one inventory stack.
 ///
@@ -430,6 +442,15 @@ pub struct Host {
     pending_births: Vec<PendingBirth>,
     /// Explosion cues for the client/network layer (runtime only).
     explosion_events: Vec<ExplosionEvent>,
+    /// Authoritative weather machine (persisted in the additive `level.txt`).
+    weather: weather::WeatherState,
+    /// Whether `tick_weather` advances the machine (the `do_weather_cycle`
+    /// gamerule equivalent; `false` freezes it for tests/admin pause).
+    weather_cycle: bool,
+    /// Lightning cues for the client/network layer (runtime only).
+    lightning_events: Vec<weather::LightningEvent>,
+    /// Burning fire cells and their remaining ticks (persisted in `fire.txt`).
+    fires: BTreeMap<BlockPos, fire::FireCell>,
 }
 
 /// One breeding birth waiting for its 60-tick gestation.
@@ -487,13 +508,23 @@ impl Host {
             }
             let generator = Generator::new(world.seed());
             let (player, saved_ticks) = load_player(&world_dir, &world, &generator);
+            let (weather, tick_count, level_loaded) = weather::load_level(&world_dir, world.seed(), saved_ticks);
+            if level_loaded && tick_count != saved_ticks {
+                log::info!(
+                    "level.txt clock {tick_count} overrides player.txt clock {saved_ticks} (additive 1.5 sidecar)"
+                );
+            }
             host = Self {
                 world,
                 generator,
                 player,
                 registry,
                 config,
-                tick_count: saved_ticks,
+                tick_count,
+                weather,
+                weather_cycle: true,
+                lightning_events: Vec::new(),
+                fires: BTreeMap::new(),
                 unloaded: Vec::new(),
                 world_dir,
                 dirty_player: false,
@@ -545,9 +576,11 @@ impl Host {
             host.respawn_point = load_respawn_point(&host.world_dir);
             host.crops = crops::load_crops(&host.world_dir, &host.registry, &host.world);
             host.next_crop_id = crops::next_crop_id(&host.crops);
+            host.fires = fire::load_fires(&host.world_dir, &host.world);
         } else {
             let generator = Generator::new(config.seed);
             let world = World::new(Arc::clone(&registry), config.seed);
+            let weather = weather::WeatherState::new(config.seed);
             host = Self {
                 world,
                 generator,
@@ -555,6 +588,10 @@ impl Host {
                 registry,
                 config,
                 tick_count: 0,
+                weather,
+                weather_cycle: true,
+                lightning_events: Vec::new(),
+                fires: BTreeMap::new(),
                 unloaded: Vec::new(),
                 world_dir,
                 dirty_player: false,
@@ -756,14 +793,6 @@ impl Host {
     /// client or the renderer.
     pub fn day_factor(&self) -> f32 {
         day_factor_for_phase(self.day_phase())
-    }
-
-    /// Weather multiplier for the gameplay-light query.
-    ///
-    /// 1.2 has no weather machine (1.3 owns it), so the factor is the clear
-    /// [`CLEAR_WEATHER_FACTOR`].
-    pub fn weather_factor(&self) -> f32 {
-        CLEAR_WEATHER_FACTOR
     }
 
     /// Whether the current tick phase allows using a bed (`12,600..=23,400`).
@@ -1130,6 +1159,23 @@ impl Host {
         let registry = Arc::clone(&self.registry);
         let day = self.day_factor();
         let weather = self.weather_factor();
+        // Rain hydration is precomputed without borrowing the world mutably: a
+        // crop is rain-fed when the current phase precipitates, its column is a
+        // rain (not snow/dry) column and it sees open sky.
+        // The crop pass only re-evaluates hydration every
+        // `CROP_HYDRATION_INTERVAL_TICKS`, so the worldgen precipitation query
+        // (and the heightmap check) runs at that cadence, not every tick.
+        let rain_hydrated: std::collections::BTreeSet<BlockPos> = if self.weather.is_precipitating()
+            && self.tick_count.is_multiple_of(crops::CROP_HYDRATION_INTERVAL_TICKS)
+        {
+            self.crops
+                .keys()
+                .copied()
+                .filter(|pos| self.rain_reaches(*pos))
+                .collect()
+        } else {
+            std::collections::BTreeSet::new()
+        };
         let updates = crops::tick_crops(
             &mut self.world,
             &registry,
@@ -1137,6 +1183,7 @@ impl Host {
             self.tick_count,
             day,
             weather,
+            &rain_hydrated,
         );
         for (pos, block) in updates {
             self.record_block_update(pos, block);
@@ -2169,6 +2216,7 @@ impl Host {
             step_player(&self.world, &mut self.player, input, TICK_DT)
         };
         self.tick_count += 1;
+        self.tick_weather();
         if sleeping {
             self.advance_single_sleep();
         }
@@ -2210,6 +2258,7 @@ impl Host {
         self.tick_furnaces();
         self.tick_items(TICK_DT);
         self.tick_crops();
+        self.tick_fires();
         // Single-player clients read block/light changes from the world; the
         // replication queue is a network-only side channel.
         self.pending_block_updates.clear();
@@ -2330,6 +2379,15 @@ impl Host {
                         return outcome;
                     }
                 }
+                let fire = self.registry.id_or_air("openblock:fire");
+                if action.place == fire {
+                    if Aabb::block(target).intersects(&self.player.aabb()) || !self.ignite_fire(target) {
+                        return outcome;
+                    }
+                    outcome.changed = true;
+                    outcome.placed = Some(action.place);
+                    action.place_block = false;
+                }
                 let bed_foot = self.registry.id_or_air("openblock:bed_foot");
                 let bed_head = self.registry.id_or_air("openblock:bed_head");
                 if action.place == bed_foot || action.place == bed_head {
@@ -2350,6 +2408,9 @@ impl Host {
                     // discarded with the block. Multi-cell support rules still
                     // apply: a bed loses both halves, farmland loses its crop,
                     // and a torch loses its floor.
+                    if block == self.registry.id_or_air("openblock:fire") {
+                        self.fires.remove(&pos);
+                    }
                     self.remove_block_entity(pos, block);
                     let registry = Arc::clone(&self.registry);
                     let bed_foot = registry.id_or_air("openblock:bed_foot");
@@ -2451,6 +2512,12 @@ impl Host {
         outcome.broke = Some(block);
         self.record_block_update(hit, BlockId::AIR);
         let torch = registry.id_or_air("openblock:torch");
+        // Fire is a normal breakable block plus a host timer. Remove the timer
+        // with the block so a break-and-replace in the same tick cannot leave a
+        // stale burn timer attached to the new block or the state hash.
+        if block == registry.id_or_air("openblock:fire") {
+            self.fires.remove(&hit);
+        }
         let mut handled_special = false;
 
         if let Some(stage) = wheat_stage {
@@ -2621,6 +2688,22 @@ impl Host {
             debug_assert!(consumed, "a matching selected bed stack must be consumable");
             self.record_block_update(foot, bed_foot);
             self.record_block_update(head, bed_head);
+            outcome.changed = true;
+            outcome.placed = Some(block);
+            self.mark_player_dirty();
+            return outcome;
+        }
+        let fire = self.registry.id_or_air("openblock:fire");
+        if block == fire {
+            // Fire is a timed, capped host cell rather than an ordinary inert
+            // block. Route the item placement through the same ignition path as
+            // lightning and spreading so a hand-placed fire cannot become an
+            // untimed permanent block or bypass the global/per-chunk caps.
+            if !self.ignite_fire(target) {
+                return outcome;
+            }
+            let consumed = self.consume_selected(1);
+            debug_assert!(consumed, "a matching selected fire stack must be consumable");
             outcome.changed = true;
             outcome.placed = Some(block);
             self.mark_player_dirty();
@@ -2983,6 +3066,11 @@ impl Host {
         let removed = to_unload.len();
         for pos in to_unload {
             self.world.remove_chunk(pos);
+            // Unloaded chunk edits are discarded, so an untimed fire block is
+            // lost with the column. Drop its timer in the same operation rather
+            // than leaving an orphan that would only be pruned on the next tick
+            // or save/reload.
+            self.fires.retain(|fire, _| fire.chunk() != pos);
             self.unloaded.push(pos);
         }
         removed
@@ -3063,6 +3151,11 @@ impl Host {
                 net_players::network_players_state(&self.registry, &self.network_players, &self.saved_network_players)
                     .into_bytes(),
             ),
+            (
+                weather::LEVEL_FILE,
+                weather::level_state(self.tick_count, &self.weather).into_bytes(),
+            ),
+            (fire::FIRES_FILE, fire::fires_state(&self.fires).into_bytes()),
         ])
     }
 
@@ -3309,6 +3402,28 @@ impl Host {
         // the pre-save resident set. Hashing it would turn save/reload tests into
         // false negatives; a dedicated light-hash API remains on World.
         hasher.write_u64(self.tick_count);
+        // Weather is persisted in level.txt: phase, remaining, fixed-point
+        // intensity and the storm epoch all participate, so a save/reload and a
+        // deterministic replay must agree on the storm.
+        hasher.write_u8(0xF8);
+        hasher.write_u8(match self.weather.phase {
+            ob_protocol::WeatherPhase::Clear => 0,
+            ob_protocol::WeatherPhase::Precipitating => 1,
+            ob_protocol::WeatherPhase::Thunder => 2,
+        });
+        hasher.write_u64(u64::from(self.weather.remaining_ticks));
+        hasher.write_u16(self.weather.intensity_permille);
+        hasher.write_u64(self.weather.epoch);
+        // Burning fire cells are persisted in fire.txt (block ids live in the
+        // world hash below); timer state must round-trip.
+        hasher.write_u8(0xF9);
+        hasher.write_u64(self.fires.len() as u64);
+        for (pos, cell) in &self.fires {
+            hasher.write_i32(pos.x);
+            hasher.write_i32(pos.y);
+            hasher.write_i32(pos.z);
+            hasher.write_u16(cell.remaining_ticks);
+        }
         hasher.write_i64((self.player.pos.x * 1000.0) as i64);
         hasher.write_i64((self.player.pos.y * 1000.0) as i64);
         hasher.write_i64((self.player.pos.z * 1000.0) as i64);
@@ -4239,10 +4354,10 @@ mod tests {
     use ob_worldgen::Generator;
 
     use super::{
-        ARMOR_SLOTS, CHEST_SLOTS, ContainerState, CraftOutcome, DAY_LENGTH_TICKS, FurnaceSlot, FurnaceState, GameMode,
-        HOTBAR_SLOTS, Host, HostConfig, INVENTORY_SLOTS, ItemStack, MAX_HOSTILE_MOBS, MAX_PASSIVE_MOBS,
-        MOB_ATTACK_REACH, STRUCTURE_MAX_HALF_EXTENT, StableHasher, apple_drop, armor_damage_reduction,
-        armor_slot_index, block_centre, inventory_state, load_inventory,
+        ARMOR_SLOTS, CHEST_SLOTS, ContainerState, CraftOutcome, DAY_LENGTH_TICKS, FIRE_BURN_TICKS, FurnaceSlot,
+        FurnaceState, GameMode, HOTBAR_SLOTS, Host, HostConfig, INVENTORY_SLOTS, ItemStack, MAX_HOSTILE_MOBS,
+        MAX_PASSIVE_MOBS, MOB_ATTACK_REACH, STRUCTURE_MAX_HALF_EXTENT, StableHasher, apple_drop,
+        armor_damage_reduction, armor_slot_index, block_centre, inventory_state, load_inventory,
     };
 
     /// Test-only temporary data directory removed on drop (best effort).
@@ -5871,6 +5986,10 @@ mod tests {
         let world_dir = test_world_dir(&dir);
         std::fs::write(world_dir.join("player.txt"), "12.5 90.0 -3.25 0.25 -0.5 0 1234\n")
             .expect("write old player file");
+        // This fixture emulates a pre-1.5 save: `level.txt` did not exist, so the
+        // player clock must be used and the first save writes the additive level
+        // sidecar. (A world that already has `level.txt` keeps that clock.)
+        let _ = std::fs::remove_file(world_dir.join("level.txt"));
         std::fs::remove_file(world_dir.join("inventory.txt")).expect("remove inventory file");
         std::fs::remove_file(world_dir.join("items.txt")).expect("remove items file");
 
@@ -8380,6 +8499,57 @@ mod tests {
         assert_eq!(reopened.world().get_block(target), torch);
         assert_eq!(reopened.world().block_light(target), 14, "torch light persists");
         assert_eq!(reopened.state_hash(), hash, "torch light must round-trip");
+    }
+
+    #[test]
+    fn fire_item_placement_and_creative_placement_use_the_timed_capped_ignition_path() {
+        // Survival placement consumes the selected item and creates a timer.
+        let (_dir, mut host) = survival_host("fire-item", 42);
+        converge(&mut host);
+        let spawn = host.spawn();
+        let x = spawn.x.floor() as i32 + 2;
+        let z = spawn.z.floor() as i32;
+        let floor = platform(&mut host, x, 100, z);
+        let fire = host.registry().id_or_air("openblock:fire");
+        select_item(&mut host, "openblock:fire", 2);
+        let before = host.inventory_slot(host.hotbar_selection()).map(|stack| stack.count);
+        let target = floor.offset(0, 1, 0);
+        let placed = host.place_selected_at(target, fire);
+        assert!(placed.changed);
+        assert_eq!(host.world().get_block(target), fire);
+        assert_eq!(
+            host.fire_cell(target).expect("placed fire has a timer").remaining_ticks,
+            FIRE_BURN_TICKS
+        );
+        assert_eq!(
+            host.inventory_slot(host.hotbar_selection()).map(|stack| stack.count),
+            before.map(|count| count - 1),
+            "one fire item is consumed"
+        );
+
+        // Breaking the fire removes the block and its timer immediately.
+        let broken = host.break_block_at(target);
+        assert!(broken.changed);
+        assert!(!host.is_burning(target));
+        assert_eq!(host.world().get_block(target), BlockId::AIR);
+
+        // Creative camera placement goes through the same host ignition path.
+        let (_dir_creative, mut creative) = open_host("fire-creative", 42);
+        converge(&mut creative);
+        let anchor = high_target(&creative);
+        let stone = creative.registry().id_or_air("openblock:stone");
+        aim_at(&mut creative, anchor, stone);
+        let creative_target = anchor.offset(0, 0, 1);
+        let outcome = creative.apply_action_with_outcome(&place_action(fire));
+        assert!(outcome.changed, "creative fire placement must be accepted");
+        assert_eq!(creative.world().get_block(creative_target), fire);
+        assert_eq!(
+            creative
+                .fire_cell(creative_target)
+                .expect("creative fire has a timer")
+                .remaining_ticks,
+            FIRE_BURN_TICKS
+        );
     }
 
     #[test]

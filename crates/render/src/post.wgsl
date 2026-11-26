@@ -21,7 +21,7 @@ struct PostUniform {
     // x: 1 / width, y: 1 / height, z: bloom threshold, w: scene time.
     texels: vec4<f32>,
     // x: SSAO strength (0 disables the fetch), y: underwater amount,
-    // zw: reserved.
+    // z: lightning flash 0..1, w: reserved.
     effects: vec4<f32>,
 };
 
@@ -90,6 +90,18 @@ fn vignette(uv: vec2<f32>) -> f32 {
     return 1.0 - 0.06 * smoothstep(0.30, 0.80, radius);
 }
 
+// Lightning is a full-screen exposure lift, not a scene-light change: it must
+// brighten sky, terrain, water and particles together for one or two frames.
+// Multiplying the HDR colour (instead of mixing towards white) preserves the
+// storm palette; the ACES fit rolls the highlights off without a flat grey wash.
+fn flash_exposure(hdr: vec3<f32>) -> vec3<f32> {
+    let flash = clamp(post.effects.z, 0.0, 1.0);
+    if flash <= 0.0 {
+        return hdr;
+    }
+    return hdr * (1.0 + flash * 3.0);
+}
+
 fn bloom_contribution(uv: vec2<f32>) -> vec3<f32> {
     // Two mips already give a wide, soft glow; the third mip is rendered (the
     // chain keeps its documented threshold + 3-mip structure) but contributes so
@@ -138,6 +150,7 @@ fn fs_post(input: PostOutput) -> @location(0) vec4<f32> {
     var hdr = textureSampleLevel(scene, post_sampler, input.uv, 0.0).rgb;
     hdr = apply_ao(hdr, input.uv);
     hdr = hdr + bloom_contribution(input.uv) * post.params.y;
+    hdr = flash_exposure(hdr);
     var toned = tone(hdr);
 
     let fxaa = post.params.w;
@@ -168,14 +181,15 @@ fn fs_post(input: PostOutput) -> @location(0) vec4<f32> {
             toned = mix(toned, average, amount * 0.65);
         }
     }
-    return vec4<f32>(clamp(underwater_grade(grade(toned, input.uv)), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    let graded = underwater_grade(grade(toned, input.uv));
+    return vec4<f32>(clamp(graded, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 
 // No bloom, FXAA or SSAO work at all: one HDR fetch, ACES, saturation and
 // vignette (plus the cheap underwater tint when the camera is submerged).
 @fragment
 fn fs_post_simple(input: PostOutput) -> @location(0) vec4<f32> {
-    let hdr = textureSampleLevel(scene, post_sampler, input.uv, 0.0).rgb;
+    let hdr = flash_exposure(textureSampleLevel(scene, post_sampler, input.uv, 0.0).rgb);
     let toned = tone(hdr);
     let graded = underwater_grade(grade(toned, input.uv));
     return vec4<f32>(clamp(graded, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);

@@ -22,14 +22,14 @@
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::environment::Environment;
+use crate::environment::{Environment, WeatherVisual};
 use crate::graphics::GraphicsSettings;
 #[cfg(test)]
 use crate::graphics::ShadowQuality;
 use crate::outline::{OUTLINE_VERTEX_COUNT, OutlineVertex};
 use crate::shadow::{MAX_SHADOW_CASCADES, ShadowCascades};
 use crate::textures::BlockTextureArray;
-use crate::{Camera, Vertex};
+use crate::{Camera, Vertex, particles::ParticleInstance};
 
 /// Depth buffer format used by the forward pass.
 pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -43,9 +43,9 @@ pub(crate) const BLOOM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16
 /// Number of bloom mip levels written by the threshold/downsample chain.
 pub(crate) const BLOOM_MIPS: usize = 3;
 
-/// Byte size of the camera uniform block: four `mat4x4<f32>` rows plus fifteen
+/// Byte size of the camera uniform block: four `mat4x4<f32>` rows plus sixteen
 /// `vec4<f32>` rows.
-pub(crate) const CAMERA_UNIFORM_SIZE: wgpu::BufferAddress = 544;
+pub(crate) const CAMERA_UNIFORM_SIZE: wgpu::BufferAddress = 560;
 
 /// Byte size of the post-processing uniform block (three `vec4<f32>` rows).
 pub(crate) const POST_UNIFORM_SIZE: wgpu::BufferAddress = 48;
@@ -115,6 +115,14 @@ pub(crate) struct CameraUniform {
     /// `x` near plane, `y` far plane, `z` 1 when the scene-depth copy bound at
     /// binding 5 is fresh this frame (depth-responsive water), `w` reserved.
     pub(crate) clip: [f32; 4],
+    /// `x` weather intensity `0..=1`, `y` storm weight `0..=1`, `z` reserved,
+    /// `w` reserved.
+    ///
+    /// Sky/cloud storm presentation and the lower cloud layer read this row;
+    /// the CPU palette in `environment.rs` handles colour darkening and light
+    /// dimming so the same physics-free values drive windowed and offscreen
+    /// frames.
+    pub(crate) weather: [f32; 4],
 }
 
 // Keep the GPU layout in sync with the shader's `Camera` struct.
@@ -140,6 +148,7 @@ const _: () = assert!(std::mem::offset_of!(CameraUniform, water) == 480);
 const _: () = assert!(std::mem::offset_of!(CameraUniform, shadow_scale) == 496);
 const _: () = assert!(std::mem::offset_of!(CameraUniform, atmosphere) == 512);
 const _: () = assert!(std::mem::offset_of!(CameraUniform, clip) == 528);
+const _: () = assert!(std::mem::offset_of!(CameraUniform, weather) == 544);
 
 impl CameraUniform {
     /// Builds the per-frame uniform for a camera, viewport aspect ratio,
@@ -149,6 +158,7 @@ impl CameraUniform {
     /// renderers always use the same distances for the same camera. The palette
     /// comes from [`Environment::visual`], so both paths also agree on the sky,
     /// sun/moon, stars and world light.
+    #[allow(clippy::too_many_arguments)] // camera, aspect, clock, quality, shadows, seam, weather
     pub(crate) fn new(
         camera: &Camera,
         aspect: f32,
@@ -157,10 +167,19 @@ impl CameraUniform {
         graphics: GraphicsSettings,
         shadow: &ShadowCascades,
         seam: Option<(f32, f32)>,
+        weather: WeatherVisual,
     ) -> Self {
         let eye = camera.position.as_vec3();
-        let (fog_start, fog_end) = camera.fog_range();
-        let visual = environment.visual();
+        let (mut fog_start, mut fog_end) = camera.fog_range();
+        let visual = environment.visual_with_weather(weather);
+        let weather = weather.sanitised();
+        // Storms pull the fog wall closer. The near/far seam uses the same
+        // bounds so the far heightfield cannot disagree with the near world.
+        let haze = weather.cloud_weight();
+        if haze > 0.0 {
+            fog_end = (fog_end * (1.0 - 0.35 * haze)).max(fog_start + 1.0);
+            fog_start = (fog_start * (1.0 - 0.45 * haze)).max(16.0).min(fog_end - 1.0);
+        }
         let aspect = aspect.max(0.01);
         let forward = camera.forward();
         let right = camera.right();
@@ -222,7 +241,9 @@ impl CameraUniform {
             ],
             graphics: [
                 time_seconds.max(0.0),
-                graphics.cloud_coverage,
+                // Storm clouds are denser at every quality preset; adding the
+                // coverage on the CPU keeps the clear-weather uniform identical.
+                (graphics.cloud_coverage + 0.34 * haze).clamp(0.0, 1.0),
                 graphics.cloud_factor(),
                 graphics.cloud_shadow_strength(),
             ],
@@ -239,6 +260,7 @@ impl CameraUniform {
                 },
                 0.0,
             ],
+            weather: [weather.intensity, weather.storm, 0.0, 0.0],
         }
     }
 
@@ -274,6 +296,7 @@ impl CameraUniform {
                 environment.visual().sun_direction,
             ),
             None,
+            WeatherVisual::default(),
         )
     }
 }
@@ -304,7 +327,7 @@ pub(crate) struct PostUniform {
     /// `x` `1 / width`, `y` `1 / height`, `z` bloom threshold, `w` time.
     pub(crate) texels: [f32; 4],
     /// `x` SSAO strength (0 = disabled), `y` underwater amount (0..1),
-    /// `z` reserved, `w` reserved.
+    /// `z` lightning flash `0..=1` (full-screen exposure lift), `w` reserved.
     pub(crate) effects: [f32; 4],
 }
 
@@ -319,6 +342,7 @@ impl PostUniform {
         graphics: GraphicsSettings,
         time_seconds: f32,
         underwater: bool,
+        weather_flash: f32,
     ) -> Self {
         Self {
             params: [
@@ -333,9 +357,115 @@ impl PostUniform {
                 crate::graphics::BLOOM_THRESHOLD,
                 time_seconds.max(0.0),
             ],
-            effects: [graphics.ssao_strength(), if underwater { 1.0 } else { 0.0 }, 0.0, 0.0],
+            effects: [
+                graphics.ssao_strength(),
+                if underwater { 1.0 } else { 0.0 },
+                if weather_flash.is_finite() {
+                    weather_flash.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                },
+                0.0,
+            ],
         }
     }
+}
+
+/// Creates the instanced particle pipeline.
+///
+/// The pipeline shares the scene camera bind group (only binding 0 is read),
+/// expands each quad in the vertex stage from the camera basis and alpha-blends
+/// into the HDR target after the water pass. Depth is tested but not written,
+/// so particles respect terrain and entity occlusion without z-fighting with
+/// the water surface.
+pub(crate) fn create_particle_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("particle-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("particles.wgsl").into()),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("particle-pipeline-layout"),
+        bind_group_layouts: &[Some(layout)],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("particle-pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<ParticleInstance>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &[
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x3,
+                        offset: 0,
+                        shader_location: 0,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 12,
+                        shader_location: 1,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x4,
+                        offset: 20,
+                        shader_location: 2,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32,
+                        offset: 36,
+                        shader_location: 3,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Uint32,
+                        offset: 40,
+                        shader_location: 4,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32,
+                        offset: 44,
+                        shader_location: 5,
+                    },
+                ],
+            })],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 /// Creates the camera uniform buffer (uniform + copy destination).
@@ -1414,7 +1544,7 @@ pub(crate) fn create_depth_texture(device: &wgpu::Device, width: u32, height: u3
 #[cfg(test)]
 mod tests {
     use crate::Camera;
-    use crate::environment::Environment;
+    use crate::environment::{Environment, WeatherVisual};
     use crate::graphics::{GraphicsPreset, ShadowQuality};
     use crate::shadow::ShadowCascades;
     use ob_math::{RenderVec, Vec4, WorldVec};
@@ -1423,7 +1553,7 @@ mod tests {
 
     #[test]
     fn camera_uniform_matches_the_shader_layout() {
-        assert_eq!(std::mem::size_of::<CameraUniform>(), 544);
+        assert_eq!(std::mem::size_of::<CameraUniform>(), 560);
         assert_eq!(std::mem::align_of::<CameraUniform>(), 16);
         assert_eq!(std::mem::offset_of!(CameraUniform, view_proj), 0);
         assert_eq!(std::mem::offset_of!(CameraUniform, camera_pos), 64);
@@ -1445,6 +1575,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CameraUniform, shadow_scale), 496);
         assert_eq!(std::mem::offset_of!(CameraUniform, atmosphere), 512);
         assert_eq!(std::mem::offset_of!(CameraUniform, clip), 528);
+        assert_eq!(std::mem::offset_of!(CameraUniform, weather), 544);
     }
 
     #[test]
@@ -1454,7 +1585,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(PostUniform, params), 0);
         assert_eq!(std::mem::offset_of!(PostUniform, texels), 16);
         assert_eq!(std::mem::offset_of!(PostUniform, effects), 32);
-        let uniform = PostUniform::new(1920, 1080, GraphicsSettings::default(), 3.0, false);
+        let uniform = PostUniform::new(1920, 1080, GraphicsSettings::default(), 3.0, false, 0.0);
         assert!((uniform.texels[0] - 1.0 / 1920.0).abs() < 1e-9);
         assert!((uniform.texels[1] - 1.0 / 1080.0).abs() < 1e-9);
         assert_eq!(uniform.texels[3], 3.0);
@@ -1465,7 +1596,8 @@ mod tests {
                 1080,
                 GraphicsSettings::from_preset(GraphicsPreset::Low),
                 0.0,
-                false
+                false,
+                0.0
             )
             .params[3],
             0.0
@@ -1592,6 +1724,7 @@ mod tests {
             graphics,
             &shadow,
             None,
+            WeatherVisual::default(),
         );
         assert_eq!(uniform.shadow_view_proj, shadow.view_proj_array());
         assert_eq!(uniform.shadow_split, shadow.split_vec4());
@@ -1616,6 +1749,7 @@ mod tests {
                 Environment::default().visual().sun_direction,
             ),
             None,
+            WeatherVisual::default(),
         );
         assert_eq!(low.shadow_split, [0.0; 4]);
         assert_eq!(low.water[1], 0.80);
@@ -1639,6 +1773,7 @@ mod tests {
             GraphicsSettings::default(),
             &shadow,
             Some((512.0, 64.0)),
+            WeatherVisual::default(),
         );
         assert_eq!(high.atmosphere[0], 512.0);
         assert_eq!(high.atmosphere[1], 64.0);
@@ -1663,6 +1798,7 @@ mod tests {
                 Environment::default().visual().sun_direction,
             ),
             None,
+            WeatherVisual::default(),
         );
         assert_eq!(low.atmosphere[0], 0.0);
         assert_eq!(low.atmosphere[2], 0.0, "Low must keep the cheap atmosphere");
@@ -1676,6 +1812,7 @@ mod tests {
             GraphicsSettings::from_preset(GraphicsPreset::Ultra),
             &shadow,
             Some((512.0, 64.0)),
+            WeatherVisual::default(),
         );
         assert!(ultra.graphics[3] > 0.0, "Ultra projects cloud shadows");
     }

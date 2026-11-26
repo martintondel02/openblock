@@ -482,6 +482,7 @@ impl OffscreenRenderer {
                 ui,
                 outline: None,
                 time_seconds: 0.0,
+                ..SceneParams::default()
             },
         )
     }
@@ -565,6 +566,7 @@ impl OffscreenRenderer {
                 ui,
                 outline: None,
                 time_seconds: 0.0,
+                ..SceneParams::default()
             },
         )
     }
@@ -1796,6 +1798,120 @@ mod tests {
         writer.write_image_data(rgba).expect("write screenshot png pixels");
     }
 
+    /// Mean luma of an RGBA readback, used by the weather/particle checks.
+    fn weather_mean_luma(pixels: &[u8]) -> f64 {
+        let mut sum = 0.0;
+        let mut count = 0.0;
+        for texel in pixels.as_chunks::<4>().0 {
+            sum += 0.2126 * f64::from(texel[0]) + 0.7152 * f64::from(texel[1]) + 0.0722 * f64::from(texel[2]);
+            count += 1.0;
+        }
+        if count == 0.0 { 0.0 } else { sum / count }
+    }
+
+    /// Number of pixels that differ by more than `threshold` in any channel.
+    fn weather_differing_pixels(first: &[u8], second: &[u8], threshold: u8) -> usize {
+        first
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(second.as_chunks::<4>().0)
+            .filter(|(a, b)| (0..3).any(|channel| a[channel].abs_diff(b[channel]) > threshold))
+            .count()
+    }
+
+    #[test]
+    fn weather_and_particles_draw_and_flash_lifts_the_frame() {
+        if std::env::var_os("OPENBLOCK_NO_GPU_TESTS").is_some() {
+            eprintln!("skipping weather particle GPU test: OPENBLOCK_NO_GPU_TESTS is set");
+            return;
+        }
+        let registry = Arc::new(Registry::base());
+        let world = World::new(Arc::clone(&registry), 7);
+        let mut renderer = match OffscreenRenderer::new(320, 180) {
+            Ok(renderer) => renderer,
+            Err(RenderError::NoAdapter(reason)) => {
+                eprintln!("skipping weather particle GPU test: no GPU adapter ({reason})");
+                return;
+            }
+            Err(error) => panic!("failed to create the offscreen renderer: {error}"),
+        };
+        renderer.set_graphics(crate::GraphicsSettings {
+            clouds: crate::CloudQuality::Off,
+            bloom: false,
+            fxaa: false,
+            ..crate::GraphicsSettings::default()
+        });
+        let mut camera = Camera::new(WorldVec::new(8.0, 76.0, 8.0), 0.0, -0.05);
+        camera.far = 128.0;
+        let clear_scene = SceneParams {
+            environment: Environment::default(),
+            ..SceneParams::default()
+        };
+        renderer
+            .render_world_scene(&world, &camera, &clear_scene)
+            .expect("clear frame");
+        let clear = renderer.read_rgba();
+        let clear_luma = weather_mean_luma(&clear);
+
+        let mut particles = crate::particles::ParticleSystem::new(3);
+        let settings = crate::particles::WeatherParticles {
+            precipitation: crate::particles::Precipitation::Rain,
+            intensity: 1.0,
+            wind: [1.0, 0.0],
+            exposure: 1.0,
+            ground_y: 0.0,
+        };
+        particles.prefill_weather([8.0, 76.0, 8.0], settings);
+        particles.advance(0.35);
+        let instances = particles.instances();
+        assert!(instances.len() > 1_000);
+        let rain_scene = SceneParams {
+            environment: Environment::default(),
+            particles: Some(instances),
+            ..SceneParams::default()
+        };
+        renderer
+            .render_world_scene(&world, &camera, &rain_scene)
+            .expect("rain frame");
+        let stats = renderer.stats();
+        assert_eq!(stats.particle_draw_calls, 1);
+        assert!(stats.particle_instances > 1_000);
+        let rain = renderer.read_rgba();
+        assert!(
+            weather_differing_pixels(&clear, &rain, 4) > 500,
+            "rain should change a meaningful number of sky pixels"
+        );
+
+        let storm_scene = SceneParams {
+            environment: Environment::default(),
+            weather: crate::WeatherVisual::new(1.0, 1.0, crate::WeatherPrecipitation::Rain, 0.0),
+            ..SceneParams::default()
+        };
+        renderer
+            .render_world_scene(&world, &camera, &storm_scene)
+            .expect("storm frame");
+        let storm_luma = weather_mean_luma(&renderer.read_rgba());
+        assert!(
+            storm_luma < clear_luma * 0.85,
+            "storm sky should be darker (clear {clear_luma:.1}, storm {storm_luma:.1})"
+        );
+
+        let flash_scene = SceneParams {
+            environment: Environment::default(),
+            weather: crate::WeatherVisual::new(0.0, 0.0, crate::WeatherPrecipitation::None, 1.0),
+            ..SceneParams::default()
+        };
+        renderer
+            .render_world_scene(&world, &camera, &flash_scene)
+            .expect("flash frame");
+        let flash_luma = weather_mean_luma(&renderer.read_rgba());
+        assert!(
+            flash_luma > clear_luma * 1.15,
+            "full flash should lift exposure (clear {clear_luma:.1}, flash {flash_luma:.1})"
+        );
+    }
+
     /// Ignored GPU verification: noon, sunset and midnight skies over the test
     /// platform, plus the targeted-block outline.
     ///
@@ -1925,6 +2041,7 @@ mod tests {
             ui: None,
             outline: None,
             time_seconds: 8.0,
+            ..SceneParams::default()
         };
         let mut graphics = renderer.graphics();
         graphics.shadow_quality = crate::ShadowQuality::High;
@@ -1997,6 +2114,7 @@ mod tests {
             ui: None,
             outline: None,
             time_seconds: 8.0,
+            ..SceneParams::default()
         };
         renderer
             .render_world_scene(&world, &camera, &scene)
@@ -2635,6 +2753,7 @@ mod tests {
             ui: None,
             outline: None,
             time_seconds: time,
+            ..SceneParams::default()
         };
 
         let mut graphics = renderer.graphics();

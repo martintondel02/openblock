@@ -64,6 +64,8 @@ struct Camera {
     atmosphere: vec4<f32>,
     // x: near plane, y: far plane, z: fresh depth copy bound, w: reserved.
     clip: vec4<f32>,
+    // x: weather intensity 0..1, y: storm weight 0..1, zw: reserved.
+    weather: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -99,9 +101,20 @@ var cloud_density_sampler: sampler;
 // ambient light so the night sky stays dark.
 const WARM_HORIZON: vec3<f32> = vec3<f32>(0.0550, 0.0260, 0.0060);
 
+// Catalogue layer of the `openblock:fire` cross block (`ob_content::textures::FIRE`).
+// Kept as a local constant so this shader stays a pure GPU module.
+const FIRE_LAYER: u32 = 38u;
+
 // Cloud plane height above sea level, in metres. Clouds are composited from a
 // world-space plane so they parallax correctly as the camera moves.
 const CLOUD_HEIGHT: f32 = 190.0;
+// Storm clouds sit lower and thicker. The 0.58 factor at full intensity brings
+// the layer from 190 m down to about 110 m, enough to feel oppressive without
+// putting the player inside the cloud deck on a mountain.
+fn cloud_height() -> f32 {
+    let storm = clamp(camera.weather.x + camera.weather.y, 0.0, 1.0);
+    return CLOUD_HEIGHT * mix(1.0, 0.58, storm);
+}
 // Wind direction and speed of the cloud layer (metres per second).
 const CLOUD_WIND: vec2<f32> = vec2<f32>(0.82, 0.34);
 
@@ -274,13 +287,14 @@ fn cloud_contribution(view_dir: vec3<f32>) -> vec4<f32> {
     if (quality <= 0.0 || view_dir.y <= 0.005) {
         return vec4<f32>(0.0);
     }
-    let plane_height = CLOUD_HEIGHT - camera.camera_pos.y;
+    let plane_height = cloud_height() - camera.camera_pos.y;
     let distance_to_plane = plane_height / view_dir.y;
     if (distance_to_plane <= 0.0 || distance_to_plane > 30000.0) {
         return vec4<f32>(0.0);
     }
     let world = camera.camera_pos.xz + view_dir.xz * distance_to_plane;
-    let wind = CLOUD_WIND * (camera.graphics.x * 0.004);
+    let storm = clamp(camera.weather.x + camera.weather.y, 0.0, 1.0);
+    let wind = CLOUD_WIND * (camera.graphics.x * 0.004) * (1.0 + storm * 1.6);
     var uv = world * 0.0055 + wind;
     // Domain warp breaks the regular noise grid without another texture.
     // One cheap value-noise sample drives a diagonal domain warp. A full fbm
@@ -290,7 +304,7 @@ fn cloud_contribution(view_dir: vec3<f32>) -> vec4<f32> {
     uv = uv + vec2<f32>(warp, warp * 0.6) * 0.05;
     let density = cloud_noise(uv, quality);
     let coverage = clamp(camera.graphics.y, 0.0, 1.0);
-    let threshold = mix(0.60, 0.26, coverage);
+    let threshold = mix(0.60, 0.26, coverage) - storm * 0.06;
     let shaped = ramp(threshold, threshold + 0.16, density);
     if (shaped <= 0.0) {
         return vec4<f32>(0.0);
@@ -306,18 +320,21 @@ fn cloud_contribution(view_dir: vec3<f32>) -> vec4<f32> {
     let edge = clamp(shaped - ramp(threshold, threshold + 0.16, sun_side) + 0.35, 0.0, 1.0);
     let sun_amount = pow(max(dot(view_dir, sun_dir), 0.0), 6.0);
 
-    let cloud_body = mix(vec3<f32>(0.16, 0.19, 0.26), vec3<f32>(0.92, 0.94, 0.98), daylight);
+    var cloud_body = mix(vec3<f32>(0.16, 0.19, 0.26), vec3<f32>(0.92, 0.94, 0.98), daylight);
+    // Storm bases are grey and self-shaded; the lit rim survives only as a
+    // faint warm edge. This is what sells "heavy overcast" rather than "night".
+    cloud_body = mix(cloud_body, vec3<f32>(0.20, 0.22, 0.25), storm * 0.72);
     let warm = mix(camera.horizon.rgb, camera.sun_colour.rgb, 0.55);
     // Thicker parts of a cloud shade themselves a little; combined with the
     // sun-facing rim this gives the layer some volume instead of a flat white.
     let lit = cloud_body * (0.35 + 0.65 * daylight) * mix(1.0, 0.80, density);
-    let rim = warm * (edge * sun_up * (0.35 + 0.8 * sun_amount));
+    let rim = warm * (edge * sun_up * (0.35 + 0.8 * sun_amount)) * (1.0 - storm * 0.75);
     let night = mix(vec3<f32>(0.05, 0.07, 0.11), vec3<f32>(0.10, 0.13, 0.20), sun_up);
     let colour = mix(night, lit + rim, daylight);
 
     let horizon_fade = ramp(0.0, 0.10, view_dir.y);
     let distance_fade = 1.0 - ramp(12000.0, 26000.0, distance_to_plane);
-    let alpha = shaped * quality * horizon_fade * distance_fade * 0.94;
+    let alpha = shaped * quality * horizon_fade * distance_fade * (0.94 + storm * 0.05);
     return vec4<f32>(colour, alpha);
 }
 
@@ -556,7 +573,7 @@ fn cloud_shadow(world_position: vec3<f32>, view_distance: f32) -> f32 {
     if sun_dir.y <= 0.03 {
         return 1.0;
     }
-    let travel = (CLOUD_HEIGHT - world_position.y) / sun_dir.y;
+    let travel = (cloud_height() - world_position.y) / sun_dir.y;
     if travel <= 0.0 || travel > 20000.0 {
         return 1.0;
     }
@@ -610,6 +627,29 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    // Fire is an animated emissive cut-out. The one fire layer is sampled at a
+    // wobbling UV and the alpha threshold pulses, so the ragged silhouette
+    // dances without an animated texture atlas. The result is HDR (>1) so the
+    // bloom pass gives it a warm halo in rain and at night; it uses no scene
+    // light, so it reads the same under an overcast sky.
+    if (input.layer == FIRE_LAYER) {
+        let time = camera.graphics.x;
+        let wobble = vec2<f32>(
+            sin(time * 3.1 + input.world_position.x * 2.3) * 0.025,
+            sin(time * 5.3 + input.world_position.z * 1.7) * 0.018,
+        );
+        let flame = textureSampleLevel(blocks, block_sampler, input.uv + wobble, input.layer, 0.0);
+        let pulse = 0.80 + 0.20 * sin(time * 11.0 + input.world_position.x * 4.1 + input.world_position.z * 2.9)
+            + 0.06 * sin(time * 27.0 + input.world_position.y * 7.0);
+        if flame.a * pulse < 0.24 {
+            discard;
+        }
+        // Keep most of the flame below the bloom threshold; only the hot core
+        // reaches HDR so the fire reads orange instead of clipping to white.
+        let core = 0.6 + 1.1 * pulse;
+        let colour = flame.rgb * (1.0 + 0.35 * pulse) + vec3<f32>(0.34, 0.09, 0.01) * core;
+        return vec4<f32>(colour, 1.0);
+    }
     let texel = textureSample(blocks, block_sampler, input.uv, input.layer);
     // Alpha cut-out: leaf layers punch small transparent holes, everything else
     // is fully opaque. The chunk pipeline has no blending, so this stays a cheap
