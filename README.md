@@ -6,18 +6,18 @@
 <p align="center">
   <a href=".github/workflows/ci.yml"><img alt="CI" src="https://github.com/martintondel02/openblock/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE-MIT"><img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-1.4.0%20early%20access-orange.svg">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.5.0%20early%20access-orange.svg">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.100%2B-B7410E.svg?logo=rust">
   <img alt="Primary platform" src="https://img.shields.io/badge/platform-Fedora%2044%2F45%20%7C%20Linux-51A2DA.svg?logo=fedora">
 </p>
 
 OpenBlock is an open-source voxel sandbox: mine, build, explore and survive alone
-or with friends on servers you host yourself. **1.4.0 is an Early Access
+or with friends on servers you host yourself. **1.5.0 is an Early Access
 release**: the core survival game and self-hosted multiplayer are playable and
 tested end-to-end, while crafting-grid, lighting, farming, weather and the
 modding track are explicitly post-1.0 (see [Known limitations](#known-limitations)).
 
-![OpenBlock 1.4 at 512-chunk (8,192-block) visual render distance](docs/img/v1.4.0-day.png)
+![OpenBlock 1.5 weather over the 512-chunk view](docs/img/v1.5.0-rain.png)
 
 ## What's in 1.0
 
@@ -35,7 +35,7 @@ modding track are explicitly post-1.0 (see [Known limitations](#known-limitation
 - **Self-hosted multiplayer** — dedicated server with world streaming, chat,
   player roster, avatars/name tags and **server-authoritative survival**
   (inventories, vitals, equipment, actions, containers, death/respawn,
-  persistence); protocol v4 over TCP with strict limits. No TLS yet: use it on a
+  persistence); protocol v5 over TCP with strict limits. No TLS yet: use it on a
   LAN, VPN or SSH tunnel.
 - **Audio** — 79 procedurally synthesized clips total: 77 SFX (material
   footsteps, break/place, pickup, hurt/death, eat, craft, tool break, splash,
@@ -44,13 +44,19 @@ modding track are explicitly post-1.0 (see [Known limitations](#known-limitation
   at runtime; Windows/macOS build with a silent stub in 1.0.
 - **Light & Home (1.2)** — real sky/block lighting and torches, beds with
   personal respawn and multiplayer sleep, wheat farming with hydration/growth
-  stages, bread, hoes, 36-slot inventory (hotbar + main + armor) and protocol v4
+  stages, bread, hoes, 36-slot inventory (hotbar + main + armor) and protocol v5
   with authoritative light/sleep sync; 1.0/1.1 worlds migrate their fake light
   once.
+- **Weather & Fire (1.5)** — server-authoritative clear/rain/thunder cycles with
+  deterministic timing, biome rain/snow, lightning strikes with damage/ignition,
+  spreading and rain-extinguished fire, `level.txt`/`fire.txt` persistence and
+  protocol v5 sync; procedural rain/thunder/fire/explosion audio; particle
+  rain/snow, storm sky/fog, lightning flash/shake, animated fire, embers/smoke and
+  XP/explosion effects.
 - **Danger & Detail (1.4)** — spider/skeleton/creeper threats with arrows,
   explosions and daylight burning; charged/critical combat; animal breeding with
   babies and growth; XP/levels; deterministic structure-chest loot and new
-  bone/string/gunpowder/arrow items; protocol v4. Renderer gains a soft near/far
+  bone/string/gunpowder/arrow items; protocol v5. Renderer gains a soft near/far
   seam, depth-aware water/foam/underwater grade, height fog, SSAO and Ultra cloud
   shadows.
 - **512-chunk reach + shaders (1.3)** — visual render distance up to **512
@@ -233,7 +239,7 @@ The full 1.0 checklist, accepted limitations and audit results:
 
 - [docs/README.md](docs/README.md) — specification, research and project plan.
 - [docs/spec/01-technical-architecture.md](docs/spec/01-technical-architecture.md) — crate graph and architecture.
-- [docs/spec/18-networking-multiplayer.md](docs/spec/18-networking-multiplayer.md) — protocol v4 and multiplayer design.
+- [docs/spec/18-networking-multiplayer.md](docs/spec/18-networking-multiplayer.md) — protocol v5 and multiplayer design.
 - [docs/admin/](docs/admin/README.md) — server quickstart, configuration, admin, security, backup, upgrade, troubleshooting.
 - [docs/plan/1.0.1-audit.md](docs/plan/1.0.1-audit.md) — post-release docs/security/metadata audit findings and accepted risks.
 - [CONTRIBUTING.md](CONTRIBUTING.md) — build, test and review workflow.

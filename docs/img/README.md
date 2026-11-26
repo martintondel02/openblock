@@ -261,3 +261,23 @@ rendering.
 | Before/after seam comparison | `docs/img/v1.4.0-seam-before.png` / `docs/img/v1.4.0-seam.png` |
 | Live HUD with new mobs and XP bar | `docs/img/v1.4.0-mobs.png` |
 | F3 with far terrain/SSAO/FSR status | `docs/img/v1.4.0-f3.png` |
+
+## v1.5.0 screenshots (Weather & Fire)
+
+Weather presentation at 1280×720 with classic textures, captured from the new
+offscreen weather/fire/explosion screenshot modes plus normal HUD/F3 captures.
+
+| Capture | Path |
+| --- | --- |
+| Rain, HUD chip and storm sky | `docs/img/v1.5.0-rain.png` |
+| Thunder with lightning flash and particles | `docs/img/v1.5.0-thunder.png` |
+| Snow precipitation | `docs/img/v1.5.0-snow.png` |
+| Fire block and embers | `docs/img/v1.5.0-fire.png` |
+| Explosion smoke/debris flash | `docs/img/v1.5.0-explosion.png` |
+| Night storm | `docs/img/v1.5.0-night.png` |
+| F3 weather lines | `docs/img/v1.5.0-f3.png` |
+
+```sh
+openblock --no-audio --no-texture-pack --screenshot docs/img/v1.5.0-rain.png --screenshot-weather=rain
+openblock --no-audio --no-texture-pack --screenshot docs/img/v1.5.0-fire.png --screenshot-fire
+```
